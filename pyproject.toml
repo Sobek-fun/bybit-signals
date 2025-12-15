@@ -9,5 +9,6 @@ dependencies = [
     "c>=0.0.1",
     "clickhouse-connect>=0.10.0",
     "pandas>=2.3.3",
+    "pandas-ta>=0.4.71b0",
     "pydantic-settings>=2.12.0",
 ]
