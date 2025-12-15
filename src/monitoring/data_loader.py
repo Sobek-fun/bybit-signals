@@ -89,6 +89,47 @@ class DataLoader:
 
         return df
 
+    def load_candles_range(self, symbol: str, start_bucket: datetime, end_bucket: datetime) -> pd.DataFrame:
+        query = """
+        SELECT
+            toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket,
+            argMin(price, transaction_time) AS open,
+            max(price) AS high,
+            min(price) AS low,
+            argMax(price, transaction_time) AS close,
+            sum(size) AS volume,
+            sumIf(size, side = 'Buy') AS buy_volume,
+            sumIf(size, side = 'Sell') AS sell_volume,
+            sumIf(size, side = 'Buy') - sumIf(size, side = 'Sell') AS net_volume,
+            count() AS trades_count
+        FROM bybit.transactions
+        WHERE symbol = %(symbol)s
+          AND bucket >= %(start)s
+          AND bucket <= %(end)s
+        GROUP BY bucket
+        ORDER BY bucket
+        """
+
+        result = self.client.query(query, parameters={
+            "symbol": symbol,
+            "start": start_bucket,
+            "end": end_bucket
+        })
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["bucket", "open", "high", "low", "close", "volume",
+                     "buy_volume", "sell_volume", "net_volume", "trades_count"]
+        )
+
+        df["bucket"] = pd.to_datetime(df["bucket"])
+        df.set_index("bucket", inplace=True)
+
+        return df
+
     def _get_last_closed_time(self, symbol: str) -> datetime | None:
         now = datetime.now()
         minutes = (now.minute // 15) * 15
