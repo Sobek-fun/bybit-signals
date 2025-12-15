@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiogram>=3.23.0",
-    "c>=0.0.1",
     "clickhouse-connect>=0.10.0",
     "pandas>=2.3.3",
     "pandas-ta>=0.4.71b0",

@@ -145,7 +145,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "aiogram" },
-    { name = "c" },
     { name = "clickhouse-connect" },
     { name = "pandas" },
     { name = "pandas-ta" },
@@ -155,20 +154,10 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aiogram", specifier = ">=3.23.0" },
-    { name = "c", specifier = ">=0.0.1" },
     { name = "clickhouse-connect", specifier = ">=0.10.0" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "pandas-ta", specifier = ">=0.4.71b0" },
     { name = "pydantic-settings", specifier = ">=2.12.0" },
-]
-
-[[package]]
-name = "c"
-version = "0.0.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e0/90/6471c3c69538eaa1b7310c89ca8e2b80850e5ca85ac903ceab3c7b58c35b/c-0.0.1.tar.gz", hash = "sha256:2dc06dc330a40aa4ab4bdc0243c9f53ce1ef43d4875df67d758acf457ffda390", size = 6815, upload-time = "2018-06-21T06:20:51.028Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/f0/ddd790c096b50898e7876c7bf9d29a2a43ad02f3cb84ebb0cfe3b79d316d/c-0.0.1-py3-none-any.whl", hash = "sha256:99e628ba6af7f7b171ab07c807d99ea01f31cdc179ec636061eee6a49bed9c1a", size = 11579, upload-time = "2018-06-21T06:20:49.94Z" },
 ]
 
 [[package]]
