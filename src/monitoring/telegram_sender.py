@@ -8,15 +8,15 @@ class TelegramSender:
         self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
 
-    def send_pump_alert(self, symbol: str, timestamp: datetime, close_price: float, volume: float):
-        message = self._format_message(symbol, timestamp, close_price, volume)
+    def send_pump_alert(self, symbol: str, close_time: datetime, close_price: float, volume: float):
+        message = self._format_message(symbol, close_time, close_price, volume)
         asyncio.run(self._send_telegram(message))
 
-    def _format_message(self, symbol: str, timestamp: datetime, close_price: float, volume: float) -> str:
+    def _format_message(self, symbol: str, close_time: datetime, close_price: float, volume: float) -> str:
         return (
             f"🚀 Strong Pump Detected\n\n"
             f"Symbol: {symbol}\n"
-            f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Time: {close_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Close: {close_price:.6f}\n"
             f"Volume: {volume:.2f}\n\n"
             f"https://www.bybit.com/trade/usdt/{symbol}"
