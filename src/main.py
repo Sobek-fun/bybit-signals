@@ -35,12 +35,6 @@ def main():
         default=8,
         help="Number of parallel workers (default: 8)"
     )
-    parser.add_argument(
-        "--timeframe",
-        type=str,
-        default="15m",
-        help="Timeframe (default: 15m)"
-    )
 
     args = parser.parse_args()
 
@@ -51,8 +45,7 @@ def main():
         ch_dsn=args.ch_dsn,
         bot_token=args.bot_token,
         chat_id=args.chat_id,
-        workers=args.workers,
-        timeframe=args.timeframe
+        workers=args.workers
     )
 
     pipeline = Pipeline(config)

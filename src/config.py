@@ -8,6 +8,5 @@ class Config:
     bot_token: str
     chat_id: str
     workers: int = 8
-    timeframe: str = '15m'
     offset_seconds: int = 10
     lookback_candles: int = 150
