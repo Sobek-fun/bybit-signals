@@ -5,8 +5,9 @@ from urllib.parse import urlparse
 
 
 class DataLoader:
-    def __init__(self, ch_dsn: str):
+    def __init__(self, ch_dsn: str, offset_seconds: int = 10):
         self.client = self._create_client(ch_dsn)
+        self.offset_seconds = offset_seconds
 
     def _create_client(self, dsn: str):
         parsed = urlparse(dsn)
@@ -76,23 +77,23 @@ class DataLoader:
     def _get_last_closed_time(self, symbol: str) -> datetime | None:
         now = datetime.now()
         minutes = (now.minute // 15) * 15
-        last_closed = now.replace(minute=minutes, second=0, microsecond=0)
+        current_bucket_start = now.replace(minute=minutes, second=0, microsecond=0)
 
-        if now.minute % 15 == 0 and now.second < 10:
-            last_closed = last_closed - timedelta(minutes=15)
+        if now.minute % 15 == 0 and now.second < self.offset_seconds:
+            current_bucket_start = current_bucket_start - timedelta(minutes=15)
 
         query = """
         SELECT toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket
         FROM bybit.transactions
         WHERE symbol = %(symbol)s
-          AND bucket <= %(last_closed)s
+          AND transaction_time < %(current_bucket_start)s
         ORDER BY bucket DESC
         LIMIT 1
         """
 
         result = self.client.query(query, parameters={
             "symbol": symbol,
-            "last_closed": last_closed
+            "current_bucket_start": current_bucket_start
         })
 
         if not result.result_rows:
