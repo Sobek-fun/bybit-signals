@@ -1,6 +1,12 @@
-from datetime import datetime
-from aiogram import Bot
 import asyncio
+from datetime import datetime
+
+from aiogram import Bot
+
+
+def log(level: str, component: str, message: str):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{level}] {timestamp} [{component}] {message}")
 
 
 class TelegramSender:
@@ -10,7 +16,14 @@ class TelegramSender:
 
     def send_pump_alert(self, symbol: str, close_time: datetime, close_price: float, volume: float):
         message = self._format_message(symbol, close_time, close_price, volume)
-        asyncio.run(self._send_telegram(message))
+        try:
+            asyncio.run(self._send_telegram(message))
+            log("INFO", "TG",
+                f"alert sent symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')} close={close_price:.6f} volume={volume:.2f}")
+        except Exception as e:
+            log("ERROR", "TG",
+                f"send failed symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')} error={type(e).__name__}: {str(e)}")
+            raise
 
     def _format_message(self, symbol: str, close_time: datetime, close_price: float, volume: float) -> str:
         return (

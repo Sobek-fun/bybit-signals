@@ -1,10 +1,18 @@
-import pandas as pd
 from datetime import datetime, timedelta
-import clickhouse_connect
 from urllib.parse import urlparse
+
+import clickhouse_connect
+import pandas as pd
+
+
+def log(level: str, component: str, message: str):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{level}] {timestamp} [{component}] {message}")
 
 
 class DataLoader:
+    SLOW_QUERY_THRESHOLD_MS = 1500
+
     def __init__(self, ch_dsn: str, offset_seconds: int = 10):
         self.client = self._create_client(ch_dsn)
         self.offset_seconds = offset_seconds
@@ -30,6 +38,7 @@ class DataLoader:
     def load_candles(self, symbol: str, lookback: int) -> pd.DataFrame:
         t = self._get_last_closed_time(symbol)
         if t is None:
+            log("WARN", "DATA", f"symbol={symbol} no closed candles found")
             return pd.DataFrame()
 
         start_time = t - timedelta(minutes=lookback * 15)
@@ -54,13 +63,19 @@ class DataLoader:
         ORDER BY bucket
         """
 
+        query_start = datetime.now()
         result = self.client.query(query, parameters={
             "symbol": symbol,
             "start": start_time,
             "end": t
         })
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA", f"symbol={symbol} slow query: {query_duration_ms:.0f}ms rows={len(result.result_rows)}")
 
         if not result.result_rows:
+            log("WARN", "DATA", f"symbol={symbol} returned 0 rows for lookback={lookback}")
             return pd.DataFrame()
 
         df = pd.DataFrame(
