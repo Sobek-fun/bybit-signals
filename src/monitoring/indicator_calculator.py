@@ -1,5 +1,5 @@
 import pandas as pd
-
+import pandas_ta as ta
 
 class IndicatorCalculator:
     def calculate(self, df: pd.DataFrame) -> pd.DataFrame:
