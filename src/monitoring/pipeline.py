@@ -1,5 +1,6 @@
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from time import sleep
 from src.config import Config
 from src.monitoring.worker import Worker
 
@@ -8,6 +9,7 @@ class Pipeline:
     def __init__(self, config: Config):
         self.config = config
         self.last_processed_minute = None
+        self.last_alerted_bucket = {}
 
     def run(self):
         while True:
@@ -17,11 +19,13 @@ class Pipeline:
                 self._process_cycle()
                 self.last_processed_minute = current_time.replace(second=0, microsecond=0)
 
+            sleep(0.1)
+
     def _should_process(self, current_time: datetime) -> bool:
         if current_time.minute % 15 != 0:
             return False
 
-        if current_time.second != self.config.offset_seconds:
+        if current_time.second < self.config.offset_seconds:
             return False
 
         current_minute = current_time.replace(second=0, microsecond=0)
@@ -44,5 +48,5 @@ class Pipeline:
                     print(f"Error: {e}")
 
     def _process_token(self, token: str):
-        worker = Worker(self.config, token)
+        worker = Worker(self.config, token, self.last_alerted_bucket)
         worker.process()
