@@ -12,6 +12,7 @@ class Config:
     workers: int = 8
     offset_seconds: int = 10
     lookback_candles: int = 150
+    test_days: int = 30
 
 
 @dataclass
