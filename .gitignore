@@ -19,3 +19,6 @@ docker-compose.override.yml
 .idea
 .vscode
 t
+
+# AI
+bybit-signals.xml
