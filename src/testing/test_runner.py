@@ -85,13 +85,15 @@ class TestRunner:
                     f"SIGNAL symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')} close={last['close']:.6f} volume={last['volume']:.2f}")
                 signals_found += 1
 
-                if self._check_lookahead(df_all, i, lookback):
-                    log("ERROR", "TEST",
-                        f"LOOKAHEAD_MISMATCH symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                if self._check_lookahead(df_all, i, lookback, bucket_time, last['pump_signal'], symbol, close_time):
                     lookahead_errors += 1
 
                 stats = self._calculate_signal_stats(df_all, i, last['close'])
                 signal_stats.append(stats)
+
+            if windows_total % 500 == 0 and windows_total > 0:
+                if self._check_lookahead(df_all, i, lookback, bucket_time, last.get('pump_signal'), symbol, close_time):
+                    lookahead_errors += 1
 
             windows_total += 1
 
@@ -112,7 +114,7 @@ class TestRunner:
                 return i
         return lookback - 1
 
-    def _check_lookahead(self, df_all, i, lookback):
+    def _check_lookahead(self, df_all, i, lookback, bucket_time, original_signal, symbol, close_time):
         K = 10
         if i + K >= len(df_all):
             return False
@@ -121,10 +123,17 @@ class TestRunner:
         window_future = self.calculator.calculate(window_future)
         window_future = self.detector.detect(window_future)
 
-        original_signal = df_all.iloc[i].get('pump_signal') if 'pump_signal' in df_all.columns else None
-        future_signal = window_future.iloc[lookback - 1]['pump_signal']
+        try:
+            future_signal = window_future.loc[bucket_time, 'pump_signal']
+        except KeyError:
+            return False
 
-        return original_signal != future_signal
+        if original_signal != future_signal:
+            log("ERROR", "TEST",
+                f"LOOKAHEAD_MISMATCH symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')} original_signal={original_signal} future_signal={future_signal}")
+            return True
+
+        return False
 
     def _calculate_signal_stats(self, df_all, i, close_price):
         N = 8
