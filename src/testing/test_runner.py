@@ -93,7 +93,6 @@ class TestRunner:
         signals_found = 0
         lookahead_errors = 0
         windows_total = 0
-        signal_stats = []
 
         start_index = self._find_start_index(df_all, start_bucket, lookback)
 
@@ -116,9 +115,6 @@ class TestRunner:
                 if self._check_lookahead(df_all, i, lookback, bucket_time, last['pump_signal'], symbol, close_time):
                     lookahead_errors += 1
 
-                stats = self._calculate_signal_stats(df_all, i, last['close'])
-                signal_stats.append(stats)
-
             if windows_total % 500 == 0 and windows_total > 0:
                 if self._check_lookahead(df_all, i, lookback, bucket_time, last.get('pump_signal'), symbol, close_time):
                     lookahead_errors += 1
@@ -130,9 +126,6 @@ class TestRunner:
                     f"symbol={symbol} progress i={i}/{len(df_all)} windows={windows_total} found={signals_found}")
 
         log("INFO", "TEST", f"symbol={symbol} done windows={windows_total} signals={signals_found}")
-
-        if signal_stats:
-            self._log_quality_stats(symbol, signal_stats)
 
         return signals_found, lookahead_errors
 
@@ -162,41 +155,6 @@ class TestRunner:
             return True
 
         return False
-
-    def _calculate_signal_stats(self, df_all, i, close_price):
-        N = 8
-        if i + N >= len(df_all):
-            return None
-
-        future_candles = df_all.iloc[i + 1: i + 1 + N]
-        min_low = future_candles['low'].min()
-        close_after_n = df_all.iloc[i + N]['close']
-
-        max_drawdown = (min_low / close_price - 1) * 100
-        return_after_n = (close_after_n / close_price - 1) * 100
-
-        return {
-            'max_drawdown': max_drawdown,
-            'return_after_n': return_after_n
-        }
-
-    def _log_quality_stats(self, symbol, signal_stats):
-        stats = [s for s in signal_stats if s is not None]
-        if not stats:
-            return
-
-        drawdowns = [s['max_drawdown'] for s in stats]
-        returns = [s['return_after_n'] for s in stats]
-
-        drops_1 = sum(1 for d in drawdowns if d < -1)
-        drops_3 = sum(1 for d in drawdowns if d < -3)
-        drops_5 = sum(1 for d in drawdowns if d < -5)
-
-        median_drawdown = sorted(drawdowns)[len(drawdowns) // 2]
-        median_return = sorted(returns)[len(returns) // 2]
-
-        log("INFO", "TEST",
-            f"symbol={symbol} quality: drops(>1%/3%/5%)={drops_1}/{drops_3}/{drops_5} median_drawdown={median_drawdown:.2f}% median_return={median_return:.2f}%")
 
     def _get_last_closed_time(self):
         if not self.config.tokens:
