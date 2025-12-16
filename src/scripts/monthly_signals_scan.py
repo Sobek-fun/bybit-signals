@@ -50,7 +50,7 @@ def get_available_symbols(client, query_start_bucket: datetime, end_close_time: 
     FROM bybit.transactions
     WHERE transaction_time >= %(start)s
       AND transaction_time < %(end)s
-      AND symbol LIKE '%USDT'
+      AND symbol LIKE '%%USDT'
     ORDER BY symbol
     """
 
