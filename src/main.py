@@ -2,6 +2,8 @@ import argparse
 from datetime import datetime
 from urllib.parse import urlparse
 
+import clickhouse_connect
+
 from src.config import Config
 from src.monitoring.pipeline import Pipeline
 
@@ -62,6 +64,28 @@ def main():
             parser.error("--bot-token and --chat-id are required for prod mode")
 
     tokens = [token.strip().upper() for token in args.token.split(",")]
+
+    if len(tokens) == 1 and tokens[0] == "ALL":
+        parsed = urlparse(args.ch_dsn)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 8123
+        username = parsed.username or "default"
+        password = parsed.password or ""
+        database = parsed.path.lstrip("/") if parsed.path else "default"
+        secure = parsed.scheme == "https"
+
+        client = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            database=database,
+            secure=secure
+        )
+
+        query = "SELECT DISTINCT symbol FROM bybit.transactions WHERE endsWith(symbol, 'USDT') ORDER BY symbol"
+        result = client.query(query)
+        tokens = [row[0][:-4] for row in result.result_rows]
 
     config = Config(
         tokens=tokens,
