@@ -1,8 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import sleep
 
 from src.config import Config
+from src.monitoring.data_loader import DataLoader
+from src.monitoring.indicator_calculator import IndicatorCalculator
+from src.monitoring.pump_detector import PumpDetector
 from src.monitoring.worker import Worker
 
 
@@ -16,6 +19,9 @@ class Pipeline:
         self.config = config
         self.last_processed_minute = None
         self.last_alerted_bucket = {}
+        self.loader = DataLoader(self.config.ch_dsn, self.config.offset_seconds)
+        self.calculator = IndicatorCalculator()
+        self.detector = PumpDetector()
 
     def run(self):
         while True:
@@ -42,15 +48,23 @@ class Pipeline:
 
     def _process_cycle(self, current_time: datetime):
         expected_close_time = current_time.replace(second=0, microsecond=0)
+        expected_bucket_start = expected_close_time - timedelta(minutes=15)
+        start_bucket = expected_bucket_start - timedelta(minutes=(self.config.lookback_candles - 1) * 15)
+
         log("INFO", "PIPELINE",
-            f"cycle start expected_close_time={expected_close_time.strftime('%Y-%m-%d %H:%M:%S')} tokens={len(self.config.tokens)}")
+            f"cycle start expected_close_time={expected_close_time.strftime('%Y-%m-%d %H:%M:%S')} expected_bucket_start={expected_bucket_start.strftime('%Y-%m-%d %H:%M:%S')} tokens={len(self.config.tokens)}")
 
         cycle_start = datetime.now()
+
+        symbols = [f"{token}USDT" for token in self.config.tokens]
+        candles_dict = self.loader.load_candles_batch(symbols, start_bucket, expected_bucket_start)
+
         results = []
 
         with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
             futures = {
-                executor.submit(self._process_token, token): token
+                executor.submit(self._process_token, token, candles_dict.get(f"{token}USDT"),
+                                expected_bucket_start): token
                 for token in self.config.tokens
             }
 
@@ -66,8 +80,12 @@ class Pipeline:
 
         self._log_cycle_summary(results, cycle_duration)
 
-    def _process_token(self, token: str):
-        worker = Worker(self.config, token, self.last_alerted_bucket)
+    def _process_token(self, token: str, df, expected_bucket_start: datetime):
+        if df is None:
+            df = DataLoader.empty_dataframe()
+
+        worker = Worker(self.config, token, df, expected_bucket_start, self.calculator, self.detector,
+                        self.last_alerted_bucket)
         return worker.process()
 
     def _log_cycle_summary(self, results, cycle_duration: float):
@@ -80,10 +98,12 @@ class Pipeline:
         dedup = status_counts.get("ALERT_DEDUP", 0)
         skipped_empty = status_counts.get("SKIP_EMPTY", 0)
         skipped_short = status_counts.get("SKIP_SHORT", 0)
+        skipped_missing_last = status_counts.get("SKIP_MISSING_LAST", 0)
+        skipped_gapped = status_counts.get("SKIP_GAPPED", 0)
         errors = status_counts.get("ERROR", 0)
 
         log("INFO", "PIPELINE",
-            f"cycle done ok={ok} alerts_sent={alerts_sent} dedup={dedup} skipped_empty={skipped_empty} skipped_short={skipped_short} errors={errors}")
+            f"cycle done ok={ok} alerts_sent={alerts_sent} dedup={dedup} skipped_empty={skipped_empty} skipped_short={skipped_short} skipped_missing_last={skipped_missing_last} skipped_gapped={skipped_gapped} errors={errors}")
 
         if skipped_short > 0:
             short_examples = [r.symbol for r in results if r.status == "SKIP_SHORT"][:3]
@@ -94,8 +114,17 @@ class Pipeline:
             empty_examples = [r.symbol for r in results if r.status == "SKIP_EMPTY"][:3]
             log("WARN", "PIPELINE", f"skipped_empty={skipped_empty} (examples: {', '.join(empty_examples)})")
 
+        if skipped_missing_last > 0:
+            missing_last_examples = [r.symbol for r in results if r.status == "SKIP_MISSING_LAST"][:3]
+            log("WARN", "PIPELINE",
+                f"skipped_missing_last={skipped_missing_last} (examples: {', '.join(missing_last_examples)})")
+
+        if skipped_gapped > 0:
+            gapped_examples = [r.symbol for r in results if r.status == "SKIP_GAPPED"][:3]
+            log("WARN", "PIPELINE",
+                f"skipped_gapped={skipped_gapped} (examples: {', '.join(gapped_examples)})")
+
         durations = [r.duration_total_ms for r in results]
-        load_durations = [r.duration_load_ms for r in results if r.duration_load_ms > 0]
 
         if durations:
             avg_token = sum(durations) / len(durations)
@@ -103,11 +132,8 @@ class Pipeline:
             slowest_result = max(results, key=lambda r: r.duration_total_ms)
             slowest = slowest_result.symbol
 
-            load_avg = sum(load_durations) / len(load_durations) if load_durations else 0
-            load_max = max(load_durations) if load_durations else 0
-
             log("INFO", "PIPELINE",
-                f"perf total={cycle_duration:.1f}s avg_token={avg_token:.0f}ms max_token={max_token:.0f}ms slowest={slowest} load_avg={load_avg:.0f}ms load_max={load_max:.0f}ms")
+                f"perf total={cycle_duration:.1f}s avg_token={avg_token:.0f}ms max_token={max_token:.0f}ms slowest={slowest}")
 
         candle_counts = [r.candles_count for r in results if r.candles_count > 0]
         if candle_counts:

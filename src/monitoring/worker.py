@@ -1,8 +1,9 @@
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
+
+import pandas as pd
 
 from src.config import Config, WorkerResult
-from src.monitoring.data_loader import DataLoader
 from src.monitoring.indicator_calculator import IndicatorCalculator
 from src.monitoring.pump_detector import PumpDetector
 from src.monitoring.telegram_sender import TelegramSender
@@ -11,54 +12,76 @@ from src.monitoring.telegram_sender import TelegramSender
 class Worker:
     MIN_CANDLES = 60
 
-    def __init__(self, config: Config, token: str, last_alerted_bucket: dict):
+    def __init__(self, config: Config, token: str, df: pd.DataFrame, expected_bucket_start: datetime,
+                 calculator: IndicatorCalculator, detector: PumpDetector, last_alerted_bucket: dict):
         self.config = config
         self.token = token
         self.symbol = f"{token}USDT"
+        self.df = df
+        self.expected_bucket_start = expected_bucket_start
+        self.calculator = calculator
+        self.detector = detector
         self.last_alerted_bucket = last_alerted_bucket
 
     def process(self) -> WorkerResult:
         start_time = time.time()
 
         try:
-            load_start = time.time()
-            loader = DataLoader(self.config.ch_dsn, self.config.offset_seconds)
-            df = loader.load_candles(self.symbol, self.config.lookback_candles)
-            load_duration = (time.time() - load_start) * 1000
-
-            if df.empty:
+            if self.df.empty:
                 total_duration = (time.time() - start_time) * 1000
                 return WorkerResult(
                     token=self.token,
                     symbol=self.symbol,
                     status="SKIP_EMPTY",
-                    duration_total_ms=total_duration,
-                    duration_load_ms=load_duration
+                    duration_total_ms=total_duration
                 )
 
-            if len(df) < self.MIN_CANDLES:
+            if self.expected_bucket_start not in self.df.index:
+                total_duration = (time.time() - start_time) * 1000
+                return WorkerResult(
+                    token=self.token,
+                    symbol=self.symbol,
+                    status="SKIP_MISSING_LAST",
+                    duration_total_ms=total_duration,
+                    candles_count=len(self.df)
+                )
+
+            expected_buckets = pd.date_range(
+                end=self.expected_bucket_start,
+                periods=self.MIN_CANDLES,
+                freq='15min'
+            )
+            missing_buckets = expected_buckets.difference(self.df.index)
+            if len(missing_buckets) > 0:
+                total_duration = (time.time() - start_time) * 1000
+                return WorkerResult(
+                    token=self.token,
+                    symbol=self.symbol,
+                    status="SKIP_GAPPED",
+                    duration_total_ms=total_duration,
+                    candles_count=len(self.df)
+                )
+
+            if len(self.df) < self.MIN_CANDLES:
                 total_duration = (time.time() - start_time) * 1000
                 return WorkerResult(
                     token=self.token,
                     symbol=self.symbol,
                     status="SKIP_SHORT",
                     duration_total_ms=total_duration,
-                    duration_load_ms=load_duration,
-                    candles_count=len(df)
+                    candles_count=len(self.df)
                 )
 
             indicators_start = time.time()
-            calculator = IndicatorCalculator()
-            df = calculator.calculate(df)
+            self.df = self.calculator.calculate(self.df)
             indicators_duration = (time.time() - indicators_start) * 1000
 
             detect_start = time.time()
-            detector = PumpDetector()
-            df = detector.detect(df)
+            self.df = self.detector.detect(self.df)
             detect_duration = (time.time() - detect_start) * 1000
 
-            last_candle = df.iloc[-1]
-            bucket = last_candle.name
+            last_candle = self.df.loc[self.expected_bucket_start]
+            bucket = self.expected_bucket_start
 
             if last_candle['pump_signal'] == 'strong_pump':
                 if self.last_alerted_bucket.get(self.symbol) == bucket:
@@ -68,10 +91,9 @@ class Worker:
                         symbol=self.symbol,
                         status="ALERT_DEDUP",
                         duration_total_ms=total_duration,
-                        duration_load_ms=load_duration,
                         duration_indicators_ms=indicators_duration,
                         duration_detect_ms=detect_duration,
-                        candles_count=len(df),
+                        candles_count=len(self.df),
                         last_bucket=bucket
                     )
 
@@ -94,11 +116,10 @@ class Worker:
                     symbol=self.symbol,
                     status="ALERT_SENT",
                     duration_total_ms=total_duration,
-                    duration_load_ms=load_duration,
                     duration_indicators_ms=indicators_duration,
                     duration_detect_ms=detect_duration,
                     duration_telegram_ms=telegram_duration,
-                    candles_count=len(df),
+                    candles_count=len(self.df),
                     last_bucket=bucket
                 )
 
@@ -108,10 +129,9 @@ class Worker:
                 symbol=self.symbol,
                 status="OK_NO_SIGNAL",
                 duration_total_ms=total_duration,
-                duration_load_ms=load_duration,
                 duration_indicators_ms=indicators_duration,
                 duration_detect_ms=detect_duration,
-                candles_count=len(df),
+                candles_count=len(self.df),
                 last_bucket=bucket
             )
 
@@ -119,16 +139,13 @@ class Worker:
             total_duration = (time.time() - start_time) * 1000
 
             error_stage = "unknown"
-            if "loader" not in locals():
+            if not hasattr(self, 'df') or self.df is None:
                 error_stage = "init"
-            elif "df" not in locals() or df is None:
-                error_stage = "load"
-            elif "calculator" in locals() and "df" in dir() and df is not None:
-                if "MFI_14" not in df.columns:
-                    error_stage = "indicators"
-                else:
-                    error_stage = "detect"
-            elif "sender" in locals():
+            elif "MFI_14" not in self.df.columns:
+                error_stage = "indicators"
+            elif 'pump_signal' not in self.df.columns:
+                error_stage = "detect"
+            else:
                 error_stage = "telegram"
 
             return WorkerResult(
