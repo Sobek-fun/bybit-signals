@@ -55,8 +55,6 @@ class PumpDetector:
         self.cooldown_bars = cooldown_bars
 
     def detect(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-
         df['vol_median'] = df['volume'].rolling(window=self.volume_median_window).median()
         df['vol_ratio'] = df['volume'] / df['vol_median']
 

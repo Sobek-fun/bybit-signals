@@ -35,6 +35,61 @@ class DataLoader:
             secure=secure
         )
 
+    def load_candles_batch(self, symbols: list[str], start_bucket: datetime, end_bucket: datetime) -> dict[
+        str, pd.DataFrame]:
+        query = """
+        SELECT
+            symbol,
+            toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket,
+            argMin(price, transaction_time) AS open,
+            max(price) AS high,
+            min(price) AS low,
+            argMax(price, transaction_time) AS close,
+            sum(size) AS volume,
+            sumIf(size, side = 'Buy') AS buy_volume,
+            sumIf(size, side = 'Sell') AS sell_volume,
+            sumIf(size, side = 'Buy') - sumIf(size, side = 'Sell') AS net_volume,
+            count() AS trades_count
+        FROM bybit.transactions
+        WHERE symbol IN %(symbols)s
+          AND transaction_time >= %(start)s
+          AND transaction_time < %(end)s
+        GROUP BY symbol, bucket
+        ORDER BY symbol, bucket
+        """
+
+        query_start = datetime.now()
+        result = self.client.query(query, parameters={
+            "symbols": symbols,
+            "start": start_bucket,
+            "end": end_bucket + timedelta(minutes=15)
+        })
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"batch query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbols={len(symbols)}")
+
+        if not result.result_rows:
+            return {}
+
+        df_all = pd.DataFrame(
+            result.result_rows,
+            columns=["symbol", "bucket", "open", "high", "low", "close", "volume",
+                     "buy_volume", "sell_volume", "net_volume", "trades_count"]
+        )
+
+        df_all["bucket"] = pd.to_datetime(df_all["bucket"])
+
+        result_dict = {}
+        for symbol in df_all["symbol"].unique():
+            symbol_df = df_all[df_all["symbol"] == symbol].copy()
+            symbol_df = symbol_df.drop(columns=["symbol"])
+            symbol_df.set_index("bucket", inplace=True)
+            result_dict[symbol] = symbol_df
+
+        return result_dict
+
     def load_candles(self, symbol: str, lookback: int) -> pd.DataFrame:
         t = self._get_last_closed_time(symbol)
         if t is None:
