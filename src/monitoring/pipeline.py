@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from time import sleep
 
+import pandas as pd
+
 from src.config import Config
 from src.monitoring.data_loader import DataLoader
 from src.monitoring.indicator_calculator import IndicatorCalculator
@@ -82,7 +84,7 @@ class Pipeline:
 
     def _process_token(self, token: str, df, expected_bucket_start: datetime):
         if df is None:
-            df = DataLoader.empty_dataframe()
+            df = pd.DataFrame()
 
         worker = Worker(self.config, token, df, expected_bucket_start, self.calculator, self.detector,
                         self.last_alerted_bucket)
