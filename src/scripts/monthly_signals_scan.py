@@ -40,7 +40,8 @@ def get_last_closed_time(client, offset_seconds: int):
     if not result.result_rows:
         return None
 
-    return result.result_rows[0][0]
+    bucket = result.result_rows[0][0]
+    return bucket + timedelta(minutes=15)
 
 
 def get_available_symbols(client, query_start_bucket: datetime, end_close_time: datetime):
