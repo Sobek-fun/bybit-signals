@@ -1,3 +1,4 @@
+import csv
 from datetime import datetime, timedelta
 
 from src.config import Config
@@ -17,11 +18,34 @@ class TestRunner:
         self.loader = DataLoader(config.ch_dsn, config.offset_seconds)
         self.calculator = IndicatorCalculator()
         self.detector = PumpDetector()
+        self.csv_file_handle = None
+        self.csv_writer = None
+
+    def _init_csv_file(self):
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"signals_test_{timestamp}.csv"
+        self.csv_file_handle = open(filename, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file_handle)
+        self.csv_writer.writerow(['timestamp', 'symbol'])
+        self.csv_file_handle.flush()
+        return filename
+
+    def _write_signal_to_csv(self, close_time: datetime, symbol: str):
+        timestamp_str = close_time.strftime('%Y-%m-%d %H:%M:%S')
+        self.csv_writer.writerow([timestamp_str, symbol])
+        self.csv_file_handle.flush()
+
+    def _close_csv_file(self):
+        if self.csv_file_handle:
+            self.csv_file_handle.close()
 
     def run_test(self):
+        csv_filename = self._init_csv_file()
+
         end_close_time = self._get_last_closed_time()
         if end_close_time is None:
             log("ERROR", "TEST", "no closed candles found")
+            self._close_csv_file()
             return
 
         start_close_time = end_close_time - timedelta(days=self.config.test_days)
@@ -47,6 +71,9 @@ class TestRunner:
             total_symbols += 1
 
         log("INFO", "TEST", f"done total_symbols={total_symbols} total_signals={total_signals} errors={total_errors}")
+        log("INFO", "TEST", f"signals saved to {csv_filename}")
+
+        self._close_csv_file()
 
     def _test_symbol(self, symbol: str, query_start_bucket: datetime, end_bucket: datetime, start_bucket: datetime):
         df_all = self.loader.load_candles_range(symbol, query_start_bucket, end_bucket)
@@ -83,6 +110,7 @@ class TestRunner:
             if last['pump_signal'] == 'strong_pump':
                 log("INFO", "TEST",
                     f"SIGNAL symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')} close={last['close']:.6f} volume={last['volume']:.2f}")
+                self._write_signal_to_csv(close_time, symbol)
                 signals_found += 1
 
                 if self._check_lookahead(df_all, i, lookback, bucket_time, last['pump_signal'], symbol, close_time):
