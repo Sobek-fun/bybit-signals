@@ -31,7 +31,7 @@ class TelegramSender:
 
         return (
             f"🚀 Strong Pump Detected\n\n"
-            f"Symbol: {symbol}\n"
+            f"PUMP DETECTED: {symbol}\n"
             f"Time: {close_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Close: {close_price:.6f}\n"
             f"Volume: {volume:.2f}\n"
