@@ -26,12 +26,17 @@ class TelegramSender:
             raise
 
     def _format_message(self, symbol: str, close_time: datetime, close_price: float, volume: float) -> str:
+        tp_price = close_price * 0.94
+        sl_price = close_price * 1.20
+
         return (
             f"🚀 Strong Pump Detected\n\n"
             f"Symbol: {symbol}\n"
             f"Time: {close_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Close: {close_price:.6f}\n"
-            f"Volume: {volume:.2f}\n\n"
+            f"Volume: {volume:.2f}\n"
+            f"TP: {tp_price:.6f} (-6%)\n"
+            f"SL: {sl_price:.6f} (+20%)\n\n"
             f"https://www.bybit.com/trade/usdt/{symbol}"
         )
 
