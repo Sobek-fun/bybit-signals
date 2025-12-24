@@ -13,7 +13,8 @@ class Worker:
     MIN_CANDLES = 60
 
     def __init__(self, config: Config, token: str, df: pd.DataFrame, expected_bucket_start: datetime,
-                 calculator: IndicatorCalculator, detector: PumpDetector, last_alerted_bucket: dict):
+                 calculator: IndicatorCalculator, detector: PumpDetector, last_alerted_bucket: dict,
+                 telegram_sender: TelegramSender):
         self.config = config
         self.token = token
         self.symbol = f"{token}USDT"
@@ -22,6 +23,7 @@ class Worker:
         self.calculator = calculator
         self.detector = detector
         self.last_alerted_bucket = last_alerted_bucket
+        self.telegram_sender = telegram_sender
 
     def process(self) -> WorkerResult:
         start_time = time.time()
@@ -99,8 +101,7 @@ class Worker:
 
                 telegram_start = time.time()
                 close_time = bucket + timedelta(minutes=15)
-                sender = TelegramSender(self.config.bot_token, self.config.chat_id)
-                sender.send_pump_alert(
+                self.telegram_sender.send_pump_alert(
                     symbol=self.symbol,
                     close_time=close_time,
                     close_price=last_candle['close'],
