@@ -10,7 +10,7 @@ class Config:
     bot_token: str
     chat_id: str
     workers: int = 8
-    offset_seconds: int = 10
+    offset_seconds: int = 1
     lookback_candles: int = 150
     test_days: int = 30
 
