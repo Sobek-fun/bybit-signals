@@ -62,11 +62,7 @@ class Pipeline:
 
         symbols = [f"{token}USDT" for token in self.config.tokens]
 
-        start_1m = start_bucket
-        end_1m = expected_bucket_start + timedelta(minutes=14)
-        candles_1m_dict = self.loader.load_candles_batch(symbols, start_1m, end_1m)
-
-        candles_15m_dict = self._aggregate_1m_to_15m(candles_1m_dict)
+        candles_15m_dict = self.loader.load_candles_batch(symbols, start_bucket, expected_bucket_start)
 
         results = []
 
@@ -88,30 +84,6 @@ class Pipeline:
         cycle_duration = (datetime.now() - cycle_start).total_seconds()
 
         self._log_cycle_summary(results, cycle_duration)
-
-    def _aggregate_1m_to_15m(self, candles_1m_dict: dict) -> dict:
-        result = {}
-        for symbol, df_1m in candles_1m_dict.items():
-            if df_1m.empty:
-                result[symbol] = pd.DataFrame()
-                continue
-
-            df_1m['bucket15'] = df_1m.index.floor('15min')
-
-            df_15m = df_1m.groupby('bucket15').agg({
-                'open': 'first',
-                'close': 'last',
-                'high': 'max',
-                'low': 'min',
-                'volume': 'sum',
-                'buy_volume': 'sum',
-                'sell_volume': 'sum',
-                'net_volume': 'sum',
-                'trades_count': 'sum'
-            })
-
-            result[symbol] = df_15m
-        return result
 
     def _process_token(self, token: str, df, expected_bucket_start: datetime):
         if df is None:

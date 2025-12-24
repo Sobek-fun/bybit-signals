@@ -40,12 +40,12 @@ class DataLoader:
         query = """
         SELECT
             symbol,
-            open_time AS bucket,
-            open,
-            high,
-            low,
-            close,
-            volume,
+            toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+            argMin(open, open_time) AS open,
+            max(high) AS high,
+            min(low) AS low,
+            argMax(close, open_time) AS close,
+            sum(volume) AS volume,
             0 AS buy_volume,
             0 AS sell_volume,
             0 AS net_volume,
@@ -55,14 +55,15 @@ class DataLoader:
           AND interval = 1
           AND open_time >= %(start)s
           AND open_time < %(end)s
-        ORDER BY symbol, open_time
+        GROUP BY symbol, bucket
+        ORDER BY symbol, bucket
         """
 
         query_start = datetime.now()
         result = self.client.query(query, parameters={
             "symbols": symbols,
             "start": start_bucket,
-            "end": end_bucket + timedelta(minutes=1)
+            "end": end_bucket + timedelta(minutes=15)
         })
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
@@ -147,12 +148,12 @@ class DataLoader:
     def load_candles_range(self, symbol: str, start_bucket: datetime, end_bucket: datetime) -> pd.DataFrame:
         query = """
         SELECT
-            open_time AS bucket,
-            open,
-            high,
-            low,
-            close,
-            volume,
+            toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+            argMin(open, open_time) AS open,
+            max(high) AS high,
+            min(low) AS low,
+            argMax(close, open_time) AS close,
+            sum(volume) AS volume,
             0 AS buy_volume,
             0 AS sell_volume,
             0 AS net_volume,
@@ -161,14 +162,15 @@ class DataLoader:
         WHERE symbol = %(symbol)s
           AND interval = 1
           AND open_time >= %(start)s
-          AND open_time <= %(end)s
-        ORDER BY open_time
+          AND open_time < %(end)s
+        GROUP BY bucket
+        ORDER BY bucket
         """
 
         result = self.client.query(query, parameters={
             "symbol": symbol,
             "start": start_bucket,
-            "end": end_bucket
+            "end": end_bucket + timedelta(minutes=15)
         })
 
         if not result.result_rows:
