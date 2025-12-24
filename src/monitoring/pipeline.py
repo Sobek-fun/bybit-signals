@@ -8,6 +8,7 @@ from src.config import Config
 from src.monitoring.data_loader import DataLoader
 from src.monitoring.indicator_calculator import IndicatorCalculator
 from src.monitoring.pump_detector import PumpDetector
+from src.monitoring.telegram_sender import TelegramSender
 from src.monitoring.worker import Worker
 
 
@@ -24,6 +25,7 @@ class Pipeline:
         self.loader = DataLoader(self.config.ch_dsn, self.config.offset_seconds)
         self.calculator = IndicatorCalculator()
         self.detector = PumpDetector()
+        self.telegram_sender = TelegramSender(self.config.bot_token, self.config.chat_id)
 
     def run(self):
         while True:
@@ -59,13 +61,18 @@ class Pipeline:
         cycle_start = datetime.now()
 
         symbols = [f"{token}USDT" for token in self.config.tokens]
-        candles_dict = self.loader.load_candles_batch(symbols, start_bucket, expected_bucket_start)
+
+        start_1m = start_bucket
+        end_1m = expected_bucket_start + timedelta(minutes=14)
+        candles_1m_dict = self.loader.load_candles_batch(symbols, start_1m, end_1m)
+
+        candles_15m_dict = self._aggregate_1m_to_15m(candles_1m_dict)
 
         results = []
 
         with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
             futures = {
-                executor.submit(self._process_token, token, candles_dict.get(f"{token}USDT"),
+                executor.submit(self._process_token, token, candles_15m_dict.get(f"{token}USDT"),
                                 expected_bucket_start): token
                 for token in self.config.tokens
             }
@@ -82,12 +89,36 @@ class Pipeline:
 
         self._log_cycle_summary(results, cycle_duration)
 
+    def _aggregate_1m_to_15m(self, candles_1m_dict: dict) -> dict:
+        result = {}
+        for symbol, df_1m in candles_1m_dict.items():
+            if df_1m.empty:
+                result[symbol] = pd.DataFrame()
+                continue
+
+            df_1m['bucket15'] = df_1m.index.floor('15min')
+
+            df_15m = df_1m.groupby('bucket15').agg({
+                'open': 'first',
+                'close': 'last',
+                'high': 'max',
+                'low': 'min',
+                'volume': 'sum',
+                'buy_volume': 'sum',
+                'sell_volume': 'sum',
+                'net_volume': 'sum',
+                'trades_count': 'sum'
+            })
+
+            result[symbol] = df_15m
+        return result
+
     def _process_token(self, token: str, df, expected_bucket_start: datetime):
         if df is None:
             df = pd.DataFrame()
 
         worker = Worker(self.config, token, df, expected_bucket_start, self.calculator, self.detector,
-                        self.last_alerted_bucket)
+                        self.last_alerted_bucket, self.telegram_sender)
         return worker.process()
 
     def _log_cycle_summary(self, results, cycle_duration: float):

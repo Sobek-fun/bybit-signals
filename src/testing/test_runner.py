@@ -19,10 +19,24 @@ def _process_symbol_test(config: Config, symbol: str, query_start_bucket: dateti
     calculator = IndicatorCalculator()
     detector = PumpDetector()
 
-    df_all = loader.load_candles_range(symbol, query_start_bucket, end_bucket)
+    df_all_1m = loader.load_candles_range(symbol, query_start_bucket, end_bucket)
 
-    if df_all.empty:
+    if df_all_1m.empty:
         return symbol, 0, 0, []
+
+    df_all_1m['bucket15'] = df_all_1m.index.floor('15min')
+
+    df_all = df_all_1m.groupby('bucket15').agg({
+        'open': 'first',
+        'close': 'last',
+        'high': 'max',
+        'low': 'min',
+        'volume': 'sum',
+        'buy_volume': 'sum',
+        'sell_volume': 'sum',
+        'net_volume': 'sum',
+        'trades_count': 'sum'
+    })
 
     if len(df_all) < config.lookback_candles:
         return symbol, 0, 0, []
