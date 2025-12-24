@@ -116,12 +116,19 @@ class PumpDetector:
         candle_range = high_p - low_p
         range_pos = candle_range > 0
 
-        close_pos = np.where(range_pos, (close_p - low_p) / candle_range, 0.0)
-        max_oc = np.where(np.isnan(open_p), open_p, np.where(np.isnan(close_p), open_p, np.maximum(open_p, close_p)))
+        close_pos = np.zeros(n, dtype=float)
+        np.divide(close_p - low_p, candle_range, out=close_pos, where=range_pos)
+
+        max_oc = np.maximum(open_p, close_p)
         upper_wick = high_p - max_oc
-        wick_ratio = np.where(range_pos, upper_wick / candle_range, 0.0)
+
+        wick_ratio = np.zeros(n, dtype=float)
+        np.divide(upper_wick, candle_range, out=wick_ratio, where=range_pos)
+
         body_size = np.abs(close_p - open_p)
-        body_ratio = np.where(range_pos, body_size / candle_range, 0.0)
+        body_ratio = np.zeros(n, dtype=float)
+        np.divide(body_size, candle_range, out=body_ratio, where=range_pos)
+
         bearish = close_p < open_p
 
         blowoff_exhaustion = (
