@@ -40,29 +40,29 @@ class DataLoader:
         query = """
         SELECT
             symbol,
-            toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket,
-            argMin(price, transaction_time) AS open,
-            max(price) AS high,
-            min(price) AS low,
-            argMax(price, transaction_time) AS close,
-            sum(size) AS volume,
-            sumIf(size, side = 'Buy') AS buy_volume,
-            sumIf(size, side = 'Sell') AS sell_volume,
-            sumIf(size, side = 'Buy') - sumIf(size, side = 'Sell') AS net_volume,
-            count() AS trades_count
-        FROM bybit.transactions
+            open_time AS bucket,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            0 AS buy_volume,
+            0 AS sell_volume,
+            0 AS net_volume,
+            0 AS trades_count
+        FROM bybit.candles
         WHERE symbol IN %(symbols)s
-          AND transaction_time >= %(start)s
-          AND transaction_time < %(end)s
-        GROUP BY symbol, bucket
-        ORDER BY symbol, bucket
+          AND interval = 1
+          AND open_time >= %(start)s
+          AND open_time < %(end)s
+        ORDER BY symbol, open_time
         """
 
         query_start = datetime.now()
         result = self.client.query(query, parameters={
             "symbols": symbols,
             "start": start_bucket,
-            "end": end_bucket + timedelta(minutes=15)
+            "end": end_bucket + timedelta(minutes=1)
         })
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
@@ -100,22 +100,22 @@ class DataLoader:
 
         query = """
         SELECT
-            toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket,
-            argMin(price, transaction_time) AS open,
-            max(price) AS high,
-            min(price) AS low,
-            argMax(price, transaction_time) AS close,
-            sum(size) AS volume,
-            sumIf(size, side = 'Buy') AS buy_volume,
-            sumIf(size, side = 'Sell') AS sell_volume,
-            sumIf(size, side = 'Buy') - sumIf(size, side = 'Sell') AS net_volume,
-            count() AS trades_count
-        FROM bybit.transactions
+            open_time AS bucket,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            0 AS buy_volume,
+            0 AS sell_volume,
+            0 AS net_volume,
+            0 AS trades_count
+        FROM bybit.candles
         WHERE symbol = %(symbol)s
-          AND bucket >= %(start)s
-          AND bucket <= %(end)s
-        GROUP BY bucket
-        ORDER BY bucket
+          AND interval = 1
+          AND open_time >= %(start)s
+          AND open_time <= %(end)s
+        ORDER BY open_time
         """
 
         query_start = datetime.now()
@@ -147,22 +147,22 @@ class DataLoader:
     def load_candles_range(self, symbol: str, start_bucket: datetime, end_bucket: datetime) -> pd.DataFrame:
         query = """
         SELECT
-            toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket,
-            argMin(price, transaction_time) AS open,
-            max(price) AS high,
-            min(price) AS low,
-            argMax(price, transaction_time) AS close,
-            sum(size) AS volume,
-            sumIf(size, side = 'Buy') AS buy_volume,
-            sumIf(size, side = 'Sell') AS sell_volume,
-            sumIf(size, side = 'Buy') - sumIf(size, side = 'Sell') AS net_volume,
-            count() AS trades_count
-        FROM bybit.transactions
+            open_time AS bucket,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            0 AS buy_volume,
+            0 AS sell_volume,
+            0 AS net_volume,
+            0 AS trades_count
+        FROM bybit.candles
         WHERE symbol = %(symbol)s
-          AND bucket >= %(start)s
-          AND bucket <= %(end)s
-        GROUP BY bucket
-        ORDER BY bucket
+          AND interval = 1
+          AND open_time >= %(start)s
+          AND open_time <= %(end)s
+        ORDER BY open_time
         """
 
         result = self.client.query(query, parameters={
@@ -194,11 +194,12 @@ class DataLoader:
             current_bucket_start = current_bucket_start - timedelta(minutes=15)
 
         query = """
-        SELECT toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket
-        FROM bybit.transactions
+        SELECT open_time
+        FROM bybit.candles
         WHERE symbol = %(symbol)s
-          AND transaction_time < %(current_bucket_start)s
-        ORDER BY bucket DESC
+          AND interval = 1
+          AND open_time < %(current_bucket_start)s
+        ORDER BY open_time DESC
         LIMIT 1
         """
 

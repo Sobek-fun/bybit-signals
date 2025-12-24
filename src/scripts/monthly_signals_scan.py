@@ -26,10 +26,11 @@ def get_last_closed_time(client, offset_seconds: int):
         current_bucket_start = current_bucket_start - timedelta(minutes=15)
 
     query = """
-    SELECT toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket
-    FROM bybit.transactions
-    WHERE transaction_time < %(current_bucket_start)s
-    ORDER BY bucket DESC
+    SELECT open_time
+    FROM bybit.candles
+    WHERE interval = 1
+      AND open_time < %(current_bucket_start)s
+    ORDER BY open_time DESC
     LIMIT 1
     """
 
@@ -41,15 +42,16 @@ def get_last_closed_time(client, offset_seconds: int):
         return None
 
     bucket = result.result_rows[0][0]
-    return bucket + timedelta(minutes=15)
+    return bucket + timedelta(minutes=1)
 
 
 def get_available_symbols(client, query_start_bucket: datetime, end_close_time: datetime):
     query = """
     SELECT DISTINCT symbol
-    FROM bybit.transactions
-    WHERE transaction_time >= %(start)s
-      AND transaction_time < %(end)s
+    FROM bybit.candles
+    WHERE interval = 1
+      AND open_time >= %(start)s
+      AND open_time < %(end)s
       AND symbol LIKE '%%USDT'
     ORDER BY symbol
     """
@@ -100,22 +102,22 @@ def process_symbol_chunk(worker_id: int, symbols_chunk: list, ch_dsn: str, query
         try:
             query = """
             SELECT
-                toStartOfInterval(transaction_time, INTERVAL 15 minute) AS bucket,
-                argMin(price, transaction_time) AS open,
-                max(price) AS high,
-                min(price) AS low,
-                argMax(price, transaction_time) AS close,
-                sum(size) AS volume,
-                sumIf(size, side = 'Buy') AS buy_volume,
-                sumIf(size, side = 'Sell') AS sell_volume,
-                sumIf(size, side = 'Buy') - sumIf(size, side = 'Sell') AS net_volume,
-                count() AS trades_count
-            FROM bybit.transactions
+                open_time AS bucket,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                0 AS buy_volume,
+                0 AS sell_volume,
+                0 AS net_volume,
+                0 AS trades_count
+            FROM bybit.candles
             WHERE symbol = %(symbol)s
-              AND transaction_time >= %(start)s
-              AND transaction_time < %(end)s
-            GROUP BY bucket
-            ORDER BY bucket
+              AND interval = 1
+              AND open_time >= %(start)s
+              AND open_time < %(end)s
+            ORDER BY open_time
             """
 
             result = client.query(query, parameters={
@@ -137,14 +139,28 @@ def process_symbol_chunk(worker_id: int, symbols_chunk: list, ch_dsn: str, query
             df["bucket"] = pd.to_datetime(df["bucket"])
             df.set_index("bucket", inplace=True)
 
-            if len(df) < lookback_candles:
+            df['bucket15'] = df.index.floor('15min')
+
+            df_15m = df.groupby('bucket15').agg({
+                'open': 'first',
+                'close': 'last',
+                'high': 'max',
+                'low': 'min',
+                'volume': 'sum',
+                'buy_volume': 'sum',
+                'sell_volume': 'sum',
+                'net_volume': 'sum',
+                'trades_count': 'sum'
+            })
+
+            if len(df_15m) < lookback_candles:
                 symbols_skipped += 1
                 continue
 
-            df = calculator.calculate(df)
-            df = detector.detect(df)
+            df_15m = calculator.calculate(df_15m)
+            df_15m = detector.detect(df_15m)
 
-            signals = df[(df.index >= start_bucket) & (df['pump_signal'] == 'strong_pump')]
+            signals = df_15m[(df_15m.index >= start_bucket) & (df_15m['pump_signal'] == 'strong_pump')]
 
             for idx, row in signals.iterrows():
                 close_time = idx + timedelta(minutes=15)
