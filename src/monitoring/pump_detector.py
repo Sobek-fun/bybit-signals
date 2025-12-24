@@ -1,5 +1,6 @@
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -58,20 +59,21 @@ class PumpDetector:
         df['vol_median'] = df['volume'].rolling(window=self.volume_median_window).median()
         df['vol_ratio'] = df['volume'] / df['vol_median']
 
-        df['MFI_corridor'] = df['MFI_14'].rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
-        df['RSI_corridor'] = df['RSI_14'].rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
-        df['MACDh_corridor'] = df['MACDh_12_26_9'].rolling(window=self.corridor_window).quantile(
-            self.corridor_quantile).shift(1)
+        mfi = df['MFI_14']
+        rsi = df['RSI_14']
+        macdh = df['MACDh_12_26_9']
+
+        df['MFI_corridor'] = mfi.rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
+        df['RSI_corridor'] = rsi.rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
+        df['MACDh_corridor'] = macdh.rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
 
         df['vol_ratio_max'] = df['vol_ratio'].rolling(window=self.peak_window).max().shift(1)
-        df['RSI_max'] = df['RSI_14'].rolling(window=self.peak_window).max().shift(1)
-        df['MACDh_max'] = df['MACDh_12_26_9'].rolling(window=self.peak_window).max().shift(1)
+        df['RSI_max'] = rsi.rolling(window=self.peak_window).max().shift(1)
+        df['MACDh_max'] = macdh.rolling(window=self.peak_window).max().shift(1)
         df['high_max'] = df['high'].rolling(window=self.peak_window).max().shift(1)
 
         df['pump_score'] = 0
         df['pump_signal'] = None
-
-        last_star_index: Optional[int] = None
 
         skip_initial = max(
             self.volume_median_window,
@@ -81,108 +83,98 @@ class PumpDetector:
             self.peak_window
         )
 
-        for i in range(skip_initial, len(df)):
-            runup_met = False
-            local_min_price = float('inf')
-            for j in range(i - self.runup_window + 1, i + 1):
-                if j >= 0:
-                    local_min_price = min(local_min_price, df.iloc[j]['low'], df.iloc[j]['open'])
-            if local_min_price > 0:
-                runup = (df.iloc[i]['high'] / local_min_price) - 1
-                if runup >= self.runup_threshold:
-                    runup_met = True
+        n = len(df)
+        if n <= skip_initial:
+            return df
 
-            vol_spike_recent = False
-            for j in range(max(0, i - self.context_window + 1), i + 1):
-                vol_ratio = df.iloc[j]['vol_ratio']
-                if not pd.isna(vol_ratio) and vol_ratio >= self.vol_ratio_spike:
-                    vol_spike_recent = True
-                    break
+        min_price = df[['low', 'open']].min(axis=1)
+        local_min = min_price.rolling(window=self.runup_window).min()
+        runup = (df['high'] / local_min) - 1
+        runup_met = ((local_min > 0) & (runup >= self.runup_threshold)).fillna(False)
 
-            osc_hot_recent = False
-            for j in range(max(0, i - self.context_window + 1), i + 1):
-                rsi = df.iloc[j].get('RSI_14')
-                mfi = df.iloc[j].get('MFI_14')
-                rsi_corridor = df.iloc[j]['RSI_corridor']
-                mfi_corridor = df.iloc[j]['MFI_corridor']
+        vol_spike_cond = df['vol_ratio'] >= self.vol_ratio_spike
+        vol_spike_recent = vol_spike_cond.rolling(window=self.context_window).sum().fillna(0) > 0
 
-                rsi_hot = not pd.isna(rsi) and not pd.isna(rsi_corridor) and rsi >= max(self.rsi_hot, rsi_corridor)
-                mfi_hot = not pd.isna(mfi) and not pd.isna(mfi_corridor) and mfi >= max(self.mfi_hot, mfi_corridor)
+        rsi_corridor = df['RSI_corridor']
+        mfi_corridor = df['MFI_corridor']
+        rsi_hot = rsi.notna() & rsi_corridor.notna() & (rsi >= np.maximum(self.rsi_hot, rsi_corridor))
+        mfi_hot = mfi.notna() & mfi_corridor.notna() & (mfi >= np.maximum(self.mfi_hot, mfi_corridor))
+        osc_hot_recent = (rsi_hot | mfi_hot).rolling(window=self.context_window).sum().fillna(0) > 0
 
-                if rsi_hot or mfi_hot:
-                    osc_hot_recent = True
-                    break
+        macd_pos_recent = (macdh.notna() & (macdh > 0)).rolling(window=self.context_window).sum().fillna(0) > 0
 
-            macd_pos_recent = False
-            for j in range(max(0, i - self.context_window + 1), i + 1):
-                macdh = df.iloc[j].get('MACDh_12_26_9')
-                if not pd.isna(macdh) and macdh > 0:
-                    macd_pos_recent = True
-                    break
+        pump_ctx = runup_met & vol_spike_recent & osc_hot_recent & macd_pos_recent
 
-            pump_ctx = runup_met and vol_spike_recent and osc_hot_recent and macd_pos_recent
+        high_max = df['high_max']
+        near_peak = high_max.notna() & (high_max > 0) & (df['high'] >= high_max * (1 - self.peak_tol))
 
-            near_peak = False
-            high_max = df.iloc[i]['high_max']
-            if not pd.isna(high_max) and high_max > 0:
-                if df.iloc[i]['high'] >= high_max * (1 - self.peak_tol):
-                    near_peak = True
+        open_p = df['open'].to_numpy(dtype=float, copy=False)
+        high_p = df['high'].to_numpy(dtype=float, copy=False)
+        low_p = df['low'].to_numpy(dtype=float, copy=False)
+        close_p = df['close'].to_numpy(dtype=float, copy=False)
 
-            open_price = df.iloc[i]['open']
-            high_price = df.iloc[i]['high']
-            low_price = df.iloc[i]['low']
-            close_price = df.iloc[i]['close']
+        candle_range = high_p - low_p
+        range_pos = candle_range > 0
 
-            candle_range = high_price - low_price
-            close_pos = (close_price - low_price) / candle_range if candle_range > 0 else 0
-            upper_wick = high_price - max(open_price, close_price)
-            wick_ratio = upper_wick / candle_range if candle_range > 0 else 0
-            body_size = abs(close_price - open_price)
-            body_ratio = body_size / candle_range if candle_range > 0 else 0
-            bearish = close_price < open_price
+        close_pos = np.where(range_pos, (close_p - low_p) / candle_range, 0.0)
+        max_oc = np.where(np.isnan(open_p), open_p, np.where(np.isnan(close_p), open_p, np.maximum(open_p, close_p)))
+        upper_wick = high_p - max_oc
+        wick_ratio = np.where(range_pos, upper_wick / candle_range, 0.0)
+        body_size = np.abs(close_p - open_p)
+        body_ratio = np.where(range_pos, body_size / candle_range, 0.0)
+        bearish = close_p < open_p
 
-            blowoff_exhaustion = False
-            if close_pos <= self.close_pos_low:
-                blowoff_exhaustion = True
-            elif bearish and close_pos <= 0.45:
-                blowoff_exhaustion = True
-            elif wick_ratio >= self.wick_blowoff and body_ratio <= self.body_blowoff:
-                blowoff_exhaustion = True
+        blowoff_exhaustion = (
+                (close_pos <= self.close_pos_low) |
+                (bearish & (close_pos <= 0.45)) |
+                ((wick_ratio >= self.wick_blowoff) & (body_ratio <= self.body_blowoff))
+        )
 
-            predump_peak = False
-            rsi = df.iloc[i].get('RSI_14')
-            mfi = df.iloc[i].get('MFI_14')
-            osc_extreme = not pd.isna(rsi) and rsi >= self.rsi_extreme and not pd.isna(mfi) and mfi >= self.mfi_extreme
+        osc_extreme = rsi.notna() & mfi.notna() & (rsi >= self.rsi_extreme) & (mfi >= self.mfi_extreme)
+        predump_mask = osc_extreme & (close_pos >= self.close_pos_high)
 
-            if osc_extreme and close_pos >= self.close_pos_high:
-                vol_ratio_max = df.iloc[i]['vol_ratio_max']
-                vol_ratio = df.iloc[i]['vol_ratio']
-                vol_fade = not pd.isna(
-                    vol_ratio_max) and vol_ratio_max > 0 and vol_ratio <= vol_ratio_max * self.vol_fade_ratio
+        vol_ratio_max = df['vol_ratio_max']
+        vol_ratio = df['vol_ratio']
+        vol_fade = vol_ratio_max.notna() & (vol_ratio_max > 0) & (vol_ratio <= vol_ratio_max * self.vol_fade_ratio)
 
-                if wick_ratio >= self.wick_high:
-                    if vol_fade:
-                        predump_peak = True
-                elif wick_ratio >= self.wick_low:
-                    rsi_max = df.iloc[i]['RSI_max']
-                    macdh_max = df.iloc[i]['MACDh_max']
-                    macdh = df.iloc[i].get('MACDh_12_26_9')
+        wick_high_mask = wick_ratio >= self.wick_high
+        wick_low_mask = (wick_ratio >= self.wick_low) & (~wick_high_mask)
 
-                    rsi_fade = not pd.isna(rsi_max) and rsi_max > 0 and rsi <= rsi_max * self.rsi_fade_ratio
-                    macd_fade = not pd.isna(macdh_max) and not pd.isna(
-                        macdh) and macdh_max > 0 and macdh <= macdh_max * self.macd_fade_ratio
+        rsi_max = df['RSI_max']
+        macdh_max = df['MACDh_max']
+        rsi_fade = rsi_max.notna() & (rsi_max > 0) & (rsi <= rsi_max * self.rsi_fade_ratio)
+        macd_fade = macdh_max.notna() & macdh.notna() & (macdh_max > 0) & (macdh <= macdh_max * self.macd_fade_ratio)
 
-                    if vol_fade and (rsi_fade or macd_fade):
-                        predump_peak = True
+        predump_peak = (
+                predump_mask &
+                (
+                        (wick_high_mask & vol_fade) |
+                        (wick_low_mask & vol_fade & (rsi_fade | macd_fade))
+                )
+        ).fillna(False).to_numpy(dtype=bool, copy=False)
 
-            score = sum([pump_ctx, near_peak, blowoff_exhaustion or predump_peak])
-            df.at[df.index[i], 'pump_score'] = score
+        pump_ctx_arr = pump_ctx.to_numpy(dtype=bool, copy=False)
+        near_peak_arr = near_peak.to_numpy(dtype=bool, copy=False)
+        strong_cond = pump_ctx_arr & near_peak_arr & (blowoff_exhaustion | predump_peak)
 
+        score_arr = pump_ctx_arr.astype(int) + near_peak_arr.astype(int) + (blowoff_exhaustion | predump_peak).astype(
+            int)
+
+        pump_score = np.zeros(n, dtype=int)
+        pump_score[skip_initial:] = score_arr[skip_initial:]
+
+        signals = np.full(n, None, dtype=object)
+
+        last_star_index: Optional[int] = None
+        for i in np.nonzero(strong_cond)[0]:
+            if i < skip_initial:
+                continue
             if last_star_index is not None and i - last_star_index < self.cooldown_bars:
                 continue
+            signals[i] = 'strong_pump'
+            last_star_index = i
 
-            if pump_ctx and near_peak and (predump_peak or blowoff_exhaustion):
-                df.at[df.index[i], 'pump_signal'] = 'strong_pump'
-                last_star_index = i
+        df['pump_score'] = pump_score
+        df['pump_signal'] = signals
 
         return df
