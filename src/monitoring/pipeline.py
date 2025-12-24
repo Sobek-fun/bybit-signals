@@ -62,7 +62,9 @@ class Pipeline:
 
         symbols = [f"{token}USDT" for token in self.config.tokens]
 
+        load_start = datetime.now()
         candles_15m_dict = self.loader.load_candles_batch(symbols, start_bucket, expected_bucket_start)
+        load_duration = (datetime.now() - load_start).total_seconds()
 
         results = []
 
@@ -83,7 +85,7 @@ class Pipeline:
 
         cycle_duration = (datetime.now() - cycle_start).total_seconds()
 
-        self._log_cycle_summary(results, cycle_duration)
+        self._log_cycle_summary(results, cycle_duration, load_duration)
 
     def _process_token(self, token: str, df, expected_bucket_start: datetime):
         if df is None:
@@ -93,7 +95,7 @@ class Pipeline:
                         self.last_alerted_bucket, self.telegram_sender)
         return worker.process()
 
-    def _log_cycle_summary(self, results, cycle_duration: float):
+    def _log_cycle_summary(self, results, cycle_duration: float, load_duration: float):
         status_counts = {}
         for result in results:
             status_counts[result.status] = status_counts.get(result.status, 0) + 1
@@ -137,8 +139,16 @@ class Pipeline:
             slowest_result = max(results, key=lambda r: r.duration_total_ms)
             slowest = slowest_result.symbol
 
+            indicators_times = [r.duration_indicators_ms for r in results if r.duration_indicators_ms > 0]
+            detect_times = [r.duration_detect_ms for r in results if r.duration_detect_ms > 0]
+            telegram_times = [r.duration_telegram_ms for r in results if r.duration_telegram_ms > 0]
+
+            avg_indicators = sum(indicators_times) / len(indicators_times) if indicators_times else 0
+            avg_detect = sum(detect_times) / len(detect_times) if detect_times else 0
+            avg_telegram = sum(telegram_times) / len(telegram_times) if telegram_times else 0
+
             log("INFO", "PIPELINE",
-                f"perf total={cycle_duration:.1f}s avg_token={avg_token:.0f}ms max_token={max_token:.0f}ms slowest={slowest}")
+                f"perf total={cycle_duration:.1f}s load_data={load_duration:.1f}s avg_indicators={avg_indicators:.0f}ms avg_detect={avg_detect:.0f}ms avg_telegram={avg_telegram:.0f}ms avg_token={avg_token:.0f}ms max_token={max_token:.0f}ms slowest={slowest}")
 
         candle_counts = [r.candles_count for r in results if r.candles_count > 0]
         if candle_counts:
