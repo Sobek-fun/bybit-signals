@@ -41,7 +41,7 @@ class TelegramSender:
         sl_price = close_price * 1.20
 
         return (
-            f"ðŸš€ Strong Pump Detected\n\n"
+            f"🚀 Strong Pump Detected\n\n"
             f"PUMP DETECTED: {symbol}\n"
             f"Time: {close_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Close: {close_price:.6f}\n"
