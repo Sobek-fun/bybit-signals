@@ -56,12 +56,29 @@ def main():
         default=30,
         help="Number of days to backtest (default: 30, test mode only)"
     )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Start date for backtest in YYYY-MM-DD format (test mode only)"
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="End date for backtest in YYYY-MM-DD format (test mode only)"
+    )
 
     args = parser.parse_args()
 
     if args.mode == "prod":
         if not args.bot_token or not args.chat_id:
             parser.error("--bot-token and --chat-id are required for prod mode")
+
+    start_date = None
+    end_date = None
+    if args.start_date:
+        start_date = datetime.strptime(args.start_date, "%Y-%m-%d")
+    if args.end_date:
+        end_date = datetime.strptime(args.end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
 
     tokens = [token.strip().upper() for token in args.token.split(",")]
 
@@ -93,14 +110,20 @@ def main():
         bot_token=args.bot_token or "",
         chat_id=args.chat_id or "",
         workers=args.workers,
-        test_days=args.test_days
+        test_days=args.test_days,
+        start_date=start_date,
+        end_date=end_date
     )
 
     if args.mode == "test":
         from src.testing.test_runner import TestRunner
 
-        log("INFO", "MAIN",
-            f"mode=test tokens={len(config.tokens)} days={config.test_days} lookback={config.lookback_candles}")
+        if config.start_date and config.end_date:
+            log("INFO", "MAIN",
+                f"mode=test tokens={len(config.tokens)} start_date={config.start_date.strftime('%Y-%m-%d')} end_date={config.end_date.strftime('%Y-%m-%d')} lookback={config.lookback_candles}")
+        else:
+            log("INFO", "MAIN",
+                f"mode=test tokens={len(config.tokens)} days={config.test_days} lookback={config.lookback_candles}")
 
         runner = TestRunner(config)
         runner.run_test()

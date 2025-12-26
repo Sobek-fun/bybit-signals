@@ -115,13 +115,16 @@ class TestRunner:
     def run_test(self):
         csv_filename = self._init_csv_file()
 
-        end_close_time = self._get_last_closed_time()
-        if end_close_time is None:
-            log("ERROR", "TEST", "no closed candles found")
-            self._close_csv_file()
-            return
-
-        start_close_time = end_close_time - timedelta(days=self.config.test_days)
+        if self.config.start_date and self.config.end_date:
+            start_close_time = self.config.start_date
+            end_close_time = self.config.end_date
+        else:
+            end_close_time = self._get_last_closed_time()
+            if end_close_time is None:
+                log("ERROR", "TEST", "no closed candles found")
+                self._close_csv_file()
+                return
+            start_close_time = end_close_time - timedelta(days=self.config.test_days)
 
         end_bucket = end_close_time - timedelta(minutes=15)
         start_bucket = start_close_time - timedelta(minutes=15)
