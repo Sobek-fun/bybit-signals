@@ -8,7 +8,7 @@ class PumpDetector:
     def __init__(
             self,
             runup_window: int = 8,
-            runup_threshold: float = 0.08,
+            runup_threshold: float = 0.06,
             context_window: int = 16,
             peak_window: int = 8,
             peak_tol: float = 0.005,
@@ -16,9 +16,9 @@ class PumpDetector:
             vol_ratio_spike: float = 5.0,
             vol_fade_ratio: float = 0.85,
             corridor_window: int = 30,
-            corridor_quantile: float = 0.90,
-            rsi_hot: float = 75.0,
-            mfi_hot: float = 80.0,
+            corridor_quantile: float = 0.95,
+            rsi_hot: float = 70.0,
+            mfi_hot: float = 82.5,
             rsi_extreme: float = 85.0,
             mfi_extreme: float = 85.0,
             rsi_fade_ratio: float = 0.98,
@@ -29,7 +29,7 @@ class PumpDetector:
             close_pos_low: float = 0.35,
             wick_blowoff: float = 0.35,
             body_blowoff: float = 0.25,
-            cooldown_bars: int = 8
+            cooldown_bars: int = 4
     ):
         self.runup_window = runup_window
         self.runup_threshold = runup_threshold
