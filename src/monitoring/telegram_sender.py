@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 from queue import Queue
 from threading import Thread
@@ -12,9 +13,10 @@ def log(level: str, component: str, message: str):
 
 
 class TelegramSender:
-    def __init__(self, bot_token: str, chat_id: str):
+    def __init__(self, bot_token: str, chat_id: str, ws_broadcaster=None):
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.ws_broadcaster = ws_broadcaster
         self.queue = Queue()
         self.worker_thread = Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
@@ -30,6 +32,14 @@ class TelegramSender:
                 asyncio.run(self._send_telegram(message))
                 log("INFO", "TG",
                     f"alert sent symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+                if self.ws_broadcaster:
+                    payload = {
+                        "symbol": symbol,
+                        "close_time": close_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        "message": message
+                    }
+                    self.ws_broadcaster.broadcast(json.dumps(payload))
             except Exception as e:
                 log("ERROR", "TG",
                     f"send failed symbol={symbol} close_time={close_time.strftime('%Y-%m-%d %H:%M:%S')} error={type(e).__name__}: {str(e)}")

@@ -9,6 +9,7 @@ from src.monitoring.data_loader import DataLoader
 from src.monitoring.indicator_calculator import IndicatorCalculator
 from src.monitoring.pump_detector import PumpDetector
 from src.monitoring.telegram_sender import TelegramSender
+from src.monitoring.ws_broadcaster import WsBroadcaster
 from src.monitoring.worker import Worker
 
 
@@ -25,7 +26,8 @@ class Pipeline:
         self.loader = DataLoader(self.config.ch_dsn, self.config.offset_seconds)
         self.calculator = IndicatorCalculator()
         self.detector = PumpDetector()
-        self.telegram_sender = TelegramSender(self.config.bot_token, self.config.chat_id)
+        self.ws_broadcaster = WsBroadcaster(self.config.ws_host, self.config.ws_port)
+        self.telegram_sender = TelegramSender(self.config.bot_token, self.config.chat_id, self.ws_broadcaster)
 
     def run(self):
         while True:
