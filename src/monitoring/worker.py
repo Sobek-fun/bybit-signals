@@ -6,7 +6,7 @@ import pandas as pd
 from src.config import Config, WorkerResult
 from src.monitoring.indicator_calculator import IndicatorCalculator
 from src.monitoring.pump_detector import PumpDetector
-from src.monitoring.telegram_sender import TelegramSender
+from src.monitoring.sender import TelegramSender
 
 
 class Worker:

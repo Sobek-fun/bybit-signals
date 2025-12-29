@@ -8,7 +8,7 @@ from src.config import Config
 from src.monitoring.data_loader import DataLoader
 from src.monitoring.indicator_calculator import IndicatorCalculator
 from src.monitoring.pump_detector import PumpDetector
-from src.monitoring.telegram_sender import TelegramSender
+from src.monitoring.sender import TelegramSender
 from src.monitoring.ws_broadcaster import WsBroadcaster
 from src.monitoring.worker import Worker
 
