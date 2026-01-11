@@ -45,11 +45,7 @@ class DataLoader:
             max(high) AS high,
             min(low) AS low,
             argMax(close, open_time) AS close,
-            sum(volume) AS volume,
-            0 AS buy_volume,
-            0 AS sell_volume,
-            0 AS net_volume,
-            0 AS trades_count
+            sum(volume) AS volume
         FROM bybit.candles
         WHERE symbol IN %(symbols)s
           AND interval = 1
@@ -76,8 +72,7 @@ class DataLoader:
 
         df_all = pd.DataFrame(
             result.result_rows,
-            columns=["symbol", "bucket", "open", "high", "low", "close", "volume",
-                     "buy_volume", "sell_volume", "net_volume", "trades_count"]
+            columns=["symbol", "bucket", "open", "high", "low", "close", "volume"]
         )
 
         df_all["bucket"] = pd.to_datetime(df_all["bucket"])
@@ -106,11 +101,7 @@ class DataLoader:
             high,
             low,
             close,
-            volume,
-            0 AS buy_volume,
-            0 AS sell_volume,
-            0 AS net_volume,
-            0 AS trades_count
+            volume
         FROM bybit.candles
         WHERE symbol = %(symbol)s
           AND interval = 1
@@ -136,8 +127,7 @@ class DataLoader:
 
         df = pd.DataFrame(
             result.result_rows,
-            columns=["bucket", "open", "high", "low", "close", "volume",
-                     "buy_volume", "sell_volume", "net_volume", "trades_count"]
+            columns=["bucket", "open", "high", "low", "close", "volume"]
         )
 
         df["bucket"] = pd.to_datetime(df["bucket"])
@@ -153,11 +143,7 @@ class DataLoader:
             max(high) AS high,
             min(low) AS low,
             argMax(close, open_time) AS close,
-            sum(volume) AS volume,
-            0 AS buy_volume,
-            0 AS sell_volume,
-            0 AS net_volume,
-            0 AS trades_count
+            sum(volume) AS volume
         FROM bybit.candles
         WHERE symbol = %(symbol)s
           AND interval = 1
@@ -178,8 +164,7 @@ class DataLoader:
 
         df = pd.DataFrame(
             result.result_rows,
-            columns=["bucket", "open", "high", "low", "close", "volume",
-                     "buy_volume", "sell_volume", "net_volume", "trades_count"]
+            columns=["bucket", "open", "high", "low", "close", "volume"]
         )
 
         df["bucket"] = pd.to_datetime(df["bucket"])
