@@ -18,9 +18,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["prod", "test"],
+        choices=["prod", "test", "debug"],
         default="prod",
-        help="Run mode: prod (continuous monitoring) or test (historical backtest)"
+        help="Run mode: prod (continuous monitoring), test (historical backtest), or debug (indicator snapshot)"
     )
     parser.add_argument(
         "--token",
@@ -68,12 +68,47 @@ def main():
         default=30,
         help="Number of days to backtest (default: 30, test mode only)"
     )
+    parser.add_argument(
+        "--timestamp",
+        type=str,
+        help="Timestamp for debug mode (format: YYYY-MM-DD HH:MM:SS)"
+    )
+    parser.add_argument(
+        "--timestamp-kind",
+        type=str,
+        choices=["close", "bucket"],
+        default="close",
+        help="Timestamp interpretation: 'close' (close_time) or 'bucket' (bucket_start)"
+    )
 
     args = parser.parse_args()
 
     if args.mode == "prod":
         if not args.bot_token or not args.chat_id:
             parser.error("--bot-token and --chat-id are required for prod mode")
+
+    if args.mode == "debug":
+        if not args.timestamp:
+            parser.error("--timestamp is required for debug mode")
+
+        from src.monitoring.indicator_snapshot import get_indicator_snapshot
+
+        tokens = [token.strip() for token in args.token.split(",")]
+        if len(tokens) != 1:
+            parser.error("debug mode requires exactly one token")
+
+        symbol = tokens[0].upper()
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+
+        get_indicator_snapshot(
+            ch_dsn=args.ch_dsn,
+            symbol=symbol,
+            timestamp_str=args.timestamp,
+            timestamp_kind=args.timestamp_kind,
+            lookback_candles=150
+        )
+        return
 
     tokens = [token.strip().upper() for token in args.token.split(",")]
 

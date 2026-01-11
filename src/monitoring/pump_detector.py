@@ -184,4 +184,18 @@ class PumpDetector:
         df['pump_score'] = pump_score
         df['pump_signal'] = signals
 
+        df['runup'] = runup
+        df['runup_met'] = runup_met
+        df['vol_spike_cond'] = vol_spike_cond
+        df['vol_spike_recent'] = vol_spike_recent
+        df['rsi_hot'] = rsi_hot
+        df['mfi_hot'] = mfi_hot
+        df['osc_hot_recent'] = osc_hot_recent
+        df['macd_pos_recent'] = macd_pos_recent
+        df['pump_ctx'] = pump_ctx
+        df['near_peak'] = near_peak
+        df['blowoff_exhaustion'] = blowoff_exhaustion
+        df['predump_peak'] = predump_peak
+        df['strong_cond'] = strong_cond
+
         return df
