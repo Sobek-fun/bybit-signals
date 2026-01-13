@@ -10,6 +10,7 @@ class PumpLabelerLookahead:
     def detect(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df['pump_la_type'] = None
+        df['pump_la_runup'] = np.nan
 
         n = len(df)
         if n <= 35:
@@ -40,6 +41,7 @@ class PumpLabelerLookahead:
         candidate_indices = np.nonzero(candidate_mask.to_numpy())[0]
 
         labels = np.full(n, None, dtype=object)
+        runup_values = np.full(n, np.nan, dtype=float)
         last_accepted_index: Optional[int] = None
 
         for i in candidate_indices:
@@ -51,8 +53,10 @@ class PumpLabelerLookahead:
             else:
                 labels[i] = 'B'
 
+            runup_values[i] = runup.iloc[i]
             last_accepted_index = i
 
         df['pump_la_type'] = labels
+        df['pump_la_runup'] = runup_values
 
         return df

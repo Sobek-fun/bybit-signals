@@ -102,7 +102,8 @@ def main():
                 all_labels.append({
                     'symbol': symbol,
                     'timestamp': timestamp,
-                    'pump_la_type': row['pump_la_type']
+                    'pump_la_type': row['pump_la_type'],
+                    'runup_pct': round(row['pump_la_runup'] * 100, 2)
                 })
             print(
                 f"  Found {len(labeled)} labels (A={len(labeled[labeled['pump_la_type'] == 'A'])}, B={len(labeled[labeled['pump_la_type'] == 'B'])})")
