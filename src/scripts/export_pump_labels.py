@@ -64,7 +64,7 @@ def main():
     FROM bybit.candles
     WHERE open_time >= %(start_date)s
       AND open_time <= %(end_date)s
-      AND "interval" = 1
+      AND interval = 1
     ORDER BY symbol
     """
     result = client.query(symbols_query, parameters={

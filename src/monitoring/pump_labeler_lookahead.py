@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from typing import Optional
 
@@ -14,48 +15,44 @@ class PumpLabelerLookahead:
         if n <= 35:
             return df
 
+        close = df['close']
+        low = df['low']
+        high = df['high']
+
+        rolling_max_31 = close.rolling(window=31, center=True).max()
+        peak_mask = (close == rolling_max_31)
+
+        close_shift5 = close.shift(5)
+        runup = (close / close_shift5) - 1
+        runup_mask = (runup >= 0.08) & (close_shift5 > 0)
+
+        min_low_next5 = low.shift(-1).rolling(5).min().shift(-4)
+        max_high_next5 = high.shift(-1).rolling(5).max().shift(-4)
+
+        candidate_mask = peak_mask & runup_mask
+
+        pullback_threshold = close * 0.97
+        squeeze_threshold = close * 1.05
+
+        A_mask = candidate_mask & (min_low_next5 <= pullback_threshold) & (max_high_next5 < squeeze_threshold)
+        B_mask = candidate_mask & ~A_mask
+
+        candidate_indices = np.nonzero(candidate_mask.to_numpy())[0]
+
+        labels = np.full(n, None, dtype=object)
         last_accepted_index: Optional[int] = None
 
-        for i in range(15, n - 15):
-            close_i = df.iloc[i]['close']
-
-            window_start = i - 15
-            window_end = i + 16
-            close_window = df.iloc[window_start:window_end]['close']
-
-            if close_i != close_window.max():
-                continue
-
-            close_i_minus_5 = df.iloc[i - 5]['close']
-            if close_i_minus_5 <= 0:
-                continue
-
-            runup = (close_i / close_i_minus_5) - 1
-            if runup < 0.08:
-                continue
-
+        for i in candidate_indices:
             if last_accepted_index is not None and i - last_accepted_index < self.cooldown_bars:
                 continue
 
-            if i + 5 >= n:
-                continue
-
-            next_5_start = i + 1
-            next_5_end = i + 6
-            next_5_lows = df.iloc[next_5_start:next_5_end]['low']
-            next_5_highs = df.iloc[next_5_start:next_5_end]['high']
-
-            min_low = next_5_lows.min()
-            max_high = next_5_highs.max()
-
-            pullback_threshold = close_i * 0.97
-            squeeze_threshold = close_i * 1.05
-
-            if min_low <= pullback_threshold and max_high < squeeze_threshold:
-                df.iloc[i, df.columns.get_loc('pump_la_type')] = 'A'
+            if A_mask.iloc[i]:
+                labels[i] = 'A'
             else:
-                df.iloc[i, df.columns.get_loc('pump_la_type')] = 'B'
+                labels[i] = 'B'
 
             last_accepted_index = i
+
+        df['pump_la_type'] = labels
 
         return df
