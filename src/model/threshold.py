@@ -12,40 +12,45 @@ def find_first_signal_offset(event_df: pd.DataFrame, threshold: float) -> int:
     return triggered.iloc[0]['offset']
 
 
-def compute_event_metrics_for_threshold(
-        predictions_df: pd.DataFrame,
-        threshold: float
-) -> dict:
-    event_ids = predictions_df['event_id'].unique()
+def _prepare_event_data(predictions_df: pd.DataFrame) -> dict:
+    event_data = {}
+    for event_id, group in predictions_df.groupby('event_id'):
+        sorted_group = group.sort_values('offset')
+        event_data[event_id] = {
+            'offsets': sorted_group['offset'].values,
+            'p_end': sorted_group['p_end'].values
+        }
+    return event_data
 
+
+def _compute_event_metrics_from_data(event_data: dict, threshold: float) -> dict:
     hit0 = 0
     hit1 = 0
     early = 0
     late = 0
     miss = 0
-
     offsets = []
 
-    for event_id in event_ids:
-        event_df = predictions_df[predictions_df['event_id'] == event_id]
-        offset = find_first_signal_offset(event_df, threshold)
-
-        if offset is None:
+    for event_id, data in event_data.items():
+        mask = data['p_end'] >= threshold
+        if not mask.any():
             miss += 1
-        elif offset == 0:
+            continue
+
+        first_idx = np.argmax(mask)
+        offset = data['offsets'][first_idx]
+        offsets.append(offset)
+
+        if offset == 0:
             hit0 += 1
-            offsets.append(offset)
         elif offset == 1:
             hit1 += 1
-            offsets.append(offset)
         elif offset < 0:
             early += 1
-            offsets.append(offset)
         else:
             late += 1
-            offsets.append(offset)
 
-    n_events = len(event_ids)
+    n_events = len(event_data)
 
     return {
         'threshold': threshold,
@@ -65,6 +70,14 @@ def compute_event_metrics_for_threshold(
     }
 
 
+def compute_event_metrics_for_threshold(
+        predictions_df: pd.DataFrame,
+        threshold: float
+) -> dict:
+    event_data = _prepare_event_data(predictions_df)
+    return _compute_event_metrics_from_data(event_data, threshold)
+
+
 def threshold_sweep(
         predictions_df: pd.DataFrame,
         grid_from: float = 0.05,
@@ -74,11 +87,13 @@ def threshold_sweep(
         beta_early: float = 2.0,
         gamma_miss: float = 1.0
 ) -> tuple:
+    event_data = _prepare_event_data(predictions_df)
+
     thresholds = np.arange(grid_from, grid_to + grid_step, grid_step)
     results = []
 
     for threshold in thresholds:
-        metrics = compute_event_metrics_for_threshold(predictions_df, threshold)
+        metrics = _compute_event_metrics_from_data(event_data, threshold)
 
         score = (
                 metrics['hit0_rate'] +

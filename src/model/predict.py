@@ -1,7 +1,8 @@
+import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from src.model.threshold import find_first_signal_offset
+from src.model.threshold import _prepare_event_data
 
 
 def predict_proba(
@@ -22,21 +23,27 @@ def extract_signals(
         predictions_df: pd.DataFrame,
         threshold: float
 ) -> pd.DataFrame:
-    event_ids = predictions_df['event_id'].unique()
+    event_data = _prepare_event_data(predictions_df)
+
+    symbol_map = predictions_df.groupby('event_id')['symbol'].first().to_dict()
+    time_map = {}
+    for event_id, group in predictions_df.groupby('event_id'):
+        sorted_group = group.sort_values('offset')
+        time_map[event_id] = dict(zip(sorted_group['offset'], sorted_group['close_time']))
 
     signals = []
 
-    for event_id in event_ids:
-        event_df = predictions_df[predictions_df['event_id'] == event_id]
-        event_df = event_df.sort_values('offset')
+    for event_id, data in event_data.items():
+        mask = data['p_end'] >= threshold
+        if not mask.any():
+            continue
 
-        triggered = event_df[event_df['p_end'] >= threshold]
+        first_idx = np.argmax(mask)
+        offset = data['offsets'][first_idx]
 
-        if not triggered.empty:
-            first_signal = triggered.iloc[0]
-            signals.append({
-                'symbol': first_signal['symbol'],
-                'close_time': first_signal['close_time']
-            })
+        signals.append({
+            'symbol': symbol_map[event_id],
+            'close_time': time_map[event_id][offset]
+        })
 
     return pd.DataFrame(signals)

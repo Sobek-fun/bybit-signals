@@ -8,43 +8,42 @@ from sklearn.metrics import (
     recall_score
 )
 
-from src.model.threshold import find_first_signal_offset
+from src.model.threshold import _prepare_event_data
 
 
 def compute_event_level_metrics(
         predictions_df: pd.DataFrame,
         threshold: float
 ) -> dict:
-    event_ids = predictions_df['event_id'].unique()
+    event_data = _prepare_event_data(predictions_df)
 
     hit0 = 0
     hit1 = 0
     early = 0
     late = 0
     miss = 0
-
     offsets = []
 
-    for event_id in event_ids:
-        event_df = predictions_df[predictions_df['event_id'] == event_id]
-        offset = find_first_signal_offset(event_df, threshold)
-
-        if offset is None:
+    for event_id, data in event_data.items():
+        mask = data['p_end'] >= threshold
+        if not mask.any():
             miss += 1
-        elif offset == 0:
+            continue
+
+        first_idx = np.argmax(mask)
+        offset = data['offsets'][first_idx]
+        offsets.append(offset)
+
+        if offset == 0:
             hit0 += 1
-            offsets.append(offset)
         elif offset == 1:
             hit1 += 1
-            offsets.append(offset)
         elif offset < 0:
             early += 1
-            offsets.append(offset)
         else:
             late += 1
-            offsets.append(offset)
 
-    n_events = len(event_ids)
+    n_events = len(event_data)
 
     return {
         'n_events': n_events,
