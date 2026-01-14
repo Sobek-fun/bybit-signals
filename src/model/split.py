@@ -9,20 +9,16 @@ def time_split(
         train_end: datetime,
         val_end: datetime
 ) -> pd.DataFrame:
-    event_times = points_df[points_df['offset'] == 0][['event_id', 'close_time']].copy()
-    event_times = event_times.drop_duplicates('event_id')
+    event_times = points_df[points_df['offset'] == 0][['event_id', 'close_time']].drop_duplicates('event_id')
 
-    event_to_split = {}
-    for _, row in event_times.iterrows():
-        event_id = row['event_id']
-        event_time = row['close_time']
+    conditions = [
+        event_times['close_time'] < train_end,
+        event_times['close_time'] < val_end
+    ]
+    choices = ['train', 'val']
+    event_times['split'] = np.select(conditions, choices, default='test')
 
-        if event_time <= train_end:
-            event_to_split[event_id] = 'train'
-        elif event_time <= val_end:
-            event_to_split[event_id] = 'val'
-        else:
-            event_to_split[event_id] = 'test'
+    event_to_split = event_times.set_index('event_id')['split']
 
     points_df = points_df.copy()
     points_df['split'] = points_df['event_id'].map(event_to_split)
@@ -46,14 +42,12 @@ def ratio_split(
     train_end_idx = int(n * train_ratio)
     val_end_idx = int(n * (train_ratio + val_ratio))
 
-    event_to_split = {}
-    for i, event_id in enumerate(event_ids):
-        if i < train_end_idx:
-            event_to_split[event_id] = 'train'
-        elif i < val_end_idx:
-            event_to_split[event_id] = 'val'
-        else:
-            event_to_split[event_id] = 'test'
+    splits = np.empty(n, dtype=object)
+    splits[:train_end_idx] = 'train'
+    splits[train_end_idx:val_end_idx] = 'val'
+    splits[val_end_idx:] = 'test'
+
+    event_to_split = dict(zip(event_ids, splits))
 
     points_df = points_df.copy()
     points_df['split'] = points_df['event_id'].map(event_to_split)
