@@ -6,10 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiogram>=3.23.0",
+    "catboost>=1.2.8",
     "clickhouse-connect>=0.10.0",
     "pandas>=2.3.3",
     "pandas-ta>=0.4.71b0",
     "pyarrow>=22.0.0",
     "pydantic-settings>=2.12.0",
+    "scikit-learn>=1.8.0",
     "websockets>=15.0.1",
 ]
