@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 
 
@@ -14,7 +15,7 @@ def load_labels(path: str, start_date: datetime = None, end_date: datetime = Non
     if start_date:
         df = df[df['close_time'] >= start_date]
     if end_date:
-        df = df[df['close_time'] <= end_date]
+        df = df[df['close_time'] < end_date]
 
     return df
 
@@ -30,48 +31,41 @@ def build_training_points(
     else:
         events = labels_df[labels_df['pump_la_type'] == 'A'].copy()
 
-    points = []
+    if events.empty:
+        return pd.DataFrame()
 
-    for _, row in events.iterrows():
-        symbol = row['symbol']
-        close_time = row['close_time']
-        event_id = f"{symbol}|{close_time.strftime('%Y%m%d_%H%M%S')}"
+    events['event_id'] = events['symbol'] + '|' + events['close_time'].dt.strftime('%Y%m%d_%H%M%S')
 
-        points.append({
-            'event_id': event_id,
-            'symbol': symbol,
-            'close_time': close_time,
-            'offset': 0,
-            'y': 1,
-            'pump_la_type': row['pump_la_type'],
-            'runup_pct': row.get('runup_pct', None)
-        })
+    all_offsets = [0] + list(range(-neg_before, 0)) + list(range(1, neg_after + 1))
+    n_events = len(events)
+    n_offsets = len(all_offsets)
 
-        for k in range(1, neg_before + 1):
-            neg_time = close_time - timedelta(minutes=15 * k)
-            points.append({
-                'event_id': event_id,
-                'symbol': symbol,
-                'close_time': neg_time,
-                'offset': -k,
-                'y': 0,
-                'pump_la_type': row['pump_la_type'],
-                'runup_pct': row.get('runup_pct', None)
-            })
+    event_ids = np.repeat(events['event_id'].values, n_offsets)
+    symbols = np.repeat(events['symbol'].values, n_offsets)
+    base_times = np.repeat(events['close_time'].values, n_offsets)
+    pump_types = np.repeat(events['pump_la_type'].values, n_offsets)
+    runup_pcts = np.repeat(events['runup_pct'].values if 'runup_pct' in events.columns else np.nan, n_offsets)
 
-        for m in range(1, neg_after + 1):
-            pos_time = close_time + timedelta(minutes=15 * m)
-            points.append({
-                'event_id': event_id,
-                'symbol': symbol,
-                'close_time': pos_time,
-                'offset': m,
-                'y': 0,
-                'pump_la_type': row['pump_la_type'],
-                'runup_pct': row.get('runup_pct', None)
-            })
+    offsets = np.tile(all_offsets, n_events)
+    time_deltas = pd.to_timedelta(offsets * 15, unit='m')
+    close_times = pd.to_datetime(base_times) + time_deltas
 
-    points_df = pd.DataFrame(points)
+    y_values = np.where(
+        (offsets == 0) & (pump_types == 'A'),
+        1,
+        0
+    )
+
+    points_df = pd.DataFrame({
+        'event_id': event_ids,
+        'symbol': symbols,
+        'close_time': close_times,
+        'offset': offsets,
+        'y': y_values,
+        'pump_la_type': pump_types,
+        'runup_pct': runup_pcts
+    })
+
     return points_df
 
 
