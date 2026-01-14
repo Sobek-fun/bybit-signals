@@ -22,11 +22,11 @@ class PumpFeatureBuilder:
 
     def build(self, labels_df: pd.DataFrame) -> pd.DataFrame:
         labels_df = labels_df[labels_df['pump_la_type'].isin(['A', 'B'])].copy()
-        labels_df['close_time'] = pd.to_datetime(labels_df['timestamp'])
+        labels_df['close_time'] = pd.to_datetime(labels_df['timestamp'], utc=True).dt.tz_localize(None)
         labels_df = labels_df.sort_values(['symbol', 'close_time'])
 
         all_rows = []
-        grouped = labels_df.groupby('symbol')
+        grouped = labels_df.groupby('symbol', sort=False)
 
         for symbol, group in grouped:
             rows = self._process_symbol(symbol, group)
@@ -57,23 +57,24 @@ class PumpFeatureBuilder:
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
 
-        rows = []
-        for _, event in events.iterrows():
-            row = self._extract_features_for_event(df, symbol, event)
-            if row is not None:
-                rows.append(row)
+        self._validate_columns(df)
 
-        return rows
+        return self._extract_features_vectorized(df, symbol, events)
 
     def _normalize_to_close_time(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
         df['close_time'] = df.index + pd.Timedelta(minutes=15)
+        if df['close_time'].dt.tz is not None:
+            df['close_time'] = df['close_time'].dt.tz_localize(None)
         df = df.set_index('close_time')
         return df
 
-    def _calculate_base_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
+    def _validate_columns(self, df: pd.DataFrame):
+        required = ['rsi_14', 'mfi_14', 'macdh_12_26_9']
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required indicator columns: {missing}")
 
+    def _calculate_base_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df['ret_1'] = df['close'] / df['close'].shift(1) - 1
 
         candle_range = df['high'] - df['low']
@@ -116,8 +117,6 @@ class PumpFeatureBuilder:
         return df
 
     def _calculate_extended_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-
         df.ta.atr(length=14, append=True)
         atr_col = [c for c in df.columns if 'ATR' in c and '14' in c]
         if atr_col:
@@ -140,114 +139,110 @@ class PumpFeatureBuilder:
 
         return df
 
-    def _extract_features_for_event(self, df: pd.DataFrame, symbol: str, event: pd.Series) -> dict:
-        close_time = event['close_time']
+    def _extract_features_vectorized(self, df: pd.DataFrame, symbol: str, events: pd.DataFrame) -> list:
+        event_times = events['close_time'].values
+        positions = df.index.get_indexer(pd.DatetimeIndex(event_times))
 
-        if close_time not in df.index:
-            return None
+        required_history = self.warmup_bars + self.window_bars - 1
+        valid_mask = (positions >= 0) & (positions >= required_history)
 
-        loc = df.index.get_loc(close_time)
-        required_history = self.warmup_bars + self.window_bars
+        valid_positions = positions[valid_mask]
+        valid_events = events.iloc[valid_mask]
 
-        if loc < required_history - 1:
-            return None
-
-        window_start = loc - self.window_bars + 1
-        window = df.iloc[window_start:loc + 1].copy()
-
-        if len(window) != self.window_bars:
-            return None
-
-        row = {
-            'symbol': symbol,
-            'close_time': close_time,
-            'pump_la_type': event['pump_la_type'],
-            'target': 1 if event['pump_la_type'] == 'A' else 0,
-            'runup_pct': event['runup_pct'],
-            'timeframe': '15m',
-            'window_bars': self.window_bars,
-            'warmup_bars': self.warmup_bars
-        }
-
-        lag_features = self._build_lag_features(window)
-        row.update(lag_features)
-
-        agg_features = self._build_aggregate_features(window)
-        row.update(agg_features)
-
-        return row
-
-    def _build_lag_features(self, window: pd.DataFrame) -> dict:
-        features = {}
+        if len(valid_positions) == 0:
+            return []
 
         base_series = [
             'ret_1', 'range', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio',
             'volume', 'log_volume', 'rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio'
         ]
-
         extended_series = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
+        agg_series = ['rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio', 'ret_1']
 
         series_to_lag = base_series.copy()
         if self.feature_set == "extended":
-            series_to_lag.extend([s for s in extended_series if s in window.columns])
+            series_to_lag.extend([s for s in extended_series if s in df.columns])
 
-        for series_name in series_to_lag:
-            if series_name not in window.columns:
-                continue
+        series_arrays = {}
+        for s in series_to_lag:
+            if s in df.columns:
+                series_arrays[s] = df[s].values
 
-            values = window[series_name].values
-            for lag in range(self.window_bars):
-                idx = self.window_bars - 1 - lag
-                features[f'{series_name}_lag_{lag}'] = values[idx]
+        close_arr = df['close'].values
+        open_arr = df['open'].values
+        volume_arr = df['volume'].values
 
-        return features
+        num_events = len(valid_positions)
+        w = self.window_bars
 
-    def _build_aggregate_features(self, window: pd.DataFrame) -> dict:
-        features = {}
+        lag_indices = np.zeros((num_events, w), dtype=np.int64)
+        for i, pos in enumerate(valid_positions):
+            lag_indices[i] = np.arange(pos, pos - w, -1)
 
-        agg_series = ['rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio', 'ret_1']
+        rows = []
+        for ev_idx in range(num_events):
+            event_row = valid_events.iloc[ev_idx]
+            pos = valid_positions[ev_idx]
 
-        for series_name in agg_series:
-            if series_name not in window.columns:
-                continue
+            row = {
+                'symbol': symbol,
+                'close_time': df.index[pos],
+                'pump_la_type': event_row['pump_la_type'],
+                'target': 1 if event_row['pump_la_type'] == 'A' else 0,
+                'runup_pct': event_row['runup_pct'],
+                'timeframe': '15m',
+                'window_bars': self.window_bars,
+                'warmup_bars': self.warmup_bars
+            }
 
-            values = window[series_name].values
+            window_indices = lag_indices[ev_idx]
 
-            features[f'{series_name}_max_30'] = np.nanmax(values)
-            features[f'{series_name}_min_30'] = np.nanmin(values)
-            features[f'{series_name}_mean_30'] = np.nanmean(values)
-            features[f'{series_name}_std_30'] = np.nanstd(values)
+            for series_name, arr in series_arrays.items():
+                values = arr[window_indices]
+                for lag in range(w):
+                    row[f'{series_name}_lag_{lag}'] = values[lag]
 
-            features[f'{series_name}_last_minus_max_30'] = values[-1] - np.nanmax(values)
+            for series_name in agg_series:
+                if series_name not in series_arrays:
+                    continue
+                values = series_arrays[series_name][window_indices]
 
-            if len(values) >= 5:
-                features[f'{series_name}_slope_5'] = values[-1] - values[-5]
-            else:
-                features[f'{series_name}_slope_5'] = np.nan
+                row[f'{series_name}_max_{w}'] = np.nanmax(values)
+                row[f'{series_name}_min_{w}'] = np.nanmin(values)
+                row[f'{series_name}_mean_{w}'] = np.nanmean(values)
+                row[f'{series_name}_std_{w}'] = np.nanstd(values)
+                row[f'{series_name}_last_minus_max_{w}'] = values[0] - np.nanmax(values)
 
-            features[f'{series_name}_delta_1'] = values[-1] - values[-2] if len(values) >= 2 else np.nan
-            features[f'{series_name}_delta_3'] = values[-1] - values[-3] if len(values) >= 3 else np.nan
-            features[f'{series_name}_delta_5'] = values[-1] - values[-5] if len(values) >= 5 else np.nan
+                if len(values) >= 5:
+                    row[f'{series_name}_slope_5'] = values[0] - values[4]
+                else:
+                    row[f'{series_name}_slope_5'] = np.nan
 
-        close_values = window['close'].values
-        features['cum_ret_5'] = (close_values[-1] / close_values[-5] - 1) if len(close_values) >= 5 else np.nan
-        features['cum_ret_10'] = (close_values[-1] / close_values[-10] - 1) if len(close_values) >= 10 else np.nan
-        features['cum_ret_30'] = (close_values[-1] / close_values[0] - 1)
+                row[f'{series_name}_delta_1'] = values[0] - values[1] if len(values) >= 2 else np.nan
+                row[f'{series_name}_delta_3'] = values[0] - values[2] if len(values) >= 3 else np.nan
+                row[f'{series_name}_delta_5'] = values[0] - values[4] if len(values) >= 5 else np.nan
 
-        red_candles = window['close'].values < window['open'].values
-        features['count_red_last_5'] = int(np.sum(red_candles[-5:]))
+            close_window = close_arr[window_indices]
+            row['cum_ret_5'] = (close_window[0] / close_window[4] - 1) if w >= 5 else np.nan
+            row['cum_ret_10'] = (close_window[0] / close_window[9] - 1) if w >= 10 else np.nan
+            row[f'cum_ret_{w}'] = close_window[0] / close_window[w - 1] - 1
 
-        upper_wick_last_5 = window['upper_wick_ratio'].values[-5:]
-        features['max_upper_wick_last_5'] = np.nanmax(upper_wick_last_5)
+            open_window = open_arr[window_indices]
+            red_candles = close_window[:5] < open_window[:5]
+            row['count_red_last_5'] = int(np.sum(red_candles))
 
-        if 'vol_ratio' in window.columns:
-            vol_ratio_values = window['vol_ratio'].values
-            features['vol_ratio_max_10'] = np.nanmax(vol_ratio_values[-10:]) if len(vol_ratio_values) >= 10 else np.nan
-            features['vol_ratio_slope_5'] = vol_ratio_values[-1] - vol_ratio_values[-5] if len(
-                vol_ratio_values) >= 5 else np.nan
+            upper_wick_last_5 = series_arrays.get('upper_wick_ratio', np.array([]))[window_indices[:5]]
+            row['max_upper_wick_last_5'] = np.nanmax(upper_wick_last_5) if len(upper_wick_last_5) > 0 else np.nan
 
-        volume_last_10 = window['volume'].values[-10:]
-        max_vol_10 = np.nanmax(volume_last_10)
-        features['volume_fade'] = window['volume'].values[-1] / max_vol_10 if max_vol_10 > 0 else np.nan
+            if 'vol_ratio' in series_arrays:
+                vol_ratio_window = series_arrays['vol_ratio'][window_indices]
+                row['vol_ratio_max_10'] = np.nanmax(vol_ratio_window[:10]) if w >= 10 else np.nan
+                row['vol_ratio_slope_5'] = vol_ratio_window[0] - vol_ratio_window[4] if w >= 5 else np.nan
 
-        return features
+            volume_window = volume_arr[window_indices]
+            max_vol_10 = np.nanmax(volume_window[:10]) if w >= 10 else np.nan
+            row['volume_fade'] = volume_window[0] / max_vol_10 if max_vol_10 > 0 else np.nan
+
+            rows.append(row)
+
+        return rows
