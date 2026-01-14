@@ -175,27 +175,30 @@ class PumpFeatureBuilder:
         num_events = len(valid_positions)
         w = self.window_bars
 
-        lag_indices = np.zeros((num_events, w), dtype=np.int64)
+        lag_matrix = np.zeros((num_events, w), dtype=np.int64)
         for i, pos in enumerate(valid_positions):
-            lag_indices[i] = np.arange(pos, pos - w, -1)
+            lag_matrix[i] = np.arange(pos, pos - w, -1)
+
+        event_symbols = np.full(num_events, symbol)
+        event_close_times = df.index[valid_positions].values
+        event_pump_types = valid_events['pump_la_type'].values
+        event_targets = (valid_events['pump_la_type'].values == 'A').astype(int)
+        event_runups = valid_events['runup_pct'].values
 
         rows = []
         for ev_idx in range(num_events):
-            event_row = valid_events.iloc[ev_idx]
-            pos = valid_positions[ev_idx]
-
             row = {
-                'symbol': symbol,
-                'close_time': df.index[pos],
-                'pump_la_type': event_row['pump_la_type'],
-                'target': 1 if event_row['pump_la_type'] == 'A' else 0,
-                'runup_pct': event_row['runup_pct'],
+                'symbol': event_symbols[ev_idx],
+                'close_time': event_close_times[ev_idx],
+                'pump_la_type': event_pump_types[ev_idx],
+                'target': event_targets[ev_idx],
+                'runup_pct': event_runups[ev_idx],
                 'timeframe': '15m',
                 'window_bars': self.window_bars,
                 'warmup_bars': self.warmup_bars
             }
 
-            window_indices = lag_indices[ev_idx]
+            window_indices = lag_matrix[ev_idx]
 
             for series_name, arr in series_arrays.items():
                 values = arr[window_indices]
