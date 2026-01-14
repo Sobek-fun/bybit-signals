@@ -1,5 +1,5 @@
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -16,6 +16,57 @@ from src.model.predict import predict_proba, extract_signals
 def log(level: str, component: str, message: str):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{level}] {timestamp} [{component}] {message}")
+
+
+def parse_date_exclusive(date_str: str) -> datetime:
+    dt = datetime.strptime(date_str, '%Y-%m-%d')
+    return dt + timedelta(days=1)
+
+
+def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
+    required_cols = {'event_id', 'offset', 'y'}
+    missing_cols = required_cols - set(features_df.columns)
+    if missing_cols:
+        raise ValueError(f"Features parquet missing required columns: {missing_cols}")
+
+    features_events = set(features_df['event_id'].unique())
+    points_events = set(points_df['event_id'].unique())
+
+    common_events = features_events & points_events
+    missing_in_features = points_events - features_events
+    extra_in_features = features_events - points_events
+
+    if missing_in_features:
+        log("WARN", "TRAIN", f"events in points but not in features: {len(missing_in_features)}")
+    if extra_in_features:
+        log("WARN", "TRAIN", f"events in features but not in points: {len(extra_in_features)}")
+
+    features_df = features_df[features_df['event_id'].isin(common_events)]
+    log("INFO", "TRAIN", f"common events after validation: {len(common_events)}")
+
+    return features_df
+
+
+def check_event_integrity(features_df: pd.DataFrame) -> pd.DataFrame:
+    offset_zero = features_df[features_df['offset'] == 0]
+    event_counts = offset_zero.groupby('event_id').size()
+
+    valid_events = event_counts[event_counts == 1].index
+    invalid_events = event_counts[event_counts != 1].index
+
+    if len(invalid_events) > 0:
+        log("WARN", "TRAIN", f"dropping {len(invalid_events)} events with missing/duplicate offset=0")
+
+    features_df = features_df[features_df['event_id'].isin(valid_events)]
+    return features_df
+
+
+def check_nan_features(features_df: pd.DataFrame, feature_columns: list) -> int:
+    nan_rows = features_df[feature_columns].isna().any(axis=1).sum()
+    total_rows = len(features_df)
+    if nan_rows > 0:
+        log("WARN", "TRAIN", f"rows with NaN in features: {nan_rows}/{total_rows} ({nan_rows / total_rows * 100:.2f}%)")
+    return nan_rows
 
 
 def main():
@@ -75,7 +126,7 @@ def main():
     artifacts.save_config(config)
 
     start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
-    end_date = datetime.strptime(args.end_date, '%Y-%m-%d') if args.end_date else None
+    end_date = parse_date_exclusive(args.end_date) if args.end_date else None
 
     log("INFO", "TRAIN", f"loading labels from {args.labels}")
     labels_df = load_labels(args.labels, start_date, end_date)
@@ -100,6 +151,7 @@ def main():
     if args.features_parquet:
         log("INFO", "TRAIN", f"loading features from {args.features_parquet}")
         features_df = pd.read_parquet(args.features_parquet)
+        features_df = validate_features_parquet(features_df, points_df)
     else:
         log("INFO", "TRAIN", f"building features from ClickHouse")
         builder = PumpFeatureBuilder(
@@ -122,12 +174,16 @@ def main():
             how='inner'
         )
 
+    features_df = check_event_integrity(features_df)
+
+    features_df = features_df.sort_values(['event_id', 'offset']).reset_index(drop=True)
+
     log("INFO", "TRAIN", f"features shape: {features_df.shape}")
     artifacts.save_features(features_df)
 
     if args.split_strategy == "time":
-        train_end = datetime.strptime(args.train_end, '%Y-%m-%d')
-        val_end = datetime.strptime(args.val_end, '%Y-%m-%d')
+        train_end = parse_date_exclusive(args.train_end)
+        val_end = parse_date_exclusive(args.val_end)
         features_df = time_split(features_df, train_end, val_end)
     else:
         features_df = ratio_split(
@@ -145,6 +201,8 @@ def main():
 
     feature_columns = get_feature_columns(features_df)
     log("INFO", "TRAIN", f"training with {len(feature_columns)} features")
+
+    check_nan_features(features_df, feature_columns)
 
     model = train_model(
         features_df,
