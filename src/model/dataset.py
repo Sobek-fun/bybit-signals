@@ -64,7 +64,7 @@ def build_training_points(
 
     pos_offsets_set = set(pos_offsets)
     y_values = np.where(
-        np.isin(offsets, list(pos_offsets_set)) & (np.tile(events['pump_la_type'].values, n_offsets) == 'A'),
+        np.isin(offsets, list(pos_offsets_set)) & (pump_types == 'A'),
         1,
         0
     )
