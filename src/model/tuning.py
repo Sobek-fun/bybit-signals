@@ -68,6 +68,38 @@ def apply_fold_split(points_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
     return points_df
 
 
+def clip_fold_points(points_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
+    points_df = points_df.copy()
+
+    train_mask = points_df['split'] == 'train'
+    points_df = points_df[~(train_mask & (points_df['open_time'] >= fold['train_end']))]
+
+    val_mask = points_df['split'] == 'val'
+    points_df = points_df[~(val_mask & (points_df['open_time'] < fold['val_start']))]
+    points_df = points_df[~(val_mask & (points_df['open_time'] >= fold['val_end']))]
+
+    return points_df.reset_index(drop=True)
+
+
+def apply_fold_embargo(points_df: pd.DataFrame, fold: dict, embargo_bars: int) -> pd.DataFrame:
+    if embargo_bars <= 0:
+        return points_df
+
+    embargo_delta = timedelta(minutes=embargo_bars * 15)
+
+    event_times = points_df[points_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
+
+    train_embargo_start = fold['train_end'] - embargo_delta
+    train_embargo_end = fold['train_end'] + embargo_delta
+
+    in_embargo = (event_times['open_time'] >= train_embargo_start) & (event_times['open_time'] < train_embargo_end)
+    events_to_remove = event_times[in_embargo]['event_id']
+
+    points_df = points_df[~points_df['event_id'].isin(events_to_remove)].copy()
+
+    return points_df
+
+
 def get_hyperparameter_grid() -> list:
     param_grid = {
         'depth': [4, 6, 8],
@@ -133,7 +165,9 @@ def evaluate_fold(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float
+        gamma_miss: float,
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -147,10 +181,18 @@ def evaluate_fold(
         alpha_hit1=alpha_hit1,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
-        signal_rule=signal_rule
+        signal_rule=signal_rule,
+        min_pending_bars=min_pending_bars,
+        drop_delta=drop_delta
     )
 
-    metrics = compute_event_level_metrics(predictions, best_threshold, signal_rule)
+    metrics = compute_event_level_metrics(
+        predictions,
+        best_threshold,
+        signal_rule,
+        min_pending_bars=min_pending_bars,
+        drop_delta=drop_delta
+    )
 
     score = (
             metrics['hit0_rate'] +
@@ -178,6 +220,9 @@ def run_cv(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0,
+        embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         seed: int = 42
@@ -186,6 +231,8 @@ def run_cv(
 
     for fold_idx, fold in enumerate(folds):
         fold_df = apply_fold_split(features_df, fold)
+        fold_df = apply_fold_embargo(fold_df, fold, embargo_bars)
+        fold_df = clip_fold_points(fold_df, fold)
 
         model, _ = train_fold(
             fold_df,
@@ -206,7 +253,9 @@ def run_cv(
             signal_rule,
             alpha_hit1,
             beta_early,
-            gamma_miss
+            gamma_miss,
+            min_pending_bars=min_pending_bars,
+            drop_delta=drop_delta
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -239,6 +288,9 @@ def tune_model(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0,
+        embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         seed: int = 42
@@ -272,6 +324,9 @@ def tune_model(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            min_pending_bars=min_pending_bars,
+            drop_delta=drop_delta,
+            embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
             seed=seed
@@ -318,7 +373,10 @@ def train_final_model(
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     train_events = event_times[event_times['open_time'] < train_end]['event_id']
 
-    train_df = features_df[features_df['event_id'].isin(train_events)]
+    train_df = features_df[
+        (features_df['event_id'].isin(train_events)) &
+        (features_df['open_time'] < train_end)
+        ]
 
     X_train = train_df[feature_columns]
     y_train = train_df['y']
