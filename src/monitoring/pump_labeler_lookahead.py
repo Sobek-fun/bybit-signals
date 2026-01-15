@@ -11,8 +11,8 @@ class PumpLabelerLookahead:
         df = df.copy()
         df['pump_la_type'] = None
         df['pump_la_runup'] = np.nan
-
-        df['pump_la_event_close_time'] = pd.NaT
+        df['peak_open_time'] = pd.NaT
+        df['event_open_time'] = pd.NaT
 
         n = len(df)
         if n <= 35:
@@ -58,9 +58,9 @@ class PumpLabelerLookahead:
         df['pump_la_runup'] = runup_values
 
         bucket_start = pd.to_datetime(df.index, errors='coerce')
-        event_close_time = bucket_start + pd.Timedelta(minutes=15)
 
         labeled_mask = df['pump_la_type'].notna()
-        df.loc[labeled_mask, 'pump_la_event_close_time'] = event_close_time[labeled_mask]
+        df.loc[labeled_mask, 'peak_open_time'] = bucket_start[labeled_mask]
+        df.loc[labeled_mask, 'event_open_time'] = bucket_start[labeled_mask] + pd.Timedelta(minutes=15)
 
         return df

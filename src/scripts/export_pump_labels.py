@@ -98,10 +98,11 @@ def main():
         labeled = df[df['pump_la_type'].notna()]
 
         if not labeled.empty:
-            for timestamp, row in labeled.iterrows():
+            for _, row in labeled.iterrows():
                 all_labels.append({
                     'symbol': symbol,
-                    'timestamp': timestamp,
+                    'event_open_time': row['event_open_time'],
+                    'peak_open_time': row['peak_open_time'],
                     'pump_la_type': row['pump_la_type'],
                     'runup_pct': round(row['pump_la_runup'] * 100, 2)
                 })
