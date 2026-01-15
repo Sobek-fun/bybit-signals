@@ -63,5 +63,9 @@ class RunArtifacts:
         path = self.run_dir / "predicted_signals_holdout.csv"
         df.to_csv(path, index=False)
 
+    def save_predictions(self, df: pd.DataFrame, split_name: str):
+        path = self.run_dir / f"predictions_{split_name}.parquet"
+        df.to_parquet(path, index=False)
+
     def get_path(self) -> Path:
         return self.run_dir
