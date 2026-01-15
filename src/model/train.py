@@ -4,7 +4,7 @@ from catboost import CatBoostClassifier, Pool
 
 def get_feature_columns(df: pd.DataFrame) -> list:
     exclude_cols = {
-        'event_id', 'symbol', 'close_time', 'offset', 'y',
+        'event_id', 'symbol', 'open_time', 'offset', 'y',
         'pump_la_type', 'runup_pct', 'split', 'target',
         'timeframe', 'window_bars', 'warmup_bars'
     }
@@ -69,6 +69,9 @@ def get_feature_importance_grouped(importance_df: pd.DataFrame) -> pd.DataFrame:
             ('rsi_14', 'RSI'),
             ('mfi_14', 'MFI'),
             ('macdh_12_26_9', 'MACDh'),
+            ('macd_line', 'MACD_line'),
+            ('macd_signal', 'MACD_signal'),
+            ('drawdown', 'drawdown'),
             ('vol_ratio', 'vol_ratio'),
             ('volume', 'volume'),
             ('log_volume', 'volume'),
@@ -82,7 +85,8 @@ def get_feature_importance_grouped(importance_df: pd.DataFrame) -> pd.DataFrame:
             ('atr', 'ATR'),
             ('bb_', 'BB'),
             ('vwap', 'VWAP'),
-            ('obv', 'OBV')
+            ('obv', 'OBV'),
+            ('corridor', 'corridor')
         ]
 
         for prefix, group in prefixes:
