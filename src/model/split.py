@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -9,11 +9,11 @@ def time_split(
         train_end: datetime,
         val_end: datetime
 ) -> pd.DataFrame:
-    event_times = points_df[points_df['offset'] == 0][['event_id', 'close_time']].drop_duplicates('event_id')
+    event_times = points_df[points_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
 
     conditions = [
-        event_times['close_time'] < train_end,
-        event_times['close_time'] < val_end
+        event_times['open_time'] < train_end,
+        event_times['open_time'] < val_end
     ]
     choices = ['train', 'val']
     event_times['split'] = np.select(conditions, choices, default='test')
@@ -53,6 +53,55 @@ def ratio_split(
     points_df['split'] = points_df['event_id'].map(event_to_split)
 
     return points_df
+
+
+def apply_embargo(
+        points_df: pd.DataFrame,
+        train_end: datetime,
+        val_end: datetime,
+        embargo_bars: int
+) -> pd.DataFrame:
+    embargo_delta = timedelta(minutes=embargo_bars * 15)
+
+    event_times = points_df[points_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
+
+    train_embargo_start = train_end - embargo_delta
+    train_embargo_end = train_end + embargo_delta
+    val_embargo_start = val_end - embargo_delta
+    val_embargo_end = val_end + embargo_delta
+
+    in_train_embargo = (event_times['open_time'] >= train_embargo_start) & (
+                event_times['open_time'] < train_embargo_end)
+    in_val_embargo = (event_times['open_time'] >= val_embargo_start) & (event_times['open_time'] < val_embargo_end)
+
+    events_to_remove = event_times[in_train_embargo | in_val_embargo]['event_id']
+
+    points_df = points_df[~points_df['event_id'].isin(events_to_remove)].copy()
+
+    return points_df
+
+
+def clip_points_to_split_bounds(
+        points_df: pd.DataFrame,
+        train_end: datetime,
+        val_end: datetime,
+        test_end: datetime = None
+) -> pd.DataFrame:
+    points_df = points_df.copy()
+
+    train_mask = points_df['split'] == 'train'
+    points_df = points_df[~(train_mask & (points_df['open_time'] >= train_end))]
+
+    val_mask = points_df['split'] == 'val'
+    points_df = points_df[~(val_mask & (points_df['open_time'] < train_end))]
+    points_df = points_df[~(val_mask & (points_df['open_time'] >= val_end))]
+
+    test_mask = points_df['split'] == 'test'
+    points_df = points_df[~(test_mask & (points_df['open_time'] < val_end))]
+    if test_end:
+        points_df = points_df[~(test_mask & (points_df['open_time'] >= test_end))]
+
+    return points_df.reset_index(drop=True)
 
 
 def get_split_info(points_df: pd.DataFrame) -> dict:
