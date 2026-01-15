@@ -265,6 +265,9 @@ def run_tune(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        min_pending_bars=args.min_pending_bars,
+        drop_delta=args.drop_delta,
+        embargo_bars=args.embargo_bars,
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
         seed=args.seed
@@ -276,7 +279,11 @@ def run_tune(args, artifacts: RunArtifacts):
     log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
 
     artifacts.save_best_params(tune_result['best_params'])
-    artifacts.save_best_threshold(tune_result['best_threshold'], {'signal_rule': args.signal_rule})
+    artifacts.save_best_threshold(tune_result['best_threshold'], {
+        'signal_rule': args.signal_rule,
+        'min_pending_bars': args.min_pending_bars,
+        'drop_delta': args.drop_delta
+    })
     artifacts.save_leaderboard(tune_result['leaderboard'])
     artifacts.save_cv_report(tune_result['best_cv_result'])
     artifacts.save_folds(tune_result['folds'])
@@ -314,12 +321,24 @@ def run_tune(args, artifacts: RunArtifacts):
             )
             artifacts.save_predictions(test_predictions, 'test')
 
-            test_metrics = evaluate(test_predictions, tune_result['best_threshold'], signal_rule=args.signal_rule)
+            test_metrics = evaluate(
+                test_predictions,
+                tune_result['best_threshold'],
+                signal_rule=args.signal_rule,
+                min_pending_bars=args.min_pending_bars,
+                drop_delta=args.drop_delta
+            )
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
                 f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
-            signals_df = extract_signals(test_predictions, tune_result['best_threshold'], signal_rule=args.signal_rule)
+            signals_df = extract_signals(
+                test_predictions,
+                tune_result['best_threshold'],
+                signal_rule=args.signal_rule,
+                min_pending_bars=args.min_pending_bars,
+                drop_delta=args.drop_delta
+            )
             artifacts.save_predicted_signals(signals_df)
             log("INFO", "TUNE", f"saved {len(signals_df)} predicted signals")
 
