@@ -6,11 +6,12 @@ import pandas as pd
 from src.datasets.pump_feature_builder import PumpFeatureBuilder
 from src.model.artifacts import RunArtifacts
 from src.model.dataset import load_labels, build_training_points, deduplicate_points
-from src.model.split import time_split, ratio_split, get_split_info
+from src.model.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
 from src.model.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
 from src.model.threshold import threshold_sweep
 from src.model.evaluate import evaluate
 from src.model.predict import predict_proba, extract_signals
+from src.model.tuning import tune_model, train_final_model
 
 
 def log(level: str, component: str, message: str):
@@ -21,6 +22,10 @@ def log(level: str, component: str, message: str):
 def parse_date_exclusive(date_str: str) -> datetime:
     dt = datetime.strptime(date_str, '%Y-%m-%d')
     return dt + timedelta(days=1)
+
+
+def parse_pos_offsets(offsets_str: str) -> list:
+    return [int(x.strip()) for x in offsets_str.split(',')]
 
 
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
@@ -69,125 +74,79 @@ def check_nan_features(features_df: pd.DataFrame, feature_columns: list) -> int:
     return nan_rows
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train pump end prediction model")
-
-    parser.add_argument("--labels", type=str, required=True)
-    parser.add_argument("--start-date", type=str, default=None)
-    parser.add_argument("--end-date", type=str, default=None)
-    parser.add_argument("--clickhouse-dsn", type=str, default=None)
-    parser.add_argument("--features-parquet", type=str, default=None)
-
-    parser.add_argument("--neg-before", type=int, default=20)
-    parser.add_argument("--neg-after", type=int, default=0)
-    parser.add_argument("--include-b", action="store_true", default=False)
-
-    parser.add_argument("--window-bars", type=int, default=30)
-    parser.add_argument("--warmup-bars", type=int, default=150)
-    parser.add_argument("--feature-set", type=str, choices=["base", "extended"], default="base")
-
-    parser.add_argument("--split-strategy", type=str, choices=["time", "ratio"], default="time")
-    parser.add_argument("--train-end", type=str, default=None)
-    parser.add_argument("--val-end", type=str, default=None)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--test-ratio", type=float, default=0.15)
-    parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--iterations", type=int, default=1000)
-    parser.add_argument("--depth", type=int, default=6)
-    parser.add_argument("--learning-rate", type=float, default=0.03)
-    parser.add_argument("--l2-leaf-reg", type=float, default=3.0)
-    parser.add_argument("--early-stopping-rounds", type=int, default=50)
-    parser.add_argument("--thread-count", type=int, default=-1)
-
-    parser.add_argument("--threshold-grid-from", type=float, default=0.05)
-    parser.add_argument("--threshold-grid-to", type=float, default=0.95)
-    parser.add_argument("--threshold-grid-step", type=float, default=0.01)
-    parser.add_argument("--alpha-hit1", type=float, default=0.5)
-    parser.add_argument("--beta-early", type=float, default=2.0)
-    parser.add_argument("--gamma-miss", type=float, default=1.0)
-
-    parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down"],
-                        default="pending_turn_down")
-
-    parser.add_argument("--out-dir", type=str, required=True)
-    parser.add_argument("--run-name", type=str, default=None)
-
-    args = parser.parse_args()
-
-    if args.split_strategy == "time" and (not args.train_end or not args.val_end):
-        parser.error("--train-end and --val-end required for time split strategy")
-
-    if not args.clickhouse_dsn and not args.features_parquet:
-        parser.error("Either --clickhouse-dsn or --features-parquet is required")
-
-    artifacts = RunArtifacts(args.out_dir, args.run_name)
-    log("INFO", "TRAIN", f"run_dir={artifacts.get_path()}")
-
-    config = vars(args)
-    artifacts.save_config(config)
-
+def run_build_dataset(args, artifacts: RunArtifacts):
     start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
     end_date = parse_date_exclusive(args.end_date) if args.end_date else None
 
-    log("INFO", "TRAIN", f"loading labels from {args.labels}")
+    log("INFO", "BUILD", f"loading labels from {args.labels}")
     labels_df = load_labels(args.labels, start_date, end_date)
-    log("INFO", "TRAIN",
+    log("INFO", "BUILD",
         f"loaded {len(labels_df)} labels (A={len(labels_df[labels_df['pump_la_type'] == 'A'])}, B={len(labels_df[labels_df['pump_la_type'] == 'B'])})")
 
     artifacts.save_labels_filtered(labels_df)
 
-    log("INFO", "TRAIN", f"building training points neg_before={args.neg_before} neg_after={args.neg_after}")
+    pos_offsets = parse_pos_offsets(args.pos_offsets)
+    log("INFO", "BUILD",
+        f"building training points neg_before={args.neg_before} neg_after={args.neg_after} pos_offsets={pos_offsets}")
     points_df = build_training_points(
         labels_df,
         neg_before=args.neg_before,
         neg_after=args.neg_after,
+        pos_offsets=pos_offsets,
         include_b=args.include_b
     )
     points_df = deduplicate_points(points_df)
-    log("INFO", "TRAIN",
+    log("INFO", "BUILD",
         f"training points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
 
     artifacts.save_training_points(points_df)
 
-    if args.features_parquet:
-        log("INFO", "TRAIN", f"loading features from {args.features_parquet}")
-        features_df = pd.read_parquet(args.features_parquet)
-        features_df = validate_features_parquet(features_df, points_df)
-    else:
-        log("INFO", "TRAIN", f"building features from ClickHouse")
-        builder = PumpFeatureBuilder(
-            ch_dsn=args.clickhouse_dsn,
-            window_bars=args.window_bars,
-            warmup_bars=args.warmup_bars,
-            feature_set=args.feature_set
-        )
+    log("INFO", "BUILD", f"building features from ClickHouse")
+    builder = PumpFeatureBuilder(
+        ch_dsn=args.clickhouse_dsn,
+        window_bars=args.window_bars,
+        warmup_bars=args.warmup_bars,
+        feature_set=args.feature_set
+    )
 
-        feature_input = points_df[['symbol', 'close_time']].copy()
-        feature_input = feature_input.rename(columns={'close_time': 'timestamp'})
-        feature_input['pump_la_type'] = 'A'
-        feature_input['runup_pct'] = 0
+    feature_input = points_df[['symbol', 'open_time']].copy()
+    feature_input = feature_input.rename(columns={'open_time': 'event_open_time'})
+    feature_input['pump_la_type'] = 'A'
+    feature_input['runup_pct'] = 0
 
-        features_df = builder.build(feature_input)
+    features_df = builder.build(feature_input)
 
-        features_df = features_df.merge(
-            points_df[['symbol', 'close_time', 'event_id', 'offset', 'y']],
-            on=['symbol', 'close_time'],
-            how='inner'
-        )
+    features_df = features_df.merge(
+        points_df[['symbol', 'open_time', 'event_id', 'offset', 'y']],
+        on=['symbol', 'open_time'],
+        how='inner'
+    )
 
     features_df = check_event_integrity(features_df)
-
     features_df = features_df.sort_values(['event_id', 'offset']).reset_index(drop=True)
 
-    log("INFO", "TRAIN", f"features shape: {features_df.shape}")
+    log("INFO", "BUILD", f"features shape: {features_df.shape}")
     artifacts.save_features(features_df)
+
+    log("INFO", "BUILD", f"dataset saved to {artifacts.get_path()}")
+
+
+def run_train_only(args, artifacts: RunArtifacts):
+    log("INFO", "TRAIN", f"loading features from {args.dataset_parquet}")
+    features_df = pd.read_parquet(args.dataset_parquet)
+
+    feature_columns = get_feature_columns(features_df)
+    log("INFO", "TRAIN", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
 
     if args.split_strategy == "time":
         train_end = parse_date_exclusive(args.train_end)
         val_end = parse_date_exclusive(args.val_end)
         features_df = time_split(features_df, train_end, val_end)
+
+        if args.embargo_bars > 0:
+            features_df = apply_embargo(features_df, train_end, val_end, args.embargo_bars)
+
+        features_df = clip_points_to_split_bounds(features_df, train_end, val_end)
     else:
         features_df = ratio_split(
             features_df,
@@ -201,9 +160,6 @@ def main():
     artifacts.save_splits(split_info)
     log("INFO", "TRAIN",
         f"split info: train={split_info['train']['n_events']} val={split_info['val']['n_events']} test={split_info['test']['n_events']} events")
-
-    feature_columns = get_feature_columns(features_df)
-    log("INFO", "TRAIN", f"training with {len(feature_columns)} features")
 
     check_nan_features(features_df, feature_columns)
 
@@ -235,7 +191,6 @@ def main():
         features_df[features_df['split'] == 'val'],
         feature_columns
     )
-
     artifacts.save_predictions(val_predictions, 'val')
 
     log("INFO", "TRAIN", "searching optimal threshold")
@@ -247,14 +202,22 @@ def main():
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
-        signal_rule=args.signal_rule
+        signal_rule=args.signal_rule,
+        min_pending_bars=args.min_pending_bars,
+        drop_delta=args.drop_delta
     )
 
     artifacts.save_threshold_sweep(sweep_df)
+    artifacts.save_best_threshold(best_threshold, {
+        'signal_rule': args.signal_rule,
+        'min_pending_bars': args.min_pending_bars,
+        'drop_delta': args.drop_delta
+    })
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set")
-    val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule)
+    val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule,
+                           min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} early={val_metrics['event_level']['early_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
@@ -265,21 +228,187 @@ def main():
         features_df[features_df['split'] == 'test'],
         feature_columns
     )
-
     artifacts.save_predictions(test_predictions, 'test')
 
     log("INFO", "TRAIN", "evaluating on test set")
-    test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule)
+    test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule,
+                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
     log("INFO", "TRAIN", "extracting holdout signals")
-    signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule)
+    signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule,
+                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
 
     log("INFO", "TRAIN", f"done. artifacts saved to {artifacts.get_path()}")
+
+
+def run_tune(args, artifacts: RunArtifacts):
+    log("INFO", "TUNE", f"loading features from {args.dataset_parquet}")
+    features_df = pd.read_parquet(args.dataset_parquet)
+
+    feature_columns = get_feature_columns(features_df)
+    log("INFO", "TUNE", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
+
+    log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min")
+
+    tune_result = tune_model(
+        features_df,
+        feature_columns,
+        time_budget_min=args.time_budget_min,
+        fold_months=args.fold_months,
+        min_train_months=args.min_train_months,
+        signal_rule=args.signal_rule,
+        alpha_hit1=args.alpha_hit1,
+        beta_early=args.beta_early,
+        gamma_miss=args.gamma_miss,
+        iterations=args.iterations,
+        early_stopping_rounds=args.early_stopping_rounds,
+        seed=args.seed
+    )
+
+    log("INFO", "TUNE",
+        f"tuning completed: {tune_result['trials_completed']} trials in {tune_result['time_elapsed_sec']:.1f}s")
+    log("INFO", "TUNE", f"best score: {tune_result['best_score']:.4f}")
+    log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
+
+    artifacts.save_best_params(tune_result['best_params'])
+    artifacts.save_best_threshold(tune_result['best_threshold'], {'signal_rule': args.signal_rule})
+    artifacts.save_leaderboard(tune_result['leaderboard'])
+    artifacts.save_cv_report(tune_result['best_cv_result'])
+    artifacts.save_folds(tune_result['folds'])
+
+    if args.train_end:
+        train_end = parse_date_exclusive(args.train_end)
+        log("INFO", "TUNE", f"training final model on data up to {args.train_end}")
+
+        final_model = train_final_model(
+            features_df,
+            feature_columns,
+            tune_result['best_params'],
+            train_end,
+            iterations=args.iterations,
+            seed=args.seed
+        )
+
+        artifacts.save_model(final_model)
+        log("INFO", "TUNE", f"final model saved")
+
+        importance_df = get_feature_importance(final_model, feature_columns)
+        artifacts.save_feature_importance(importance_df)
+
+        importance_grouped_df = get_feature_importance_grouped(importance_df)
+        artifacts.save_feature_importance_grouped(importance_grouped_df)
+
+        if args.val_end:
+            val_end = parse_date_exclusive(args.val_end)
+            features_df = time_split(features_df, train_end, val_end)
+
+            test_predictions = predict_proba(
+                final_model,
+                features_df[features_df['split'] == 'test'],
+                feature_columns
+            )
+            artifacts.save_predictions(test_predictions, 'test')
+
+            test_metrics = evaluate(test_predictions, tune_result['best_threshold'], signal_rule=args.signal_rule)
+            artifacts.save_metrics(test_metrics, 'test')
+            log("INFO", "TUNE",
+                f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
+
+            signals_df = extract_signals(test_predictions, tune_result['best_threshold'], signal_rule=args.signal_rule)
+            artifacts.save_predicted_signals(signals_df)
+            log("INFO", "TUNE", f"saved {len(signals_df)} predicted signals")
+
+    log("INFO", "TUNE", f"done. artifacts saved to {artifacts.get_path()}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train pump end prediction model")
+
+    parser.add_argument("--mode", type=str, choices=["build-dataset", "train", "tune"], required=True)
+
+    parser.add_argument("--labels", type=str)
+    parser.add_argument("--start-date", type=str, default=None)
+    parser.add_argument("--end-date", type=str, default=None)
+    parser.add_argument("--clickhouse-dsn", type=str, default=None)
+    parser.add_argument("--dataset-parquet", type=str, default=None)
+
+    parser.add_argument("--neg-before", type=int, default=20)
+    parser.add_argument("--neg-after", type=int, default=0)
+    parser.add_argument("--pos-offsets", type=str, default="0")
+    parser.add_argument("--include-b", action="store_true", default=False)
+
+    parser.add_argument("--window-bars", type=int, default=30)
+    parser.add_argument("--warmup-bars", type=int, default=150)
+    parser.add_argument("--feature-set", type=str, choices=["base", "extended"], default="base")
+
+    parser.add_argument("--split-strategy", type=str, choices=["time", "ratio"], default="time")
+    parser.add_argument("--train-end", type=str, default=None)
+    parser.add_argument("--val-end", type=str, default=None)
+    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
+    parser.add_argument("--embargo-bars", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--depth", type=int, default=6)
+    parser.add_argument("--learning-rate", type=float, default=0.03)
+    parser.add_argument("--l2-leaf-reg", type=float, default=3.0)
+    parser.add_argument("--early-stopping-rounds", type=int, default=50)
+    parser.add_argument("--thread-count", type=int, default=-1)
+
+    parser.add_argument("--threshold-grid-from", type=float, default=0.05)
+    parser.add_argument("--threshold-grid-to", type=float, default=0.95)
+    parser.add_argument("--threshold-grid-step", type=float, default=0.01)
+    parser.add_argument("--alpha-hit1", type=float, default=0.5)
+    parser.add_argument("--beta-early", type=float, default=2.0)
+    parser.add_argument("--gamma-miss", type=float, default=1.0)
+
+    parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down"],
+                        default="pending_turn_down")
+    parser.add_argument("--min-pending-bars", type=int, default=1)
+    parser.add_argument("--drop-delta", type=float, default=0.0)
+
+    parser.add_argument("--time-budget-min", type=int, default=60)
+    parser.add_argument("--fold-months", type=int, default=1)
+    parser.add_argument("--min-train-months", type=int, default=3)
+
+    parser.add_argument("--out-dir", type=str, required=True)
+    parser.add_argument("--run-name", type=str, default=None)
+
+    args = parser.parse_args()
+
+    if args.mode == "build-dataset":
+        if not args.labels or not args.clickhouse_dsn:
+            parser.error("--labels and --clickhouse-dsn required for build-dataset mode")
+
+    if args.mode == "train":
+        if not args.dataset_parquet:
+            parser.error("--dataset-parquet required for train mode")
+        if args.split_strategy == "time" and (not args.train_end or not args.val_end):
+            parser.error("--train-end and --val-end required for time split strategy")
+
+    if args.mode == "tune":
+        if not args.dataset_parquet:
+            parser.error("--dataset-parquet required for tune mode")
+
+    artifacts = RunArtifacts(args.out_dir, args.run_name)
+    log("INFO", "MAIN", f"run_dir={artifacts.get_path()}")
+
+    config = vars(args)
+    artifacts.save_config(config)
+
+    if args.mode == "build-dataset":
+        run_build_dataset(args, artifacts)
+    elif args.mode == "train":
+        run_train_only(args, artifacts)
+    elif args.mode == "tune":
+        run_tune(args, artifacts)
 
 
 if __name__ == "__main__":
