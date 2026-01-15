@@ -14,7 +14,9 @@ from src.model.threshold import _prepare_event_data
 def compute_event_level_metrics(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down'
+        signal_rule: str = 'pending_turn_down',
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0
 ) -> dict:
     event_data = _prepare_event_data(predictions_df)
 
@@ -38,12 +40,19 @@ def compute_event_level_metrics(
             p_end = data['p_end']
 
             triggered = False
+            pending_count = 0
+
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
-                    if i > 0 and p_end[i] < p_end[i - 1]:
-                        offset = offsets_arr[i]
-                        triggered = True
-                        break
+                    pending_count += 1
+                    if pending_count >= min_pending_bars and i > 0:
+                        drop = p_end[i - 1] - p_end[i]
+                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
+                            offset = offsets_arr[i]
+                            triggered = True
+                            break
+                else:
+                    pending_count = 0
 
             if not triggered:
                 miss += 1
@@ -109,9 +118,11 @@ def compute_point_level_metrics(
 def evaluate(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down'
+        signal_rule: str = 'pending_turn_down',
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0
 ) -> dict:
-    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule)
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {

@@ -13,7 +13,7 @@ def predict_proba(
     X = features_df[feature_columns]
     proba = model.predict_proba(X)[:, 1]
 
-    result_df = features_df[['event_id', 'symbol', 'close_time', 'offset', 'y', 'split']].copy()
+    result_df = features_df[['event_id', 'symbol', 'open_time', 'offset', 'y', 'split']].copy()
     result_df['p_end'] = proba
 
     return result_df
@@ -22,7 +22,9 @@ def predict_proba(
 def extract_signals(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down'
+        signal_rule: str = 'pending_turn_down',
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0
 ) -> pd.DataFrame:
     event_data = _prepare_event_data(predictions_df)
 
@@ -30,7 +32,7 @@ def extract_signals(
     time_map = {}
     for event_id, group in predictions_df.groupby('event_id'):
         sorted_group = group.sort_values('offset')
-        time_map[event_id] = dict(zip(sorted_group['offset'], sorted_group['close_time']))
+        time_map[event_id] = dict(zip(sorted_group['offset'], sorted_group['open_time']))
 
     signals = []
 
@@ -46,19 +48,26 @@ def extract_signals(
             p_end = data['p_end']
 
             triggered = False
+            pending_count = 0
+
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
-                    if i > 0 and p_end[i] < p_end[i - 1]:
-                        offset = offsets_arr[i]
-                        triggered = True
-                        break
+                    pending_count += 1
+                    if pending_count >= min_pending_bars and i > 0:
+                        drop = p_end[i - 1] - p_end[i]
+                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
+                            offset = offsets_arr[i]
+                            triggered = True
+                            break
+                else:
+                    pending_count = 0
 
             if not triggered:
                 continue
 
         signals.append({
             'symbol': symbol_map[event_id],
-            'close_time': time_map[event_id][offset]
+            'open_time': time_map[event_id][offset]
         })
 
     return pd.DataFrame(signals)
