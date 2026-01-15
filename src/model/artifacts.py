@@ -67,5 +67,38 @@ class RunArtifacts:
         path = self.run_dir / f"predictions_{split_name}.parquet"
         df.to_parquet(path, index=False)
 
+    def save_best_params(self, params: dict):
+        path = self.run_dir / "best_params.json"
+        with open(path, 'w') as f:
+            json.dump(params, f, indent=2, default=str)
+
+    def save_best_threshold(self, threshold: float, signal_rule_params: dict = None):
+        data = {'threshold': threshold}
+        if signal_rule_params:
+            data.update(signal_rule_params)
+        path = self.run_dir / "best_threshold.json"
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+
+    def save_leaderboard(self, df: pd.DataFrame):
+        path = self.run_dir / "leaderboard.csv"
+        df.to_csv(path, index=False)
+
+    def save_cv_report(self, cv_result: dict):
+        path = self.run_dir / "cv_report.json"
+        serializable = {
+            'mean_score': cv_result.get('mean_score'),
+            'std_score': cv_result.get('std_score'),
+            'mean_threshold': cv_result.get('mean_threshold'),
+            'fold_results': cv_result.get('fold_results', [])
+        }
+        with open(path, 'w') as f:
+            json.dump(serializable, f, indent=2, default=str)
+
+    def save_folds(self, folds: list):
+        path = self.run_dir / "folds.json"
+        with open(path, 'w') as f:
+            json.dump(folds, f, indent=2, default=str)
+
     def get_path(self) -> Path:
         return self.run_dir
