@@ -21,7 +21,8 @@ def predict_proba(
 
 def extract_signals(
         predictions_df: pd.DataFrame,
-        threshold: float
+        threshold: float,
+        signal_rule: str = 'pending_turn_down'
 ) -> pd.DataFrame:
     event_data = _prepare_event_data(predictions_df)
 
@@ -34,12 +35,26 @@ def extract_signals(
     signals = []
 
     for event_id, data in event_data.items():
-        mask = data['p_end'] >= threshold
-        if not mask.any():
-            continue
+        if signal_rule == 'first_cross':
+            mask = data['p_end'] >= threshold
+            if not mask.any():
+                continue
+            first_idx = np.argmax(mask)
+            offset = data['offsets'][first_idx]
+        else:
+            offsets_arr = data['offsets']
+            p_end = data['p_end']
 
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
+            triggered = False
+            for i in range(len(offsets_arr)):
+                if p_end[i] >= threshold:
+                    if i > 0 and p_end[i] < p_end[i - 1]:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+
+            if not triggered:
+                continue
 
         signals.append({
             'symbol': symbol_map[event_id],

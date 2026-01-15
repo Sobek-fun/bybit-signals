@@ -23,7 +23,8 @@ def _prepare_event_data(predictions_df: pd.DataFrame) -> dict:
     return event_data
 
 
-def _compute_event_metrics_from_data(event_data: dict, threshold: float) -> dict:
+def _compute_event_metrics_from_data(event_data: dict, threshold: float,
+                                     signal_rule: str = 'pending_turn_down') -> dict:
     hit0 = 0
     hit1 = 0
     early = 0
@@ -32,13 +33,29 @@ def _compute_event_metrics_from_data(event_data: dict, threshold: float) -> dict
     offsets = []
 
     for event_id, data in event_data.items():
-        mask = data['p_end'] >= threshold
-        if not mask.any():
-            miss += 1
-            continue
+        if signal_rule == 'first_cross':
+            mask = data['p_end'] >= threshold
+            if not mask.any():
+                miss += 1
+                continue
+            first_idx = np.argmax(mask)
+            offset = data['offsets'][first_idx]
+        else:
+            offsets_arr = data['offsets']
+            p_end = data['p_end']
 
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
+            triggered = False
+            for i in range(len(offsets_arr)):
+                if p_end[i] >= threshold:
+                    if i > 0 and p_end[i] < p_end[i - 1]:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+
+            if not triggered:
+                miss += 1
+                continue
+
         offsets.append(offset)
 
         if offset == 0:
@@ -72,10 +89,11 @@ def _compute_event_metrics_from_data(event_data: dict, threshold: float) -> dict
 
 def compute_event_metrics_for_threshold(
         predictions_df: pd.DataFrame,
-        threshold: float
+        threshold: float,
+        signal_rule: str = 'pending_turn_down'
 ) -> dict:
     event_data = _prepare_event_data(predictions_df)
-    return _compute_event_metrics_from_data(event_data, threshold)
+    return _compute_event_metrics_from_data(event_data, threshold, signal_rule)
 
 
 def threshold_sweep(
@@ -85,7 +103,8 @@ def threshold_sweep(
         grid_step: float = 0.01,
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
-        gamma_miss: float = 1.0
+        gamma_miss: float = 1.0,
+        signal_rule: str = 'pending_turn_down'
 ) -> tuple:
     event_data = _prepare_event_data(predictions_df)
 
@@ -93,7 +112,7 @@ def threshold_sweep(
     results = []
 
     for threshold in thresholds:
-        metrics = _compute_event_metrics_from_data(event_data, threshold)
+        metrics = _compute_event_metrics_from_data(event_data, threshold, signal_rule)
 
         score = (
                 metrics['hit0_rate'] +

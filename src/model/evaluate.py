@@ -13,7 +13,8 @@ from src.model.threshold import _prepare_event_data
 
 def compute_event_level_metrics(
         predictions_df: pd.DataFrame,
-        threshold: float
+        threshold: float,
+        signal_rule: str = 'pending_turn_down'
 ) -> dict:
     event_data = _prepare_event_data(predictions_df)
 
@@ -25,13 +26,29 @@ def compute_event_level_metrics(
     offsets = []
 
     for event_id, data in event_data.items():
-        mask = data['p_end'] >= threshold
-        if not mask.any():
-            miss += 1
-            continue
+        if signal_rule == 'first_cross':
+            mask = data['p_end'] >= threshold
+            if not mask.any():
+                miss += 1
+                continue
+            first_idx = np.argmax(mask)
+            offset = data['offsets'][first_idx]
+        else:
+            offsets_arr = data['offsets']
+            p_end = data['p_end']
 
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
+            triggered = False
+            for i in range(len(offsets_arr)):
+                if p_end[i] >= threshold:
+                    if i > 0 and p_end[i] < p_end[i - 1]:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+
+            if not triggered:
+                miss += 1
+                continue
+
         offsets.append(offset)
 
         if offset == 0:
@@ -91,9 +108,10 @@ def compute_point_level_metrics(
 
 def evaluate(
         predictions_df: pd.DataFrame,
-        threshold: float
+        threshold: float,
+        signal_rule: str = 'pending_turn_down'
 ) -> dict:
-    event_metrics = compute_event_level_metrics(predictions_df, threshold)
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {
