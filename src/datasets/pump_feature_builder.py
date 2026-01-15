@@ -19,11 +19,18 @@ class PumpFeatureBuilder:
         self.feature_set = feature_set
         self.vol_ratio_period = 50
         self.vwap_period = 30
+        self.corridor_window = 30
+        self.corridor_quantile = 0.95
 
     def build(self, labels_df: pd.DataFrame) -> pd.DataFrame:
         labels_df = labels_df[labels_df['pump_la_type'].isin(['A', 'B'])].copy()
-        labels_df['close_time'] = pd.to_datetime(labels_df['timestamp'], utc=True).dt.tz_localize(None)
-        labels_df = labels_df.sort_values(['symbol', 'close_time'])
+
+        if 'event_open_time' in labels_df.columns:
+            labels_df['open_time'] = pd.to_datetime(labels_df['event_open_time'], utc=True).dt.tz_localize(None)
+        elif 'timestamp' in labels_df.columns:
+            labels_df['open_time'] = pd.to_datetime(labels_df['timestamp'], utc=True).dt.tz_localize(None)
+
+        labels_df = labels_df.sort_values(['symbol', 'open_time'])
 
         all_rows = []
         grouped = labels_df.groupby('symbol', sort=False)
@@ -39,10 +46,10 @@ class PumpFeatureBuilder:
         return result_df
 
     def _process_symbol(self, symbol: str, events: pd.DataFrame) -> list:
-        t_min = events['close_time'].min()
-        t_max = events['close_time'].max()
+        t_min = events['open_time'].min()
+        t_max = events['open_time'].max()
 
-        buffer_bars = self.warmup_bars + self.window_bars + 20
+        buffer_bars = self.warmup_bars + self.window_bars + 21
         start_bucket = t_min - pd.Timedelta(minutes=buffer_bars * 15)
         end_bucket = t_max
 
@@ -51,22 +58,16 @@ class PumpFeatureBuilder:
         if df.empty:
             return []
 
-        df = self._normalize_to_close_time(df)
         df = self._calculate_base_indicators(df)
 
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
 
+        df = self._apply_decision_shift(df)
+
         self._validate_columns(df)
 
         return self._extract_features_vectorized(df, symbol, events)
-
-    def _normalize_to_close_time(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['close_time'] = df.index + pd.Timedelta(minutes=15)
-        if df['close_time'].dt.tz is not None:
-            df['close_time'] = df['close_time'].dt.tz_localize(None)
-        df = df.set_index('close_time')
-        return df
 
     def _validate_columns(self, df: pd.DataFrame):
         required = ['rsi_14', 'mfi_14', 'macdh_12_26_9']
@@ -111,8 +112,17 @@ class PumpFeatureBuilder:
         df = df.rename(columns={
             'RSI_14': 'rsi_14',
             'MFI_14': 'mfi_14',
-            'MACDh_12_26_9': 'macdh_12_26_9'
+            'MACDh_12_26_9': 'macdh_12_26_9',
+            'MACD_12_26_9': 'macd_line',
+            'MACDs_12_26_9': 'macd_signal'
         })
+
+        rolling_max_close = df['close'].rolling(window=self.window_bars).max()
+        df['drawdown'] = (df['close'] - rolling_max_close) / rolling_max_close
+
+        df['rsi_corridor'] = df['rsi_14'].rolling(window=self.corridor_window).quantile(self.corridor_quantile)
+        df['mfi_corridor'] = df['mfi_14'].rolling(window=self.corridor_window).quantile(self.corridor_quantile)
+        df['macdh_corridor'] = df['macdh_12_26_9'].rolling(window=self.corridor_window).quantile(self.corridor_quantile)
 
         return df
 
@@ -139,11 +149,32 @@ class PumpFeatureBuilder:
 
         return df
 
+    def _apply_decision_shift(self, df: pd.DataFrame) -> pd.DataFrame:
+        shift_columns = [
+            'ret_1', 'range', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio',
+            'volume', 'log_volume', 'rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio',
+            'macd_line', 'macd_signal', 'drawdown',
+            'rsi_corridor', 'mfi_corridor', 'macdh_corridor'
+        ]
+
+        extended_columns = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
+
+        for col in shift_columns:
+            if col in df.columns:
+                df[col] = df[col].shift(1)
+
+        if self.feature_set == "extended":
+            for col in extended_columns:
+                if col in df.columns:
+                    df[col] = df[col].shift(1)
+
+        return df
+
     def _extract_features_vectorized(self, df: pd.DataFrame, symbol: str, events: pd.DataFrame) -> list:
-        event_times = events['close_time'].values
+        event_times = events['open_time'].values
         positions = df.index.get_indexer(pd.DatetimeIndex(event_times))
 
-        required_history = self.warmup_bars + self.window_bars - 1
+        required_history = self.warmup_bars + self.window_bars
         valid_mask = (positions >= 0) & (positions >= required_history)
 
         valid_positions = positions[valid_mask]
@@ -154,10 +185,12 @@ class PumpFeatureBuilder:
 
         base_series = [
             'ret_1', 'range', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio',
-            'volume', 'log_volume', 'rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio'
+            'volume', 'log_volume', 'rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio',
+            'macd_line', 'macd_signal', 'drawdown',
+            'rsi_corridor', 'mfi_corridor', 'macdh_corridor'
         ]
         extended_series = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
-        agg_series = ['rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio', 'ret_1']
+        agg_series = ['rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio', 'ret_1', 'macd_line', 'drawdown']
 
         series_to_lag = base_series.copy()
         if self.feature_set == "extended":
@@ -180,7 +213,7 @@ class PumpFeatureBuilder:
             lag_matrix[i] = np.arange(pos, pos - w, -1)
 
         event_symbols = np.full(num_events, symbol)
-        event_close_times = df.index[valid_positions].values
+        event_open_times = df.index[valid_positions].values
         event_pump_types = valid_events['pump_la_type'].values
         event_targets = (valid_events['pump_la_type'].values == 'A').astype(int)
         event_runups = valid_events['runup_pct'].values
@@ -189,7 +222,7 @@ class PumpFeatureBuilder:
         for ev_idx in range(num_events):
             row = {
                 'symbol': event_symbols[ev_idx],
-                'close_time': event_close_times[ev_idx],
+                'open_time': event_open_times[ev_idx],
                 'pump_la_type': event_pump_types[ev_idx],
                 'target': event_targets[ev_idx],
                 'runup_pct': event_runups[ev_idx],
