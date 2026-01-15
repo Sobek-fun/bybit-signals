@@ -108,6 +108,9 @@ def main():
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
 
+    parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down"],
+                        default="pending_turn_down")
+
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
 
@@ -233,6 +236,8 @@ def main():
         feature_columns
     )
 
+    artifacts.save_predictions(val_predictions, 'val')
+
     log("INFO", "TRAIN", "searching optimal threshold")
     best_threshold, sweep_df = threshold_sweep(
         val_predictions,
@@ -241,14 +246,15 @@ def main():
         grid_step=args.threshold_grid_step,
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
-        gamma_miss=args.gamma_miss
+        gamma_miss=args.gamma_miss,
+        signal_rule=args.signal_rule
     )
 
     artifacts.save_threshold_sweep(sweep_df)
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set")
-    val_metrics = evaluate(val_predictions, best_threshold)
+    val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} early={val_metrics['event_level']['early_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
@@ -260,14 +266,16 @@ def main():
         feature_columns
     )
 
+    artifacts.save_predictions(test_predictions, 'test')
+
     log("INFO", "TRAIN", "evaluating on test set")
-    test_metrics = evaluate(test_predictions, best_threshold)
+    test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
     log("INFO", "TRAIN", "extracting holdout signals")
-    signals_df = extract_signals(test_predictions, best_threshold)
+    signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule)
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
 
