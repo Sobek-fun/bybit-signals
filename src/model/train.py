@@ -43,7 +43,8 @@ def train_model(
         random_seed=seed,
         verbose=100,
         eval_metric='Logloss',
-        use_best_model=True
+        use_best_model=True,
+        auto_class_weights='Balanced'
     )
 
     model.fit(train_pool, eval_set=val_pool)

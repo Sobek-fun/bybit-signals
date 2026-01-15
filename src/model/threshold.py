@@ -112,8 +112,8 @@ def compute_event_metrics_for_threshold(
 
 def threshold_sweep(
         predictions_df: pd.DataFrame,
-        grid_from: float = 0.05,
-        grid_to: float = 0.95,
+        grid_from: float = 0.01,
+        grid_to: float = 0.30,
         grid_step: float = 0.01,
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,

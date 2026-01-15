@@ -118,6 +118,22 @@ def get_hyperparameter_grid() -> list:
     return combinations
 
 
+def get_rule_parameter_grid() -> list:
+    rule_grid = {
+        'min_pending_bars': [1, 2, 3],
+        'drop_delta': [0.0, 0.01, 0.02]
+    }
+
+    keys = list(rule_grid.keys())
+    values = list(rule_grid.values())
+
+    combinations = []
+    for combo in product(*values):
+        combinations.append(dict(zip(keys, combo)))
+
+    return combinations
+
+
 def train_fold(
         features_df: pd.DataFrame,
         feature_columns: list,
@@ -150,7 +166,8 @@ def train_fold(
         random_seed=seed,
         verbose=0,
         eval_metric='Logloss',
-        use_best_model=True
+        use_best_model=True,
+        auto_class_weights='Balanced'
     )
 
     model.fit(train_pool, eval_set=val_pool)
@@ -165,9 +182,7 @@ def evaluate_fold(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float,
-        min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        gamma_miss: float
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -176,38 +191,59 @@ def evaluate_fold(
 
     predictions = predict_proba(model, val_df, feature_columns)
 
-    best_threshold, _ = threshold_sweep(
-        predictions,
-        alpha_hit1=alpha_hit1,
-        beta_early=beta_early,
-        gamma_miss=gamma_miss,
-        signal_rule=signal_rule,
-        min_pending_bars=min_pending_bars,
-        drop_delta=drop_delta
-    )
+    rule_combinations = get_rule_parameter_grid()
 
-    metrics = compute_event_level_metrics(
-        predictions,
-        best_threshold,
-        signal_rule,
-        min_pending_bars=min_pending_bars,
-        drop_delta=drop_delta
-    )
+    best_score = -np.inf
+    best_threshold = None
+    best_min_pending_bars = None
+    best_drop_delta = None
+    best_metrics = None
 
-    score = (
-            metrics['hit0_rate'] +
-            alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate']) -
-            beta_early * metrics['early_rate'] -
-            gamma_miss * metrics['miss_rate']
-    )
+    for rule_params in rule_combinations:
+        min_pending_bars = rule_params['min_pending_bars']
+        drop_delta = rule_params['drop_delta']
+
+        threshold, _ = threshold_sweep(
+            predictions,
+            alpha_hit1=alpha_hit1,
+            beta_early=beta_early,
+            gamma_miss=gamma_miss,
+            signal_rule=signal_rule,
+            min_pending_bars=min_pending_bars,
+            drop_delta=drop_delta
+        )
+
+        metrics = compute_event_level_metrics(
+            predictions,
+            threshold,
+            signal_rule,
+            min_pending_bars=min_pending_bars,
+            drop_delta=drop_delta
+        )
+
+        score = (
+                metrics['hit0_rate'] +
+                alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate']) -
+                beta_early * metrics['early_rate'] -
+                gamma_miss * metrics['miss_rate']
+        )
+
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_min_pending_bars = min_pending_bars
+            best_drop_delta = drop_delta
+            best_metrics = metrics
 
     return {
-        'score': score,
+        'score': best_score,
         'threshold': best_threshold,
-        'hit0_rate': metrics['hit0_rate'],
-        'early_rate': metrics['early_rate'],
-        'miss_rate': metrics['miss_rate'],
-        'n_events': metrics['n_events']
+        'min_pending_bars': best_min_pending_bars,
+        'drop_delta': best_drop_delta,
+        'hit0_rate': best_metrics['hit0_rate'] if best_metrics else 0,
+        'early_rate': best_metrics['early_rate'] if best_metrics else 0,
+        'miss_rate': best_metrics['miss_rate'] if best_metrics else 0,
+        'n_events': best_metrics['n_events'] if best_metrics else 0
     }
 
 
@@ -220,8 +256,6 @@ def run_cv(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
-        min_pending_bars: int = 1,
-        drop_delta: float = 0.0,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -253,9 +287,7 @@ def run_cv(
             signal_rule,
             alpha_hit1,
             beta_early,
-            gamma_miss,
-            min_pending_bars=min_pending_bars,
-            drop_delta=drop_delta
+            gamma_miss
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -273,7 +305,6 @@ def run_cv(
     return {
         'mean_score': np.mean(scores),
         'std_score': np.std(scores),
-        'mean_threshold': np.mean([r['threshold'] for r in fold_results]),
         'fold_results': fold_results
     }
 
@@ -288,8 +319,6 @@ def tune_model(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
-        min_pending_bars: int = 1,
-        drop_delta: float = 0.0,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -324,8 +353,6 @@ def tune_model(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
-            min_pending_bars=min_pending_bars,
-            drop_delta=drop_delta,
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
@@ -337,7 +364,6 @@ def tune_model(
             **params,
             'mean_score': cv_result['mean_score'],
             'std_score': cv_result['std_score'],
-            'mean_threshold': cv_result.get('mean_threshold', np.nan),
             'elapsed_sec': time.time() - start_time
         }
         leaderboard.append(trial_record)
@@ -352,7 +378,6 @@ def tune_model(
 
     return {
         'best_params': best_params,
-        'best_threshold': best_result['mean_threshold'] if best_result else None,
         'best_score': best_score,
         'best_cv_result': best_result,
         'leaderboard': leaderboard_df,
@@ -391,7 +416,8 @@ def train_final_model(
         min_data_in_leaf=params['min_data_in_leaf'],
         random_seed=seed,
         verbose=100,
-        eval_metric='Logloss'
+        eval_metric='Logloss',
+        auto_class_weights='Balanced'
     )
 
     model.fit(train_pool)

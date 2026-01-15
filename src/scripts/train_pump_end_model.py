@@ -11,7 +11,7 @@ from src.model.train import train_model, get_feature_columns, get_feature_import
 from src.model.threshold import threshold_sweep
 from src.model.evaluate import evaluate
 from src.model.predict import predict_proba, extract_signals
-from src.model.tuning import tune_model, train_final_model
+from src.model.tuning import tune_model, train_final_model, get_rule_parameter_grid
 
 
 def log(level: str, component: str, message: str):
@@ -72,6 +72,78 @@ def check_nan_features(features_df: pd.DataFrame, feature_columns: list) -> int:
     if nan_rows > 0:
         log("WARN", "TRAIN", f"rows with NaN in features: {nan_rows}/{total_rows} ({nan_rows / total_rows * 100:.2f}%)")
     return nan_rows
+
+
+def filter_features_by_event_time(features_df: pd.DataFrame, cutoff: datetime) -> pd.DataFrame:
+    event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
+    valid_events = event_times[event_times['open_time'] < cutoff]['event_id']
+    return features_df[features_df['event_id'].isin(valid_events)].copy()
+
+
+def calibrate_threshold_on_val(
+        model,
+        features_df: pd.DataFrame,
+        feature_columns: list,
+        train_end: datetime,
+        val_end: datetime,
+        signal_rule: str,
+        alpha_hit1: float,
+        beta_early: float,
+        gamma_miss: float
+) -> dict:
+    event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
+    val_events = event_times[
+        (event_times['open_time'] >= train_end) &
+        (event_times['open_time'] < val_end)
+        ]['event_id']
+
+    val_df = features_df[
+        (features_df['event_id'].isin(val_events)) &
+        (features_df['open_time'] >= train_end) &
+        (features_df['open_time'] < val_end)
+        ].copy()
+
+    if len(val_df) == 0:
+        return {'threshold': 0.1, 'min_pending_bars': 1, 'drop_delta': 0.0}
+
+    val_df['split'] = 'val'
+    predictions = predict_proba(model, val_df, feature_columns)
+
+    rule_combinations = get_rule_parameter_grid()
+
+    best_score = -float('inf')
+    best_threshold = 0.1
+    best_min_pending_bars = 1
+    best_drop_delta = 0.0
+
+    for rule_params in rule_combinations:
+        min_pending_bars = rule_params['min_pending_bars']
+        drop_delta = rule_params['drop_delta']
+
+        threshold, sweep_df = threshold_sweep(
+            predictions,
+            alpha_hit1=alpha_hit1,
+            beta_early=beta_early,
+            gamma_miss=gamma_miss,
+            signal_rule=signal_rule,
+            min_pending_bars=min_pending_bars,
+            drop_delta=drop_delta
+        )
+
+        best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
+        score = best_row['score']
+
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_min_pending_bars = min_pending_bars
+            best_drop_delta = drop_delta
+
+    return {
+        'threshold': best_threshold,
+        'min_pending_bars': best_min_pending_bars,
+        'drop_delta': best_drop_delta
+    }
 
 
 def run_build_dataset(args, artifacts: RunArtifacts):
@@ -253,10 +325,19 @@ def run_tune(args, artifacts: RunArtifacts):
     feature_columns = get_feature_columns(features_df)
     log("INFO", "TUNE", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
 
+    train_end = parse_date_exclusive(args.train_end) if args.train_end else None
+    val_end = parse_date_exclusive(args.val_end) if args.val_end else None
+
+    if train_end:
+        cv_features_df = filter_features_by_event_time(features_df, train_end)
+        log("INFO", "TUNE", f"filtered CV data: {len(cv_features_df)} rows (events before {args.train_end})")
+    else:
+        cv_features_df = features_df
+
     log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min")
 
     tune_result = tune_model(
-        features_df,
+        cv_features_df,
         feature_columns,
         time_budget_min=args.time_budget_min,
         fold_months=args.fold_months,
@@ -265,8 +346,6 @@ def run_tune(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
-        min_pending_bars=args.min_pending_bars,
-        drop_delta=args.drop_delta,
         embargo_bars=args.embargo_bars,
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
@@ -279,17 +358,11 @@ def run_tune(args, artifacts: RunArtifacts):
     log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
 
     artifacts.save_best_params(tune_result['best_params'])
-    artifacts.save_best_threshold(tune_result['best_threshold'], {
-        'signal_rule': args.signal_rule,
-        'min_pending_bars': args.min_pending_bars,
-        'drop_delta': args.drop_delta
-    })
     artifacts.save_leaderboard(tune_result['leaderboard'])
     artifacts.save_cv_report(tune_result['best_cv_result'])
     artifacts.save_folds(tune_result['folds'])
 
-    if args.train_end:
-        train_end = parse_date_exclusive(args.train_end)
+    if train_end:
         log("INFO", "TUNE", f"training final model on data up to {args.train_end}")
 
         final_model = train_final_model(
@@ -310,8 +383,34 @@ def run_tune(args, artifacts: RunArtifacts):
         importance_grouped_df = get_feature_importance_grouped(importance_df)
         artifacts.save_feature_importance_grouped(importance_grouped_df)
 
-        if args.val_end:
-            val_end = parse_date_exclusive(args.val_end)
+        if val_end:
+            log("INFO", "TUNE", f"calibrating threshold on val window [{args.train_end}, {args.val_end})")
+
+            calibration_result = calibrate_threshold_on_val(
+                final_model,
+                features_df,
+                feature_columns,
+                train_end,
+                val_end,
+                args.signal_rule,
+                args.alpha_hit1,
+                args.beta_early,
+                args.gamma_miss
+            )
+
+            best_threshold = calibration_result['threshold']
+            best_min_pending_bars = calibration_result['min_pending_bars']
+            best_drop_delta = calibration_result['drop_delta']
+
+            log("INFO", "TUNE",
+                f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
+
+            artifacts.save_best_threshold(best_threshold, {
+                'signal_rule': args.signal_rule,
+                'min_pending_bars': best_min_pending_bars,
+                'drop_delta': best_drop_delta
+            })
+
             features_df = time_split(features_df, train_end, val_end)
 
             test_predictions = predict_proba(
@@ -323,10 +422,10 @@ def run_tune(args, artifacts: RunArtifacts):
 
             test_metrics = evaluate(
                 test_predictions,
-                tune_result['best_threshold'],
+                best_threshold,
                 signal_rule=args.signal_rule,
-                min_pending_bars=args.min_pending_bars,
-                drop_delta=args.drop_delta
+                min_pending_bars=best_min_pending_bars,
+                drop_delta=best_drop_delta
             )
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
@@ -334,10 +433,10 @@ def run_tune(args, artifacts: RunArtifacts):
 
             signals_df = extract_signals(
                 test_predictions,
-                tune_result['best_threshold'],
+                best_threshold,
                 signal_rule=args.signal_rule,
-                min_pending_bars=args.min_pending_bars,
-                drop_delta=args.drop_delta
+                min_pending_bars=best_min_pending_bars,
+                drop_delta=best_drop_delta
             )
             artifacts.save_predicted_signals(signals_df)
             log("INFO", "TUNE", f"saved {len(signals_df)} predicted signals")
@@ -381,8 +480,8 @@ def main():
     parser.add_argument("--early-stopping-rounds", type=int, default=50)
     parser.add_argument("--thread-count", type=int, default=-1)
 
-    parser.add_argument("--threshold-grid-from", type=float, default=0.05)
-    parser.add_argument("--threshold-grid-to", type=float, default=0.95)
+    parser.add_argument("--threshold-grid-from", type=float, default=0.01)
+    parser.add_argument("--threshold-grid-to", type=float, default=0.30)
     parser.add_argument("--threshold-grid-step", type=float, default=0.01)
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
