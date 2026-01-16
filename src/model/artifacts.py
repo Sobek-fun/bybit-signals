@@ -100,5 +100,10 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(folds, f, indent=2, default=str)
 
+    def save_trade_quality(self, metrics: dict, split_name: str):
+        path = self.run_dir / f"trade_quality_{split_name}.json"
+        with open(path, 'w') as f:
+            json.dump(metrics, f, indent=2, default=str)
+
     def get_path(self) -> Path:
         return self.run_dir

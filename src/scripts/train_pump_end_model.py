@@ -9,9 +9,10 @@ from src.model.dataset import load_labels, build_training_points, deduplicate_po
 from src.model.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
 from src.model.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
 from src.model.threshold import threshold_sweep
-from src.model.evaluate import evaluate
+from src.model.evaluate import evaluate, evaluate_with_trade_quality
 from src.model.predict import predict_proba, extract_signals
-from src.model.tuning import tune_model, train_final_model, get_rule_parameter_grid
+from src.model.tuning import tune_model, tune_model_both_strategies, train_final_model, get_rule_parameter_grid
+from src.monitoring.data_loader import DataLoader
 
 
 def log(level: str, component: str, message: str):
@@ -334,44 +335,85 @@ def run_tune(args, artifacts: RunArtifacts):
     else:
         cv_features_df = features_df
 
-    log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min")
+    log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min strategy={args.tune_strategy}")
 
-    tune_result = tune_model(
-        cv_features_df,
-        feature_columns,
-        time_budget_min=args.time_budget_min,
-        fold_months=args.fold_months,
-        min_train_months=args.min_train_months,
-        signal_rule=args.signal_rule,
-        alpha_hit1=args.alpha_hit1,
-        beta_early=args.beta_early,
-        gamma_miss=args.gamma_miss,
-        embargo_bars=args.embargo_bars,
-        iterations=args.iterations,
-        early_stopping_rounds=args.early_stopping_rounds,
-        seed=args.seed
-    )
+    if args.tune_strategy == 'both':
+        tune_result = tune_model_both_strategies(
+            cv_features_df,
+            feature_columns,
+            time_budget_min=args.time_budget_min,
+            fold_months=args.fold_months,
+            min_train_months=args.min_train_months,
+            signal_rule=args.signal_rule,
+            alpha_hit1=args.alpha_hit1,
+            beta_early=args.beta_early,
+            gamma_miss=args.gamma_miss,
+            embargo_bars=args.embargo_bars,
+            iterations=args.iterations,
+            early_stopping_rounds=args.early_stopping_rounds,
+            seed=args.seed
+        )
 
-    log("INFO", "TUNE",
-        f"tuning completed: {tune_result['trials_completed']} trials in {tune_result['time_elapsed_sec']:.1f}s")
-    log("INFO", "TUNE", f"best score: {tune_result['best_score']:.4f}")
-    log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
+        log("INFO", "TUNE", f"winner strategy: {tune_result['winner']}")
+        log("INFO", "TUNE", f"threshold score: {tune_result['threshold_result']['best_score']:.4f}")
+        log("INFO", "TUNE", f"ranking score: {tune_result['ranking_result']['best_score']:.4f}")
 
-    artifacts.save_best_params(tune_result['best_params'])
-    artifacts.save_leaderboard(tune_result['leaderboard'])
-    artifacts.save_cv_report(tune_result['best_cv_result'])
-    artifacts.save_folds(tune_result['folds'])
+        best_result = tune_result['best_result']
+        actual_strategy = tune_result['winner']
+
+        artifacts.save_best_params({
+            **best_result['best_params'],
+            'tune_strategy': actual_strategy,
+            'winner': tune_result['winner'],
+            'threshold_score': tune_result['threshold_result']['best_score'],
+            'ranking_score': tune_result['ranking_result']['best_score']
+        })
+        artifacts.save_leaderboard(best_result['leaderboard'])
+        artifacts.save_cv_report(best_result['best_cv_result'])
+        artifacts.save_folds(best_result['folds'])
+
+    else:
+        tune_result = tune_model(
+            cv_features_df,
+            feature_columns,
+            time_budget_min=args.time_budget_min,
+            fold_months=args.fold_months,
+            min_train_months=args.min_train_months,
+            signal_rule=args.signal_rule,
+            alpha_hit1=args.alpha_hit1,
+            beta_early=args.beta_early,
+            gamma_miss=args.gamma_miss,
+            embargo_bars=args.embargo_bars,
+            iterations=args.iterations,
+            early_stopping_rounds=args.early_stopping_rounds,
+            seed=args.seed,
+            tune_strategy=args.tune_strategy
+        )
+
+        best_result = tune_result
+        actual_strategy = args.tune_strategy
+
+        log("INFO", "TUNE",
+            f"tuning completed: {tune_result['trials_completed']} trials in {tune_result['time_elapsed_sec']:.1f}s")
+        log("INFO", "TUNE", f"best score: {tune_result['best_score']:.4f}")
+        log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
+
+        artifacts.save_best_params({**tune_result['best_params'], 'tune_strategy': actual_strategy})
+        artifacts.save_leaderboard(tune_result['leaderboard'])
+        artifacts.save_cv_report(tune_result['best_cv_result'])
+        artifacts.save_folds(tune_result['folds'])
 
     if train_end:
-        log("INFO", "TUNE", f"training final model on data up to {args.train_end}")
+        log("INFO", "TUNE", f"training final model on data up to {args.train_end} with strategy={actual_strategy}")
 
         final_model = train_final_model(
             features_df,
             feature_columns,
-            tune_result['best_params'],
+            best_result['best_params'],
             train_end,
             iterations=args.iterations,
-            seed=args.seed
+            seed=args.seed,
+            tune_strategy=actual_strategy
         )
 
         artifacts.save_model(final_model)
@@ -420,13 +462,33 @@ def run_tune(args, artifacts: RunArtifacts):
             )
             artifacts.save_predictions(test_predictions, 'test')
 
-            test_metrics = evaluate(
-                test_predictions,
-                best_threshold,
-                signal_rule=args.signal_rule,
-                min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta
-            )
+            if args.clickhouse_dsn:
+                log("INFO", "TUNE", "evaluating with trade quality metrics")
+                loader = DataLoader(args.clickhouse_dsn)
+                test_metrics = evaluate_with_trade_quality(
+                    test_predictions,
+                    best_threshold,
+                    loader,
+                    signal_rule=args.signal_rule,
+                    min_pending_bars=best_min_pending_bars,
+                    drop_delta=best_drop_delta,
+                    horizons=[16, 32]
+                )
+                log("INFO", "TUNE",
+                    f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
+                if 'mfe_short_32' in test_metrics['trade_quality'] and test_metrics['trade_quality']['mfe_short_32']:
+                    mfe_stats = test_metrics['trade_quality']['mfe_short_32']
+                    log("INFO", "TUNE",
+                        f"MFE_32: median={mfe_stats.get('median', 0):.4f} pct_above_2pct={mfe_stats.get('pct_above_2pct', 0):.2f}")
+            else:
+                test_metrics = evaluate(
+                    test_predictions,
+                    best_threshold,
+                    signal_rule=args.signal_rule,
+                    min_pending_bars=best_min_pending_bars,
+                    drop_delta=best_drop_delta
+                )
+
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
                 f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
@@ -492,6 +554,8 @@ def main():
     parser.add_argument("--min-pending-bars", type=int, default=1)
     parser.add_argument("--drop-delta", type=float, default=0.0)
 
+    parser.add_argument("--tune-strategy", type=str, choices=["threshold", "ranking", "both"],
+                        default="threshold")
     parser.add_argument("--time-budget-min", type=int, default=60)
     parser.add_argument("--fold-months", type=int, default=1)
     parser.add_argument("--min-train-months", type=int, default=3)

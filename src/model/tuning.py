@@ -175,6 +175,58 @@ def train_fold(
     return model, val_df
 
 
+def train_fold_ranking(
+        features_df: pd.DataFrame,
+        feature_columns: list,
+        params: dict,
+        iterations: int = 1000,
+        early_stopping_rounds: int = 50,
+        seed: int = 42
+) -> tuple:
+    train_df = features_df[features_df['split'] == 'train']
+    val_df = features_df[features_df['split'] == 'val']
+
+    if len(train_df) == 0 or len(val_df) == 0:
+        return None, None
+
+    train_df = train_df.copy()
+    train_df['rank_target'] = 0
+    train_df.loc[train_df['offset'] == 0, 'rank_target'] = 1
+    train_df.loc[train_df['offset'] == 1, 'rank_target'] = 0.8
+    train_df.loc[(train_df['offset'] >= -3) & (train_df['offset'] < 0), 'rank_target'] = 0.3
+
+    X_train = train_df[feature_columns]
+    y_train = train_df['rank_target']
+
+    val_df = val_df.copy()
+    val_df['rank_target'] = 0
+    val_df.loc[val_df['offset'] == 0, 'rank_target'] = 1
+
+    X_val = val_df[feature_columns]
+    y_val = val_df['rank_target']
+
+    train_pool = Pool(X_train, y_train, group_id=train_df['event_id'].values)
+    val_pool = Pool(X_val, y_val, group_id=val_df['event_id'].values)
+
+    model = CatBoostClassifier(
+        iterations=iterations,
+        depth=params['depth'],
+        learning_rate=params['learning_rate'],
+        l2_leaf_reg=params['l2_leaf_reg'],
+        min_data_in_leaf=params['min_data_in_leaf'],
+        early_stopping_rounds=early_stopping_rounds,
+        random_seed=seed,
+        verbose=0,
+        eval_metric='Logloss',
+        use_best_model=True,
+        auto_class_weights='Balanced'
+    )
+
+    model.fit(train_pool, eval_set=val_pool)
+
+    return model, val_df
+
+
 def evaluate_fold(
         model: CatBoostClassifier,
         features_df: pd.DataFrame,
@@ -182,7 +234,8 @@ def evaluate_fold(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float
+        gamma_miss: float,
+        early_penalty_threshold: int = -5
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -221,11 +274,18 @@ def evaluate_fold(
             drop_delta=drop_delta
         )
 
+        median_offset = metrics.get('median_pred_offset')
+        if median_offset is not None and median_offset < early_penalty_threshold:
+            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
+        else:
+            early_penalty = 0
+
         score = (
                 metrics['hit0_rate'] +
                 alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate']) -
                 beta_early * metrics['early_rate'] -
-                gamma_miss * metrics['miss_rate']
+                gamma_miss * metrics['miss_rate'] -
+                early_penalty
         )
 
         if score > best_score:
@@ -243,6 +303,7 @@ def evaluate_fold(
         'hit0_rate': best_metrics['hit0_rate'] if best_metrics else 0,
         'early_rate': best_metrics['early_rate'] if best_metrics else 0,
         'miss_rate': best_metrics['miss_rate'] if best_metrics else 0,
+        'median_pred_offset': best_metrics.get('median_pred_offset') if best_metrics else None,
         'n_events': best_metrics['n_events'] if best_metrics else 0
     }
 
@@ -259,7 +320,8 @@ def run_cv(
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
-        seed: int = 42
+        seed: int = 42,
+        tune_strategy: str = 'threshold'
 ) -> dict:
     fold_results = []
 
@@ -268,14 +330,24 @@ def run_cv(
         fold_df = apply_fold_embargo(fold_df, fold, embargo_bars)
         fold_df = clip_fold_points(fold_df, fold)
 
-        model, _ = train_fold(
-            fold_df,
-            feature_columns,
-            params,
-            iterations=iterations,
-            early_stopping_rounds=early_stopping_rounds,
-            seed=seed
-        )
+        if tune_strategy == 'ranking':
+            model, _ = train_fold_ranking(
+                fold_df,
+                feature_columns,
+                params,
+                iterations=iterations,
+                early_stopping_rounds=early_stopping_rounds,
+                seed=seed
+            )
+        else:
+            model, _ = train_fold(
+                fold_df,
+                feature_columns,
+                params,
+                iterations=iterations,
+                early_stopping_rounds=early_stopping_rounds,
+                seed=seed
+            )
 
         if model is None:
             continue
@@ -297,14 +369,17 @@ def run_cv(
         return {
             'mean_score': -np.inf,
             'std_score': np.inf,
+            'mean_threshold': None,
             'fold_results': []
         }
 
     scores = [r['score'] for r in fold_results]
+    thresholds = [r['threshold'] for r in fold_results if r['threshold'] is not None]
 
     return {
         'mean_score': np.mean(scores),
         'std_score': np.std(scores),
+        'mean_threshold': np.mean(thresholds) if thresholds else None,
         'fold_results': fold_results
     }
 
@@ -322,7 +397,8 @@ def tune_model(
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
-        seed: int = 42
+        seed: int = 42,
+        tune_strategy: str = 'threshold'
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -356,7 +432,8 @@ def tune_model(
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
-            seed=seed
+            seed=seed,
+            tune_strategy=tune_strategy
         )
 
         trial_record = {
@@ -383,7 +460,74 @@ def tune_model(
         'leaderboard': leaderboard_df,
         'folds': folds,
         'trials_completed': len(leaderboard),
-        'time_elapsed_sec': time.time() - start_time
+        'time_elapsed_sec': time.time() - start_time,
+        'tune_strategy': tune_strategy
+    }
+
+
+def tune_model_both_strategies(
+        features_df: pd.DataFrame,
+        feature_columns: list,
+        time_budget_min: int = 60,
+        fold_months: int = 1,
+        min_train_months: int = 3,
+        signal_rule: str = 'pending_turn_down',
+        alpha_hit1: float = 0.5,
+        beta_early: float = 2.0,
+        gamma_miss: float = 1.0,
+        embargo_bars: int = 0,
+        iterations: int = 1000,
+        early_stopping_rounds: int = 50,
+        seed: int = 42
+) -> dict:
+    half_budget = time_budget_min // 2
+
+    threshold_result = tune_model(
+        features_df,
+        feature_columns,
+        time_budget_min=half_budget,
+        fold_months=fold_months,
+        min_train_months=min_train_months,
+        signal_rule=signal_rule,
+        alpha_hit1=alpha_hit1,
+        beta_early=beta_early,
+        gamma_miss=gamma_miss,
+        embargo_bars=embargo_bars,
+        iterations=iterations,
+        early_stopping_rounds=early_stopping_rounds,
+        seed=seed,
+        tune_strategy='threshold'
+    )
+
+    ranking_result = tune_model(
+        features_df,
+        feature_columns,
+        time_budget_min=half_budget,
+        fold_months=fold_months,
+        min_train_months=min_train_months,
+        signal_rule=signal_rule,
+        alpha_hit1=alpha_hit1,
+        beta_early=beta_early,
+        gamma_miss=gamma_miss,
+        embargo_bars=embargo_bars,
+        iterations=iterations,
+        early_stopping_rounds=early_stopping_rounds,
+        seed=seed,
+        tune_strategy='ranking'
+    )
+
+    if threshold_result['best_score'] >= ranking_result['best_score']:
+        winner = 'threshold'
+        best_result = threshold_result
+    else:
+        winner = 'ranking'
+        best_result = ranking_result
+
+    return {
+        'winner': winner,
+        'threshold_result': threshold_result,
+        'ranking_result': ranking_result,
+        'best_result': best_result
     }
 
 
@@ -393,7 +537,8 @@ def train_final_model(
         params: dict,
         train_end: datetime,
         iterations: int = 1000,
-        seed: int = 42
+        seed: int = 42,
+        tune_strategy: str = 'threshold'
 ) -> CatBoostClassifier:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     train_events = event_times[event_times['open_time'] < train_end]['event_id']
@@ -403,10 +548,20 @@ def train_final_model(
         (features_df['open_time'] < train_end)
         ]
 
-    X_train = train_df[feature_columns]
-    y_train = train_df['y']
+    if tune_strategy == 'ranking':
+        train_df = train_df.copy()
+        train_df['rank_target'] = 0
+        train_df.loc[train_df['offset'] == 0, 'rank_target'] = 1
+        train_df.loc[train_df['offset'] == 1, 'rank_target'] = 0.8
+        train_df.loc[(train_df['offset'] >= -3) & (train_df['offset'] < 0), 'rank_target'] = 0.3
 
-    train_pool = Pool(X_train, y_train)
+        X_train = train_df[feature_columns]
+        y_train = train_df['rank_target']
+        train_pool = Pool(X_train, y_train, group_id=train_df['event_id'].values)
+    else:
+        X_train = train_df[feature_columns]
+        y_train = train_df['y']
+        train_pool = Pool(X_train, y_train)
 
     model = CatBoostClassifier(
         iterations=iterations,

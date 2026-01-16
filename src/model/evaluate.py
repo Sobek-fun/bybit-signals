@@ -115,6 +115,102 @@ def compute_point_level_metrics(
     }
 
 
+def compute_trade_quality_metrics(
+        signals_df: pd.DataFrame,
+        candles_loader,
+        horizons: list = None
+) -> dict:
+    if horizons is None:
+        horizons = [16, 32]
+
+    if signals_df.empty:
+        return {f'mfe_short_{h}': {} for h in horizons} | {f'mae_short_{h}': {} for h in horizons}
+
+    results = {}
+
+    for h in horizons:
+        mfe_values = []
+        mae_values = []
+
+        for _, row in signals_df.iterrows():
+            symbol = row['symbol']
+            entry_time = pd.to_datetime(row['open_time'])
+
+            start_bucket = entry_time
+            end_bucket = entry_time + pd.Timedelta(minutes=h * 15)
+
+            df = candles_loader.load_candles_range(symbol, start_bucket, end_bucket)
+
+            if df.empty or len(df) < 2:
+                continue
+
+            entry_open = df.iloc[0]['open']
+            if entry_open <= 0:
+                continue
+
+            future_df = df.iloc[1:h + 1] if len(df) > h else df.iloc[1:]
+
+            if future_df.empty:
+                continue
+
+            min_low = future_df['low'].min()
+            max_high = future_df['high'].max()
+
+            mfe = (entry_open - min_low) / entry_open
+            mae = (max_high - entry_open) / entry_open
+
+            mfe_values.append(mfe)
+            mae_values.append(mae)
+
+        if mfe_values:
+            results[f'mfe_short_{h}'] = {
+                'mean': np.mean(mfe_values),
+                'median': np.median(mfe_values),
+                'p25': np.percentile(mfe_values, 25),
+                'p75': np.percentile(mfe_values, 75),
+                'min': np.min(mfe_values),
+                'max': np.max(mfe_values),
+                'pct_above_2pct': np.mean(np.array(mfe_values) >= 0.02),
+                'count': len(mfe_values)
+            }
+        else:
+            results[f'mfe_short_{h}'] = {}
+
+        if mae_values:
+            results[f'mae_short_{h}'] = {
+                'mean': np.mean(mae_values),
+                'median': np.median(mae_values),
+                'p25': np.percentile(mae_values, 25),
+                'p75': np.percentile(mae_values, 75),
+                'min': np.min(mae_values),
+                'max': np.max(mae_values),
+                'count': len(mae_values)
+            }
+        else:
+            results[f'mae_short_{h}'] = {}
+
+    return results
+
+
+def compute_trade_quality_score(trade_metrics: dict, horizon: int = 32) -> float:
+    mfe_key = f'mfe_short_{horizon}'
+    mae_key = f'mae_short_{horizon}'
+
+    if mfe_key not in trade_metrics or not trade_metrics[mfe_key]:
+        return -np.inf
+
+    mfe_stats = trade_metrics[mfe_key]
+    mae_stats = trade_metrics.get(mae_key, {})
+
+    mfe_median = mfe_stats.get('median', 0)
+    mfe_pct_above_2pct = mfe_stats.get('pct_above_2pct', 0)
+    mae_median = mae_stats.get('median', 0.1)
+
+    score = mfe_median * 100 + mfe_pct_above_2pct * 50 - mae_median * 30
+
+    return score
+
+
 def evaluate(
         predictions_df: pd.DataFrame,
         threshold: float,
@@ -128,4 +224,30 @@ def evaluate(
     return {
         'event_level': event_metrics,
         'point_level': point_metrics
+    }
+
+
+def evaluate_with_trade_quality(
+        predictions_df: pd.DataFrame,
+        threshold: float,
+        candles_loader,
+        signal_rule: str = 'pending_turn_down',
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0,
+        horizons: list = None
+) -> dict:
+    from src.model.predict import extract_signals
+
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)
+    point_metrics = compute_point_level_metrics(predictions_df, threshold)
+
+    signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)
+    trade_metrics = compute_trade_quality_metrics(signals_df, candles_loader, horizons)
+    trade_score = compute_trade_quality_score(trade_metrics)
+
+    return {
+        'event_level': event_metrics,
+        'point_level': point_metrics,
+        'trade_quality': trade_metrics,
+        'trade_quality_score': trade_score
     }
