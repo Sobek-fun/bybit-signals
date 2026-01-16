@@ -45,6 +45,9 @@ def _compute_event_metrics_from_data(
                 continue
             first_idx = np.argmax(mask)
             offset = data['offsets'][first_idx]
+        elif signal_rule == 'argmax_per_event':
+            argmax_idx = np.argmax(data['p_end'])
+            offset = data['offsets'][argmax_idx]
         else:
             offsets_arr = data['offsets']
             p_end = data['p_end']
@@ -104,9 +107,11 @@ def compute_event_metrics_for_threshold(
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        drop_delta: float = 0.0,
+        event_data: dict = None
 ) -> dict:
-    event_data = _prepare_event_data(predictions_df)
+    if event_data is None:
+        event_data = _prepare_event_data(predictions_df)
     return _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta)
 
 
@@ -120,9 +125,11 @@ def threshold_sweep(
         gamma_miss: float = 1.0,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        drop_delta: float = 0.0,
+        event_data: dict = None
 ) -> tuple:
-    event_data = _prepare_event_data(predictions_df)
+    if event_data is None:
+        event_data = _prepare_event_data(predictions_df)
 
     thresholds = np.arange(grid_from, grid_to + grid_step, grid_step)
     results = []

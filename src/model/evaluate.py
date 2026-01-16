@@ -8,7 +8,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from src.model.threshold import _prepare_event_data
+from src.model.threshold import _prepare_event_data, _compute_event_metrics_from_data
 
 
 def compute_event_level_metrics(
@@ -16,9 +16,11 @@ def compute_event_level_metrics(
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        drop_delta: float = 0.0,
+        event_data: dict = None
 ) -> dict:
-    event_data = _prepare_event_data(predictions_df)
+    if event_data is None:
+        event_data = _prepare_event_data(predictions_df)
 
     hit0 = 0
     hit1 = 0
@@ -35,6 +37,9 @@ def compute_event_level_metrics(
                 continue
             first_idx = np.argmax(mask)
             offset = data['offsets'][first_idx]
+        elif signal_rule == 'argmax_per_event':
+            argmax_idx = np.argmax(data['p_end'])
+            offset = data['offsets'][argmax_idx]
         else:
             offsets_arr = data['offsets']
             p_end = data['p_end']
@@ -126,29 +131,49 @@ def compute_trade_quality_metrics(
     if signals_df.empty:
         return {f'mfe_short_{h}': {} for h in horizons} | {f'mae_short_{h}': {} for h in horizons}
 
+    signals_df = signals_df.copy()
+    signals_df['open_time'] = pd.to_datetime(signals_df['open_time'])
+
     results = {}
+    max_horizon = max(horizons)
+
+    grouped = signals_df.groupby('symbol')
+
+    symbol_candles = {}
+    for symbol, group in grouped:
+        min_time = group['open_time'].min()
+        max_time = group['open_time'].max() + pd.Timedelta(minutes=(max_horizon + 1) * 15)
+
+        df = candles_loader.load_candles_range(symbol, min_time, max_time)
+        if not df.empty:
+            symbol_candles[symbol] = df
 
     for h in horizons:
         mfe_values = []
         mae_values = []
 
-        for _, row in signals_df.iterrows():
-            symbol = row['symbol']
-            entry_time = pd.to_datetime(row['open_time'])
+        for row in signals_df.itertuples():
+            symbol = row.symbol
+            entry_time = row.open_time
 
-            start_bucket = entry_time
-            end_bucket = entry_time + pd.Timedelta(minutes=h * 15)
-
-            df = candles_loader.load_candles_range(symbol, start_bucket, end_bucket)
-
-            if df.empty or len(df) < 2:
+            if symbol not in symbol_candles:
                 continue
 
-            entry_open = df.iloc[0]['open']
+            df = symbol_candles[symbol]
+
+            if entry_time not in df.index:
+                continue
+
+            entry_idx = df.index.get_loc(entry_time)
+
+            if entry_idx + h >= len(df):
+                continue
+
+            entry_open = df.iloc[entry_idx]['open']
             if entry_open <= 0:
                 continue
 
-            future_df = df.iloc[1:h + 1] if len(df) > h else df.iloc[1:]
+            future_df = df.iloc[entry_idx + 1:entry_idx + h + 1]
 
             if future_df.empty:
                 continue
@@ -216,9 +241,11 @@ def evaluate(
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        drop_delta: float = 0.0,
+        event_data: dict = None
 ) -> dict:
-    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
+                                                event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {
@@ -234,11 +261,13 @@ def evaluate_with_trade_quality(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        horizons: list = None
+        horizons: list = None,
+        event_data: dict = None
 ) -> dict:
     from src.model.predict import extract_signals
 
-    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
+                                                event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)

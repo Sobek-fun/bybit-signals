@@ -8,7 +8,7 @@ from src.model.artifacts import RunArtifacts
 from src.model.dataset import load_labels, build_training_points, deduplicate_points
 from src.model.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
 from src.model.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
-from src.model.threshold import threshold_sweep
+from src.model.threshold import threshold_sweep, _prepare_event_data
 from src.model.evaluate import evaluate, evaluate_with_trade_quality
 from src.model.predict import predict_proba, extract_signals
 from src.model.tuning import tune_model, tune_model_both_strategies, train_final_model, get_rule_parameter_grid
@@ -110,6 +110,10 @@ def calibrate_threshold_on_val(
     val_df['split'] = 'val'
     predictions = predict_proba(model, val_df, feature_columns)
 
+    if signal_rule == 'argmax_per_event':
+        return {'threshold': 0.0, 'min_pending_bars': 1, 'drop_delta': 0.0}
+
+    event_data = _prepare_event_data(predictions)
     rule_combinations = get_rule_parameter_grid()
 
     best_score = -float('inf')
@@ -128,7 +132,8 @@ def calibrate_threshold_on_val(
             gamma_miss=gamma_miss,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
-            drop_delta=drop_delta
+            drop_delta=drop_delta,
+            event_data=event_data
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -187,7 +192,7 @@ def run_build_dataset(args, artifacts: RunArtifacts):
     feature_input['pump_la_type'] = 'A'
     feature_input['runup_pct'] = 0
 
-    features_df = builder.build(feature_input)
+    features_df = builder.build(feature_input, max_workers=args.build_workers)
 
     features_df = features_df.merge(
         points_df[['symbol', 'open_time', 'event_id', 'offset', 'y']],
@@ -403,6 +408,8 @@ def run_tune(args, artifacts: RunArtifacts):
         artifacts.save_cv_report(tune_result['best_cv_result'])
         artifacts.save_folds(tune_result['folds'])
 
+    actual_signal_rule = 'argmax_per_event' if actual_strategy == 'ranking' else args.signal_rule
+
     if train_end:
         log("INFO", "TUNE", f"training final model on data up to {args.train_end} with strategy={actual_strategy}")
 
@@ -434,7 +441,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 feature_columns,
                 train_end,
                 val_end,
-                args.signal_rule,
+                actual_signal_rule,
                 args.alpha_hit1,
                 args.beta_early,
                 args.gamma_miss
@@ -448,7 +455,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
 
             artifacts.save_best_threshold(best_threshold, {
-                'signal_rule': args.signal_rule,
+                'signal_rule': actual_signal_rule,
                 'min_pending_bars': best_min_pending_bars,
                 'drop_delta': best_drop_delta
             })
@@ -469,7 +476,7 @@ def run_tune(args, artifacts: RunArtifacts):
                     test_predictions,
                     best_threshold,
                     loader,
-                    signal_rule=args.signal_rule,
+                    signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
                     drop_delta=best_drop_delta,
                     horizons=[16, 32]
@@ -484,7 +491,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 test_metrics = evaluate(
                     test_predictions,
                     best_threshold,
-                    signal_rule=args.signal_rule,
+                    signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
                     drop_delta=best_drop_delta
                 )
@@ -496,7 +503,7 @@ def run_tune(args, artifacts: RunArtifacts):
             signals_df = extract_signals(
                 test_predictions,
                 best_threshold,
-                signal_rule=args.signal_rule,
+                signal_rule=actual_signal_rule,
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta
             )
@@ -525,6 +532,7 @@ def main():
     parser.add_argument("--window-bars", type=int, default=30)
     parser.add_argument("--warmup-bars", type=int, default=150)
     parser.add_argument("--feature-set", type=str, choices=["base", "extended"], default="base")
+    parser.add_argument("--build-workers", type=int, default=4)
 
     parser.add_argument("--split-strategy", type=str, choices=["time", "ratio"], default="time")
     parser.add_argument("--train-end", type=str, default=None)
@@ -549,7 +557,7 @@ def main():
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
 
-    parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down"],
+    parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
     parser.add_argument("--min-pending-bars", type=int, default=1)
     parser.add_argument("--drop-delta", type=float, default=0.0)

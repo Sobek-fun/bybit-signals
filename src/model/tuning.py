@@ -7,8 +7,7 @@ import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
 from src.model.predict import predict_proba
-from src.model.threshold import threshold_sweep
-from src.model.evaluate import compute_event_level_metrics
+from src.model.threshold import threshold_sweep, _prepare_event_data
 
 
 def generate_walk_forward_folds(
@@ -175,58 +174,6 @@ def train_fold(
     return model, val_df
 
 
-def train_fold_ranking(
-        features_df: pd.DataFrame,
-        feature_columns: list,
-        params: dict,
-        iterations: int = 1000,
-        early_stopping_rounds: int = 50,
-        seed: int = 42
-) -> tuple:
-    train_df = features_df[features_df['split'] == 'train']
-    val_df = features_df[features_df['split'] == 'val']
-
-    if len(train_df) == 0 or len(val_df) == 0:
-        return None, None
-
-    train_df = train_df.copy()
-    train_df['rank_target'] = 0
-    train_df.loc[train_df['offset'] == 0, 'rank_target'] = 1
-    train_df.loc[train_df['offset'] == 1, 'rank_target'] = 0.8
-    train_df.loc[(train_df['offset'] >= -3) & (train_df['offset'] < 0), 'rank_target'] = 0.3
-
-    X_train = train_df[feature_columns]
-    y_train = train_df['rank_target']
-
-    val_df = val_df.copy()
-    val_df['rank_target'] = 0
-    val_df.loc[val_df['offset'] == 0, 'rank_target'] = 1
-
-    X_val = val_df[feature_columns]
-    y_val = val_df['rank_target']
-
-    train_pool = Pool(X_train, y_train, group_id=train_df['event_id'].values)
-    val_pool = Pool(X_val, y_val, group_id=val_df['event_id'].values)
-
-    model = CatBoostClassifier(
-        iterations=iterations,
-        depth=params['depth'],
-        learning_rate=params['learning_rate'],
-        l2_leaf_reg=params['l2_leaf_reg'],
-        min_data_in_leaf=params['min_data_in_leaf'],
-        early_stopping_rounds=early_stopping_rounds,
-        random_seed=seed,
-        verbose=0,
-        eval_metric='Logloss',
-        use_best_model=True,
-        auto_class_weights='Balanced'
-    )
-
-    model.fit(train_pool, eval_set=val_pool)
-
-    return model, val_df
-
-
 def evaluate_fold(
         model: CatBoostClassifier,
         features_df: pd.DataFrame,
@@ -243,6 +190,66 @@ def evaluate_fold(
         return {'score': -np.inf}
 
     predictions = predict_proba(model, val_df, feature_columns)
+    event_data = _prepare_event_data(predictions)
+
+    if signal_rule == 'argmax_per_event':
+        best_score = -np.inf
+        best_metrics = None
+
+        hit0 = 0
+        hit1 = 0
+        early = 0
+        late = 0
+        offsets_list = []
+
+        for event_id, data in event_data.items():
+            argmax_idx = np.argmax(data['p_end'])
+            offset = data['offsets'][argmax_idx]
+            offsets_list.append(offset)
+
+            if offset == 0:
+                hit0 += 1
+            elif offset == 1:
+                hit1 += 1
+            elif offset < 0:
+                early += 1
+            else:
+                late += 1
+
+        n_events = len(event_data)
+        best_metrics = {
+            'hit0_rate': hit0 / n_events if n_events > 0 else 0,
+            'hit1_rate': hit1 / n_events if n_events > 0 else 0,
+            'early_rate': early / n_events if n_events > 0 else 0,
+            'miss_rate': 0,
+            'median_pred_offset': np.median(offsets_list) if offsets_list else None,
+            'n_events': n_events
+        }
+
+        median_offset = best_metrics.get('median_pred_offset')
+        if median_offset is not None and median_offset < early_penalty_threshold:
+            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
+        else:
+            early_penalty = 0
+
+        best_score = (
+                best_metrics['hit0_rate'] +
+                alpha_hit1 * best_metrics['hit1_rate'] -
+                beta_early * best_metrics['early_rate'] -
+                early_penalty
+        )
+
+        return {
+            'score': best_score,
+            'threshold': 0.0,
+            'min_pending_bars': 1,
+            'drop_delta': 0.0,
+            'hit0_rate': best_metrics['hit0_rate'],
+            'early_rate': best_metrics['early_rate'],
+            'miss_rate': best_metrics['miss_rate'],
+            'median_pred_offset': best_metrics.get('median_pred_offset'),
+            'n_events': best_metrics['n_events']
+        }
 
     rule_combinations = get_rule_parameter_grid()
 
@@ -256,23 +263,27 @@ def evaluate_fold(
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
 
-        threshold, _ = threshold_sweep(
+        threshold, sweep_df = threshold_sweep(
             predictions,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
-            drop_delta=drop_delta
+            drop_delta=drop_delta,
+            event_data=event_data
         )
 
-        metrics = compute_event_level_metrics(
-            predictions,
-            threshold,
-            signal_rule,
-            min_pending_bars=min_pending_bars,
-            drop_delta=drop_delta
-        )
+        best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
+
+        metrics = {
+            'hit0_rate': best_row['hit0_rate'],
+            'hit1_rate': best_row['hit1_rate'],
+            'early_rate': best_row['early_rate'],
+            'miss_rate': best_row['miss_rate'],
+            'median_pred_offset': best_row['median_offset'],
+            'n_events': best_row['n_events']
+        }
 
         median_offset = metrics.get('median_pred_offset')
         if median_offset is not None and median_offset < early_penalty_threshold:
@@ -282,7 +293,7 @@ def evaluate_fold(
 
         score = (
                 metrics['hit0_rate'] +
-                alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate']) -
+                alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate'] + metrics['hit1_rate']) -
                 beta_early * metrics['early_rate'] -
                 gamma_miss * metrics['miss_rate'] -
                 early_penalty
@@ -325,29 +336,21 @@ def run_cv(
 ) -> dict:
     fold_results = []
 
+    actual_signal_rule = 'argmax_per_event' if tune_strategy == 'ranking' else signal_rule
+
     for fold_idx, fold in enumerate(folds):
         fold_df = apply_fold_split(features_df, fold)
         fold_df = apply_fold_embargo(fold_df, fold, embargo_bars)
         fold_df = clip_fold_points(fold_df, fold)
 
-        if tune_strategy == 'ranking':
-            model, _ = train_fold_ranking(
-                fold_df,
-                feature_columns,
-                params,
-                iterations=iterations,
-                early_stopping_rounds=early_stopping_rounds,
-                seed=seed
-            )
-        else:
-            model, _ = train_fold(
-                fold_df,
-                feature_columns,
-                params,
-                iterations=iterations,
-                early_stopping_rounds=early_stopping_rounds,
-                seed=seed
-            )
+        model, _ = train_fold(
+            fold_df,
+            feature_columns,
+            params,
+            iterations=iterations,
+            early_stopping_rounds=early_stopping_rounds,
+            seed=seed
+        )
 
         if model is None:
             continue
@@ -356,7 +359,7 @@ def run_cv(
             model,
             fold_df,
             feature_columns,
-            signal_rule,
+            actual_signal_rule,
             alpha_hit1,
             beta_early,
             gamma_miss
@@ -548,20 +551,9 @@ def train_final_model(
         (features_df['open_time'] < train_end)
         ]
 
-    if tune_strategy == 'ranking':
-        train_df = train_df.copy()
-        train_df['rank_target'] = 0
-        train_df.loc[train_df['offset'] == 0, 'rank_target'] = 1
-        train_df.loc[train_df['offset'] == 1, 'rank_target'] = 0.8
-        train_df.loc[(train_df['offset'] >= -3) & (train_df['offset'] < 0), 'rank_target'] = 0.3
-
-        X_train = train_df[feature_columns]
-        y_train = train_df['rank_target']
-        train_pool = Pool(X_train, y_train, group_id=train_df['event_id'].values)
-    else:
-        X_train = train_df[feature_columns]
-        y_train = train_df['y']
-        train_pool = Pool(X_train, y_train)
+    X_train = train_df[feature_columns]
+    y_train = train_df['y']
+    train_pool = Pool(X_train, y_train)
 
     model = CatBoostClassifier(
         iterations=iterations,

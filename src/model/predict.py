@@ -43,6 +43,9 @@ def extract_signals(
                 continue
             first_idx = np.argmax(mask)
             offset = data['offsets'][first_idx]
+        elif signal_rule == 'argmax_per_event':
+            argmax_idx = np.argmax(data['p_end'])
+            offset = data['offsets'][argmax_idx]
         else:
             offsets_arr = data['offsets']
             p_end = data['p_end']
