@@ -3,6 +3,7 @@ import pandas as pd
 import pandas_ta as ta
 
 from src.monitoring.data_loader import DataLoader
+from src.monitoring.pump_params import PumpParams, DEFAULT_PUMP_PARAMS
 
 
 class PumpFeatureBuilder:
@@ -11,16 +12,18 @@ class PumpFeatureBuilder:
             ch_dsn: str,
             window_bars: int = 30,
             warmup_bars: int = 150,
-            feature_set: str = "base"
+            feature_set: str = "base",
+            params: PumpParams = None
     ):
         self.loader = DataLoader(ch_dsn)
         self.window_bars = window_bars
         self.warmup_bars = warmup_bars
         self.feature_set = feature_set
+        self.params = params or DEFAULT_PUMP_PARAMS
         self.vol_ratio_period = 50
         self.vwap_period = 30
-        self.corridor_window = 30
-        self.corridor_quantile = 0.95
+        self.corridor_window = self.params.corridor_window
+        self.corridor_quantile = self.params.corridor_quantile
 
     def build(self, labels_df: pd.DataFrame) -> pd.DataFrame:
         labels_df = labels_df[labels_df['pump_la_type'].isin(['A', 'B'])].copy()
@@ -49,7 +52,7 @@ class PumpFeatureBuilder:
         t_min = events['open_time'].min()
         t_max = events['open_time'].max()
 
-        buffer_bars = self.warmup_bars + self.window_bars + 21
+        buffer_bars = self.warmup_bars + self.window_bars + self.params.liquidity_window_bars + 21
         start_bucket = t_min - pd.Timedelta(minutes=buffer_bars * 15)
         end_bucket = t_max
 
@@ -59,6 +62,8 @@ class PumpFeatureBuilder:
             return []
 
         df = self._calculate_base_indicators(df)
+        df = self._calculate_pump_detector_features(df)
+        df = self._calculate_liquidity_features(df)
 
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
@@ -108,6 +113,7 @@ class PumpFeatureBuilder:
         df.ta.rsi(length=14, append=True)
         df.ta.mfi(length=14, append=True)
         df.ta.macd(fast=12, slow=26, signal=9, append=True)
+        df.ta.atr(length=14, append=True)
 
         df = df.rename(columns={
             'RSI_14': 'rsi_14',
@@ -116,6 +122,10 @@ class PumpFeatureBuilder:
             'MACD_12_26_9': 'macd_line',
             'MACDs_12_26_9': 'macd_signal'
         })
+
+        atr_col = [c for c in df.columns if 'ATR' in c and '14' in c]
+        if atr_col:
+            df = df.rename(columns={atr_col[0]: 'atr_14'})
 
         rolling_max_close = df['close'].rolling(window=self.window_bars).max()
         df['drawdown'] = (df['close'] - rolling_max_close) / rolling_max_close
@@ -126,11 +136,255 @@ class PumpFeatureBuilder:
 
         return df
 
+    def _calculate_pump_detector_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+
+        df['vol_median_pd'] = df['volume'].rolling(window=p.volume_median_window).median()
+        df['vol_ratio_pd'] = df['volume'] / df['vol_median_pd']
+
+        df['vol_ratio_max'] = df['vol_ratio_pd'].rolling(window=p.peak_window).max()
+        df['rsi_max'] = df['rsi_14'].rolling(window=p.peak_window).max()
+        df['macdh_max'] = df['macdh_12_26_9'].rolling(window=p.peak_window).max()
+        df['high_max'] = df['high'].rolling(window=p.peak_window).max()
+
+        min_price = df[['low', 'open']].min(axis=1)
+        local_min = min_price.rolling(window=p.runup_window).min()
+        df['runup'] = (df['high'] / local_min) - 1
+        df['runup_met'] = ((local_min > 0) & (df['runup'] >= p.runup_threshold)).astype(int)
+
+        df['vol_spike_cond'] = (df['vol_ratio_pd'] >= p.vol_ratio_spike).astype(int)
+        df['vol_spike_recent'] = (df['vol_spike_cond'].rolling(window=p.context_window).sum() > 0).astype(int)
+
+        rsi = df['rsi_14']
+        mfi = df['mfi_14']
+        macdh = df['macdh_12_26_9']
+
+        rsi_corridor_pd = rsi.rolling(window=p.corridor_window).quantile(p.corridor_quantile)
+        mfi_corridor_pd = mfi.rolling(window=p.corridor_window).quantile(p.corridor_quantile)
+
+        df['rsi_hot'] = (
+                    rsi.notna() & rsi_corridor_pd.notna() & (rsi >= np.maximum(p.rsi_hot, rsi_corridor_pd))).astype(int)
+        df['mfi_hot'] = (
+                    mfi.notna() & mfi_corridor_pd.notna() & (mfi >= np.maximum(p.mfi_hot, mfi_corridor_pd))).astype(int)
+        df['osc_hot_recent'] = ((df['rsi_hot'] | df['mfi_hot']).rolling(window=p.context_window).sum() > 0).astype(int)
+
+        df['macd_pos_recent'] = ((macdh.notna() & (macdh > 0)).rolling(window=p.context_window).sum() > 0).astype(int)
+
+        df['pump_ctx'] = (
+                    df['runup_met'] & df['vol_spike_recent'] & df['osc_hot_recent'] & df['macd_pos_recent']).astype(int)
+
+        df['near_peak'] = (df['high_max'].notna() & (df['high_max'] > 0) & (
+                    df['high'] >= df['high_max'] * (1 - p.peak_tol))).astype(int)
+
+        candle_range = df['high'] - df['low']
+        range_pos = candle_range > 0
+
+        df['close_pos'] = np.where(range_pos, (df['close'] - df['low']) / candle_range, 0)
+
+        max_oc = np.maximum(df['open'], df['close'])
+        df['wick_ratio'] = np.where(range_pos, (df['high'] - max_oc) / candle_range, 0)
+
+        body_size = np.abs(df['close'] - df['open'])
+        df['body_ratio_pd'] = np.where(range_pos, body_size / candle_range, 0)
+
+        bearish = df['close'] < df['open']
+
+        df['blowoff_exhaustion'] = (
+                (df['close_pos'] <= p.close_pos_low) |
+                (bearish & (df['close_pos'] <= 0.45)) |
+                ((df['wick_ratio'] >= p.wick_blowoff) & (df['body_ratio_pd'] <= p.body_blowoff))
+        ).astype(int)
+
+        df['osc_extreme'] = (rsi.notna() & mfi.notna() & (rsi >= p.rsi_extreme) & (mfi >= p.mfi_extreme)).astype(int)
+        df['predump_mask'] = (df['osc_extreme'] & (df['close_pos'] >= p.close_pos_high)).astype(int)
+
+        df['vol_fade'] = (df['vol_ratio_max'].notna() & (df['vol_ratio_max'] > 0) & (
+                    df['vol_ratio_pd'] <= df['vol_ratio_max'] * p.vol_fade_ratio)).astype(int)
+        df['rsi_fade'] = (
+                    df['rsi_max'].notna() & (df['rsi_max'] > 0) & (rsi <= df['rsi_max'] * p.rsi_fade_ratio)).astype(int)
+        df['macd_fade'] = (df['macdh_max'].notna() & macdh.notna() & (df['macdh_max'] > 0) & (
+                    macdh <= df['macdh_max'] * p.macd_fade_ratio)).astype(int)
+
+        wick_high_mask = df['wick_ratio'] >= p.wick_high
+        wick_low_mask = (df['wick_ratio'] >= p.wick_low) & (~wick_high_mask)
+
+        df['predump_peak'] = (
+                df['predump_mask'].astype(bool) &
+                (
+                        (wick_high_mask & df['vol_fade'].astype(bool)) |
+                        (wick_low_mask & df['vol_fade'].astype(bool) & (
+                                    df['rsi_fade'].astype(bool) | df['macd_fade'].astype(bool)))
+                )
+        ).astype(int)
+
+        df['strong_cond'] = (df['pump_ctx'].astype(bool) & df['near_peak'].astype(bool) & (
+                    df['blowoff_exhaustion'].astype(bool) | df['predump_peak'].astype(bool))).astype(int)
+
+        df['pump_score'] = df['pump_ctx'] + df['near_peak'] + (df['blowoff_exhaustion'] | df['predump_peak']).astype(
+            int)
+
+        return df
+
+    def _calculate_liquidity_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        n = len(df)
+
+        df['pdh'] = np.nan
+        df['pwh'] = np.nan
+
+        if df.index.dtype == 'datetime64[ns]' or hasattr(df.index, 'date'):
+            dates = pd.to_datetime(df.index).date
+            unique_dates = pd.Series(dates).unique()
+
+            for i, current_date in enumerate(unique_dates):
+                if i == 0:
+                    continue
+                prev_date = unique_dates[i - 1]
+                prev_day_mask = dates == prev_date
+                if prev_day_mask.any():
+                    pdh_value = df.loc[prev_day_mask, 'high'].max()
+                    current_day_mask = dates == current_date
+                    df.loc[current_day_mask, 'pdh'] = pdh_value
+
+            weeks = pd.to_datetime(df.index).isocalendar()
+            df_weeks = pd.DataFrame({'year': weeks.year, 'week': weeks.week}, index=df.index)
+            unique_weeks = df_weeks.drop_duplicates().values.tolist()
+
+            for i, (year, week) in enumerate(unique_weeks):
+                if i == 0:
+                    continue
+                prev_year, prev_week = unique_weeks[i - 1]
+                prev_week_mask = (df_weeks['year'] == prev_year) & (df_weeks['week'] == prev_week)
+                if prev_week_mask.any():
+                    pwh_value = df.loc[prev_week_mask, 'high'].max()
+                    current_week_mask = (df_weeks['year'] == year) & (df_weeks['week'] == week)
+                    df.loc[current_week_mask, 'pwh'] = pwh_value
+
+        df['dist_to_pdh'] = np.where(df['pdh'].notna() & (df['pdh'] > 0), (df['pdh'] - df['close']) / df['close'],
+                                     np.nan)
+        df['dist_to_pwh'] = np.where(df['pwh'].notna() & (df['pwh'] > 0), (df['pwh'] - df['close']) / df['close'],
+                                     np.nan)
+
+        df['touched_pdh'] = ((df['high'] >= df['pdh'] * 0.999) & df['pdh'].notna()).astype(int)
+        df['touched_pwh'] = ((df['high'] >= df['pwh'] * 0.999) & df['pwh'].notna()).astype(int)
+
+        df['sweep_pdh'] = (
+                    (df['high'] > df['pdh'] * 1.001) & (df['close'] < df['pdh'] * 0.999) & df['pdh'].notna()).astype(
+            int)
+        df['sweep_pwh'] = (
+                    (df['high'] > df['pwh'] * 1.001) & (df['close'] < df['pwh'] * 0.999) & df['pwh'].notna()).astype(
+            int)
+
+        df['overshoot_pdh'] = np.where(df['sweep_pdh'] == 1, (df['high'] - df['pdh']) / df['pdh'], 0)
+        df['overshoot_pwh'] = np.where(df['sweep_pwh'] == 1, (df['high'] - df['pwh']) / df['pwh'], 0)
+
+        liq_window = p.liquidity_window_bars
+        eqh_tol_base = p.eqh_base_tol
+        eqh_atr_factor = p.eqh_atr_factor
+        min_touches = p.eqh_min_touches
+
+        df['eqh_level'] = np.nan
+        df['eqh_strength'] = 0
+        df['eqh_age_bars'] = np.nan
+
+        high_arr = df['high'].values
+        atr_arr = df['atr_14'].values if 'atr_14' in df.columns else np.full(n, np.nan)
+        close_arr = df['close'].values
+
+        for i in range(liq_window, n):
+            window_highs = high_arr[i - liq_window:i]
+            current_atr = atr_arr[i] if not np.isnan(atr_arr[i]) else 0
+            tol = max(eqh_tol_base, eqh_atr_factor * current_atr / close_arr[i] if close_arr[i] > 0 else eqh_tol_base)
+
+            clusters = []
+            used = np.zeros(liq_window, dtype=bool)
+
+            sorted_indices = np.argsort(window_highs)[::-1]
+
+            for idx in sorted_indices:
+                if used[idx]:
+                    continue
+                level = window_highs[idx]
+                if level <= 0:
+                    continue
+
+                touches = []
+                for j in range(liq_window):
+                    if not used[j] and abs(window_highs[j] - level) / level <= tol:
+                        touches.append(j)
+                        used[j] = True
+
+                if len(touches) >= min_touches:
+                    avg_level = np.mean([window_highs[t] for t in touches])
+                    last_touch_age = liq_window - max(touches) - 1
+                    clusters.append((avg_level, len(touches), last_touch_age))
+
+            if clusters:
+                clusters.sort(key=lambda x: (-x[1], -x[0]))
+                best = clusters[0]
+                df.iloc[i, df.columns.get_loc('eqh_level')] = best[0]
+                df.iloc[i, df.columns.get_loc('eqh_strength')] = best[1]
+                df.iloc[i, df.columns.get_loc('eqh_age_bars')] = best[2]
+
+        df['dist_to_eqh'] = np.where(df['eqh_level'].notna() & (df['eqh_level'] > 0),
+                                     (df['eqh_level'] - df['close']) / df['close'], np.nan)
+        df['sweep_eqh'] = ((df['high'] > df['eqh_level'] * 1.001) & (df['close'] < df['eqh_level'] * 0.999) & df[
+            'eqh_level'].notna()).astype(int)
+        df['overshoot_eqh'] = np.where(df['sweep_eqh'] == 1, (df['high'] - df['eqh_level']) / df['eqh_level'], 0)
+
+        df['liq_level_type_pwh'] = 0
+        df['liq_level_type_pdh'] = 0
+        df['liq_level_type_eqh'] = 0
+        df['liq_level_dist'] = np.nan
+        df['liq_sweep_flag'] = 0
+        df['liq_sweep_overshoot'] = 0.0
+
+        for i in range(n):
+            if df['sweep_pwh'].iloc[i] == 1:
+                df.iloc[i, df.columns.get_loc('liq_level_type_pwh')] = 1
+                df.iloc[i, df.columns.get_loc('liq_level_dist')] = df['dist_to_pwh'].iloc[i]
+                df.iloc[i, df.columns.get_loc('liq_sweep_flag')] = 1
+                df.iloc[i, df.columns.get_loc('liq_sweep_overshoot')] = df['overshoot_pwh'].iloc[i]
+            elif df['sweep_pdh'].iloc[i] == 1:
+                df.iloc[i, df.columns.get_loc('liq_level_type_pdh')] = 1
+                df.iloc[i, df.columns.get_loc('liq_level_dist')] = df['dist_to_pdh'].iloc[i]
+                df.iloc[i, df.columns.get_loc('liq_sweep_flag')] = 1
+                df.iloc[i, df.columns.get_loc('liq_sweep_overshoot')] = df['overshoot_pdh'].iloc[i]
+            elif df['sweep_eqh'].iloc[i] == 1:
+                df.iloc[i, df.columns.get_loc('liq_level_type_eqh')] = 1
+                df.iloc[i, df.columns.get_loc('liq_level_dist')] = df['dist_to_eqh'].iloc[i]
+                df.iloc[i, df.columns.get_loc('liq_sweep_flag')] = 1
+                df.iloc[i, df.columns.get_loc('liq_sweep_overshoot')] = df['overshoot_eqh'].iloc[i]
+            else:
+                candidates = []
+                if pd.notna(df['dist_to_pwh'].iloc[i]) and df['dist_to_pwh'].iloc[i] > 0:
+                    candidates.append(('pwh', df['dist_to_pwh'].iloc[i]))
+                if pd.notna(df['dist_to_pdh'].iloc[i]) and df['dist_to_pdh'].iloc[i] > 0:
+                    candidates.append(('pdh', df['dist_to_pdh'].iloc[i]))
+                if pd.notna(df['dist_to_eqh'].iloc[i]) and df['dist_to_eqh'].iloc[i] > 0:
+                    candidates.append(('eqh', df['dist_to_eqh'].iloc[i]))
+
+                if candidates:
+                    candidates.sort(key=lambda x: x[1])
+                    best_type, best_dist = candidates[0]
+                    df.iloc[i, df.columns.get_loc(f'liq_level_type_{best_type}')] = 1
+                    df.iloc[i, df.columns.get_loc('liq_level_dist')] = best_dist
+
+        df['liq_reject_strength'] = np.where(
+            (df['close_pos'] <= 0.4) & (df['wick_ratio'] >= 0.25),
+            (0.4 - df['close_pos']) + (df['wick_ratio'] - 0.25),
+            0
+        )
+
+        return df
+
     def _calculate_extended_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df.ta.atr(length=14, append=True)
-        atr_col = [c for c in df.columns if 'ATR' in c and '14' in c]
-        if atr_col:
-            df = df.rename(columns={atr_col[0]: 'atr_14'})
+        if 'atr_14' not in df.columns:
+            df.ta.atr(length=14, append=True)
+            atr_col = [c for c in df.columns if 'ATR' in c and '14' in c]
+            if atr_col:
+                df = df.rename(columns={atr_col[0]: 'atr_14'})
+
         df['atr_norm'] = df['atr_14'] / df['close']
 
         sma_20 = df['close'].rolling(window=20).mean()
@@ -154,7 +408,19 @@ class PumpFeatureBuilder:
             'ret_1', 'range', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio',
             'volume', 'log_volume', 'rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio',
             'macd_line', 'macd_signal', 'drawdown',
-            'rsi_corridor', 'mfi_corridor', 'macdh_corridor'
+            'rsi_corridor', 'mfi_corridor', 'macdh_corridor',
+            'vol_median_pd', 'vol_ratio_pd', 'vol_ratio_max', 'rsi_max', 'macdh_max', 'high_max',
+            'runup', 'runup_met', 'vol_spike_cond', 'vol_spike_recent',
+            'rsi_hot', 'mfi_hot', 'osc_hot_recent', 'macd_pos_recent',
+            'pump_ctx', 'near_peak', 'close_pos', 'wick_ratio', 'body_ratio_pd',
+            'blowoff_exhaustion', 'osc_extreme', 'predump_mask',
+            'vol_fade', 'rsi_fade', 'macd_fade', 'predump_peak', 'strong_cond', 'pump_score',
+            'pdh', 'pwh', 'dist_to_pdh', 'dist_to_pwh',
+            'touched_pdh', 'touched_pwh', 'sweep_pdh', 'sweep_pwh',
+            'overshoot_pdh', 'overshoot_pwh',
+            'eqh_level', 'eqh_strength', 'eqh_age_bars', 'dist_to_eqh', 'sweep_eqh', 'overshoot_eqh',
+            'liq_level_type_pwh', 'liq_level_type_pdh', 'liq_level_type_eqh',
+            'liq_level_dist', 'liq_sweep_flag', 'liq_sweep_overshoot', 'liq_reject_strength'
         ]
 
         extended_columns = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
@@ -183,27 +449,63 @@ class PumpFeatureBuilder:
         if len(valid_positions) == 0:
             return []
 
-        base_series = [
-            'ret_1', 'range', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio',
-            'volume', 'log_volume', 'rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio',
-            'macd_line', 'macd_signal', 'drawdown',
-            'rsi_corridor', 'mfi_corridor', 'macdh_corridor'
+        lag_series = [
+            'ret_1', 'vol_ratio', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio', 'range',
+            'close_pos', 'wick_ratio',
+            'liq_sweep_flag', 'liq_sweep_overshoot', 'liq_reject_strength'
         ]
-        extended_series = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
-        agg_series = ['rsi_14', 'mfi_14', 'macdh_12_26_9', 'vol_ratio', 'ret_1', 'macd_line', 'drawdown']
 
-        series_to_lag = base_series.copy()
-        if self.feature_set == "extended":
-            series_to_lag.extend([s for s in extended_series if s in df.columns])
+        compact_series = ['rsi_14', 'mfi_14', 'macdh_12_26_9', 'macd_line', 'vol_ratio', 'ret_1', 'drawdown']
+
+        pump_detector_features = [
+            'runup', 'runup_met', 'vol_spike_cond', 'vol_spike_recent',
+            'rsi_hot', 'mfi_hot', 'osc_hot_recent', 'macd_pos_recent',
+            'pump_ctx', 'near_peak', 'blowoff_exhaustion',
+            'osc_extreme', 'predump_mask', 'vol_fade', 'rsi_fade', 'macd_fade',
+            'predump_peak', 'strong_cond', 'pump_score'
+        ]
+
+        liquidity_features = [
+            'dist_to_pdh', 'dist_to_pwh', 'dist_to_eqh',
+            'touched_pdh', 'touched_pwh', 'sweep_pdh', 'sweep_pwh', 'sweep_eqh',
+            'overshoot_pdh', 'overshoot_pwh', 'overshoot_eqh',
+            'eqh_strength', 'eqh_age_bars',
+            'liq_level_type_pwh', 'liq_level_type_pdh', 'liq_level_type_eqh',
+            'liq_level_dist'
+        ]
+
+        extended_features = ['atr_norm', 'bb_z', 'bb_width', 'vwap_dev']
 
         series_arrays = {}
-        for s in series_to_lag:
+        for s in lag_series:
             if s in df.columns:
                 series_arrays[s] = df[s].values
+
+        for s in compact_series:
+            if s in df.columns:
+                series_arrays[s] = df[s].values
+
+        for s in pump_detector_features:
+            if s in df.columns:
+                series_arrays[s] = df[s].values
+
+        for s in liquidity_features:
+            if s in df.columns:
+                series_arrays[s] = df[s].values
+
+        if self.feature_set == "extended":
+            for s in extended_features:
+                if s in df.columns:
+                    series_arrays[s] = df[s].values
 
         close_arr = df['close'].values
         open_arr = df['open'].values
         volume_arr = df['volume'].values
+
+        corridor_arrays = {}
+        for name in ['rsi_corridor', 'mfi_corridor', 'macdh_corridor']:
+            if name in df.columns:
+                corridor_arrays[name] = df[name].values
 
         num_events = len(valid_positions)
         w = self.window_bars
@@ -233,12 +535,14 @@ class PumpFeatureBuilder:
 
             window_indices = lag_matrix[ev_idx]
 
-            for series_name, arr in series_arrays.items():
-                values = arr[window_indices]
+            for series_name in lag_series:
+                if series_name not in series_arrays:
+                    continue
+                values = series_arrays[series_name][window_indices]
                 for lag in range(w):
                     row[f'{series_name}_lag_{lag}'] = values[lag]
 
-            for series_name in agg_series:
+            for series_name in compact_series:
                 if series_name not in series_arrays:
                     continue
                 values = series_arrays[series_name][window_indices]
@@ -258,6 +562,27 @@ class PumpFeatureBuilder:
                 row[f'{series_name}_delta_3'] = values[0] - values[2] if len(values) >= 3 else np.nan
                 row[f'{series_name}_delta_5'] = values[0] - values[4] if len(values) >= 5 else np.nan
 
+            for corridor_name, base_name in [('rsi_corridor', 'rsi_14'), ('mfi_corridor', 'mfi_14'),
+                                             ('macdh_corridor', 'macdh_12_26_9')]:
+                if corridor_name in corridor_arrays and base_name in series_arrays:
+                    corridor_val = corridor_arrays[corridor_name][window_indices[0]]
+                    base_val = series_arrays[base_name][window_indices[0]]
+                    row[f'{base_name}_minus_corridor'] = base_val - corridor_val if pd.notna(base_val) and pd.notna(
+                        corridor_val) else np.nan
+
+            for feat_name in pump_detector_features:
+                if feat_name in series_arrays:
+                    row[feat_name] = series_arrays[feat_name][window_indices[0]]
+
+            for feat_name in liquidity_features:
+                if feat_name in series_arrays:
+                    row[feat_name] = series_arrays[feat_name][window_indices[0]]
+
+            if self.feature_set == "extended":
+                for feat_name in extended_features:
+                    if feat_name in series_arrays:
+                        row[feat_name] = series_arrays[feat_name][window_indices[0]]
+
             close_window = close_arr[window_indices]
             row['cum_ret_5'] = (close_window[0] / close_window[4] - 1) if w >= 5 else np.nan
             row['cum_ret_10'] = (close_window[0] / close_window[9] - 1) if w >= 10 else np.nan
@@ -267,8 +592,9 @@ class PumpFeatureBuilder:
             red_candles = close_window[:5] < open_window[:5]
             row['count_red_last_5'] = int(np.sum(red_candles))
 
-            upper_wick_last_5 = series_arrays.get('upper_wick_ratio', np.array([]))[window_indices[:5]]
-            row['max_upper_wick_last_5'] = np.nanmax(upper_wick_last_5) if len(upper_wick_last_5) > 0 else np.nan
+            if 'upper_wick_ratio' in series_arrays:
+                upper_wick_last_5 = series_arrays['upper_wick_ratio'][window_indices[:5]]
+                row['max_upper_wick_last_5'] = np.nanmax(upper_wick_last_5) if len(upper_wick_last_5) > 0 else np.nan
 
             if 'vol_ratio' in series_arrays:
                 vol_ratio_window = series_arrays['vol_ratio'][window_indices]
