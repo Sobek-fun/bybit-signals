@@ -3,57 +3,35 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from src.monitoring.pump_params import PumpParams, DEFAULT_PUMP_PARAMS
+
 
 class PumpDetector:
-    def __init__(
-            self,
-            runup_window: int = 8,
-            runup_threshold: float = 0.06,
-            context_window: int = 16,
-            peak_window: int = 8,
-            peak_tol: float = 0.005,
-            volume_median_window: int = 20,
-            vol_ratio_spike: float = 5.0,
-            vol_fade_ratio: float = 0.85,
-            corridor_window: int = 30,
-            corridor_quantile: float = 0.95,
-            rsi_hot: float = 70.0,
-            mfi_hot: float = 82.5,
-            rsi_extreme: float = 85.0,
-            mfi_extreme: float = 85.0,
-            rsi_fade_ratio: float = 0.98,
-            macd_fade_ratio: float = 0.99,
-            wick_high: float = 0.28,
-            wick_low: float = 0.20,
-            close_pos_high: float = 0.60,
-            close_pos_low: float = 0.35,
-            wick_blowoff: float = 0.35,
-            body_blowoff: float = 0.25,
-            cooldown_bars: int = 4
-    ):
-        self.runup_window = runup_window
-        self.runup_threshold = runup_threshold
-        self.context_window = context_window
-        self.peak_window = peak_window
-        self.peak_tol = peak_tol
-        self.volume_median_window = volume_median_window
-        self.vol_ratio_spike = vol_ratio_spike
-        self.vol_fade_ratio = vol_fade_ratio
-        self.corridor_window = corridor_window
-        self.corridor_quantile = corridor_quantile
-        self.rsi_hot = rsi_hot
-        self.mfi_hot = mfi_hot
-        self.rsi_extreme = rsi_extreme
-        self.mfi_extreme = mfi_extreme
-        self.rsi_fade_ratio = rsi_fade_ratio
-        self.macd_fade_ratio = macd_fade_ratio
-        self.wick_high = wick_high
-        self.wick_low = wick_low
-        self.close_pos_high = close_pos_high
-        self.close_pos_low = close_pos_low
-        self.wick_blowoff = wick_blowoff
-        self.body_blowoff = body_blowoff
-        self.cooldown_bars = cooldown_bars
+    def __init__(self, params: PumpParams = None):
+        p = params or DEFAULT_PUMP_PARAMS
+        self.runup_window = p.runup_window
+        self.runup_threshold = p.runup_threshold
+        self.context_window = p.context_window
+        self.peak_window = p.peak_window
+        self.peak_tol = p.peak_tol
+        self.volume_median_window = p.volume_median_window
+        self.vol_ratio_spike = p.vol_ratio_spike
+        self.vol_fade_ratio = p.vol_fade_ratio
+        self.corridor_window = p.corridor_window
+        self.corridor_quantile = p.corridor_quantile
+        self.rsi_hot = p.rsi_hot
+        self.mfi_hot = p.mfi_hot
+        self.rsi_extreme = p.rsi_extreme
+        self.mfi_extreme = p.mfi_extreme
+        self.rsi_fade_ratio = p.rsi_fade_ratio
+        self.macd_fade_ratio = p.macd_fade_ratio
+        self.wick_high = p.wick_high
+        self.wick_low = p.wick_low
+        self.close_pos_high = p.close_pos_high
+        self.close_pos_low = p.close_pos_low
+        self.wick_blowoff = p.wick_blowoff
+        self.body_blowoff = p.body_blowoff
+        self.cooldown_bars = p.cooldown_bars
 
     def detect(self, df: pd.DataFrame) -> pd.DataFrame:
         df['vol_median'] = df['volume'].rolling(window=self.volume_median_window).median()
@@ -62,6 +40,8 @@ class PumpDetector:
         mfi = df['MFI_14']
         rsi = df['RSI_14']
         macdh = df['MACDh_12_26_9']
+
+        macd_line = df['MACD_12_26_9']
 
         df['MFI_corridor'] = mfi.rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
         df['RSI_corridor'] = rsi.rolling(window=self.corridor_window).quantile(self.corridor_quantile).shift(1)
@@ -172,14 +152,31 @@ class PumpDetector:
 
         signals = np.full(n, None, dtype=object)
 
+        raw_trigger = np.zeros(n, dtype=bool)
+
         last_star_index: Optional[int] = None
         for i in np.nonzero(strong_cond)[0]:
             if i < skip_initial:
                 continue
             if last_star_index is not None and i - last_star_index < self.cooldown_bars:
                 continue
-            signals[i] = 'strong_pump'
+            raw_trigger[i] = True
             last_star_index = i
+
+        macd_turn_down = (
+                macd_line.notna() &
+                macd_line.shift(1).notna() &
+                (macd_line < macd_line.shift(1))
+        ).to_numpy(dtype=bool, copy=False)
+
+        pending = False
+        for t in range(skip_initial, n):
+            if raw_trigger[t] and not pending:
+                pending = True
+
+            if pending and macd_turn_down[t]:
+                signals[t] = 'strong_pump'
+                pending = False
 
         df['pump_score'] = pump_score
         df['pump_signal'] = signals

@@ -22,11 +22,11 @@ class PumpLabelerLookahead:
         low = df['low']
         high = df['high']
 
-        rolling_max_31 = close.rolling(window=31, center=True).max()
-        peak_mask = (close == rolling_max_31)
+        rolling_max_high_31 = high.rolling(window=31, center=True).max()
+        peak_mask = (high == rolling_max_high_31)
 
         close_shift5 = close.shift(5)
-        runup = (close / close_shift5) - 1
+        runup = (high / close_shift5) - 1
         runup_mask = (runup >= 0.08) & (close_shift5 > 0)
 
         min_low_next10 = low.shift(-1).rolling(10).min().shift(-9)
@@ -34,8 +34,8 @@ class PumpLabelerLookahead:
 
         candidate_mask = peak_mask & runup_mask
 
-        pullback_threshold = close * 0.97
-        squeeze_threshold = close * 1.10
+        pullback_threshold = high * 0.97
+        squeeze_threshold = high * 1.10
 
         A_mask = candidate_mask & (min_low_next10 <= pullback_threshold) & (max_high_next10 < squeeze_threshold)
         B_mask = candidate_mask & ~A_mask
