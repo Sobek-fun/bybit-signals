@@ -27,7 +27,6 @@ class PumpParams:
     body_blowoff: float = 0.25
     cooldown_bars: int = 4
 
-    liquidity_window_days: int = 7
     liquidity_window_bars: int = 672
     eqh_min_touches: int = 2
     eqh_base_tol: float = 0.001
