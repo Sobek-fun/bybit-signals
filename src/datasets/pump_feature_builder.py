@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from concurrent.futures import ProcessPoolExecutor
+from datetime import timedelta
 
 from src.monitoring.data_loader import DataLoader
 from src.monitoring.pump_params import PumpParams, DEFAULT_PUMP_PARAMS
@@ -27,14 +28,14 @@ def _process_symbol_worker(args):
 class PumpFeatureBuilder:
     def __init__(
             self,
-            ch_dsn: str,
+            ch_dsn: str = None,
             window_bars: int = 30,
             warmup_bars: int = 150,
             feature_set: str = "base",
             params: PumpParams = None
     ):
         self.ch_dsn = ch_dsn
-        self.loader = DataLoader(ch_dsn)
+        self.loader = DataLoader(ch_dsn) if ch_dsn else None
         self.window_bars = window_bars
         self.warmup_bars = warmup_bars
         self.feature_set = feature_set
@@ -116,6 +117,51 @@ class PumpFeatureBuilder:
 
         result_df = pd.DataFrame(all_rows)
         return result_df
+
+    def build_one_for_inference(
+            self,
+            df_candles: pd.DataFrame,
+            symbol: str,
+            decision_open_time: pd.Timestamp
+    ) -> dict:
+        df = df_candles.copy()
+
+        expected_bucket_start = decision_open_time - timedelta(minutes=15)
+
+        events = pd.DataFrame([{
+            'open_time': expected_bucket_start,
+            'pump_la_type': 'A',
+            'runup_pct': 0
+        }])
+
+        df = self._calculate_base_indicators(df)
+        df = self._calculate_pump_detector_features(df)
+        df = self._calculate_liquidity_features(df, events)
+
+        if self.feature_set == "extended":
+            df = self._calculate_extended_indicators(df)
+
+        synthetic_row = pd.DataFrame(
+            [[np.nan] * len(df.columns)],
+            columns=df.columns,
+            index=[decision_open_time]
+        )
+        df = pd.concat([df, synthetic_row])
+
+        df = self._apply_decision_shift(df)
+
+        events_for_extract = pd.DataFrame([{
+            'open_time': decision_open_time,
+            'pump_la_type': 'A',
+            'runup_pct': 0
+        }])
+
+        rows = self._extract_features_vectorized(df, symbol, events_for_extract)
+
+        if not rows:
+            return {}
+
+        return rows[0]
 
     def _process_symbol(self, symbol: str, events: pd.DataFrame) -> list:
         t_min = events['open_time'].min()
