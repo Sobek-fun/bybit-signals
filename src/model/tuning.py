@@ -74,8 +74,8 @@ def clip_fold_points(points_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
     points_df = points_df[~(train_mask & (points_df['open_time'] >= fold['train_end']))]
 
     val_mask = points_df['split'] == 'val'
-    points_df = points_df[~(val_mask & (points_df['open_time'] < fold['val_start']))]
-    points_df = points_df[~(val_mask & (points_df['open_time'] >= fold['val_end']))]
+    points_df = points_df[
+        ~(val_mask & ((points_df['open_time'] < fold['val_start']) | (points_df['open_time'] >= fold['val_end'])))]
 
     return points_df.reset_index(drop=True)
 
