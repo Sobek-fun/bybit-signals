@@ -92,6 +92,9 @@ def calibrate_threshold_on_val(
         beta_early: float,
         gamma_miss: float
 ) -> dict:
+    if signal_rule == 'argmax_per_event':
+        raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
+
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     val_events = event_times[
         (event_times['open_time'] >= train_end) &
@@ -109,9 +112,6 @@ def calibrate_threshold_on_val(
 
     val_df['split'] = 'val'
     predictions = predict_proba(model, val_df, feature_columns)
-
-    if signal_rule == 'argmax_per_event':
-        return {'threshold': 0.0, 'min_pending_bars': 1, 'drop_delta': 0.0}
 
     event_data = _prepare_event_data(predictions)
     rule_combinations = get_rule_parameter_grid()
@@ -408,7 +408,7 @@ def run_tune(args, artifacts: RunArtifacts):
         artifacts.save_cv_report(tune_result['best_cv_result'])
         artifacts.save_folds(tune_result['folds'])
 
-    actual_signal_rule = 'argmax_per_event' if actual_strategy == 'ranking' else args.signal_rule
+    actual_signal_rule = args.signal_rule
 
     if train_end:
         log("INFO", "TUNE", f"training final model on data up to {args.train_end} with strategy={actual_strategy}")
@@ -461,6 +461,11 @@ def run_tune(args, artifacts: RunArtifacts):
             })
 
             features_df = time_split(features_df, train_end, val_end)
+
+            if args.embargo_bars > 0:
+                features_df = apply_embargo(features_df, train_end, val_end, args.embargo_bars)
+
+            features_df = clip_points_to_split_bounds(features_df, train_end, val_end)
 
             test_predictions = predict_proba(
                 final_model,
@@ -572,6 +577,10 @@ def main():
     parser.add_argument("--run-name", type=str, default=None)
 
     args = parser.parse_args()
+
+    if args.mode in ("train", "tune") and args.signal_rule == "argmax_per_event":
+        parser.error(
+            "--signal-rule argmax_per_event is offline-only and non-causal. Use pending_turn_down or first_cross.")
 
     if args.mode == "build-dataset":
         if not args.labels or not args.clickhouse_dsn:

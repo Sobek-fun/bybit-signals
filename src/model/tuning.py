@@ -336,7 +336,7 @@ def run_cv(
 ) -> dict:
     fold_results = []
 
-    actual_signal_rule = 'argmax_per_event' if tune_strategy == 'ranking' else signal_rule
+    actual_signal_rule = signal_rule
 
     for fold_idx, fold in enumerate(folds):
         fold_df = apply_fold_split(features_df, fold)
