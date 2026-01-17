@@ -29,6 +29,7 @@ class PumpEndSignalState:
         self.prev_p_end: dict[str, float] = {}
         self.pending_count: dict[str, int] = {}
         self.last_signal_time: dict[str, datetime] = {}
+        self.disarmed: dict[str, bool] = {}
 
     def update_and_check(
             self,
@@ -41,19 +42,25 @@ class PumpEndSignalState:
     ) -> bool:
         prev = self.prev_p_end.get(symbol)
         count = self.pending_count.get(symbol, 0)
+        is_disarmed = self.disarmed.get(symbol, False)
 
         triggered = False
 
         if p_end >= threshold:
-            count += 1
-            if count >= min_pending_bars and prev is not None:
-                drop = prev - p_end
-                if p_end < prev and drop >= drop_delta:
-                    if self.last_signal_time.get(symbol) != current_time:
-                        triggered = True
-                        self.last_signal_time[symbol] = current_time
+            if is_disarmed:
+                pass
+            else:
+                count += 1
+                if count >= min_pending_bars and prev is not None:
+                    drop = prev - p_end
+                    if p_end < prev and drop >= drop_delta:
+                        if self.last_signal_time.get(symbol) != current_time:
+                            triggered = True
+                            self.last_signal_time[symbol] = current_time
+                            self.disarmed[symbol] = True
         else:
             count = 0
+            self.disarmed[symbol] = False
 
         self.pending_count[symbol] = count
         self.prev_p_end[symbol] = p_end
@@ -116,13 +123,7 @@ class PumpEndWorker:
                     candles_count=len(self.df)
                 )
 
-            expected_buckets = pd.date_range(
-                end=self.expected_bucket_start,
-                periods=self.MIN_CANDLES,
-                freq='15min'
-            )
-            missing_buckets = expected_buckets.difference(self.df.index)
-            if len(missing_buckets) > 0:
+            if len(self.df) != self.MIN_CANDLES:
                 return PumpEndWorkerResult(
                     token=self.token,
                     symbol=self.symbol,
@@ -131,11 +132,12 @@ class PumpEndWorker:
                     candles_count=len(self.df)
                 )
 
-            if len(self.df) < self.MIN_CANDLES:
+            start_bucket = self.expected_bucket_start - timedelta(minutes=(self.MIN_CANDLES - 1) * 15)
+            if self.df.index[0] != start_bucket:
                 return PumpEndWorkerResult(
                     token=self.token,
                     symbol=self.symbol,
-                    status="SKIP_SHORT",
+                    status="SKIP_GAPPED",
                     duration_total_ms=(time.time() - start_time) * 1000,
                     candles_count=len(self.df)
                 )

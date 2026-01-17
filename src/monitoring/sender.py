@@ -51,7 +51,7 @@ class TelegramSender:
                 if self.ws_broadcaster:
                     payload = {
                         "symbol": symbol,
-                        "time": event_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        "close_time": event_time.strftime('%Y-%m-%d %H:%M:%S'),
                         "message": message
                     }
                     self.ws_broadcaster.broadcast(json.dumps(payload))

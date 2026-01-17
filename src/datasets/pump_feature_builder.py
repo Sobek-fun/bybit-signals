@@ -124,7 +124,7 @@ class PumpFeatureBuilder:
             symbol: str,
             decision_open_time: pd.Timestamp
     ) -> dict:
-        df = df_candles.copy()
+        df = df_candles
 
         expected_bucket_start = decision_open_time - timedelta(minutes=15)
 
@@ -141,12 +141,7 @@ class PumpFeatureBuilder:
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
 
-        synthetic_row = pd.DataFrame(
-            [[np.nan] * len(df.columns)],
-            columns=df.columns,
-            index=[decision_open_time]
-        )
-        df = pd.concat([df, synthetic_row])
+        df.loc[decision_open_time] = np.nan
 
         df = self._apply_decision_shift(df)
 

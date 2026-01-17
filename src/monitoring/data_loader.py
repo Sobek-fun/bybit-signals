@@ -78,10 +78,8 @@ class DataLoader:
         df_all["bucket"] = pd.to_datetime(df_all["bucket"])
 
         result_dict = {}
-        for symbol in df_all["symbol"].unique():
-            symbol_df = df_all[df_all["symbol"] == symbol].copy()
-            symbol_df = symbol_df.drop(columns=["symbol"])
-            symbol_df.set_index("bucket", inplace=True)
+        for symbol, group in df_all.groupby("symbol", sort=False):
+            symbol_df = group.drop(columns=["symbol"]).set_index("bucket")
             result_dict[symbol] = symbol_df
 
         return result_dict

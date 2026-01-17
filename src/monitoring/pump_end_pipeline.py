@@ -47,33 +47,38 @@ class PumpEndPipeline:
         self.signal_state = PumpEndSignalState()
         self.telegram_sender = TelegramSender(bot_token, chat_id, ws_broadcaster=None)
 
+        self.candles_cache: dict[str, pd.DataFrame] = {}
+        self.last_processed_minute: datetime = None
+
         log("INFO", "PUMP_END", f"model loaded: threshold={self.model.threshold:.4f} "
                                 f"min_pending_bars={self.model.min_pending_bars} "
                                 f"drop_delta={self.model.drop_delta}")
 
     def run(self):
-        next_t = self._align_to_next_15m()
-        log("INFO", "PUMP_END", f"aligned to next T={next_t.strftime('%Y-%m-%d %H:%M:%S')}")
+        log("INFO", "PUMP_END", f"started, waiting for next 15m boundary")
 
         while True:
-            now = datetime.now()
-            target_time = next_t + timedelta(seconds=self.offset_seconds)
+            current_time = datetime.now()
 
-            if now < target_time:
-                sleep_seconds = (target_time - now).total_seconds()
-                sleep(sleep_seconds)
+            if self._should_process(current_time):
+                decision_open_time = current_time.replace(second=0, microsecond=0)
+                self._process_cycle(decision_open_time)
+                self.last_processed_minute = decision_open_time
 
-            self._process_cycle(next_t)
-            next_t = next_t + timedelta(minutes=15)
+            sleep(0.1)
 
-    def _align_to_next_15m(self) -> datetime:
-        now = datetime.now()
-        minutes = (now.minute // 15 + 1) * 15
-        if minutes >= 60:
-            next_t = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        else:
-            next_t = now.replace(minute=minutes, second=0, microsecond=0)
-        return next_t
+    def _should_process(self, current_time: datetime) -> bool:
+        if current_time.minute % 15 != 0:
+            return False
+
+        if current_time.second < self.offset_seconds:
+            return False
+
+        current_minute = current_time.replace(second=0, microsecond=0)
+        if self.last_processed_minute == current_minute:
+            return False
+
+        return True
 
     def _process_cycle(self, decision_open_time: datetime):
         expected_bucket_start = decision_open_time - timedelta(minutes=15)
@@ -89,21 +94,31 @@ class PumpEndPipeline:
         symbols = [f"{token}USDT" for token in self.tokens]
 
         load_start = datetime.now()
-        candles_dict = self.loader.load_candles_batch(symbols, start_bucket, expected_bucket_start)
+
+        if not self.candles_cache:
+            candles_dict = self.loader.load_candles_batch(symbols, start_bucket, expected_bucket_start)
+            self.candles_cache = candles_dict
+        else:
+            latest_candles = self.loader.load_candles_batch(symbols, expected_bucket_start, expected_bucket_start)
+            self._update_cache(latest_candles)
+            candles_dict = self.candles_cache
+
         load_duration = (datetime.now() - load_start).total_seconds()
 
         results = []
 
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {
-                executor.submit(
+            futures = {}
+            for token in self.tokens:
+                symbol = f"{token}USDT"
+                cached_df = candles_dict.get(symbol)
+                df_copy = cached_df.copy() if cached_df is not None else None
+                futures[executor.submit(
                     self._process_token,
                     token,
-                    candles_dict.get(f"{token}USDT"),
+                    df_copy,
                     expected_bucket_start
-                ): token
-                for token in self.tokens
-            }
+                )] = token
 
             for future in as_completed(futures):
                 try:
@@ -116,6 +131,14 @@ class PumpEndPipeline:
         cycle_duration = (datetime.now() - cycle_start).total_seconds()
 
         self._log_cycle_summary(results, cycle_duration, load_duration)
+
+    def _update_cache(self, latest_candles: dict[str, pd.DataFrame]):
+        for symbol, new_df in latest_candles.items():
+            if symbol in self.candles_cache and not new_df.empty:
+                cached = self.candles_cache[symbol]
+                cached = cached.iloc[1:]
+                cached = pd.concat([cached, new_df])
+                self.candles_cache[symbol] = cached
 
     def _process_token(
             self,

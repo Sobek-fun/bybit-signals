@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 from catboost import CatBoostClassifier
 
 
@@ -36,7 +37,8 @@ class PumpEndModel:
     def predict(self, features_row: dict) -> float:
         feature_values = []
         for name in self.feature_names:
-            feature_values.append(features_row.get(name))
+            val = features_row.get(name)
+            feature_values.append(np.nan if val is None else val)
 
         proba = self.model.predict_proba([feature_values])[0][1]
         return proba
