@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from src.model.predict import predict_proba
-from src.model.threshold import threshold_sweep, _prepare_event_data
+from src.dev.ml.predict import predict_proba
+from src.dev.ml.threshold import threshold_sweep, _prepare_event_data
 
 
 def generate_walk_forward_folds(

@@ -8,7 +8,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from src.model.threshold import _prepare_event_data, _compute_event_metrics_from_data
+from src.dev.ml.threshold import _prepare_event_data, _compute_event_metrics_from_data
 
 
 def compute_event_level_metrics(
@@ -264,7 +264,7 @@ def evaluate_with_trade_quality(
         horizons: list = None,
         event_data: dict = None
 ) -> dict:
-    from src.model.predict import extract_signals
+    from src.dev.ml.predict import extract_signals
 
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
                                                 event_data)
