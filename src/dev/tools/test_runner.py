@@ -3,14 +3,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from src.config import Config
-from src.monitoring.data_loader import DataLoader
-from src.monitoring.indicator_calculator import IndicatorCalculator
-from src.monitoring.pump_detector import PumpDetector
-
-
-def log(level: str, component: str, message: str):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{level}] {timestamp} [{component}] {message}")
+from src.shared.clickhouse import DataLoader
+from src.shared.indicators import IndicatorCalculator
+from src.shared.pump.detector import PumpDetector
+from src.shared.logging import log
 
 
 def _process_symbol_test(config: Config, symbol: str, query_start_bucket: datetime, end_bucket: datetime,

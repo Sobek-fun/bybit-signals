@@ -1,9 +1,9 @@
 import json
 from datetime import datetime, timedelta
 
-from src.monitoring.data_loader import DataLoader
-from src.monitoring.indicator_calculator import IndicatorCalculator
-from src.monitoring.pump_detector import PumpDetector
+from src.shared.clickhouse import DataLoader
+from src.shared.indicators import IndicatorCalculator
+from src.shared.pump.detector import PumpDetector
 
 
 def get_indicator_snapshot(ch_dsn: str, symbol: str, timestamp_str: str, timestamp_kind: str, lookback_candles: int):

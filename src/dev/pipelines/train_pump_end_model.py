@@ -3,16 +3,16 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from src.datasets.pump_feature_builder import PumpFeatureBuilder
-from src.model.artifacts import RunArtifacts
-from src.model.dataset import load_labels, build_training_points, deduplicate_points
-from src.model.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
-from src.model.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
-from src.model.threshold import threshold_sweep, _prepare_event_data
-from src.model.evaluate import evaluate, evaluate_with_trade_quality
-from src.model.predict import predict_proba, extract_signals
-from src.model.tuning import tune_model, tune_model_both_strategies, train_final_model, get_rule_parameter_grid
-from src.monitoring.data_loader import DataLoader
+from src.shared.pump_end.feature_builder import PumpFeatureBuilder
+from src.dev.ml.artifacts import RunArtifacts
+from src.dev.ml.dataset import load_labels, build_training_points, deduplicate_points
+from src.dev.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
+from src.dev.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
+from src.dev.ml.threshold import threshold_sweep, _prepare_event_data
+from src.dev.ml.evaluate import evaluate, evaluate_with_trade_quality
+from src.dev.ml.predict import predict_proba, extract_signals
+from src.dev.ml.tuning import tune_model, tune_model_both_strategies, train_final_model, get_rule_parameter_grid
+from src.shared.clickhouse import DataLoader
 
 
 def log(level: str, component: str, message: str):
