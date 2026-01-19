@@ -8,8 +8,8 @@ from urllib.parse import urlparse
 import clickhouse_connect
 import pandas as pd
 
-from src.monitoring.indicator_calculator import IndicatorCalculator
-from src.monitoring.pump_detector import PumpDetector
+from src.shared.indicators import IndicatorCalculator
+from src.shared.pump.detector import PumpDetector
 
 
 def log(level: str, component: str, message: str):
