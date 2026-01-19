@@ -1,15 +1,8 @@
 import argparse
+import sys
 from datetime import datetime
-from urllib.parse import urlparse
 
-import clickhouse_connect
-
-from src.monitoring.pump_end_pipeline import PumpEndPipeline
-
-
-def log(level: str, component: str, message: str):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{level}] {timestamp} [{component}] {message}")
+from src.shared.logging import log
 
 
 def main():
@@ -64,47 +57,8 @@ def main():
 
     args = parser.parse_args()
 
-    tokens = [token.strip().upper() for token in args.token.split(",")]
-
-    if len(tokens) == 1 and tokens[0] == "ALL":
-        parsed = urlparse(args.ch_dsn)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or 8123
-        username = parsed.username or "default"
-        password = parsed.password or ""
-        database = parsed.path.lstrip("/") if parsed.path else "default"
-        secure = parsed.scheme == "https"
-
-        client = clickhouse_connect.get_client(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            database=database,
-            secure=secure
-        )
-
-        query = "SELECT DISTINCT symbol FROM bybit.transactions WHERE endsWith(symbol, 'USDT') ORDER BY symbol"
-        result = client.query(query)
-        tokens = [row[0][:-4] for row in result.result_rows]
-        log("INFO", "MAIN", f"loaded {len(tokens)} tokens from ClickHouse")
-
-    log("INFO", "MAIN",
-        f"start tokens={len(tokens)} workers={args.workers} offset={args.offset_seconds} "
-        f"model_dir={args.model_dir} dry_run={args.dry_run}")
-
-    pipeline = PumpEndPipeline(
-        tokens=tokens,
-        ch_dsn=args.ch_dsn,
-        bot_token=args.bot_token,
-        chat_id=args.chat_id,
-        model_dir=args.model_dir,
-        workers=args.workers,
-        offset_seconds=args.offset_seconds,
-        dry_run=args.dry_run
-    )
-
-    pipeline.run()
+    from src.prod.cli import run_pump_end
+    run_pump_end(args)
 
 
 if __name__ == "__main__":

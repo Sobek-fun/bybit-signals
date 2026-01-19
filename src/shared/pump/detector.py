@@ -3,7 +3,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.monitoring.pump_params import PumpParams, DEFAULT_PUMP_PARAMS
+from src.shared.pump.params import PumpParams, DEFAULT_PUMP_PARAMS
 
 
 class PumpDetector:

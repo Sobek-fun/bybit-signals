@@ -4,10 +4,7 @@ from urllib.parse import urlparse
 import clickhouse_connect
 import pandas as pd
 
-
-def log(level: str, component: str, message: str):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{level}] {timestamp} [{component}] {message}")
+from src.shared.logging import log
 
 
 class DataLoader:
@@ -197,3 +194,26 @@ class DataLoader:
             return None
 
         return result.result_rows[0][0]
+
+
+def list_all_usdt_tokens(ch_dsn: str) -> list[str]:
+    parsed = urlparse(ch_dsn)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "default"
+    password = parsed.password or ""
+    database = parsed.path.lstrip("/") if parsed.path else "default"
+    secure = parsed.scheme == "https"
+
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        database=database,
+        secure=secure
+    )
+
+    query = "SELECT DISTINCT symbol FROM bybit.transactions WHERE endsWith(symbol, 'USDT') ORDER BY symbol"
+    result = client.query(query)
+    return [row[0][:-4] for row in result.result_rows]
