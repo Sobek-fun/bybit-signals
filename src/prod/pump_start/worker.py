@@ -4,9 +4,9 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from src.config import Config, WorkerResult
-from src.monitoring.indicator_calculator import IndicatorCalculator
-from src.monitoring.pump_detector import PumpDetector
-from src.monitoring.sender import TelegramSender
+from src.shared.indicators import IndicatorCalculator
+from src.shared.pump.detector import PumpDetector
+from src.prod.delivery.telegram_sender import TelegramSender
 
 
 class Worker:

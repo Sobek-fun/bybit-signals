@@ -5,9 +5,9 @@ from typing import Optional
 
 import pandas as pd
 
-from src.datasets.pump_feature_builder import PumpFeatureBuilder
-from src.monitoring.pump_end_model import PumpEndModel
-from src.monitoring.sender import TelegramSender
+from src.shared.pump_end.feature_builder import PumpFeatureBuilder
+from src.prod.pump_end.model import PumpEndModel
+from src.prod.delivery.telegram_sender import TelegramSender
 
 
 @dataclass

@@ -4,16 +4,12 @@ from time import sleep
 
 import pandas as pd
 
-from src.datasets.pump_feature_builder import PumpFeatureBuilder
-from src.monitoring.data_loader import DataLoader
-from src.monitoring.pump_end_model import PumpEndModel
-from src.monitoring.pump_end_worker import PumpEndWorker, PumpEndWorkerResult, PumpEndSignalState
-from src.monitoring.sender import TelegramSender
-
-
-def log(level: str, component: str, message: str):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{level}] {timestamp} [{component}] {message}")
+from src.shared.pump_end.feature_builder import PumpFeatureBuilder
+from src.shared.clickhouse import DataLoader
+from src.shared.logging import log
+from src.prod.pump_end.model import PumpEndModel
+from src.prod.pump_end.worker import PumpEndWorker, PumpEndWorkerResult, PumpEndSignalState
+from src.prod.delivery.telegram_sender import TelegramSender
 
 
 class PumpEndPipeline:
