@@ -15,6 +15,8 @@ class Config:
     offset_seconds: int = 1
     lookback_candles: int = 150
     test_days: int = 30
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
 
 
 @dataclass

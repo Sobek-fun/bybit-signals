@@ -1,5 +1,4 @@
 import argparse
-import sys
 from datetime import datetime
 
 from src.shared.logging import log
