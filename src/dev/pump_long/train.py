@@ -1,5 +1,6 @@
 import argparse
 import json
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -117,7 +118,81 @@ class RunArtifacts:
         return self.run_dir
 
 
-def export_pump_long_labels(ch_dsn: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+def _process_symbol_labels(args: tuple) -> list:
+    ch_dsn, symbol, start_dt, end_dt = args
+
+    parsed = urlparse(ch_dsn)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "default"
+    password = parsed.password or ""
+    database = parsed.path.lstrip("/") if parsed.path else "default"
+    secure = parsed.scheme == "https"
+
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        database=database,
+        secure=secure
+    )
+
+    query = """
+    SELECT
+        toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+        argMin(open, open_time) AS open,
+        max(high) AS high,
+        min(low) AS low,
+        argMax(close, open_time) AS close,
+        sum(volume) AS volume
+    FROM bybit.candles
+    WHERE symbol = %(symbol)s
+      AND interval = 1
+      AND open_time >= %(start)s
+      AND open_time < %(end)s
+    GROUP BY bucket
+    ORDER BY bucket
+    """
+
+    result = client.query(query, parameters={
+        "symbol": symbol,
+        "start": start_dt,
+        "end": end_dt + timedelta(minutes=15)
+    })
+
+    if not result.result_rows:
+        return []
+
+    df = pd.DataFrame(
+        result.result_rows,
+        columns=["bucket", "open", "high", "low", "close", "volume"]
+    )
+    df["bucket"] = pd.to_datetime(df["bucket"])
+    df.set_index("bucket", inplace=True)
+
+    labeler = PumpStartLabelerLookahead()
+    df = labeler.detect(df)
+
+    labeled = df[df['pump_start_type'].notna()]
+    if labeled.empty:
+        return []
+
+    labels = []
+    for idx in labeled.index:
+        row = labeled.loc[idx]
+        labels.append({
+            'symbol': symbol,
+            'event_open_time': row['start_open_time'],
+            'peak_open_time': row['peak_open_time'],
+            'pump_la_type': row['pump_start_type'],
+            'runup_pct': round(row['pump_start_runup'] * 100, 2)
+        })
+
+    return labels
+
+
+def export_pump_long_labels(ch_dsn: str, start_dt: datetime, end_dt: datetime, max_workers: int = 4) -> pd.DataFrame:
     parsed = urlparse(ch_dsn)
     host = parsed.hostname or "localhost"
     port = parsed.port or 8123
@@ -154,33 +229,17 @@ def export_pump_long_labels(ch_dsn: str, start_dt: datetime, end_dt: datetime) -
 
     log("INFO", "EXPORT", f"found {len(symbols)} symbols")
 
-    loader = DataLoader(ch_dsn)
-    labeler = PumpStartLabelerLookahead()
+    tasks = [(ch_dsn, symbol, start_dt, end_dt) for symbol in symbols]
 
     all_labels = []
-
-    for symbol in symbols:
-        df = loader.load_candles_range(symbol, start_dt, end_dt)
-
-        if df.empty:
-            continue
-
-        df = labeler.detect(df)
-
-        labeled = df[df['pump_start_type'].notna()]
-
-        if not labeled.empty:
-            for _, row in labeled.iterrows():
-                all_labels.append({
-                    'symbol': symbol,
-                    'event_open_time': row['start_open_time'],
-                    'peak_open_time': row['peak_open_time'],
-                    'pump_la_type': row['pump_start_type'],
-                    'runup_pct': round(row['pump_start_runup'] * 100, 2)
-                })
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for labels in executor.map(_process_symbol_labels, tasks):
+            all_labels.extend(labels)
 
     if all_labels:
-        return pd.DataFrame(all_labels)
+        df = pd.DataFrame(all_labels)
+        df = df.sort_values(['symbol', 'event_open_time']).reset_index(drop=True)
+        return df
     return pd.DataFrame()
 
 
@@ -245,13 +304,6 @@ def build_training_points(
         'runup_pct': runup_pcts
     })
 
-    return points_df
-
-
-def deduplicate_points(points_df: pd.DataFrame) -> pd.DataFrame:
-    points_df = points_df.sort_values('y', ascending=False)
-    points_df = points_df.drop_duplicates(subset=['symbol', 'open_time'], keep='first')
-    points_df = points_df.sort_values(['symbol', 'open_time']).reset_index(drop=True)
     return points_df
 
 
@@ -477,7 +529,7 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         labels_df = load_labels(args.labels, start_date, end_date)
     else:
         log("INFO", "BUILD", f"exporting labels from ClickHouse")
-        labels_df = export_pump_long_labels(args.clickhouse_dsn, start_date, end_date)
+        labels_df = export_pump_long_labels(args.clickhouse_dsn, start_date, end_date, max_workers=args.build_workers)
 
     log("INFO", "BUILD", f"loaded {len(labels_df)} labels")
 
@@ -492,7 +544,6 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         neg_after=args.neg_after,
         pos_offsets=pos_offsets
     )
-    points_df = deduplicate_points(points_df)
     log("INFO", "BUILD",
         f"training points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
 
@@ -506,7 +557,8 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         feature_set=args.feature_set
     )
 
-    feature_input = points_df[['symbol', 'open_time']].copy()
+    unique_times = points_df[['symbol', 'open_time']].drop_duplicates()
+    feature_input = unique_times.copy()
     feature_input = feature_input.rename(columns={'open_time': 'event_open_time'})
     feature_input['pump_la_type'] = 'A'
     feature_input['runup_pct'] = 0
@@ -575,6 +627,8 @@ def run_train(args, artifacts: RunArtifacts):
     )
     artifacts.save_predictions(val_predictions, 'val')
 
+    val_event_data = _prepare_event_data(val_predictions)
+
     log("INFO", "TRAIN", "searching optimal threshold")
     best_threshold, sweep_df = threshold_sweep_long(
         val_predictions,
@@ -582,7 +636,8 @@ def run_train(args, artifacts: RunArtifacts):
         beta_early=args.beta_early,
         beta_late=args.beta_late,
         gamma_miss=args.gamma_miss,
-        signal_rule=args.signal_rule
+        signal_rule=args.signal_rule,
+        event_data=val_event_data
     )
 
     artifacts.save_threshold_sweep(sweep_df)
@@ -590,7 +645,8 @@ def run_train(args, artifacts: RunArtifacts):
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set")
-    val_metrics = evaluate_long(val_predictions, best_threshold, signal_rule=args.signal_rule)
+    val_metrics = evaluate_long(val_predictions, best_threshold, signal_rule=args.signal_rule,
+                                event_data=val_event_data)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} hitM1={val_metrics['event_level']['hitM1_rate']:.3f} late={val_metrics['event_level']['late_rate']:.3f}")
@@ -603,8 +659,11 @@ def run_train(args, artifacts: RunArtifacts):
     )
     artifacts.save_predictions(test_predictions, 'test')
 
+    test_event_data = _prepare_event_data(test_predictions)
+
     log("INFO", "TRAIN", "evaluating on test set")
-    test_metrics = evaluate_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
+    test_metrics = evaluate_long(test_predictions, best_threshold, signal_rule=args.signal_rule,
+                                 event_data=test_event_data)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f}")
@@ -649,6 +708,7 @@ def run_tune(args, artifacts: RunArtifacts):
         embargo_bars=args.embargo_bars,
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
+        thread_count=args.thread_count,
         seed=args.seed
     )
 
@@ -671,6 +731,7 @@ def run_tune(args, artifacts: RunArtifacts):
             tune_result['best_params'],
             train_end,
             iterations=args.iterations,
+            thread_count=args.thread_count,
             seed=args.seed
         )
 
@@ -713,7 +774,10 @@ def run_tune(args, artifacts: RunArtifacts):
             )
             artifacts.save_predictions(test_predictions, 'test')
 
-            test_metrics = evaluate_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
+            test_event_data = _prepare_event_data(test_predictions)
+
+            test_metrics = evaluate_long(test_predictions, best_threshold, signal_rule=args.signal_rule,
+                                         event_data=test_event_data)
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
                 f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f}")
@@ -747,7 +811,7 @@ def main():
 
     parser.add_argument("--train-end", type=str, default=None)
     parser.add_argument("--val-end", type=str, default=None)
-    parser.add_argument("--embargo-bars", type=int, default=0)
+    parser.add_argument("--embargo-bars", type=int, default=80)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--iterations", type=int, default=1000)

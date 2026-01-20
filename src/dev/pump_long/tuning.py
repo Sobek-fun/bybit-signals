@@ -136,6 +136,7 @@ def train_fold(
         params: dict,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
+        thread_count: int = -1,
         seed: int = 42
 ) -> tuple:
     train_df = features_df[features_df['split'] == 'train']
@@ -159,6 +160,7 @@ def train_fold(
         l2_leaf_reg=params['l2_leaf_reg'],
         min_data_in_leaf=params['min_data_in_leaf'],
         early_stopping_rounds=early_stopping_rounds,
+        thread_count=thread_count,
         random_seed=seed,
         verbose=0,
         eval_metric='Logloss',
@@ -227,6 +229,7 @@ def run_cv_long(
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
+        thread_count: int = -1,
         seed: int = 42
 ) -> dict:
     fold_results = []
@@ -242,6 +245,7 @@ def run_cv_long(
             params,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
+            thread_count=thread_count,
             seed=seed
         )
 
@@ -295,6 +299,7 @@ def tune_model_long(
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
+        thread_count: int = -1,
         seed: int = 42
 ) -> dict:
     start_time = time.time()
@@ -330,6 +335,7 @@ def tune_model_long(
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
+            thread_count=thread_count,
             seed=seed
         )
 
@@ -367,6 +373,7 @@ def train_final_model_long(
         params: dict,
         train_end: datetime,
         iterations: int = 1000,
+        thread_count: int = -1,
         seed: int = 42
 ) -> CatBoostClassifier:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
@@ -387,6 +394,7 @@ def train_final_model_long(
         learning_rate=params['learning_rate'],
         l2_leaf_reg=params['l2_leaf_reg'],
         min_data_in_leaf=params['min_data_in_leaf'],
+        thread_count=thread_count,
         random_seed=seed,
         verbose=100,
         eval_metric='Logloss',
