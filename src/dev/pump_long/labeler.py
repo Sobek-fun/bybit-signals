@@ -44,8 +44,8 @@ class PumpStartLabelerLookahead:
         n = len(df)
         labels = np.full(n, None, dtype=object)
         runup_values = np.full(n, np.nan, dtype=float)
-        start_times = np.full(n, pd.NaT, dtype='datetime64[ns]')
-        peak_times = np.full(n, pd.NaT, dtype='datetime64[ns]')
+        start_times = np.full(n, np.datetime64('NaT'), dtype='datetime64[ns]')
+        peak_times = np.full(n, np.datetime64('NaT'), dtype='datetime64[ns]')
 
         bucket_start = pd.to_datetime(df.index, errors='coerce')
 
