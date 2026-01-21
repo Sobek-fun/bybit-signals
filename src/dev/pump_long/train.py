@@ -350,7 +350,7 @@ def add_background_negatives(
         while generated < num_per_symbol and attempts < max_attempts:
             attempts += 1
 
-            random_offset = rng.integers(0, int(time_range))
+            random_offset = int(rng.integers(0, int(time_range)))
             candidate_time = min_time + timedelta(minutes=random_offset * 15)
 
             is_far = True
