@@ -29,6 +29,35 @@ def parse_pos_offsets(offsets_str: str) -> list:
     return [int(x.strip()) for x in offsets_str.split(',')]
 
 
+def prune_feature_columns(feature_columns: list) -> list:
+    prune_prefixes = [
+        'liq_sweep_flag_lag_',
+        'liq_sweep_overshoot_lag_',
+        'liq_reject_strength_lag_',
+    ]
+
+    prune_names = {
+        'touched_pdh', 'touched_pwh',
+        'sweep_pdh', 'sweep_pwh', 'sweep_eqh',
+        'overshoot_pdh', 'overshoot_pwh', 'overshoot_eqh',
+        'liq_level_type_pwh',
+        'vol_spike_cond', 'vol_spike_recent',
+        'rsi_hot', 'mfi_hot', 'osc_hot_recent', 'osc_extreme', 'macd_pos_recent',
+        'pump_ctx', 'strong_cond', 'pump_score',
+        'predump_mask', 'predump_peak',
+    }
+
+    pruned = []
+    for col in feature_columns:
+        if col in prune_names:
+            continue
+        if any(col.startswith(prefix) for prefix in prune_prefixes):
+            continue
+        pruned.append(col)
+
+    return pruned
+
+
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
     required_cols = {'event_id', 'offset', 'y'}
     missing_cols = required_cols - set(features_df.columns)
@@ -216,6 +245,12 @@ def run_train_only(args, artifacts: RunArtifacts):
     feature_columns = get_feature_columns(features_df)
     log("INFO", "TRAIN", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
 
+    if args.prune_features:
+        original_count = len(feature_columns)
+        feature_columns = prune_feature_columns(feature_columns)
+        log("INFO", "TRAIN",
+            f"pruned features: {original_count} -> {len(feature_columns)} (removed {original_count - len(feature_columns)})")
+
     if args.split_strategy == "time":
         train_end = parse_date_exclusive(args.train_end)
         val_end = parse_date_exclusive(args.val_end)
@@ -330,6 +365,12 @@ def run_tune(args, artifacts: RunArtifacts):
 
     feature_columns = get_feature_columns(features_df)
     log("INFO", "TUNE", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
+
+    if args.prune_features:
+        original_count = len(feature_columns)
+        feature_columns = prune_feature_columns(feature_columns)
+        log("INFO", "TUNE",
+            f"pruned features: {original_count} -> {len(feature_columns)} (removed {original_count - len(feature_columns)})")
 
     train_end = parse_date_exclusive(args.train_end) if args.train_end else None
     val_end = parse_date_exclusive(args.val_end) if args.val_end else None
@@ -572,6 +613,8 @@ def main():
     parser.add_argument("--time-budget-min", type=int, default=60)
     parser.add_argument("--fold-months", type=int, default=1)
     parser.add_argument("--min-train-months", type=int, default=3)
+
+    parser.add_argument("--prune-features", action="store_true", default=False)
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
