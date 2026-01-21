@@ -8,7 +8,8 @@ from src.dev.pump_long.threshold import _prepare_event_data
 def compute_event_level_metrics_long(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'first_cross',
+        signal_rule: str = 'cross_up',
+        hysteresis_delta: float = 0.05,
         event_data: dict = None
 ) -> dict:
     if event_data is None:
@@ -22,12 +23,78 @@ def compute_event_level_metrics_long(
     offsets = []
 
     for event_id, data in event_data.items():
-        mask = data['p_long'] >= threshold
-        if not mask.any():
-            miss += 1
-            continue
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
+        offsets_arr = data['offsets']
+        p_long = data['p_long']
+
+        if signal_rule == 'first_cross':
+            mask = p_long >= threshold
+            if not mask.any():
+                miss += 1
+                continue
+            first_idx = np.argmax(mask)
+            offset = offsets_arr[first_idx]
+
+        elif signal_rule == 'cross_up':
+            triggered = False
+            for i in range(1, len(offsets_arr)):
+                if p_long[i - 1] < threshold and p_long[i] >= threshold:
+                    offset = offsets_arr[i]
+                    triggered = True
+                    break
+            if not triggered:
+                if p_long[0] >= threshold:
+                    offset = offsets_arr[0]
+                else:
+                    miss += 1
+                    continue
+
+        elif signal_rule == 'hysteresis':
+            armed = False
+            triggered = False
+            arm_threshold = threshold - hysteresis_delta
+
+            for i in range(len(offsets_arr)):
+                if not armed:
+                    if p_long[i] < arm_threshold:
+                        armed = True
+                else:
+                    if p_long[i] >= threshold:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+
+            if not triggered:
+                miss += 1
+                continue
+
+        elif signal_rule == 'pending_turn_up':
+            triggered = False
+            pending_count = 0
+            min_pending = 2
+            up_delta = 0.01
+
+            for i in range(len(offsets_arr)):
+                if p_long[i] >= threshold:
+                    pending_count += 1
+                    if pending_count >= min_pending and i >= min_pending:
+                        if p_long[i] - p_long[i - min_pending] >= up_delta:
+                            offset = offsets_arr[i]
+                            triggered = True
+                            break
+                else:
+                    pending_count = 0
+
+            if not triggered:
+                miss += 1
+                continue
+
+        else:
+            mask = p_long >= threshold
+            if not mask.any():
+                miss += 1
+                continue
+            first_idx = np.argmax(mask)
+            offset = offsets_arr[first_idx]
 
         offsets.append(offset)
 
@@ -91,10 +158,12 @@ def compute_point_level_metrics_long(
 def evaluate_long(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'first_cross',
+        signal_rule: str = 'cross_up',
+        hysteresis_delta: float = 0.05,
         event_data: dict = None
 ) -> dict:
-    event_metrics = compute_event_level_metrics_long(predictions_df, threshold, signal_rule, event_data)
+    event_metrics = compute_event_level_metrics_long(predictions_df, threshold, signal_rule, hysteresis_delta,
+                                                     event_data)
     point_metrics = compute_point_level_metrics_long(predictions_df, threshold)
 
     return {
@@ -106,7 +175,8 @@ def evaluate_long(
 def extract_signals_long(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'first_cross'
+        signal_rule: str = 'cross_up',
+        hysteresis_delta: float = 0.05
 ) -> pd.DataFrame:
     event_data = _prepare_event_data(predictions_df)
 
@@ -119,11 +189,73 @@ def extract_signals_long(
     signals = []
 
     for event_id, data in event_data.items():
-        mask = data['p_long'] >= threshold
-        if not mask.any():
-            continue
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
+        offsets_arr = data['offsets']
+        p_long = data['p_long']
+
+        if signal_rule == 'first_cross':
+            mask = p_long >= threshold
+            if not mask.any():
+                continue
+            first_idx = np.argmax(mask)
+            offset = offsets_arr[first_idx]
+
+        elif signal_rule == 'cross_up':
+            triggered = False
+            for i in range(1, len(offsets_arr)):
+                if p_long[i - 1] < threshold and p_long[i] >= threshold:
+                    offset = offsets_arr[i]
+                    triggered = True
+                    break
+            if not triggered:
+                if p_long[0] >= threshold:
+                    offset = offsets_arr[0]
+                else:
+                    continue
+
+        elif signal_rule == 'hysteresis':
+            armed = False
+            triggered = False
+            arm_threshold = threshold - hysteresis_delta
+
+            for i in range(len(offsets_arr)):
+                if not armed:
+                    if p_long[i] < arm_threshold:
+                        armed = True
+                else:
+                    if p_long[i] >= threshold:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+
+            if not triggered:
+                continue
+
+        elif signal_rule == 'pending_turn_up':
+            triggered = False
+            pending_count = 0
+            min_pending = 2
+            up_delta = 0.01
+
+            for i in range(len(offsets_arr)):
+                if p_long[i] >= threshold:
+                    pending_count += 1
+                    if pending_count >= min_pending and i >= min_pending:
+                        if p_long[i] - p_long[i - min_pending] >= up_delta:
+                            offset = offsets_arr[i]
+                            triggered = True
+                            break
+                else:
+                    pending_count = 0
+
+            if not triggered:
+                continue
+
+        else:
+            mask = p_long >= threshold
+            if not mask.any():
+                continue
+            first_idx = np.argmax(mask)
+            offset = offsets_arr[first_idx]
 
         signals.append({
             'symbol': symbol_map[event_id],
