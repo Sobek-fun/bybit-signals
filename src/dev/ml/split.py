@@ -71,7 +71,7 @@ def apply_embargo(
     val_embargo_end = val_end + embargo_delta
 
     in_train_embargo = (event_times['open_time'] >= train_embargo_start) & (
-                event_times['open_time'] < train_embargo_end)
+            event_times['open_time'] < train_embargo_end)
     in_val_embargo = (event_times['open_time'] >= val_embargo_start) & (event_times['open_time'] < val_embargo_end)
 
     events_to_remove = event_times[in_train_embargo | in_val_embargo]['event_id']
@@ -89,19 +89,24 @@ def clip_points_to_split_bounds(
 ) -> pd.DataFrame:
     points_df = points_df.copy()
 
-    train_mask = points_df['split'] == 'train'
-    points_df = points_df[~(train_mask & (points_df['open_time'] >= train_end))]
+    split_col = points_df['split'].values
+    open_time_col = points_df['open_time'].values
 
-    val_mask = points_df['split'] == 'val'
-    points_df = points_df[~(val_mask & (points_df['open_time'] < train_end))]
-    points_df = points_df[~(val_mask & (points_df['open_time'] >= val_end))]
+    keep_mask = np.ones(len(points_df), dtype=bool)
 
-    test_mask = points_df['split'] == 'test'
-    points_df = points_df[~(test_mask & (points_df['open_time'] < val_end))]
+    train_mask = split_col == 'train'
+    keep_mask &= ~(train_mask & (open_time_col >= train_end))
+
+    val_mask = split_col == 'val'
+    keep_mask &= ~(val_mask & (open_time_col < train_end))
+    keep_mask &= ~(val_mask & (open_time_col >= val_end))
+
+    test_mask = split_col == 'test'
+    keep_mask &= ~(test_mask & (open_time_col < val_end))
     if test_end:
-        points_df = points_df[~(test_mask & (points_df['open_time'] >= test_end))]
+        keep_mask &= ~(test_mask & (open_time_col >= test_end))
 
-    return points_df.reset_index(drop=True)
+    return points_df[keep_mask].reset_index(drop=True)
 
 
 def get_split_info(points_df: pd.DataFrame) -> dict:
