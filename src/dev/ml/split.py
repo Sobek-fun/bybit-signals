@@ -89,20 +89,20 @@ def clip_points_to_split_bounds(
 ) -> pd.DataFrame:
     points_df = points_df.copy()
 
-    split_col = points_df['split'].values
-    open_time_col = points_df['open_time'].values
-
-    keep_mask = np.ones(len(points_df), dtype=bool)
+    split_col = points_df['split']
+    open_time_col = points_df['open_time']
 
     train_mask = split_col == 'train'
-    keep_mask &= ~(train_mask & (open_time_col >= train_end))
-
     val_mask = split_col == 'val'
+    test_mask = split_col == 'test'
+
+    keep_mask = pd.Series(True, index=points_df.index)
+
+    keep_mask &= ~(train_mask & (open_time_col >= train_end))
     keep_mask &= ~(val_mask & (open_time_col < train_end))
     keep_mask &= ~(val_mask & (open_time_col >= val_end))
-
-    test_mask = split_col == 'test'
     keep_mask &= ~(test_mask & (open_time_col < val_end))
+
     if test_end:
         keep_mask &= ~(test_mask & (open_time_col >= test_end))
 
