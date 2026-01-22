@@ -303,7 +303,7 @@ def select_strategy_from_result(
 ) -> dict:
     from src.dev.backtest.client import download_artifact, select_best_strategy_winrate_first
 
-    if artifact_policy == 'all':
+    if artifact_policy == 'full':
         experiments_csv_path = opt_result['result']['artifacts'].get('experiments_csv')
         if experiments_csv_path:
             csv_content = download_artifact(experiments_csv_path, base_url, api_key)
@@ -869,7 +869,7 @@ def main():
     parser.add_argument("--backtest-jobs", type=int, default=8)
     parser.add_argument("--backtest-timeout-sec", type=int, default=120)
     parser.add_argument("--backtest-poll-interval-sec", type=int, default=1)
-    parser.add_argument("--backtest-artifact-policy", type=str, choices=["best_only", "all"], default="all")
+    parser.add_argument("--backtest-artifact-policy", type=str, choices=["best_only", "full"], default="full")
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
