@@ -22,9 +22,10 @@ def submit_experiment(
         "meta": meta
     }
     response = requests.post(url, json=payload, headers=headers)
+    if response.status_code >= 400:
+        print(f"[ERROR] Backtest API error: {response.status_code} {response.text}")
     response.raise_for_status()
     return response.json()
-
 
 def poll_job(
         job_id: str,
