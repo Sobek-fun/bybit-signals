@@ -1,6 +1,9 @@
+import json
 import time
+from io import BytesIO
 from typing import Optional
 
+import pandas as pd
 import requests
 
 
@@ -26,6 +29,7 @@ def submit_experiment(
         print(f"[ERROR] Backtest API error: {response.status_code} {response.text}")
     response.raise_for_status()
     return response.json()
+
 
 def poll_job(
         job_id: str,
@@ -74,10 +78,10 @@ def select_best_strategy_winrate_first(
         min_trades: int = 200,
         winrate_eps: float = 1.0
 ) -> Optional[dict]:
-    import pandas as pd
-    from io import BytesIO
-
     df = pd.read_csv(BytesIO(experiments_csv_content))
+
+    strategy_data = df['strategy_params'].apply(json.loads).apply(pd.Series)
+    df = pd.concat([df, strategy_data], axis=1)
 
     df = df[df['total_trades'] >= min_trades]
     if df.empty:
