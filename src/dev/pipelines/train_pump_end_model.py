@@ -120,7 +120,9 @@ def calibrate_threshold_on_val(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float
+        gamma_miss: float,
+        beta_very_early: float = 1.5,
+        very_early_threshold: int = -6
 ) -> dict:
     if signal_rule == 'argmax_per_event':
         raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
@@ -146,7 +148,6 @@ def calibrate_threshold_on_val(
     event_data = _prepare_event_data(predictions)
     rule_combinations = get_rule_parameter_grid()
 
-    top_k = 5
     best_score = -float('inf')
     best_threshold = 0.1
     best_min_pending_bars = 1
@@ -156,31 +157,25 @@ def calibrate_threshold_on_val(
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
 
-        _, sweep_df = threshold_sweep(
+        threshold, sweep_df = threshold_sweep(
             predictions,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            beta_very_early=beta_very_early,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            event_data=event_data,
+            very_early_threshold=very_early_threshold
         )
 
-        top_k_df = sweep_df.nlargest(top_k, 'score')
-
-        if 'p25_offset' in top_k_df.columns and top_k_df['p25_offset'].notna().any():
-            valid_p25 = top_k_df[top_k_df['p25_offset'].notna()]
-            selected_idx = valid_p25['p25_offset'].idxmax()
-            selected_row = sweep_df.loc[selected_idx]
-        else:
-            selected_row = top_k_df.iloc[0]
-
-        score = selected_row['score']
+        best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
+        score = best_row['score']
 
         if score > best_score:
             best_score = score
-            best_threshold = selected_row['threshold']
+            best_threshold = threshold
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
 
@@ -219,8 +214,8 @@ def run_backtest_optimize(
     from src.dev.backtest.client import submit_experiment, poll_job, get_result
 
     strategy_grid = {
-        "tp_pct": [0.04, 0.05, 0.06, 0.07],
-        "sl_pct": [0.05, 0.1, 0.15, 0.2],
+        "tp_pct": [0.03, 0.04, 0.05, 0.06, 0.07],
+        "sl_pct": [0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2],
         "max_holding_hours": [48, 72],
         "notional_usdt": 1000,
         "fee_pct_per_side": 0.0
@@ -307,18 +302,34 @@ def select_strategy_from_result(
         base_url: str,
         api_key: str,
         artifact_policy: str,
-        min_trades: int = 200
+        min_trades: int = 300,
+        max_sl_pct: float = 0.2,
+        min_tp_pct: float = 0.04
 ) -> dict:
-    from src.dev.backtest.client import download_artifact, select_best_strategy_winrate_first
+    from src.dev.backtest.client import download_artifact, select_best_strategy_constrained
 
     if artifact_policy == 'full':
         experiments_csv_path = opt_result['result']['artifacts'].get('experiments_csv')
         if experiments_csv_path:
             csv_content = download_artifact(experiments_csv_path, base_url, api_key)
-            selected = select_best_strategy_winrate_first(csv_content, min_trades=min_trades)
-            return selected
+            selected = select_best_strategy_constrained(csv_content, min_trades=min_trades, max_sl_pct=max_sl_pct,
+                                                        min_tp_pct=min_tp_pct)
+            if selected:
+                return selected
 
-    return None
+    best = opt_result['result']['best_strategy']['best']
+    import json
+    strategy_params = json.loads(best['strategy_params'])
+    return {
+        'tp_pct': strategy_params['tp_pct'],
+        'sl_pct': strategy_params['sl_pct'],
+        'max_holding_hours': int(strategy_params['max_holding_hours']),
+        'winrate_all_pct': best['winrate_all_pct'],
+        'total_trades': best['total_trades'],
+        'total_pnl_usdt': best['total_pnl_usdt'],
+        'profit_factor': best['profit_factor'],
+        'timeout_pct': best['timeout_pct']
+    }
 
 
 def run_build_dataset(args, artifacts: RunArtifacts):
@@ -456,9 +467,11 @@ def run_train_only(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        beta_very_early=args.beta_very_early,
         signal_rule=args.signal_rule,
         min_pending_bars=args.min_pending_bars,
-        drop_delta=args.drop_delta
+        drop_delta=args.drop_delta,
+        very_early_threshold=args.very_early_threshold
     )
 
     artifacts.save_threshold_sweep(sweep_df)
@@ -536,10 +549,12 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
+            beta_very_early=args.beta_very_early,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
-            seed=args.seed
+            seed=args.seed,
+            very_early_threshold=args.very_early_threshold
         )
 
         log("INFO", "TUNE", f"winner strategy: {tune_result['winner']}")
@@ -571,11 +586,13 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
+            beta_very_early=args.beta_very_early,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
             seed=args.seed,
-            tune_strategy=args.tune_strategy
+            tune_strategy=args.tune_strategy,
+            very_early_threshold=args.very_early_threshold
         )
 
         best_result = tune_result
@@ -627,7 +644,9 @@ def run_tune(args, artifacts: RunArtifacts):
                 actual_signal_rule,
                 args.alpha_hit1,
                 args.beta_early,
-                args.gamma_miss
+                args.gamma_miss,
+                args.beta_very_early,
+                args.very_early_threshold
             )
 
             best_threshold = calibration_result['threshold']
@@ -744,73 +763,58 @@ def run_tune(args, artifacts: RunArtifacts):
                     backtest_url,
                     backtest_api_key,
                     args.backtest_artifact_policy,
-                    min_trades=200
+                    min_trades=args.backtest_min_trades,
+                    max_sl_pct=args.backtest_max_sl_pct,
+                    min_tp_pct=args.backtest_min_tp_pct
                 )
 
-                if selected_strategy is None:
-                    log("WARN", "BACKTEST", "no strategy satisfies constraints, skipping test evaluation")
+                log("INFO", "BACKTEST",
+                    f"selected strategy: tp={selected_strategy['tp_pct']} sl={selected_strategy['sl_pct']} "
+                    f"holding={selected_strategy['max_holding_hours']}h winrate={selected_strategy['winrate_all_pct']:.2f}%")
 
-                    backtest_summary = {
-                        'val_optimization': {
-                            'job_id': opt_result['job_id'],
-                            'run_id': opt_result['run_id'],
-                            'signals_count': len(val_signals),
-                            'selected_strategy': None,
-                            'no_strategy_satisfies_constraints': True
-                        },
-                        'test_evaluation': None
+                eval_result = run_backtest_evaluate(
+                    signals=test_signals,
+                    run_name=run_name,
+                    tp_pct=selected_strategy['tp_pct'],
+                    sl_pct=selected_strategy['sl_pct'],
+                    max_holding_hours=selected_strategy['max_holding_hours'],
+                    base_url=backtest_url,
+                    api_key=backtest_api_key,
+                    jobs=args.backtest_jobs,
+                    timeout_sec=args.backtest_timeout_sec,
+                    poll_interval_sec=args.backtest_poll_interval_sec
+                )
+
+                artifacts.save_backtest_eval_test(eval_result)
+
+                eval_best = eval_result['result']['best_strategy']['best']
+
+                backtest_summary = {
+                    'val_optimization': {
+                        'job_id': opt_result['job_id'],
+                        'run_id': opt_result['run_id'],
+                        'signals_count': len(val_signals),
+                        'selected_strategy': selected_strategy
+                    },
+                    'test_evaluation': {
+                        'job_id': eval_result['job_id'],
+                        'run_id': eval_result['run_id'],
+                        'signals_count': len(test_signals),
+                        'total_trades': eval_best['total_trades'],
+                        'winrate_all_pct': eval_best['winrate_all_pct'],
+                        'total_pnl_usdt': eval_best['total_pnl_usdt'],
+                        'profit_factor': eval_best['profit_factor'],
+                        'max_dd_pct': eval_best['max_dd_pct'],
+                        'worst_trade_usdt': eval_best['worst_trade_usdt'],
+                        'timeout_pct': eval_best['timeout_pct']
                     }
+                }
 
-                    artifacts.save_backtest_summary(backtest_summary)
+                artifacts.save_backtest_summary(backtest_summary)
 
-                else:
-                    log("INFO", "BACKTEST",
-                        f"selected strategy: tp={selected_strategy['tp_pct']} sl={selected_strategy['sl_pct']} "
-                        f"holding={selected_strategy['max_holding_hours']}h winrate={selected_strategy['winrate_all_pct']:.2f}%")
-
-                    eval_result = run_backtest_evaluate(
-                        signals=test_signals,
-                        run_name=run_name,
-                        tp_pct=selected_strategy['tp_pct'],
-                        sl_pct=selected_strategy['sl_pct'],
-                        max_holding_hours=selected_strategy['max_holding_hours'],
-                        base_url=backtest_url,
-                        api_key=backtest_api_key,
-                        jobs=args.backtest_jobs,
-                        timeout_sec=args.backtest_timeout_sec,
-                        poll_interval_sec=args.backtest_poll_interval_sec
-                    )
-
-                    artifacts.save_backtest_eval_test(eval_result)
-
-                    eval_best = eval_result['result']['best_strategy']['best']
-
-                    backtest_summary = {
-                        'val_optimization': {
-                            'job_id': opt_result['job_id'],
-                            'run_id': opt_result['run_id'],
-                            'signals_count': len(val_signals),
-                            'selected_strategy': selected_strategy
-                        },
-                        'test_evaluation': {
-                            'job_id': eval_result['job_id'],
-                            'run_id': eval_result['run_id'],
-                            'signals_count': len(test_signals),
-                            'total_trades': eval_best['total_trades'],
-                            'winrate_all_pct': eval_best['winrate_all_pct'],
-                            'total_pnl_usdt': eval_best['total_pnl_usdt'],
-                            'profit_factor': eval_best['profit_factor'],
-                            'max_dd_pct': eval_best['max_dd_pct'],
-                            'worst_trade_usdt': eval_best['worst_trade_usdt'],
-                            'timeout_pct': eval_best['timeout_pct']
-                        }
-                    }
-
-                    artifacts.save_backtest_summary(backtest_summary)
-
-                    log("INFO", "BACKTEST",
-                        f"test results: trades={eval_best['total_trades']} winrate={eval_best['winrate_all_pct']:.2f}% "
-                        f"pnl={eval_best['total_pnl_usdt']:.2f} pf={eval_best['profit_factor']:.2f}")
+                log("INFO", "BACKTEST",
+                    f"test results: trades={eval_best['total_trades']} winrate={eval_best['winrate_all_pct']:.2f}% "
+                    f"pnl={eval_best['total_pnl_usdt']:.2f} pf={eval_best['profit_factor']:.2f}")
 
             elif backtest_url and backtest_api_key:
                 log("WARN", "BACKTEST", "skipping backtest: not enough signals")
@@ -862,6 +866,8 @@ def main():
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
+    parser.add_argument("--beta-very-early", type=float, default=1.5)
+    parser.add_argument("--very-early-threshold", type=int, default=-6)
 
     parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
@@ -879,9 +885,12 @@ def main():
     parser.add_argument("--backtest-url", type=str, default=None)
     parser.add_argument("--backtest-api-key", type=str, default=None)
     parser.add_argument("--backtest-jobs", type=int, default=8)
-    parser.add_argument("--backtest-timeout-sec", type=int, default=120)
+    parser.add_argument("--backtest-timeout-sec", type=int, default=600)
     parser.add_argument("--backtest-poll-interval-sec", type=int, default=1)
     parser.add_argument("--backtest-artifact-policy", type=str, choices=["best_only", "full"], default="full")
+    parser.add_argument("--backtest-min-trades", type=int, default=300)
+    parser.add_argument("--backtest-max-sl-pct", type=float, default=0.2)
+    parser.add_argument("--backtest-min-tp-pct", type=float, default=0.04)
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
