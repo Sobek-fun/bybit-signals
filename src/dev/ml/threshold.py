@@ -28,15 +28,13 @@ def _compute_event_metrics_from_data(
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0,
-        very_early_threshold: int = -6
+        drop_delta: float = 0.0
 ) -> dict:
     hit0 = 0
     hit1 = 0
     early = 0
     late = 0
     miss = 0
-    very_early = 0
     offsets = []
 
     for event_id, data in event_data.items():
@@ -56,25 +54,18 @@ def _compute_event_metrics_from_data(
 
             triggered = False
             pending_count = 0
-            max_p_end_pending = 0.0
 
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
-                    if pending_count == 0:
-                        max_p_end_pending = p_end[i]
-                    else:
-                        max_p_end_pending = max(max_p_end_pending, p_end[i])
                     pending_count += 1
-
                     if pending_count >= min_pending_bars and i > 0:
-                        drop_from_max = max_p_end_pending - p_end[i]
-                        if drop_from_max >= drop_delta and p_end[i] < p_end[i - 1]:
+                        drop = p_end[i - 1] - p_end[i]
+                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
                             offset = offsets_arr[i]
                             triggered = True
                             break
                 else:
                     pending_count = 0
-                    max_p_end_pending = 0.0
 
             if not triggered:
                 miss += 1
@@ -88,8 +79,6 @@ def _compute_event_metrics_from_data(
             hit1 += 1
         elif offset < 0:
             early += 1
-            if offset < very_early_threshold:
-                very_early += 1
         else:
             late += 1
 
@@ -103,13 +92,11 @@ def _compute_event_metrics_from_data(
         'early': early,
         'late': late,
         'miss': miss,
-        'very_early': very_early,
         'hit0_rate': hit0 / n_events if n_events > 0 else 0,
         'hit1_rate': hit1 / n_events if n_events > 0 else 0,
         'early_rate': early / n_events if n_events > 0 else 0,
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss_rate': miss / n_events if n_events > 0 else 0,
-        'very_early_rate': very_early / n_events if n_events > 0 else 0,
         'avg_offset': np.mean(offsets) if offsets else None,
         'median_offset': np.median(offsets) if offsets else None,
         'p25_offset': np.percentile(offsets, 25) if offsets else None
@@ -122,13 +109,11 @@ def compute_event_metrics_for_threshold(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None,
-        very_early_threshold: int = -6
+        event_data: dict = None
 ) -> dict:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
-    return _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta,
-                                            very_early_threshold)
+    return _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta)
 
 
 def threshold_sweep(
@@ -139,12 +124,10 @@ def threshold_sweep(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
-        beta_very_early: float = 1.5,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None,
-        very_early_threshold: int = -6
+        event_data: dict = None
 ) -> tuple:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
@@ -153,15 +136,13 @@ def threshold_sweep(
     results = []
 
     for threshold in thresholds:
-        metrics = _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                   very_early_threshold)
+        metrics = _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta)
 
         score = (
                 metrics['hit0_rate'] +
                 alpha_hit1 * metrics['hit1_rate'] -
                 beta_early * metrics['early_rate'] -
-                gamma_miss * metrics['miss_rate'] -
-                beta_very_early * metrics['very_early_rate']
+                gamma_miss * metrics['miss_rate']
         )
         metrics['score'] = score
 
