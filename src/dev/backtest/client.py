@@ -106,3 +106,41 @@ def select_best_strategy_winrate_first(
         'profit_factor': best_row['profit_factor'],
         'timeout_pct': best_row['timeout_pct']
     }
+
+
+def select_best_strategy_constrained(
+        experiments_csv_content: bytes,
+        min_trades: int = 300,
+        max_sl_pct: float = 0.2,
+        min_tp_pct: float = 0.04
+) -> Optional[dict]:
+    df = pd.read_csv(BytesIO(experiments_csv_content))
+
+    strategy_data = df['strategy_params'].apply(json.loads).apply(pd.Series)
+    df = pd.concat([df, strategy_data], axis=1)
+
+    df = df[
+        (df['total_trades'] >= min_trades) &
+        (df['sl_pct'] <= max_sl_pct) &
+        (df['tp_pct'] >= min_tp_pct)
+        ]
+
+    if df.empty:
+        return None
+
+    df = df.sort_values(
+        by=['total_pnl_usdt', 'profit_factor', 'winrate_all_pct', 'timeout_pct'],
+        ascending=[False, False, False, True]
+    )
+
+    best_row = df.iloc[0]
+    return {
+        'tp_pct': best_row['tp_pct'],
+        'sl_pct': best_row['sl_pct'],
+        'max_holding_hours': int(best_row['max_holding_hours']),
+        'winrate_all_pct': best_row['winrate_all_pct'],
+        'total_trades': int(best_row['total_trades']),
+        'total_pnl_usdt': best_row['total_pnl_usdt'],
+        'profit_factor': best_row['profit_factor'],
+        'timeout_pct': best_row['timeout_pct']
+    }
