@@ -120,7 +120,9 @@ def calibrate_threshold_on_val(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float
+        gamma_miss: float,
+        beta_very_early: float = 1.5,
+        very_early_threshold: int = -6
 ) -> dict:
     if signal_rule == 'argmax_per_event':
         raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
@@ -160,10 +162,12 @@ def calibrate_threshold_on_val(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            beta_very_early=beta_very_early,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            event_data=event_data,
+            very_early_threshold=very_early_threshold
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -210,9 +214,8 @@ def run_backtest_optimize(
     from src.dev.backtest.client import submit_experiment, poll_job, get_result
 
     strategy_grid = {
-        "tp_pct": [0.02, 0.03, 0.04, 0.05, 0.06, 0.07],
-        "sl_pct": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9,
-                   0.95, 1.0],
+        "tp_pct": [0.03, 0.04, 0.05, 0.06, 0.07],
+        "sl_pct": [0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2],
         "max_holding_hours": [48, 72],
         "notional_usdt": 1000,
         "fee_pct_per_side": 0.0
@@ -299,15 +302,18 @@ def select_strategy_from_result(
         base_url: str,
         api_key: str,
         artifact_policy: str,
-        min_trades: int = 200
+        min_trades: int = 300,
+        max_sl_pct: float = 0.2,
+        min_tp_pct: float = 0.04
 ) -> dict:
-    from src.dev.backtest.client import download_artifact, select_best_strategy_winrate_first
+    from src.dev.backtest.client import download_artifact, select_best_strategy_constrained
 
     if artifact_policy == 'full':
         experiments_csv_path = opt_result['result']['artifacts'].get('experiments_csv')
         if experiments_csv_path:
             csv_content = download_artifact(experiments_csv_path, base_url, api_key)
-            selected = select_best_strategy_winrate_first(csv_content, min_trades=min_trades)
+            selected = select_best_strategy_constrained(csv_content, min_trades=min_trades, max_sl_pct=max_sl_pct,
+                                                        min_tp_pct=min_tp_pct)
             if selected:
                 return selected
 
@@ -461,9 +467,11 @@ def run_train_only(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        beta_very_early=args.beta_very_early,
         signal_rule=args.signal_rule,
         min_pending_bars=args.min_pending_bars,
-        drop_delta=args.drop_delta
+        drop_delta=args.drop_delta,
+        very_early_threshold=args.very_early_threshold
     )
 
     artifacts.save_threshold_sweep(sweep_df)
@@ -541,10 +549,12 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
+            beta_very_early=args.beta_very_early,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
-            seed=args.seed
+            seed=args.seed,
+            very_early_threshold=args.very_early_threshold
         )
 
         log("INFO", "TUNE", f"winner strategy: {tune_result['winner']}")
@@ -576,11 +586,13 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
+            beta_very_early=args.beta_very_early,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
             seed=args.seed,
-            tune_strategy=args.tune_strategy
+            tune_strategy=args.tune_strategy,
+            very_early_threshold=args.very_early_threshold
         )
 
         best_result = tune_result
@@ -632,7 +644,9 @@ def run_tune(args, artifacts: RunArtifacts):
                 actual_signal_rule,
                 args.alpha_hit1,
                 args.beta_early,
-                args.gamma_miss
+                args.gamma_miss,
+                args.beta_very_early,
+                args.very_early_threshold
             )
 
             best_threshold = calibration_result['threshold']
@@ -749,7 +763,9 @@ def run_tune(args, artifacts: RunArtifacts):
                     backtest_url,
                     backtest_api_key,
                     args.backtest_artifact_policy,
-                    min_trades=200
+                    min_trades=args.backtest_min_trades,
+                    max_sl_pct=args.backtest_max_sl_pct,
+                    min_tp_pct=args.backtest_min_tp_pct
                 )
 
                 log("INFO", "BACKTEST",
@@ -850,6 +866,8 @@ def main():
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
+    parser.add_argument("--beta-very-early", type=float, default=1.5)
+    parser.add_argument("--very-early-threshold", type=int, default=-6)
 
     parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
@@ -867,9 +885,12 @@ def main():
     parser.add_argument("--backtest-url", type=str, default=None)
     parser.add_argument("--backtest-api-key", type=str, default=None)
     parser.add_argument("--backtest-jobs", type=int, default=8)
-    parser.add_argument("--backtest-timeout-sec", type=int, default=120)
+    parser.add_argument("--backtest-timeout-sec", type=int, default=600)
     parser.add_argument("--backtest-poll-interval-sec", type=int, default=1)
     parser.add_argument("--backtest-artifact-policy", type=str, choices=["best_only", "full"], default="full")
+    parser.add_argument("--backtest-min-trades", type=int, default=300)
+    parser.add_argument("--backtest-max-sl-pct", type=float, default=0.2)
+    parser.add_argument("--backtest-min-tp-pct", type=float, default=0.04)
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
