@@ -182,7 +182,9 @@ def evaluate_fold(
         alpha_hit1: float,
         beta_early: float,
         gamma_miss: float,
-        early_penalty_threshold: int = -5
+        beta_very_early: float = 1.5,
+        very_early_threshold: int = -6,
+        p25_penalty_threshold: int = -6
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -200,6 +202,7 @@ def evaluate_fold(
         hit1 = 0
         early = 0
         late = 0
+        very_early = 0
         offsets_list = []
 
         for event_id, data in event_data.items():
@@ -213,6 +216,8 @@ def evaluate_fold(
                 hit1 += 1
             elif offset < 0:
                 early += 1
+                if offset < very_early_threshold:
+                    very_early += 1
             else:
                 late += 1
 
@@ -221,22 +226,25 @@ def evaluate_fold(
             'hit0_rate': hit0 / n_events if n_events > 0 else 0,
             'hit1_rate': hit1 / n_events if n_events > 0 else 0,
             'early_rate': early / n_events if n_events > 0 else 0,
+            'very_early_rate': very_early / n_events if n_events > 0 else 0,
             'miss_rate': 0,
             'median_pred_offset': np.median(offsets_list) if offsets_list else None,
+            'p25_pred_offset': np.percentile(offsets_list, 25) if offsets_list else None,
             'n_events': n_events
         }
 
-        median_offset = best_metrics.get('median_pred_offset')
-        if median_offset is not None and median_offset < early_penalty_threshold:
-            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
+        p25_offset = best_metrics.get('p25_pred_offset')
+        if p25_offset is not None and p25_offset < p25_penalty_threshold:
+            p25_penalty = abs(p25_offset - p25_penalty_threshold) * 0.1
         else:
-            early_penalty = 0
+            p25_penalty = 0
 
         best_score = (
                 best_metrics['hit0_rate'] +
                 alpha_hit1 * best_metrics['hit1_rate'] -
                 beta_early * best_metrics['early_rate'] -
-                early_penalty
+                beta_very_early * best_metrics['very_early_rate'] -
+                p25_penalty
         )
 
         return {
@@ -246,8 +254,10 @@ def evaluate_fold(
             'drop_delta': 0.0,
             'hit0_rate': best_metrics['hit0_rate'],
             'early_rate': best_metrics['early_rate'],
+            'very_early_rate': best_metrics['very_early_rate'],
             'miss_rate': best_metrics['miss_rate'],
             'median_pred_offset': best_metrics.get('median_pred_offset'),
+            'p25_pred_offset': best_metrics.get('p25_pred_offset'),
             'n_events': best_metrics['n_events']
         }
 
@@ -268,10 +278,12 @@ def evaluate_fold(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            beta_very_early=beta_very_early,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            event_data=event_data,
+            very_early_threshold=very_early_threshold
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -280,23 +292,26 @@ def evaluate_fold(
             'hit0_rate': best_row['hit0_rate'],
             'hit1_rate': best_row['hit1_rate'],
             'early_rate': best_row['early_rate'],
+            'very_early_rate': best_row['very_early_rate'],
             'miss_rate': best_row['miss_rate'],
             'median_pred_offset': best_row['median_offset'],
+            'p25_pred_offset': best_row['p25_offset'],
             'n_events': best_row['n_events']
         }
 
-        median_offset = metrics.get('median_pred_offset')
-        if median_offset is not None and median_offset < early_penalty_threshold:
-            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
+        p25_offset = metrics.get('p25_pred_offset')
+        if p25_offset is not None and p25_offset < p25_penalty_threshold:
+            p25_penalty = abs(p25_offset - p25_penalty_threshold) * 0.1
         else:
-            early_penalty = 0
+            p25_penalty = 0
 
         score = (
                 metrics['hit0_rate'] +
                 alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate'] + metrics['hit1_rate']) -
                 beta_early * metrics['early_rate'] -
                 gamma_miss * metrics['miss_rate'] -
-                early_penalty
+                beta_very_early * metrics['very_early_rate'] -
+                p25_penalty
         )
 
         if score > best_score:
@@ -313,8 +328,10 @@ def evaluate_fold(
         'drop_delta': best_drop_delta,
         'hit0_rate': best_metrics['hit0_rate'] if best_metrics else 0,
         'early_rate': best_metrics['early_rate'] if best_metrics else 0,
+        'very_early_rate': best_metrics['very_early_rate'] if best_metrics else 0,
         'miss_rate': best_metrics['miss_rate'] if best_metrics else 0,
         'median_pred_offset': best_metrics.get('median_pred_offset') if best_metrics else None,
+        'p25_pred_offset': best_metrics.get('p25_pred_offset') if best_metrics else None,
         'n_events': best_metrics['n_events'] if best_metrics else 0
     }
 
@@ -328,11 +345,13 @@ def run_cv(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        beta_very_early: float = 1.5,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         seed: int = 42,
-        tune_strategy: str = 'threshold'
+        tune_strategy: str = 'threshold',
+        very_early_threshold: int = -6
 ) -> dict:
     fold_results = []
 
@@ -362,7 +381,9 @@ def run_cv(
             actual_signal_rule,
             alpha_hit1,
             beta_early,
-            gamma_miss
+            gamma_miss,
+            beta_very_early,
+            very_early_threshold
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -397,11 +418,13 @@ def tune_model(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        beta_very_early: float = 1.5,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         seed: int = 42,
-        tune_strategy: str = 'threshold'
+        tune_strategy: str = 'threshold',
+        very_early_threshold: int = -6
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -432,11 +455,13 @@ def tune_model(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            beta_very_early=beta_very_early,
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
             seed=seed,
-            tune_strategy=tune_strategy
+            tune_strategy=tune_strategy,
+            very_early_threshold=very_early_threshold
         )
 
         trial_record = {
@@ -478,10 +503,12 @@ def tune_model_both_strategies(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        beta_very_early: float = 1.5,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
-        seed: int = 42
+        seed: int = 42,
+        very_early_threshold: int = -6
 ) -> dict:
     half_budget = time_budget_min // 2
 
@@ -495,11 +522,13 @@ def tune_model_both_strategies(
         alpha_hit1=alpha_hit1,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
+        beta_very_early=beta_very_early,
         embargo_bars=embargo_bars,
         iterations=iterations,
         early_stopping_rounds=early_stopping_rounds,
         seed=seed,
-        tune_strategy='threshold'
+        tune_strategy='threshold',
+        very_early_threshold=very_early_threshold
     )
 
     ranking_result = tune_model(
@@ -512,11 +541,13 @@ def tune_model_both_strategies(
         alpha_hit1=alpha_hit1,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
+        beta_very_early=beta_very_early,
         embargo_bars=embargo_bars,
         iterations=iterations,
         early_stopping_rounds=early_stopping_rounds,
         seed=seed,
-        tune_strategy='ranking'
+        tune_strategy='ranking',
+        very_early_threshold=very_early_threshold
     )
 
     if threshold_result['best_score'] >= ranking_result['best_score']:
