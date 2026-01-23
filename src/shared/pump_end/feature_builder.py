@@ -158,6 +158,47 @@ class PumpFeatureBuilder:
 
         return rows[0]
 
+    def build_many_for_inference(
+            self,
+            df_candles: pd.DataFrame,
+            symbol: str,
+            decision_open_times: list
+    ) -> list:
+        if not decision_open_times:
+            return []
+
+        df = df_candles.copy()
+
+        events_liq = pd.DataFrame([{
+            'open_time': dt - timedelta(minutes=15),
+            'pump_la_type': 'A',
+            'runup_pct': 0
+        } for dt in decision_open_times])
+
+        df = self._calculate_base_indicators(df)
+        df = self._calculate_pump_detector_features(df)
+        df = self._calculate_liquidity_features(df, events_liq)
+
+        if self.feature_set == "extended":
+            df = self._calculate_extended_indicators(df)
+
+        for dt in decision_open_times:
+            if dt not in df.index:
+                df.loc[dt] = np.nan
+
+        df = df.sort_index()
+        df = self._apply_decision_shift(df)
+
+        events_extract = pd.DataFrame([{
+            'open_time': dt,
+            'pump_la_type': 'A',
+            'runup_pct': 0
+        } for dt in decision_open_times])
+
+        rows = self._extract_features_vectorized(df, symbol, events_extract)
+
+        return rows
+
     def _process_symbol(self, symbol: str, events: pd.DataFrame) -> list:
         t_min = events['open_time'].min()
         t_max = events['open_time'].max()
