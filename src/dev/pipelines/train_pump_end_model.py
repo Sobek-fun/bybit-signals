@@ -214,7 +214,7 @@ def run_backtest_optimize(
     from src.dev.backtest.client import submit_experiment, poll_job, get_result
 
     strategy_grid = {
-        "tp_pct": [0.03, 0.04, 0.05, 0.06, 0.07],
+        "tp_pct": [0.04, 0.05, 0.06, 0.07],
         "sl_pct": [0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2],
         "max_holding_hours": [48, 72],
         "notional_usdt": 1000,
@@ -312,24 +312,10 @@ def select_strategy_from_result(
         experiments_csv_path = opt_result['result']['artifacts'].get('experiments_csv')
         if experiments_csv_path:
             csv_content = download_artifact(experiments_csv_path, base_url, api_key)
-            selected = select_best_strategy_constrained(csv_content, min_trades=min_trades, max_sl_pct=max_sl_pct,
-                                                        min_tp_pct=min_tp_pct)
-            if selected:
-                return selected
+            return select_best_strategy_constrained(csv_content, min_trades=min_trades, max_sl_pct=max_sl_pct,
+                                                    min_tp_pct=min_tp_pct)
 
-    best = opt_result['result']['best_strategy']['best']
-    import json
-    strategy_params = json.loads(best['strategy_params'])
-    return {
-        'tp_pct': strategy_params['tp_pct'],
-        'sl_pct': strategy_params['sl_pct'],
-        'max_holding_hours': int(strategy_params['max_holding_hours']),
-        'winrate_all_pct': best['winrate_all_pct'],
-        'total_trades': best['total_trades'],
-        'total_pnl_usdt': best['total_pnl_usdt'],
-        'profit_factor': best['profit_factor'],
-        'timeout_pct': best['timeout_pct']
-    }
+    return None
 
 
 def run_build_dataset(args, artifacts: RunArtifacts):
@@ -768,53 +754,69 @@ def run_tune(args, artifacts: RunArtifacts):
                     min_tp_pct=args.backtest_min_tp_pct
                 )
 
-                log("INFO", "BACKTEST",
-                    f"selected strategy: tp={selected_strategy['tp_pct']} sl={selected_strategy['sl_pct']} "
-                    f"holding={selected_strategy['max_holding_hours']}h winrate={selected_strategy['winrate_all_pct']:.2f}%")
+                if selected_strategy is None:
+                    log("WARN", "BACKTEST", "no strategy satisfies constraints, skipping test evaluation")
 
-                eval_result = run_backtest_evaluate(
-                    signals=test_signals,
-                    run_name=run_name,
-                    tp_pct=selected_strategy['tp_pct'],
-                    sl_pct=selected_strategy['sl_pct'],
-                    max_holding_hours=selected_strategy['max_holding_hours'],
-                    base_url=backtest_url,
-                    api_key=backtest_api_key,
-                    jobs=args.backtest_jobs,
-                    timeout_sec=args.backtest_timeout_sec,
-                    poll_interval_sec=args.backtest_poll_interval_sec
-                )
-
-                artifacts.save_backtest_eval_test(eval_result)
-
-                eval_best = eval_result['result']['best_strategy']['best']
-
-                backtest_summary = {
-                    'val_optimization': {
-                        'job_id': opt_result['job_id'],
-                        'run_id': opt_result['run_id'],
-                        'signals_count': len(val_signals),
-                        'selected_strategy': selected_strategy
-                    },
-                    'test_evaluation': {
-                        'job_id': eval_result['job_id'],
-                        'run_id': eval_result['run_id'],
-                        'signals_count': len(test_signals),
-                        'total_trades': eval_best['total_trades'],
-                        'winrate_all_pct': eval_best['winrate_all_pct'],
-                        'total_pnl_usdt': eval_best['total_pnl_usdt'],
-                        'profit_factor': eval_best['profit_factor'],
-                        'max_dd_pct': eval_best['max_dd_pct'],
-                        'worst_trade_usdt': eval_best['worst_trade_usdt'],
-                        'timeout_pct': eval_best['timeout_pct']
+                    backtest_summary = {
+                        'val_optimization': {
+                            'job_id': opt_result['job_id'],
+                            'run_id': opt_result['run_id'],
+                            'signals_count': len(val_signals),
+                            'selected_strategy': None,
+                            'status': 'no_strategy_satisfies_constraints'
+                        },
+                        'test_evaluation': None
                     }
-                }
 
-                artifacts.save_backtest_summary(backtest_summary)
+                    artifacts.save_backtest_summary(backtest_summary)
+                else:
+                    log("INFO", "BACKTEST",
+                        f"selected strategy: tp={selected_strategy['tp_pct']} sl={selected_strategy['sl_pct']} "
+                        f"holding={selected_strategy['max_holding_hours']}h winrate={selected_strategy['winrate_all_pct']:.2f}%")
 
-                log("INFO", "BACKTEST",
-                    f"test results: trades={eval_best['total_trades']} winrate={eval_best['winrate_all_pct']:.2f}% "
-                    f"pnl={eval_best['total_pnl_usdt']:.2f} pf={eval_best['profit_factor']:.2f}")
+                    eval_result = run_backtest_evaluate(
+                        signals=test_signals,
+                        run_name=run_name,
+                        tp_pct=selected_strategy['tp_pct'],
+                        sl_pct=selected_strategy['sl_pct'],
+                        max_holding_hours=selected_strategy['max_holding_hours'],
+                        base_url=backtest_url,
+                        api_key=backtest_api_key,
+                        jobs=args.backtest_jobs,
+                        timeout_sec=args.backtest_timeout_sec,
+                        poll_interval_sec=args.backtest_poll_interval_sec
+                    )
+
+                    artifacts.save_backtest_eval_test(eval_result)
+
+                    eval_best = eval_result['result']['best_strategy']['best']
+
+                    backtest_summary = {
+                        'val_optimization': {
+                            'job_id': opt_result['job_id'],
+                            'run_id': opt_result['run_id'],
+                            'signals_count': len(val_signals),
+                            'selected_strategy': selected_strategy
+                        },
+                        'test_evaluation': {
+                            'job_id': eval_result['job_id'],
+                            'run_id': eval_result['run_id'],
+                            'signals_count': len(test_signals),
+                            'total_trades': eval_best['total_trades'],
+                            'winrate_all_pct': eval_best['winrate_all_pct'],
+                            'total_pnl_usdt': eval_best['total_pnl_usdt'],
+                            'profit_factor': eval_best['profit_factor'],
+                            'max_dd_pct': eval_best['max_dd_pct'],
+                            'worst_trade_usdt': eval_best['worst_trade_usdt'],
+                            'timeout_pct': eval_best['timeout_pct']
+                        }
+                    }
+
+                    artifacts.save_backtest_summary(backtest_summary)
+
+                    log("INFO", "BACKTEST",
+                        f"test results: trades={eval_best['total_trades']} winrate={eval_best['winrate_all_pct']:.2f}% "
+                        f"pnl={eval_best['total_pnl_usdt']:.2f} pf={eval_best['profit_factor']:.2f}")
 
             elif backtest_url and backtest_api_key:
                 log("WARN", "BACKTEST", "skipping backtest: not enough signals")
