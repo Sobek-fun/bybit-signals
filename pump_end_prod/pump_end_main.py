@@ -52,6 +52,18 @@ def main():
         action="store_true",
         help="Do not send Telegram messages, only log"
     )
+    parser.add_argument(
+        "--ws-host",
+        type=str,
+        default=None,
+        help="WebSocket server host (default: disabled)"
+    )
+    parser.add_argument(
+        "--ws-port",
+        type=int,
+        default=None,
+        help="WebSocket server port (default: disabled)"
+    )
 
     args = parser.parse_args()
 

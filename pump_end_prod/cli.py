@@ -14,9 +14,13 @@ def run_pump_end(args):
         tokens = list_all_usdt_tokens(args.ch_dsn)
         log("INFO", "PUMP_END", f"loaded {len(tokens)} tokens from ClickHouse")
 
+    ws_info = ""
+    if args.ws_host and args.ws_port:
+        ws_info = f" ws={args.ws_host}:{args.ws_port}"
+
     log("INFO", "PUMP_END",
         f"start tokens={len(tokens)} workers={args.workers} offset={args.offset_seconds} "
-        f"model_dir={args.model_dir} dry_run={args.dry_run}")
+        f"model_dir={args.model_dir} dry_run={args.dry_run}{ws_info}")
 
     pipeline = PumpEndPipeline(
         tokens=tokens,
@@ -26,7 +30,9 @@ def run_pump_end(args):
         model_dir=args.model_dir,
         workers=args.workers,
         offset_seconds=args.offset_seconds,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        ws_host=args.ws_host,
+        ws_port=args.ws_port
     )
 
     pipeline.run()
@@ -113,6 +119,18 @@ def main():
         "--dry-run",
         action="store_true",
         help="Do not send Telegram messages, only log"
+    )
+    pump_end_parser.add_argument(
+        "--ws-host",
+        type=str,
+        default=None,
+        help="WebSocket server host (default: disabled)"
+    )
+    pump_end_parser.add_argument(
+        "--ws-port",
+        type=int,
+        default=None,
+        help="WebSocket server port (default: disabled)"
     )
 
     pump_end_export_parser = subparsers.add_parser('pump_end_export', help='Export historical pump end signals to CSV')

@@ -10,6 +10,8 @@ from pump_end_prod.infra.logging import log
 from pump_end_prod.pump_end.model import PumpEndModel
 from pump_end_prod.pump_end.worker import PumpEndWorker, PumpEndWorkerResult, PumpEndSignalState
 from pump_end_prod.delivery.telegram_sender import TelegramSender
+from pump_end_prod.delivery.ws_broadcaster import WsBroadcaster
+from pump_end_prod.delivery.signal_dispatcher import SignalDispatcher
 
 
 class PumpEndPipeline:
@@ -24,7 +26,9 @@ class PumpEndPipeline:
             model_dir: str,
             workers: int = 8,
             offset_seconds: int = 3,
-            dry_run: bool = False
+            dry_run: bool = False,
+            ws_host: str = None,
+            ws_port: int = None
     ):
         self.tokens = tokens
         self.ch_dsn = ch_dsn
@@ -41,7 +45,19 @@ class PumpEndPipeline:
             feature_set=self.model.feature_set
         )
         self.signal_state = PumpEndSignalState()
-        self.telegram_sender = TelegramSender(bot_token, chat_id, ws_broadcaster=None)
+
+        self.ws_broadcaster = None
+        if ws_host and ws_port:
+            self.ws_broadcaster = WsBroadcaster(ws_host, ws_port)
+            log("INFO", "PUMP_END", f"WS server started on {ws_host}:{ws_port}")
+
+        self.telegram_sender = TelegramSender(bot_token, chat_id)
+
+        self.signal_dispatcher = SignalDispatcher(
+            ws_broadcaster=self.ws_broadcaster,
+            telegram_sender=self.telegram_sender,
+            dry_run=dry_run
+        )
 
         self.candles_cache: dict[str, pd.DataFrame] = {}
         self.last_processed_minute: datetime = None
@@ -53,15 +69,22 @@ class PumpEndPipeline:
     def run(self):
         log("INFO", "PUMP_END", f"started, waiting for next 15m boundary")
 
-        while True:
-            current_time = datetime.now()
+        try:
+            while True:
+                current_time = datetime.now()
 
-            if self._should_process(current_time):
-                decision_open_time = current_time.replace(second=0, microsecond=0)
-                self._process_cycle(decision_open_time)
-                self.last_processed_minute = decision_open_time
+                if self._should_process(current_time):
+                    decision_open_time = current_time.replace(second=0, microsecond=0)
+                    self._process_cycle(decision_open_time)
+                    self.last_processed_minute = decision_open_time
 
-            sleep(0.1)
+                sleep(0.1)
+        except KeyboardInterrupt:
+            log("INFO", "PUMP_END", "shutting down...")
+        finally:
+            if self.ws_broadcaster:
+                self.ws_broadcaster.stop()
+                log("INFO", "PUMP_END", "WS server stopped")
 
     def _should_process(self, current_time: datetime) -> bool:
         if current_time.minute % 15 != 0:
@@ -152,8 +175,7 @@ class PumpEndPipeline:
             model=self.model,
             feature_builder=self.feature_builder,
             signal_state=self.signal_state,
-            telegram_sender=self.telegram_sender,
-            dry_run=self.dry_run
+            signal_dispatcher=self.signal_dispatcher
         )
         return worker.process()
 
@@ -164,7 +186,6 @@ class PumpEndPipeline:
 
         ok = status_counts.get("OK_NO_SIGNAL", 0)
         signals_sent = status_counts.get("SIGNAL_SENT", 0)
-        signals_dry = status_counts.get("SIGNAL_DRY_RUN", 0)
         skipped_empty = status_counts.get("SKIP_EMPTY", 0)
         skipped_short = status_counts.get("SKIP_SHORT", 0)
         skipped_missing_last = status_counts.get("SKIP_MISSING_LAST", 0)
@@ -173,7 +194,7 @@ class PumpEndPipeline:
         errors = status_counts.get("ERROR", 0)
 
         log("INFO", "PUMP_END",
-            f"cycle done ok={ok} signals_sent={signals_sent} signals_dry={signals_dry} "
+            f"cycle done ok={ok} signals_sent={signals_sent} "
             f"skip_empty={skipped_empty} skip_short={skipped_short} "
             f"skip_missing={skipped_missing_last} skip_gapped={skipped_gapped} "
             f"skip_features={skipped_features} errors={errors}")

@@ -7,7 +7,7 @@ import pandas as pd
 
 from pump_end_prod.pump_end.feature_builder import PumpFeatureBuilder
 from pump_end_prod.pump_end.model import PumpEndModel
-from pump_end_prod.delivery.telegram_sender import TelegramSender
+from pump_end_prod.delivery.signal_dispatcher import SignalDispatcher
 
 
 @dataclass
@@ -79,8 +79,7 @@ class PumpEndWorker:
             model: PumpEndModel,
             feature_builder: PumpFeatureBuilder,
             signal_state: PumpEndSignalState,
-            telegram_sender: TelegramSender,
-            dry_run: bool = False
+            signal_dispatcher: SignalDispatcher
     ):
         self.token = token
         self.symbol = f"{token}USDT"
@@ -89,8 +88,7 @@ class PumpEndWorker:
         self.model = model
         self.feature_builder = feature_builder
         self.signal_state = signal_state
-        self.telegram_sender = telegram_sender
-        self.dry_run = dry_run
+        self.signal_dispatcher = signal_dispatcher
 
     def process(self) -> PumpEndWorkerResult:
         start_time = time.time()
@@ -178,21 +176,20 @@ class PumpEndWorker:
             if triggered:
                 last_close = self.df.loc[self.expected_bucket_start, 'close']
 
-                if not self.dry_run:
-                    self.telegram_sender.send_pump_end_alert(
-                        symbol=self.symbol,
-                        signal_open_time=decision_open_time,
-                        p_end=p_end,
-                        threshold=self.model.threshold,
-                        close_price=last_close,
-                        min_pending_bars=self.model.min_pending_bars,
-                        drop_delta=self.model.drop_delta
-                    )
+                self.signal_dispatcher.publish_pump_end_signal(
+                    symbol=self.symbol,
+                    event_time=decision_open_time,
+                    p_end=p_end,
+                    threshold=self.model.threshold,
+                    close_price=last_close,
+                    min_pending_bars=self.model.min_pending_bars,
+                    drop_delta=self.model.drop_delta
+                )
 
                 return PumpEndWorkerResult(
                     token=self.token,
                     symbol=self.symbol,
-                    status="SIGNAL_SENT" if not self.dry_run else "SIGNAL_DRY_RUN",
+                    status="SIGNAL_SENT",
                     duration_total_ms=(time.time() - start_time) * 1000,
                     duration_features_ms=features_duration,
                     duration_predict_ms=predict_duration,
