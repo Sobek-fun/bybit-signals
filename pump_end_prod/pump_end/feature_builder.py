@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -123,7 +124,8 @@ class PumpFeatureBuilder:
             df_candles: pd.DataFrame,
             symbol: str,
             decision_open_time: pd.Timestamp
-    ) -> dict:
+    ) -> tuple[dict, dict]:
+        timings = {}
         df = df_candles
 
         expected_bucket_start = decision_open_time - timedelta(minutes=15)
@@ -134,16 +136,28 @@ class PumpFeatureBuilder:
             'runup_pct': 0
         }])
 
+        t0 = time.time()
         df = self._calculate_base_indicators(df)
+        timings['base_indicators_ms'] = (time.time() - t0) * 1000
+
+        t0 = time.time()
         df = self._calculate_pump_detector_features(df)
+        timings['pump_detector_ms'] = (time.time() - t0) * 1000
+
+        t0 = time.time()
         df = self._calculate_liquidity_features(df, events)
+        timings['liquidity_ms'] = (time.time() - t0) * 1000
 
         if self.feature_set == "extended":
+            t0 = time.time()
             df = self._calculate_extended_indicators(df)
+            timings['extended_ms'] = (time.time() - t0) * 1000
 
         df.loc[decision_open_time] = np.nan
 
+        t0 = time.time()
         df = self._apply_decision_shift(df)
+        timings['shift_ms'] = (time.time() - t0) * 1000
 
         events_for_extract = pd.DataFrame([{
             'open_time': decision_open_time,
@@ -151,12 +165,14 @@ class PumpFeatureBuilder:
             'runup_pct': 0
         }])
 
+        t0 = time.time()
         rows = self._extract_features_vectorized(df, symbol, events_for_extract)
+        timings['extract_ms'] = (time.time() - t0) * 1000
 
         if not rows:
-            return {}
+            return {}, timings
 
-        return rows[0]
+        return rows[0], timings
 
     def build_many_for_inference(
             self,

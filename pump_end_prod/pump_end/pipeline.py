@@ -1,3 +1,4 @@
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from time import sleep
@@ -204,21 +205,49 @@ class PumpEndPipeline:
             first_error = error_results[0]
             log("ERROR", "PUMP_END", f"token={first_error.symbol} error={first_error.error_message}")
 
-        durations = [r.duration_total_ms for r in results]
-        if durations:
-            avg_token = sum(durations) / len(durations)
-            max_token = max(durations)
+        processed_results = [r for r in results if r.status in ("OK_NO_SIGNAL", "SIGNAL_SENT")]
 
-            features_times = [r.duration_features_ms for r in results if r.duration_features_ms > 0]
-            predict_times = [r.duration_predict_ms for r in results if r.duration_predict_ms > 0]
+        if processed_results:
+            durations = [r.duration_total_ms for r in processed_results]
+            features_times = [r.duration_features_ms for r in processed_results]
+            predict_times = [r.duration_predict_ms for r in processed_results]
 
-            avg_features = sum(features_times) / len(features_times) if features_times else 0
-            avg_predict = sum(predict_times) / len(predict_times) if predict_times else 0
+            p50_total = np.percentile(durations, 50)
+            p95_total = np.percentile(durations, 95)
+            p99_total = np.percentile(durations, 99)
+            max_total = max(durations)
+
+            p50_features = np.percentile(features_times, 50)
+            p95_features = np.percentile(features_times, 95)
+
+            avg_predict = sum(predict_times) / len(predict_times)
 
             log("INFO", "PUMP_END",
                 f"perf total={cycle_duration:.1f}s load={load_duration:.1f}s "
-                f"avg_features={avg_features:.0f}ms avg_predict={avg_predict:.0f}ms "
-                f"avg_token={avg_token:.0f}ms max_token={max_token:.0f}ms")
+                f"token_p50={p50_total:.0f}ms p95={p95_total:.0f}ms p99={p99_total:.0f}ms max={max_total:.0f}ms")
+
+            log("INFO", "PUMP_END",
+                f"perf features_p50={p50_features:.0f}ms features_p95={p95_features:.0f}ms predict_avg={avg_predict:.1f}ms")
+
+            base_times = [r.duration_base_indicators_ms for r in processed_results]
+            pump_times = [r.duration_pump_detector_ms for r in processed_results]
+            liq_times = [r.duration_liquidity_ms for r in processed_results]
+            shift_times = [r.duration_shift_ms for r in processed_results]
+            extract_times = [r.duration_extract_ms for r in processed_results]
+
+            avg_base = sum(base_times) / len(base_times)
+            avg_pump = sum(pump_times) / len(pump_times)
+            avg_liq = sum(liq_times) / len(liq_times)
+            avg_shift = sum(shift_times) / len(shift_times)
+            avg_extract = sum(extract_times) / len(extract_times)
+
+            log("INFO", "PUMP_END",
+                f"breakdown base={avg_base:.1f}ms pump={avg_pump:.1f}ms liq={avg_liq:.1f}ms "
+                f"shift={avg_shift:.1f}ms extract={avg_extract:.1f}ms")
+
+            slowest = sorted(processed_results, key=lambda r: r.duration_total_ms, reverse=True)[:5]
+            slowest_str = " ".join([f"{r.symbol}({r.duration_total_ms:.0f}ms)" for r in slowest])
+            log("INFO", "PUMP_END", f"slowest: {slowest_str}")
 
         p_end_values = [r.p_end for r in results if r.p_end is not None]
         if p_end_values:

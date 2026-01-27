@@ -35,22 +35,22 @@ class DataLoader:
     def load_candles_batch(self, symbols: list[str], start_bucket: datetime, end_bucket: datetime) -> dict[
         str, pd.DataFrame]:
         query = """
-        SELECT
-            symbol,
-            toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
-            argMin(open, open_time) AS open,
+                SELECT symbol,
+                       toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+                       argMin(open, open_time) AS open,
             max(high) AS high,
             min(low) AS low,
             argMax(close, open_time) AS close,
             sum(volume) AS volume
-        FROM bybit.candles
-        WHERE symbol IN %(symbols)s
-          AND interval = 1
-          AND open_time >= %(start)s
-          AND open_time < %(end)s
-        GROUP BY symbol, bucket
-        ORDER BY symbol, bucket
-        """
+                FROM bybit.candles
+                WHERE symbol IN %(symbols)s
+                  AND interval = 1
+                  AND open_time >= %(start)s
+                  AND open_time
+                    < %(end)s
+                GROUP BY symbol, bucket
+                ORDER BY symbol, bucket \
+                """
 
         query_start = datetime.now()
         result = self.client.query(query, parameters={
@@ -60,9 +60,12 @@ class DataLoader:
         })
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
-        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
-            log("WARN", "DATA",
-                f"batch query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbols={len(symbols)}")
+        total_rows = len(result.result_rows)
+        rows_per_symbol = total_rows / len(symbols) if symbols else 0
+
+        log_level = "WARN" if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS else "INFO"
+        log(log_level, "DATA",
+            f"batch load symbols={len(symbols)} rows={total_rows} rows_per_symbol={rows_per_symbol:.0f} query_ms={query_duration_ms:.0f}")
 
         if not result.result_rows:
             return {}
@@ -90,20 +93,14 @@ class DataLoader:
         start_time = t - timedelta(minutes=lookback * 15)
 
         query = """
-        SELECT
-            open_time AS bucket,
-            open,
-            high,
-            low,
-            close,
-            volume
-        FROM bybit.candles
-        WHERE symbol = %(symbol)s
-          AND interval = 1
-          AND open_time >= %(start)s
-          AND open_time <= %(end)s
-        ORDER BY open_time
-        """
+                SELECT open_time AS bucket, open, high, low, close, volume
+                FROM bybit.candles
+                WHERE symbol = %(symbol)s
+                  AND interval = 1
+                  AND open_time >= %(start)s
+                  AND open_time <= %(end)s
+                ORDER BY open_time \
+                """
 
         query_start = datetime.now()
         result = self.client.query(query, parameters={
@@ -132,21 +129,21 @@ class DataLoader:
 
     def load_candles_range(self, symbol: str, start_bucket: datetime, end_bucket: datetime) -> pd.DataFrame:
         query = """
-        SELECT
-            toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
-            argMin(open, open_time) AS open,
+                SELECT toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+                       argMin(open, open_time) AS open,
             max(high) AS high,
             min(low) AS low,
             argMax(close, open_time) AS close,
             sum(volume) AS volume
-        FROM bybit.candles
-        WHERE symbol = %(symbol)s
-          AND interval = 1
-          AND open_time >= %(start)s
-          AND open_time < %(end)s
-        GROUP BY bucket
-        ORDER BY bucket
-        """
+                FROM bybit.candles
+                WHERE symbol = %(symbol)s
+                  AND interval = 1
+                  AND open_time >= %(start)s
+                  AND open_time
+                    < %(end)s
+                GROUP BY bucket
+                ORDER BY bucket \
+                """
 
         result = self.client.query(query, parameters={
             "symbol": symbol,
@@ -176,14 +173,15 @@ class DataLoader:
             current_bucket_start = current_bucket_start - timedelta(minutes=15)
 
         query = """
-        SELECT open_time
-        FROM bybit.candles
-        WHERE symbol = %(symbol)s
-          AND interval = 1
-          AND open_time < %(current_bucket_start)s
-        ORDER BY open_time DESC
-        LIMIT 1
-        """
+                SELECT open_time
+                FROM bybit.candles
+                WHERE symbol = %(symbol)s
+                  AND interval = 1
+                  AND open_time
+                    < %(current_bucket_start)s
+                ORDER BY open_time DESC
+                    LIMIT 1 \
+                """
 
         result = self.client.query(query, parameters={
             "symbol": symbol,

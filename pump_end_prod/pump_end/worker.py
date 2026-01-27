@@ -18,6 +18,11 @@ class PumpEndWorkerResult:
     duration_total_ms: float
     duration_features_ms: float = 0
     duration_predict_ms: float = 0
+    duration_base_indicators_ms: float = 0
+    duration_pump_detector_ms: float = 0
+    duration_liquidity_ms: float = 0
+    duration_shift_ms: float = 0
+    duration_extract_ms: float = 0
     candles_count: int = 0
     p_end: Optional[float] = None
     signal_triggered: bool = False
@@ -143,7 +148,7 @@ class PumpEndWorker:
             decision_open_time = self.expected_bucket_start + timedelta(minutes=15)
 
             features_start = time.time()
-            features_row = self.feature_builder.build_one_for_inference(
+            features_row, timings = self.feature_builder.build_one_for_inference(
                 self.df,
                 self.symbol,
                 decision_open_time
@@ -157,6 +162,11 @@ class PumpEndWorker:
                     status="SKIP_FEATURES_EMPTY",
                     duration_total_ms=(time.time() - start_time) * 1000,
                     duration_features_ms=features_duration,
+                    duration_base_indicators_ms=timings.get('base_indicators_ms', 0),
+                    duration_pump_detector_ms=timings.get('pump_detector_ms', 0),
+                    duration_liquidity_ms=timings.get('liquidity_ms', 0),
+                    duration_shift_ms=timings.get('shift_ms', 0),
+                    duration_extract_ms=timings.get('extract_ms', 0),
                     candles_count=len(self.df)
                 )
 
@@ -193,6 +203,11 @@ class PumpEndWorker:
                     duration_total_ms=(time.time() - start_time) * 1000,
                     duration_features_ms=features_duration,
                     duration_predict_ms=predict_duration,
+                    duration_base_indicators_ms=timings.get('base_indicators_ms', 0),
+                    duration_pump_detector_ms=timings.get('pump_detector_ms', 0),
+                    duration_liquidity_ms=timings.get('liquidity_ms', 0),
+                    duration_shift_ms=timings.get('shift_ms', 0),
+                    duration_extract_ms=timings.get('extract_ms', 0),
                     candles_count=len(self.df),
                     p_end=p_end,
                     signal_triggered=True
@@ -205,6 +220,11 @@ class PumpEndWorker:
                 duration_total_ms=(time.time() - start_time) * 1000,
                 duration_features_ms=features_duration,
                 duration_predict_ms=predict_duration,
+                duration_base_indicators_ms=timings.get('base_indicators_ms', 0),
+                duration_pump_detector_ms=timings.get('pump_detector_ms', 0),
+                duration_liquidity_ms=timings.get('liquidity_ms', 0),
+                duration_shift_ms=timings.get('shift_ms', 0),
+                duration_extract_ms=timings.get('extract_ms', 0),
                 candles_count=len(self.df),
                 p_end=p_end,
                 signal_triggered=False
