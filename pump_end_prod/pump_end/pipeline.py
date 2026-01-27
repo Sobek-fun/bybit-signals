@@ -30,7 +30,7 @@ class PumpEndPipeline:
             dry_run: bool = False,
             ws_host: str = None,
             ws_port: int = None,
-            restore_lookback_bars: int = 192
+            restore_lookback_bars: int = 0
     ):
         self.tokens = tokens
         self.ch_dsn = ch_dsn
@@ -63,33 +63,32 @@ class PumpEndPipeline:
         )
 
         self.candles_cache: dict[str, pd.DataFrame] = {}
-        self.next_decision_open_time: datetime = None
+        self.last_processed_minute: int = -1
 
         log("INFO", "PUMP_END", f"model loaded: threshold={self.model.threshold:.4f} "
                                 f"min_pending_bars={self.model.min_pending_bars} "
                                 f"drop_delta={self.model.drop_delta}")
 
     def run(self):
-        log("INFO", "PUMP_END", f"started, restoring state from last {self.restore_lookback_bars} bars")
+        if self.restore_lookback_bars > 0:
+            log("INFO", "PUMP_END", f"started, restoring state from last {self.restore_lookback_bars} bars")
+            try:
+                self._restore_state_and_cache()
+            except Exception as e:
+                log("ERROR", "PUMP_END", f"restore failed: {type(e).__name__}: {str(e)}, starting with empty state")
+                self.candles_cache = {}
+        else:
+            log("INFO", "PUMP_END", "started without state restoration")
 
-        try:
-            self._restore_state_and_cache()
-        except Exception as e:
-            log("ERROR", "PUMP_END", f"restore failed: {type(e).__name__}: {str(e)}, starting with empty state")
-            self.candles_cache = {}
-            self.next_decision_open_time = self._compute_next_decision_time(datetime.now())
-
-        log("INFO", "PUMP_END",
-            f"entering live mode, next_decision={self.next_decision_open_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        log("INFO", "PUMP_END", "entering live mode")
 
         try:
             while True:
                 current_time = datetime.now()
 
                 if self._should_process(current_time):
-                    decision_open_time = self.next_decision_open_time
-                    self._process_cycle(decision_open_time)
-                    self.next_decision_open_time += timedelta(minutes=15)
+                    self.last_processed_minute = current_time.minute
+                    self._process_cycle(current_time)
 
                 sleep(0.1)
         except KeyboardInterrupt:
@@ -99,29 +98,29 @@ class PumpEndPipeline:
                 self.ws_broadcaster.stop()
                 log("INFO", "PUMP_END", "WS server stopped")
 
-    def _compute_next_decision_time(self, now: datetime) -> datetime:
-        minutes = (now.minute // 15) * 15
-        current_boundary = now.replace(minute=minutes, second=0, microsecond=0)
-
-        trigger_time = current_boundary + timedelta(seconds=self.offset_seconds)
-
-        if now >= trigger_time:
-            return current_boundary + timedelta(minutes=15)
-        else:
-            return current_boundary
-
     def _should_process(self, current_time: datetime) -> bool:
-        if self.next_decision_open_time is None:
+        if current_time.minute % 15 != 0:
             return False
 
-        trigger_time = self.next_decision_open_time + timedelta(seconds=self.offset_seconds)
-        return current_time >= trigger_time
+        if current_time.second < self.offset_seconds:
+            return False
+
+        if self.last_processed_minute == current_time.minute:
+            return False
+
+        return True
 
     def _restore_state_and_cache(self):
         now = datetime.now()
-        next_decision_time = self._compute_next_decision_time(now)
 
-        restore_end_decision_time = next_decision_time - timedelta(minutes=15)
+        current_minute = (now.minute // 15) * 15
+        current_boundary = now.replace(minute=current_minute, second=0, microsecond=0)
+
+        if now.minute % 15 == 0 and now.second < self.offset_seconds:
+            restore_end_decision_time = current_boundary - timedelta(minutes=15)
+        else:
+            restore_end_decision_time = current_boundary
+
         restore_start_decision_time = restore_end_decision_time - timedelta(minutes=self.restore_lookback_bars * 15)
 
         restore_end_bucket = restore_end_decision_time - timedelta(minutes=15)
@@ -167,15 +166,6 @@ class PumpEndPipeline:
             symbols_processed += 1
 
         restore_duration = (datetime.now() - restore_start).total_seconds()
-
-        fresh_next = self._compute_next_decision_time(datetime.now())
-        if fresh_next > next_decision_time:
-            log("INFO", "PUMP_END",
-                f"restore took too long, shifting next_decision from "
-                f"{next_decision_time.strftime('%Y-%m-%d %H:%M:%S')} to {fresh_next.strftime('%Y-%m-%d %H:%M:%S')}")
-            next_decision_time = fresh_next
-
-        self.next_decision_open_time = next_decision_time
 
         log("INFO", "PUMP_END",
             f"restore complete: symbols_processed={symbols_processed} symbols_skipped={symbols_skipped} "
@@ -253,7 +243,9 @@ class PumpEndPipeline:
 
         return len(valid_decision_times)
 
-    def _process_cycle(self, decision_open_time: datetime):
+    def _process_cycle(self, current_time: datetime):
+        minutes = (current_time.minute // 15) * 15
+        decision_open_time = current_time.replace(minute=minutes, second=0, microsecond=0)
         expected_bucket_start = decision_open_time - timedelta(minutes=15)
         start_bucket = expected_bucket_start - timedelta(minutes=(self.MIN_CANDLES - 1) * 15)
 
@@ -315,8 +307,6 @@ class PumpEndPipeline:
                 cached = cached.iloc[1:]
                 cached = pd.concat([cached, new_df])
                 self.candles_cache[symbol] = cached
-            else:
-                self.candles_cache[symbol] = new_df
 
     def _process_token(
             self,

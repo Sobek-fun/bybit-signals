@@ -136,8 +136,8 @@ def main():
     pump_end_parser.add_argument(
         "--restore-lookback-bars",
         type=int,
-        default=192,
-        help="Number of 15m bars to look back for state restoration on startup (default: 192 = 48 hours)"
+        default=0,
+        help="Number of 15m bars to look back for state restoration on startup (default: 0 = disabled)"
     )
 
     pump_end_export_parser = subparsers.add_parser('pump_end_export', help='Export historical pump end signals to CSV')
