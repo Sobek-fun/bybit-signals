@@ -29,13 +29,15 @@ class PumpEndPipeline:
             offset_seconds: int = 3,
             dry_run: bool = False,
             ws_host: str = None,
-            ws_port: int = None
+            ws_port: int = None,
+            restore_lookback_bars: int = 192
     ):
         self.tokens = tokens
         self.ch_dsn = ch_dsn
         self.workers = workers
         self.offset_seconds = offset_seconds
         self.dry_run = dry_run
+        self.restore_lookback_bars = restore_lookback_bars
 
         self.loader = DataLoader(ch_dsn, offset_seconds)
         self.model = PumpEndModel(model_dir)
@@ -61,23 +63,33 @@ class PumpEndPipeline:
         )
 
         self.candles_cache: dict[str, pd.DataFrame] = {}
-        self.last_processed_minute: datetime = None
+        self.next_decision_open_time: datetime = None
 
         log("INFO", "PUMP_END", f"model loaded: threshold={self.model.threshold:.4f} "
                                 f"min_pending_bars={self.model.min_pending_bars} "
                                 f"drop_delta={self.model.drop_delta}")
 
     def run(self):
-        log("INFO", "PUMP_END", f"started, waiting for next 15m boundary")
+        log("INFO", "PUMP_END", f"started, restoring state from last {self.restore_lookback_bars} bars")
+
+        try:
+            self._restore_state_and_cache()
+        except Exception as e:
+            log("ERROR", "PUMP_END", f"restore failed: {type(e).__name__}: {str(e)}, starting with empty state")
+            self.candles_cache = {}
+            self.next_decision_open_time = self._compute_next_decision_time(datetime.now())
+
+        log("INFO", "PUMP_END",
+            f"entering live mode, next_decision={self.next_decision_open_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         try:
             while True:
                 current_time = datetime.now()
 
                 if self._should_process(current_time):
-                    decision_open_time = current_time.replace(second=0, microsecond=0)
+                    decision_open_time = self.next_decision_open_time
                     self._process_cycle(decision_open_time)
-                    self.last_processed_minute = decision_open_time
+                    self.next_decision_open_time += timedelta(minutes=15)
 
                 sleep(0.1)
         except KeyboardInterrupt:
@@ -87,18 +99,159 @@ class PumpEndPipeline:
                 self.ws_broadcaster.stop()
                 log("INFO", "PUMP_END", "WS server stopped")
 
+    def _compute_next_decision_time(self, now: datetime) -> datetime:
+        minutes = (now.minute // 15) * 15
+        current_boundary = now.replace(minute=minutes, second=0, microsecond=0)
+
+        trigger_time = current_boundary + timedelta(seconds=self.offset_seconds)
+
+        if now >= trigger_time:
+            return current_boundary + timedelta(minutes=15)
+        else:
+            return current_boundary
+
     def _should_process(self, current_time: datetime) -> bool:
-        if current_time.minute % 15 != 0:
+        if self.next_decision_open_time is None:
             return False
 
-        if current_time.second < self.offset_seconds:
-            return False
+        trigger_time = self.next_decision_open_time + timedelta(seconds=self.offset_seconds)
+        return current_time >= trigger_time
 
-        current_minute = current_time.replace(second=0, microsecond=0)
-        if self.last_processed_minute == current_minute:
-            return False
+    def _restore_state_and_cache(self):
+        now = datetime.now()
+        next_decision_time = self._compute_next_decision_time(now)
 
-        return True
+        restore_end_decision_time = next_decision_time - timedelta(minutes=15)
+        restore_start_decision_time = restore_end_decision_time - timedelta(minutes=self.restore_lookback_bars * 15)
+
+        restore_end_bucket = restore_end_decision_time - timedelta(minutes=15)
+        query_start_bucket = (restore_start_decision_time - timedelta(minutes=15)) - timedelta(
+            minutes=(self.MIN_CANDLES - 1) * 15)
+
+        log("INFO", "PUMP_END",
+            f"restore range: decisions [{restore_start_decision_time.strftime('%Y-%m-%d %H:%M:%S')} - "
+            f"{restore_end_decision_time.strftime('%Y-%m-%d %H:%M:%S')}], "
+            f"query_start={query_start_bucket.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        symbols = [f"{token}USDT" for token in self.tokens]
+
+        load_start = datetime.now()
+        candles_dict = self.loader.load_candles_batch(symbols, query_start_bucket, restore_end_bucket)
+        load_duration = (datetime.now() - load_start).total_seconds()
+
+        log("INFO", "PUMP_END",
+            f"restore candles loaded in {load_duration:.1f}s, symbols_with_data={len(candles_dict)}")
+
+        restore_start = datetime.now()
+        total_decisions_processed = 0
+        symbols_processed = 0
+        symbols_skipped = 0
+
+        for symbol in symbols:
+            df = candles_dict.get(symbol)
+            if df is None or df.empty:
+                symbols_skipped += 1
+                continue
+
+            decisions_count = self._restore_symbol_state(
+                symbol, df, restore_start_decision_time, restore_end_decision_time
+            )
+            total_decisions_processed += decisions_count
+
+            if restore_end_bucket in df.index:
+                idx = df.index.get_loc(restore_end_bucket)
+                if idx >= self.MIN_CANDLES - 1:
+                    start_idx = idx - (self.MIN_CANDLES - 1)
+                    self.candles_cache[symbol] = df.iloc[start_idx:idx + 1].copy()
+
+            symbols_processed += 1
+
+        restore_duration = (datetime.now() - restore_start).total_seconds()
+
+        fresh_next = self._compute_next_decision_time(datetime.now())
+        if fresh_next > next_decision_time:
+            log("INFO", "PUMP_END",
+                f"restore took too long, shifting next_decision from "
+                f"{next_decision_time.strftime('%Y-%m-%d %H:%M:%S')} to {fresh_next.strftime('%Y-%m-%d %H:%M:%S')}")
+            next_decision_time = fresh_next
+
+        self.next_decision_open_time = next_decision_time
+
+        log("INFO", "PUMP_END",
+            f"restore complete: symbols_processed={symbols_processed} symbols_skipped={symbols_skipped} "
+            f"total_decisions={total_decisions_processed} cache_size={len(self.candles_cache)} "
+            f"duration={restore_duration:.1f}s")
+
+    def _restore_symbol_state(
+            self,
+            symbol: str,
+            df: pd.DataFrame,
+            restore_start_decision_time: datetime,
+            restore_end_decision_time: datetime
+    ) -> int:
+        all_decision_times = pd.date_range(
+            start=restore_start_decision_time,
+            end=restore_end_decision_time,
+            freq='15min'
+        ).tolist()
+
+        valid_decision_times = []
+        for dt in all_decision_times:
+            expected_bucket_start = dt - timedelta(minutes=15)
+            if expected_bucket_start not in df.index:
+                continue
+
+            idx = df.index.get_loc(expected_bucket_start)
+            if idx < self.MIN_CANDLES - 1:
+                continue
+
+            start_idx = idx - (self.MIN_CANDLES - 1)
+            expected_range = pd.date_range(
+                start=df.index[start_idx],
+                end=expected_bucket_start,
+                freq='15min'
+            )
+            actual_range = df.index[start_idx:idx + 1]
+
+            if len(actual_range) == self.MIN_CANDLES and len(expected_range) == self.MIN_CANDLES:
+                if (actual_range == expected_range).all():
+                    valid_decision_times.append(dt)
+
+        if not valid_decision_times:
+            return 0
+
+        feature_rows = self.feature_builder.build_many_for_inference(df, symbol, valid_decision_times)
+
+        if not feature_rows:
+            return 0
+
+        if len(feature_rows) != len(valid_decision_times):
+            log("WARN", "PUMP_END",
+                f"restore {symbol}: feature_rows={len(feature_rows)} != valid_decisions={len(valid_decision_times)}, skipping")
+            return 0
+
+        feature_values_list = []
+        for row in feature_rows:
+            fv = []
+            for name in self.model.feature_names:
+                val = row.get(name)
+                fv.append(np.nan if val is None else val)
+            feature_values_list.append(fv)
+
+        probas = self.model.model.predict_proba(feature_values_list)[:, 1]
+
+        for i, dt in enumerate(valid_decision_times):
+            p_end = probas[i]
+            self.signal_state.update_and_check(
+                symbol,
+                p_end,
+                self.model.threshold,
+                self.model.min_pending_bars,
+                self.model.drop_delta,
+                dt
+            )
+
+        return len(valid_decision_times)
 
     def _process_cycle(self, decision_open_time: datetime):
         expected_bucket_start = decision_open_time - timedelta(minutes=15)
@@ -154,11 +307,16 @@ class PumpEndPipeline:
 
     def _update_cache(self, latest_candles: dict[str, pd.DataFrame]):
         for symbol, new_df in latest_candles.items():
-            if symbol in self.candles_cache and not new_df.empty:
+            if new_df.empty:
+                continue
+
+            if symbol in self.candles_cache:
                 cached = self.candles_cache[symbol]
                 cached = cached.iloc[1:]
                 cached = pd.concat([cached, new_df])
                 self.candles_cache[symbol] = cached
+            else:
+                self.candles_cache[symbol] = new_df
 
     def _process_token(
             self,

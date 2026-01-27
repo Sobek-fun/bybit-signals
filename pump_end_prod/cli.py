@@ -20,7 +20,7 @@ def run_pump_end(args):
 
     log("INFO", "PUMP_END",
         f"start tokens={len(tokens)} workers={args.workers} offset={args.offset_seconds} "
-        f"model_dir={args.model_dir} dry_run={args.dry_run}{ws_info}")
+        f"model_dir={args.model_dir} dry_run={args.dry_run} restore_lookback={args.restore_lookback_bars}{ws_info}")
 
     pipeline = PumpEndPipeline(
         tokens=tokens,
@@ -32,7 +32,8 @@ def run_pump_end(args):
         offset_seconds=args.offset_seconds,
         dry_run=args.dry_run,
         ws_host=args.ws_host,
-        ws_port=args.ws_port
+        ws_port=args.ws_port,
+        restore_lookback_bars=args.restore_lookback_bars
     )
 
     pipeline.run()
@@ -131,6 +132,12 @@ def main():
         type=int,
         default=None,
         help="WebSocket server port (default: disabled)"
+    )
+    pump_end_parser.add_argument(
+        "--restore-lookback-bars",
+        type=int,
+        default=192,
+        help="Number of 15m bars to look back for state restoration on startup (default: 192 = 48 hours)"
     )
 
     pump_end_export_parser = subparsers.add_parser('pump_end_export', help='Export historical pump end signals to CSV')
