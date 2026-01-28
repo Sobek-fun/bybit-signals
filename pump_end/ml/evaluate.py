@@ -99,6 +99,16 @@ def compute_point_level_metrics(
 ) -> dict:
     y_true = predictions_df['y'].values
     y_prob = predictions_df['p_end'].values
+
+    if len(y_true) == 0:
+        return {
+            'pr_auc': None,
+            'roc_auc': None,
+            'precision_at_threshold': 0,
+            'recall_at_threshold': 0,
+            'threshold_used': threshold
+        }
+
     y_pred = (y_prob >= threshold).astype(int)
 
     pr_auc = average_precision_score(y_true, y_prob)
