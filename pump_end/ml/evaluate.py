@@ -17,8 +17,7 @@ def compute_event_level_metrics(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None,
-        very_early_threshold: int = -6
+        event_data: dict = None
 ) -> dict:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
@@ -28,7 +27,6 @@ def compute_event_level_metrics(
     early = 0
     late = 0
     miss = 0
-    very_early = 0
     offsets = []
 
     for event_id, data in event_data.items():
@@ -48,25 +46,18 @@ def compute_event_level_metrics(
 
             triggered = False
             pending_count = 0
-            max_p_end_pending = 0.0
 
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
-                    if pending_count == 0:
-                        max_p_end_pending = p_end[i]
-                    else:
-                        max_p_end_pending = max(max_p_end_pending, p_end[i])
                     pending_count += 1
-
                     if pending_count >= min_pending_bars and i > 0:
-                        drop_from_max = max_p_end_pending - p_end[i]
-                        if drop_from_max >= drop_delta and p_end[i] < p_end[i - 1]:
+                        drop = p_end[i - 1] - p_end[i]
+                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
                             offset = offsets_arr[i]
                             triggered = True
                             break
                 else:
                     pending_count = 0
-                    max_p_end_pending = 0.0
 
             if not triggered:
                 miss += 1
@@ -80,8 +71,6 @@ def compute_event_level_metrics(
             hit1 += 1
         elif offset < 0:
             early += 1
-            if offset < very_early_threshold:
-                very_early += 1
         else:
             late += 1
 
@@ -95,15 +84,12 @@ def compute_event_level_metrics(
         'hit0_or_hit1_rate': (hit0 + hit1) / n_events if n_events > 0 else 0,
         'early': early,
         'early_rate': early / n_events if n_events > 0 else 0,
-        'very_early': very_early,
-        'very_early_rate': very_early / n_events if n_events > 0 else 0,
         'late': late,
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss': miss,
         'miss_rate': miss / n_events if n_events > 0 else 0,
         'avg_pred_offset': np.mean(offsets) if offsets else None,
-        'median_pred_offset': np.median(offsets) if offsets else None,
-        'p25_pred_offset': np.percentile(offsets, 25) if offsets else None
+        'median_pred_offset': np.median(offsets) if offsets else None
     }
 
 
@@ -256,11 +242,10 @@ def evaluate(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None,
-        very_early_threshold: int = -6
+        event_data: dict = None
 ) -> dict:
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                event_data, very_early_threshold)
+                                                event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {
@@ -277,13 +262,12 @@ def evaluate_with_trade_quality(
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         horizons: list = None,
-        event_data: dict = None,
-        very_early_threshold: int = -6
+        event_data: dict = None
 ) -> dict:
     from pump_end.ml.predict import extract_signals
 
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                event_data, very_early_threshold)
+                                                event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)

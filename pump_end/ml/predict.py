@@ -52,25 +52,18 @@ def extract_signals(
 
             triggered = False
             pending_count = 0
-            max_p_end_pending = 0.0
 
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
-                    if pending_count == 0:
-                        max_p_end_pending = p_end[i]
-                    else:
-                        max_p_end_pending = max(max_p_end_pending, p_end[i])
                     pending_count += 1
-
                     if pending_count >= min_pending_bars and i > 0:
-                        drop_from_max = max_p_end_pending - p_end[i]
-                        if drop_from_max >= drop_delta and p_end[i] < p_end[i - 1]:
+                        drop = p_end[i - 1] - p_end[i]
+                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
                             offset = offsets_arr[i]
                             triggered = True
                             break
                 else:
                     pending_count = 0
-                    max_p_end_pending = 0.0
 
             if not triggered:
                 continue

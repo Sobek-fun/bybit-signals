@@ -120,9 +120,7 @@ def calibrate_threshold_on_val(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float,
-        beta_very_early: float = 1.5,
-        very_early_threshold: int = -6
+        gamma_miss: float
 ) -> dict:
     if signal_rule == 'argmax_per_event':
         raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
@@ -162,12 +160,10 @@ def calibrate_threshold_on_val(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
-            beta_very_early=beta_very_early,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data,
-            very_early_threshold=very_early_threshold
+            event_data=event_data
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -453,11 +449,9 @@ def run_train_only(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
-        beta_very_early=args.beta_very_early,
         signal_rule=args.signal_rule,
         min_pending_bars=args.min_pending_bars,
-        drop_delta=args.drop_delta,
-        very_early_threshold=args.very_early_threshold
+        drop_delta=args.drop_delta
     )
 
     artifacts.save_threshold_sweep(sweep_df)
@@ -535,12 +529,10 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
-            beta_very_early=args.beta_very_early,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
-            seed=args.seed,
-            very_early_threshold=args.very_early_threshold
+            seed=args.seed
         )
 
         log("INFO", "TUNE", f"winner strategy: {tune_result['winner']}")
@@ -572,13 +564,11 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
-            beta_very_early=args.beta_very_early,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
             seed=args.seed,
-            tune_strategy=args.tune_strategy,
-            very_early_threshold=args.very_early_threshold
+            tune_strategy=args.tune_strategy
         )
 
         best_result = tune_result
@@ -630,9 +620,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 actual_signal_rule,
                 args.alpha_hit1,
                 args.beta_early,
-                args.gamma_miss,
-                args.beta_very_early,
-                args.very_early_threshold
+                args.gamma_miss
             )
 
             best_threshold = calibration_result['threshold']
@@ -718,8 +706,8 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_predicted_signals(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
 
-            backtest_url = args.backtest_url or os.environ.get('BACKTEST_URL')
-            backtest_api_key = args.backtest_api_key or os.environ.get('BACKTEST_API_KEY')
+            backtest_url = args.backtest_url
+            backtest_api_key = args.backtest_api_key
 
             if backtest_url and backtest_api_key and len(val_signals_df) > 0 and len(test_signals_df) > 0:
                 log("INFO", "BACKTEST", f"starting backtest integration")
@@ -868,8 +856,6 @@ def main():
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
-    parser.add_argument("--beta-very-early", type=float, default=1.5)
-    parser.add_argument("--very-early-threshold", type=int, default=-6)
 
     parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
