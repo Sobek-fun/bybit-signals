@@ -40,5 +40,5 @@ class PumpEndModel:
             val = features_row.get(name)
             feature_values.append(np.nan if val is None else val)
 
-        proba = self.model.predict_proba([feature_values])[0][1]
+        proba = self.model.predict_proba([feature_values], thread_count=1)[0][1]
         return proba

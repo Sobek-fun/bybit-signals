@@ -1,3 +1,10 @@
+import os
+
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -228,7 +235,7 @@ class PumpEndPipeline:
                 fv.append(np.nan if val is None else val)
             feature_values_list.append(fv)
 
-        probas = self.model.model.predict_proba(feature_values_list)[:, 1]
+        probas = self.model.model.predict_proba(feature_values_list, thread_count=1)[:, 1]
 
         for i, dt in enumerate(valid_decision_times):
             p_end = probas[i]

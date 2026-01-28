@@ -396,71 +396,88 @@ class PumpFeatureBuilder:
         p = self.params
         n = len(df)
 
-        df['pdh'] = np.nan
-        df['pwh'] = np.nan
+        high_arr = df['high'].values
+        close_arr = df['close'].values
+        atr_arr = df['atr_14'].values if 'atr_14' in df.columns else np.full(n, np.nan)
 
-        if df.index.dtype == 'datetime64[ns]' or hasattr(df.index, 'date'):
-            dates = pd.to_datetime(df.index).date
-            df_temp = df.copy()
-            df_temp['_date'] = dates
+        dates = pd.to_datetime(df.index).date
+        date_series = pd.Series(dates, index=df.index)
+        unique_dates = date_series.unique()
 
-            daily_highs = df_temp.groupby('_date')['high'].transform('max')
-            unique_dates = pd.Series(dates).unique()
-            date_to_prev_high = {}
+        date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+        bar_date_idx = np.array([date_to_idx[d] for d in dates])
 
-            for i, current_date in enumerate(unique_dates):
-                if i > 0:
-                    date_to_prev_high[current_date] = daily_highs[dates == unique_dates[i - 1]].iloc[0]
+        daily_highs = np.zeros(len(unique_dates))
+        for i, d in enumerate(unique_dates):
+            mask = dates == d
+            daily_highs[i] = high_arr[mask].max()
 
-            df['pdh'] = pd.Series(dates).map(date_to_prev_high).values
+        prev_daily_highs = np.roll(daily_highs, 1)
+        prev_daily_highs[0] = np.nan
 
-            weeks = pd.to_datetime(df.index).isocalendar()
-            df_temp['_year_week'] = list(zip(weeks.year, weeks.week))
+        pdh_arr = prev_daily_highs[bar_date_idx]
+        df['pdh'] = pdh_arr
 
-            weekly_highs = {}
-            for (year, week), group in df_temp.groupby('_year_week'):
-                weekly_highs[(year, week)] = group['high'].max()
+        weeks = pd.to_datetime(df.index).isocalendar()
+        year_week = list(zip(weeks.year, weeks.week))
+        unique_weeks = list(dict.fromkeys(year_week))
 
-            unique_weeks = list(dict.fromkeys(df_temp['_year_week'].tolist()))
-            week_to_prev_high = {}
+        week_to_idx = {w: i for i, w in enumerate(unique_weeks)}
+        bar_week_idx = np.array([week_to_idx[w] for w in year_week])
 
-            for i, (year, week) in enumerate(unique_weeks):
-                if i > 0:
-                    prev_year, prev_week = unique_weeks[i - 1]
-                    week_to_prev_high[(year, week)] = weekly_highs[(prev_year, prev_week)]
+        weekly_highs = np.zeros(len(unique_weeks))
+        for i, w in enumerate(unique_weeks):
+            mask = np.array([yw == w for yw in year_week])
+            weekly_highs[i] = high_arr[mask].max()
 
-            df['pwh'] = df_temp['_year_week'].map(week_to_prev_high).values
+        prev_weekly_highs = np.roll(weekly_highs, 1)
+        prev_weekly_highs[0] = np.nan
 
-        df['dist_to_pdh'] = np.where(df['pdh'].notna() & (df['pdh'] > 0), (df['pdh'] - df['close']) / df['close'],
-                                     np.nan)
-        df['dist_to_pwh'] = np.where(df['pwh'].notna() & (df['pwh'] > 0), (df['pwh'] - df['close']) / df['close'],
-                                     np.nan)
+        pwh_arr = prev_weekly_highs[bar_week_idx]
+        df['pwh'] = pwh_arr
 
-        df['touched_pdh'] = ((df['high'] >= df['pdh'] * 0.999) & df['pdh'].notna()).astype(int)
-        df['touched_pwh'] = ((df['high'] >= df['pwh'] * 0.999) & df['pwh'].notna()).astype(int)
+        df['dist_to_pdh'] = np.where(
+            ~np.isnan(pdh_arr) & (pdh_arr > 0),
+            (pdh_arr - close_arr) / close_arr,
+            np.nan
+        )
+        df['dist_to_pwh'] = np.where(
+            ~np.isnan(pwh_arr) & (pwh_arr > 0),
+            (pwh_arr - close_arr) / close_arr,
+            np.nan
+        )
+
+        df['touched_pdh'] = ((high_arr >= pdh_arr * 0.999) & ~np.isnan(pdh_arr)).astype(int)
+        df['touched_pwh'] = ((high_arr >= pwh_arr * 0.999) & ~np.isnan(pwh_arr)).astype(int)
 
         df['sweep_pdh'] = (
-                (df['high'] > df['pdh'] * 1.001) & (df['close'] < df['pdh'] * 0.999) & df['pdh'].notna()).astype(
-            int)
+                (high_arr > pdh_arr * 1.001) & (close_arr < pdh_arr * 0.999) & ~np.isnan(pdh_arr)
+        ).astype(int)
         df['sweep_pwh'] = (
-                (df['high'] > df['pwh'] * 1.001) & (df['close'] < df['pwh'] * 0.999) & df['pwh'].notna()).astype(
-            int)
+                (high_arr > pwh_arr * 1.001) & (close_arr < pwh_arr * 0.999) & ~np.isnan(pwh_arr)
+        ).astype(int)
 
-        df['overshoot_pdh'] = np.where(df['sweep_pdh'] == 1, (df['high'] - df['pdh']) / df['pdh'], 0)
-        df['overshoot_pwh'] = np.where(df['sweep_pwh'] == 1, (df['high'] - df['pwh']) / df['pwh'], 0)
+        sweep_pdh_mask = df['sweep_pdh'].values == 1
+        sweep_pwh_mask = df['sweep_pwh'].values == 1
+
+        overshoot_pdh_arr = np.zeros(n)
+        overshoot_pwh_arr = np.zeros(n)
+        overshoot_pdh_arr[sweep_pdh_mask] = (high_arr[sweep_pdh_mask] - pdh_arr[sweep_pdh_mask]) / pdh_arr[
+            sweep_pdh_mask]
+        overshoot_pwh_arr[sweep_pwh_mask] = (high_arr[sweep_pwh_mask] - pwh_arr[sweep_pwh_mask]) / pwh_arr[
+            sweep_pwh_mask]
+
+        df['overshoot_pdh'] = overshoot_pdh_arr
+        df['overshoot_pwh'] = overshoot_pwh_arr
 
         liq_window = p.liquidity_window_bars
         eqh_tol_base = p.eqh_base_tol
         eqh_atr_factor = p.eqh_atr_factor
         min_touches = p.eqh_min_touches
 
-        df['eqh_level'] = np.nan
-        df['eqh_strength'] = 0
-        df['eqh_age_bars'] = np.nan
-
-        high_arr = df['high'].values
-        atr_arr = df['atr_14'].values if 'atr_14' in df.columns else np.full(n, np.nan)
-        close_arr = df['close'].values
+        eqh_level_arr = np.full(n, np.nan)
+        eqh_strength_arr = np.zeros(n, dtype=int)
+        eqh_age_arr = np.full(n, np.nan)
 
         event_times = events['open_time'].values
         event_positions = df.index.get_indexer(pd.DatetimeIndex(event_times))
@@ -483,10 +500,12 @@ class PumpFeatureBuilder:
             current_close = close_arr[i - 1] if i > 0 else close_arr[i]
             tol = max(eqh_tol_base, eqh_atr_factor * current_atr / current_close if current_close > 0 else eqh_tol_base)
 
-            clusters = []
             used = np.zeros(liq_window, dtype=bool)
-
             sorted_indices = np.argsort(window_highs)[::-1]
+
+            best_strength = 0
+            best_level = 0.0
+            best_age = np.nan
 
             for idx in sorted_indices:
                 if used[idx]:
@@ -495,46 +514,57 @@ class PumpFeatureBuilder:
                 if level <= 0:
                     continue
 
-                touches = []
-                for j in range(liq_window):
-                    if not used[j] and abs(window_highs[j] - level) / level <= tol:
-                        touches.append(j)
-                        used[j] = True
+                mask = (~used) & (np.abs(window_highs - level) / level <= tol)
+                touches_indices = np.where(mask)[0]
 
-                if len(touches) >= min_touches:
-                    avg_level = np.mean([window_highs[t] for t in touches])
-                    last_touch_age = liq_window - max(touches) - 1
-                    clusters.append((avg_level, len(touches), last_touch_age))
+                if len(touches_indices) < min_touches:
+                    continue
 
-            if clusters:
-                clusters.sort(key=lambda x: (-x[1], -x[0]))
-                best = clusters[0]
-                df.iloc[i, df.columns.get_loc('eqh_level')] = best[0]
-                df.iloc[i, df.columns.get_loc('eqh_strength')] = best[1]
-                df.iloc[i, df.columns.get_loc('eqh_age_bars')] = best[2]
+                used[mask] = True
 
-        df['dist_to_eqh'] = np.where(df['eqh_level'].notna() & (df['eqh_level'] > 0),
-                                     (df['eqh_level'] - df['close']) / df['close'], np.nan)
-        df['sweep_eqh'] = ((df['high'] > df['eqh_level'] * 1.001) & (df['close'] < df['eqh_level'] * 0.999) & df[
-            'eqh_level'].notna()).astype(int)
-        df['overshoot_eqh'] = np.where(df['sweep_eqh'] == 1, (df['high'] - df['eqh_level']) / df['eqh_level'], 0)
+                avg_level = np.mean(window_highs[touches_indices])
+                last_touch_age = liq_window - touches_indices.max() - 1
+                strength = len(touches_indices)
 
-        df['liq_level_type_pwh'] = 0
-        df['liq_level_type_pdh'] = 0
-        df['liq_level_type_eqh'] = 0
-        df['liq_level_dist'] = np.nan
-        df['liq_sweep_flag'] = 0
-        df['liq_sweep_overshoot'] = 0.0
+                if strength > best_strength or (strength == best_strength and avg_level > best_level):
+                    best_strength = strength
+                    best_level = avg_level
+                    best_age = last_touch_age
+
+            if best_strength >= min_touches:
+                eqh_level_arr[i] = best_level
+                eqh_strength_arr[i] = best_strength
+                eqh_age_arr[i] = best_age
+
+        df['eqh_level'] = eqh_level_arr
+        df['eqh_strength'] = eqh_strength_arr
+        df['eqh_age_bars'] = eqh_age_arr
+
+        eqh_valid = ~np.isnan(eqh_level_arr) & (eqh_level_arr > 0)
+        dist_to_eqh_arr = np.full(n, np.nan)
+        dist_to_eqh_arr[eqh_valid] = (eqh_level_arr[eqh_valid] - close_arr[eqh_valid]) / close_arr[eqh_valid]
+        df['dist_to_eqh'] = dist_to_eqh_arr
+
+        sweep_eqh_arr = (
+                (high_arr > eqh_level_arr * 1.001) & (close_arr < eqh_level_arr * 0.999) & eqh_valid
+        ).astype(int)
+        df['sweep_eqh'] = sweep_eqh_arr
+
+        sweep_eqh_mask = sweep_eqh_arr == 1
+        overshoot_eqh_arr = np.zeros(n)
+        overshoot_eqh_arr[sweep_eqh_mask] = (high_arr[sweep_eqh_mask] - eqh_level_arr[sweep_eqh_mask]) / eqh_level_arr[
+            sweep_eqh_mask]
+        df['overshoot_eqh'] = overshoot_eqh_arr
 
         sweep_pwh = df['sweep_pwh'].values
         sweep_pdh = df['sweep_pdh'].values
-        sweep_eqh = df['sweep_eqh'].values
+        sweep_eqh = sweep_eqh_arr
         dist_pwh = df['dist_to_pwh'].values
         dist_pdh = df['dist_to_pdh'].values
-        dist_eqh = df['dist_to_eqh'].values
-        overshoot_pwh = df['overshoot_pwh'].values
-        overshoot_pdh = df['overshoot_pdh'].values
-        overshoot_eqh = df['overshoot_eqh'].values
+        dist_eqh = dist_to_eqh_arr
+        overshoot_pwh = overshoot_pwh_arr
+        overshoot_pdh = overshoot_pdh_arr
+        overshoot_eqh = overshoot_eqh_arr
 
         liq_type_pwh = np.zeros(n, dtype=int)
         liq_type_pdh = np.zeros(n, dtype=int)
@@ -543,41 +573,47 @@ class PumpFeatureBuilder:
         liq_sweep = np.zeros(n, dtype=int)
         liq_overshoot = np.zeros(n, dtype=float)
 
-        for i in range(n):
-            if sweep_pwh[i] == 1:
-                liq_type_pwh[i] = 1
-                liq_dist[i] = dist_pwh[i]
-                liq_sweep[i] = 1
-                liq_overshoot[i] = overshoot_pwh[i]
-            elif sweep_pdh[i] == 1:
-                liq_type_pdh[i] = 1
-                liq_dist[i] = dist_pdh[i]
-                liq_sweep[i] = 1
-                liq_overshoot[i] = overshoot_pdh[i]
-            elif sweep_eqh[i] == 1:
-                liq_type_eqh[i] = 1
-                liq_dist[i] = dist_eqh[i]
-                liq_sweep[i] = 1
-                liq_overshoot[i] = overshoot_eqh[i]
-            else:
-                candidates = []
-                if not np.isnan(dist_pwh[i]) and dist_pwh[i] > 0:
-                    candidates.append(('pwh', dist_pwh[i]))
-                if not np.isnan(dist_pdh[i]) and dist_pdh[i] > 0:
-                    candidates.append(('pdh', dist_pdh[i]))
-                if not np.isnan(dist_eqh[i]) and dist_eqh[i] > 0:
-                    candidates.append(('eqh', dist_eqh[i]))
+        sweep_pwh_bool = sweep_pwh == 1
+        sweep_pdh_bool = sweep_pdh == 1
+        sweep_eqh_bool = sweep_eqh == 1
 
-                if candidates:
-                    candidates.sort(key=lambda x: x[1])
-                    best_type, best_dist = candidates[0]
-                    if best_type == 'pwh':
-                        liq_type_pwh[i] = 1
-                    elif best_type == 'pdh':
-                        liq_type_pdh[i] = 1
-                    else:
-                        liq_type_eqh[i] = 1
-                    liq_dist[i] = best_dist
+        liq_type_pwh[sweep_pwh_bool] = 1
+        liq_dist[sweep_pwh_bool] = dist_pwh[sweep_pwh_bool]
+        liq_sweep[sweep_pwh_bool] = 1
+        liq_overshoot[sweep_pwh_bool] = overshoot_pwh[sweep_pwh_bool]
+
+        pdh_only = sweep_pdh_bool & ~sweep_pwh_bool
+        liq_type_pdh[pdh_only] = 1
+        liq_dist[pdh_only] = dist_pdh[pdh_only]
+        liq_sweep[pdh_only] = 1
+        liq_overshoot[pdh_only] = overshoot_pdh[pdh_only]
+
+        eqh_only = sweep_eqh_bool & ~sweep_pwh_bool & ~sweep_pdh_bool
+        liq_type_eqh[eqh_only] = 1
+        liq_dist[eqh_only] = dist_eqh[eqh_only]
+        liq_sweep[eqh_only] = 1
+        liq_overshoot[eqh_only] = overshoot_eqh[eqh_only]
+
+        no_sweep = ~sweep_pwh_bool & ~sweep_pdh_bool & ~sweep_eqh_bool
+
+        dist_pwh_safe = np.where((~np.isnan(dist_pwh)) & (dist_pwh > 0), dist_pwh, np.inf)
+        dist_pdh_safe = np.where((~np.isnan(dist_pdh)) & (dist_pdh > 0), dist_pdh, np.inf)
+        dist_eqh_safe = np.where((~np.isnan(dist_eqh)) & (dist_eqh > 0), dist_eqh, np.inf)
+
+        dist_stack = np.stack([dist_pwh_safe, dist_pdh_safe, dist_eqh_safe], axis=1)
+        min_idx = np.argmin(dist_stack, axis=1)
+        min_dist = np.min(dist_stack, axis=1)
+
+        has_candidate = no_sweep & (min_dist < np.inf)
+
+        pwh_best = has_candidate & (min_idx == 0)
+        pdh_best = has_candidate & (min_idx == 1)
+        eqh_best = has_candidate & (min_idx == 2)
+
+        liq_type_pwh[pwh_best] = 1
+        liq_type_pdh[pdh_best] = 1
+        liq_type_eqh[eqh_best] = 1
+        liq_dist[has_candidate] = min_dist[has_candidate]
 
         df['liq_level_type_pwh'] = liq_type_pwh
         df['liq_level_type_pdh'] = liq_type_pdh
