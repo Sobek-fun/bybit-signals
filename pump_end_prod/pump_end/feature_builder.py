@@ -410,7 +410,7 @@ class PumpFeatureBuilder:
         daily_highs = np.zeros(len(unique_dates))
         for i, d in enumerate(unique_dates):
             mask = dates == d
-            daily_highs[i] = high_arr[mask].max()
+            daily_highs[i] = np.nanmax(high_arr[mask])
 
         prev_daily_highs = np.roll(daily_highs, 1)
         prev_daily_highs[0] = np.nan
@@ -428,7 +428,7 @@ class PumpFeatureBuilder:
         weekly_highs = np.zeros(len(unique_weeks))
         for i, w in enumerate(unique_weeks):
             mask = np.array([yw == w for yw in year_week])
-            weekly_highs[i] = high_arr[mask].max()
+            weekly_highs[i] = np.nanmax(high_arr[mask])
 
         prev_weekly_highs = np.roll(weekly_highs, 1)
         prev_weekly_highs[0] = np.nan
@@ -517,10 +517,10 @@ class PumpFeatureBuilder:
                 mask = (~used) & (np.abs(window_highs - level) / level <= tol)
                 touches_indices = np.where(mask)[0]
 
+                used[mask] = True
+
                 if len(touches_indices) < min_touches:
                     continue
-
-                used[mask] = True
 
                 avg_level = np.mean(window_highs[touches_indices])
                 last_touch_age = liq_window - touches_indices.max() - 1
