@@ -28,6 +28,7 @@ def compute_event_level_metrics(
     late = 0
     miss = 0
     offsets = []
+    early_offsets = []
 
     for event_id, data in event_data.items():
         if signal_rule == 'first_cross':
@@ -46,18 +47,22 @@ def compute_event_level_metrics(
 
             triggered = False
             pending_count = 0
+            pending_max = -np.inf
 
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
                     pending_count += 1
+                    pending_max = max(pending_max, p_end[i])
+
                     if pending_count >= min_pending_bars and i > 0:
-                        drop = p_end[i - 1] - p_end[i]
-                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
+                        drop_from_peak = pending_max - p_end[i]
+                        if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
                             offset = offsets_arr[i]
                             triggered = True
                             break
                 else:
                     pending_count = 0
+                    pending_max = -np.inf
 
             if not triggered:
                 miss += 1
@@ -71,6 +76,7 @@ def compute_event_level_metrics(
             hit1 += 1
         elif offset < 0:
             early += 1
+            early_offsets.append(offset)
         else:
             late += 1
 
@@ -244,6 +250,79 @@ def compute_trade_quality_score(trade_metrics: dict, horizon: int = 32) -> float
     score = mfe_median * 100 + mfe_pct_above_2pct * 50 - mae_median * 30
 
     return score
+
+
+def compute_offset_distribution(
+        predictions_df: pd.DataFrame,
+        threshold: float,
+        signal_rule: str = 'pending_turn_down',
+        min_pending_bars: int = 1,
+        drop_delta: float = 0.0
+) -> dict:
+    event_data = _prepare_event_data(predictions_df)
+
+    offsets = []
+
+    for event_id, data in event_data.items():
+        if signal_rule == 'first_cross':
+            mask = data['p_end'] >= threshold
+            if not mask.any():
+                continue
+            first_idx = np.argmax(mask)
+            offset = data['offsets'][first_idx]
+        elif signal_rule == 'argmax_per_event':
+            argmax_idx = np.argmax(data['p_end'])
+            offset = data['offsets'][argmax_idx]
+        else:
+            offsets_arr = data['offsets']
+            p_end = data['p_end']
+
+            triggered = False
+            pending_count = 0
+            pending_max = -np.inf
+
+            for i in range(len(offsets_arr)):
+                if p_end[i] >= threshold:
+                    pending_count += 1
+                    pending_max = max(pending_max, p_end[i])
+
+                    if pending_count >= min_pending_bars and i > 0:
+                        drop_from_peak = pending_max - p_end[i]
+                        if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
+                            offset = offsets_arr[i]
+                            triggered = True
+                            break
+                else:
+                    pending_count = 0
+                    pending_max = -np.inf
+
+            if not triggered:
+                continue
+
+        offsets.append(offset)
+
+    if not offsets:
+        return {
+            'offset_minus2_to_plus2_rate': 0.0,
+            'tail_le_minus10_rate': 0.0,
+            'mean_offset': None,
+            'median_offset': None,
+            'total_signals': 0
+        }
+
+    offsets_arr = np.array(offsets)
+    n_signals = len(offsets_arr)
+
+    in_range = np.sum((offsets_arr >= -2) & (offsets_arr <= 2))
+    tail_early = np.sum(offsets_arr <= -10)
+
+    return {
+        'offset_minus2_to_plus2_rate': in_range / n_signals,
+        'tail_le_minus10_rate': tail_early / n_signals,
+        'mean_offset': float(np.mean(offsets_arr)),
+        'median_offset': float(np.median(offsets_arr)),
+        'total_signals': n_signals
+    }
 
 
 def evaluate(

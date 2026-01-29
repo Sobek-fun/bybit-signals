@@ -119,8 +119,8 @@ def get_hyperparameter_grid() -> list:
 
 def get_rule_parameter_grid() -> list:
     rule_grid = {
-        'min_pending_bars': [1, 2, 3],
-        'drop_delta': [0.0, 0.01, 0.02]
+        'min_pending_bars': [2, 3, 4, 5, 6],
+        'drop_delta': [0.00, 0.01, 0.02, 0.03, 0.04, 0.05]
     }
 
     keys = list(rule_grid.keys())
@@ -131,6 +131,24 @@ def get_rule_parameter_grid() -> list:
         combinations.append(dict(zip(keys, combo)))
 
     return combinations
+
+
+def make_weights(df: pd.DataFrame) -> np.ndarray:
+    w = np.ones(len(df), dtype=float)
+
+    w[df["y"] == 1] *= 8.0
+
+    near = df["offset"].between(-5, -1)
+    w[near & (df["y"] == 0)] *= 4.0
+
+    after = df["offset"].between(1, 4)
+    w[after & (df["y"] == 0)] *= 2.5
+
+    if "pump_la_type" in df.columns:
+        is_b = (df["pump_la_type"] == "B")
+        w[is_b & (df["offset"] == 0) & (df["y"] == 0)] *= 6.0
+
+    return w
 
 
 def train_fold(
@@ -152,8 +170,11 @@ def train_fold(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    train_pool = Pool(X_train, y_train)
-    val_pool = Pool(X_val, y_val)
+    w_train = make_weights(train_df)
+    w_val = make_weights(val_df)
+
+    train_pool = Pool(X_train, y_train, weight=w_train)
+    val_pool = Pool(X_val, y_val, weight=w_val)
 
     model = CatBoostClassifier(
         iterations=iterations,
@@ -293,7 +314,7 @@ def evaluate_fold(
 
         score = (
                 metrics['hit0_rate'] +
-                alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate'] + metrics['hit1_rate']) -
+                alpha_hit1 * metrics['hit1_rate'] -
                 beta_early * metrics['early_rate'] -
                 gamma_miss * metrics['miss_rate'] -
                 early_penalty
@@ -553,7 +574,10 @@ def train_final_model(
 
     X_train = train_df[feature_columns]
     y_train = train_df['y']
-    train_pool = Pool(X_train, y_train)
+
+    w_train = make_weights(train_df)
+
+    train_pool = Pool(X_train, y_train, weight=w_train)
 
     model = CatBoostClassifier(
         iterations=iterations,

@@ -36,6 +36,7 @@ def _compute_event_metrics_from_data(
     late = 0
     miss = 0
     offsets = []
+    early_offsets = []
 
     for event_id, data in event_data.items():
         if signal_rule == 'first_cross':
@@ -54,18 +55,22 @@ def _compute_event_metrics_from_data(
 
             triggered = False
             pending_count = 0
+            pending_max = -np.inf
 
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
                     pending_count += 1
+                    pending_max = max(pending_max, p_end[i])
+
                     if pending_count >= min_pending_bars and i > 0:
-                        drop = p_end[i - 1] - p_end[i]
-                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
+                        drop_from_peak = pending_max - p_end[i]
+                        if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
                             offset = offsets_arr[i]
                             triggered = True
                             break
                 else:
                     pending_count = 0
+                    pending_max = -np.inf
 
             if not triggered:
                 miss += 1
@@ -79,10 +84,13 @@ def _compute_event_metrics_from_data(
             hit1 += 1
         elif offset < 0:
             early += 1
+            early_offsets.append(offset)
         else:
             late += 1
 
     n_events = len(event_data)
+
+    early_magnitude = np.mean([max(0, -o) for o in early_offsets]) if early_offsets else 0.0
 
     return {
         'threshold': threshold,
@@ -98,7 +106,8 @@ def _compute_event_metrics_from_data(
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss_rate': miss / n_events if n_events > 0 else 0,
         'avg_offset': np.mean(offsets) if offsets else None,
-        'median_offset': np.median(offsets) if offsets else None
+        'median_offset': np.median(offsets) if offsets else None,
+        'early_magnitude': early_magnitude
     }
 
 
@@ -123,6 +132,7 @@ def threshold_sweep(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        kappa_early_magnitude: float = 0.03,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
@@ -141,7 +151,8 @@ def threshold_sweep(
                 metrics['hit0_rate'] +
                 alpha_hit1 * metrics['hit1_rate'] -
                 beta_early * metrics['early_rate'] -
-                gamma_miss * metrics['miss_rate']
+                gamma_miss * metrics['miss_rate'] -
+                kappa_early_magnitude * metrics['early_magnitude']
         )
         metrics['score'] = score
 

@@ -124,5 +124,10 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(data, f, indent=2, default=str)
 
+    def save_offset_distribution(self, data: dict, split_name: str):
+        path = self.run_dir / f"offset_distribution_{split_name}.json"
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+
     def get_path(self) -> Path:
         return self.run_dir

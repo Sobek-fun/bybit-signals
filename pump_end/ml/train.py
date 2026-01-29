@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
@@ -9,6 +10,24 @@ def get_feature_columns(df: pd.DataFrame) -> list:
         'timeframe', 'window_bars', 'warmup_bars'
     }
     return [col for col in df.columns if col not in exclude_cols]
+
+
+def make_weights(df: pd.DataFrame) -> np.ndarray:
+    w = np.ones(len(df), dtype=float)
+
+    w[df["y"] == 1] *= 8.0
+
+    near = df["offset"].between(-5, -1)
+    w[near & (df["y"] == 0)] *= 4.0
+
+    after = df["offset"].between(1, 4)
+    w[after & (df["y"] == 0)] *= 2.5
+
+    if "pump_la_type" in df.columns:
+        is_b = (df["pump_la_type"] == "B")
+        w[is_b & (df["offset"] == 0) & (df["y"] == 0)] *= 6.0
+
+    return w
 
 
 def train_model(
@@ -30,8 +49,11 @@ def train_model(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    train_pool = Pool(X_train, y_train)
-    val_pool = Pool(X_val, y_val)
+    w_train = make_weights(train_df)
+    w_val = make_weights(val_df)
+
+    train_pool = Pool(X_train, y_train, weight=w_train)
+    val_pool = Pool(X_val, y_val, weight=w_val)
 
     model = CatBoostClassifier(
         iterations=iterations,
@@ -78,11 +100,15 @@ def get_feature_importance_grouped(importance_df: pd.DataFrame) -> pd.DataFrame:
             ('log_volume', 'volume'),
             ('ret_1', 'returns'),
             ('cum_ret', 'returns'),
+            ('ret_accel', 'returns'),
             ('range', 'candle'),
             ('upper_wick', 'candle'),
             ('lower_wick', 'candle'),
             ('body_ratio', 'candle'),
             ('count_red', 'candle'),
+            ('signed_body', 'candle'),
+            ('climax_vr', 'candle'),
+            ('range_over_atr', 'candle'),
             ('atr', 'ATR'),
             ('bb_', 'BB'),
             ('vwap', 'VWAP'),
