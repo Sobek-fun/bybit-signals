@@ -667,6 +667,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta
             )
+            artifacts.save_predicted_signals_val(val_signals_df)
+            log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
 
             test_signals_df = extract_signals(
                 test_predictions,
