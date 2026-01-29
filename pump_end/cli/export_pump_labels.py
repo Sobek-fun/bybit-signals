@@ -35,6 +35,12 @@ def main():
         default="pump_labels.csv",
         help="Output CSV file path (default: pump_labels.csv)"
     )
+    parser.add_argument(
+        "--tokens",
+        type=str,
+        default=None,
+        help="Comma-separated tokens in lowercase without USDT (e.g., 0g,1000lunc,2z,act)"
+    )
 
     args = parser.parse_args()
 
@@ -58,20 +64,24 @@ def main():
         secure=secure
     )
 
-    print(f"Fetching symbols from {args.start_date} to {args.end_date}...")
-    symbols_query = """
-    SELECT DISTINCT symbol
-    FROM bybit.candles
-    WHERE open_time >= %(start_date)s
-      AND open_time <= %(end_date)s
-      AND interval = 1
-    ORDER BY symbol
-    """
-    result = client.query(symbols_query, parameters={
-        "start_date": start_dt,
-        "end_date": end_dt
-    })
-    symbols = [row[0] for row in result.result_rows]
+    if args.tokens:
+        symbols = [f"{t.strip().upper()}USDT" for t in args.tokens.split(',')]
+        print(f"Using {len(symbols)} specified tokens")
+    else:
+        print(f"Fetching symbols from {args.start_date} to {args.end_date}...")
+        symbols_query = """
+                        SELECT DISTINCT symbol
+                        FROM bybit.candles
+                        WHERE open_time >= %(start_date)s
+                          AND open_time <= %(end_date)s
+                          AND interval = 1
+                        ORDER BY symbol \
+                        """
+        result = client.query(symbols_query, parameters={
+            "start_date": start_dt,
+            "end_date": end_dt
+        })
+        symbols = [row[0] for row in result.result_rows]
 
     if not symbols:
         print("No symbols found for the specified date range")
