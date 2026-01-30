@@ -119,7 +119,7 @@ def get_hyperparameter_grid() -> list:
 
 def get_rule_parameter_grid() -> list:
     rule_grid = {
-        'min_pending_bars': [2, 3, 4, 5, 6],
+        'min_pending_bars': [1, 2, 3, 4],
         'drop_delta': [0.00, 0.01, 0.02, 0.03, 0.04, 0.05]
     }
 

@@ -136,7 +136,8 @@ def threshold_sweep(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None
+        event_data: dict = None,
+        min_trigger_rate: float = 0.10
 ) -> tuple:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
@@ -147,13 +148,17 @@ def threshold_sweep(
     for threshold in thresholds:
         metrics = _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta)
 
-        score = (
-                metrics['hit0_rate'] +
-                alpha_hit1 * metrics['hit1_rate'] -
-                beta_early * metrics['early_rate'] -
-                gamma_miss * metrics['miss_rate'] -
-                kappa_early_magnitude * metrics['early_magnitude']
-        )
+        trigger_rate = 1 - metrics['miss_rate']
+        if trigger_rate < min_trigger_rate:
+            score = -np.inf
+        else:
+            score = (
+                    metrics['hit0_rate'] +
+                    alpha_hit1 * metrics['hit1_rate'] -
+                    beta_early * metrics['early_rate'] -
+                    gamma_miss * metrics['miss_rate'] -
+                    kappa_early_magnitude * metrics['early_magnitude']
+            )
         metrics['score'] = score
 
         results.append(metrics)

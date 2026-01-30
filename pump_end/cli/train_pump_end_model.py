@@ -31,6 +31,32 @@ def parse_pos_offsets(offsets_str: str) -> list:
     return [int(x.strip()) for x in offsets_str.split(',')]
 
 
+def extract_dataset_params(features_df: pd.DataFrame) -> dict:
+    params = {}
+
+    params['neg_before'] = abs(int(features_df['offset'].min()))
+
+    max_offset = features_df['offset'].max()
+    params['neg_after'] = int(max_offset) if max_offset > 0 else 0
+
+    if 'window_bars' in features_df.columns:
+        params['window_bars'] = int(features_df['window_bars'].iloc[0])
+
+    if 'warmup_bars' in features_df.columns:
+        params['warmup_bars'] = int(features_df['warmup_bars'].iloc[0])
+
+    extended_cols = {'atr_norm', 'bb_z', 'vwap_dev', 'obv'}
+    has_extended = any(col in features_df.columns for col in extended_cols)
+    params['feature_set'] = 'extended' if has_extended else 'base'
+
+    if 'pump_la_type' in features_df.columns:
+        params['include_b'] = 'B' in features_df['pump_la_type'].values
+    else:
+        params['include_b'] = False
+
+    return params
+
+
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
     required_cols = {'event_id', 'offset', 'y'}
     missing_cols = required_cols - set(features_df.columns)
@@ -287,6 +313,9 @@ def select_strategy_from_result(
 
 
 def run_build_dataset(args, artifacts: RunArtifacts):
+    config = vars(args).copy()
+    artifacts.save_config(config)
+
     start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
     end_date = parse_date_exclusive(args.end_date) if args.end_date else None
 
@@ -346,6 +375,11 @@ def run_build_dataset(args, artifacts: RunArtifacts):
 def run_train_only(args, artifacts: RunArtifacts):
     log("INFO", "TRAIN", f"loading features from {args.dataset_parquet}")
     features_df = pd.read_parquet(args.dataset_parquet)
+
+    config = vars(args).copy()
+    dataset_params = extract_dataset_params(features_df)
+    config.update(dataset_params)
+    artifacts.save_config(config)
 
     feature_columns = get_feature_columns(features_df)
     log("INFO", "TRAIN", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
@@ -468,6 +502,11 @@ def run_train_only(args, artifacts: RunArtifacts):
 def run_tune(args, artifacts: RunArtifacts):
     log("INFO", "TUNE", f"loading features from {args.dataset_parquet}")
     features_df = pd.read_parquet(args.dataset_parquet)
+
+    config = vars(args).copy()
+    dataset_params = extract_dataset_params(features_df)
+    config.update(dataset_params)
+    artifacts.save_config(config)
 
     feature_columns = get_feature_columns(features_df)
     log("INFO", "TUNE", f"loaded {len(features_df)} rows with {len(feature_columns)} features")
@@ -677,8 +716,13 @@ def run_tune(args, artifacts: RunArtifacts):
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta
             )
-            artifacts.save_predicted_signals(test_signals_df)
-            log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
+            log("INFO", "TUNE", f"extracted {len(test_signals_df)} TEST predicted signals")
+
+            holdout_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
+            holdout_signals_df = holdout_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
+            holdout_signals_df = holdout_signals_df.sort_values('open_time').reset_index(drop=True)
+            artifacts.save_predicted_signals(holdout_signals_df)
+            log("INFO", "TUNE", f"saved {len(holdout_signals_df)} HOLDOUT predicted signals (val + test)")
 
             backtest_url = args.backtest_url
             backtest_api_key = args.backtest_api_key
@@ -879,9 +923,6 @@ def main():
 
     artifacts = RunArtifacts(args.out_dir, args.run_name)
     log("INFO", "MAIN", f"run_dir={artifacts.get_path()}")
-
-    config = vars(args)
-    artifacts.save_config(config)
 
     if args.mode == "build-dataset":
         run_build_dataset(args, artifacts)
