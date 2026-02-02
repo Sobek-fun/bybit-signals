@@ -21,7 +21,7 @@ from pump_end.ml.clustering import (
 from pump_end.infra.clickhouse import DataLoader
 
 MAX_EARLY_RATE = 0.35
-MAX_MISS_RATE = 0.65
+MAX_MISS_RATE = 0.97
 
 
 def log(level: str, component: str, message: str):
@@ -127,7 +127,10 @@ def calibrate_threshold_on_val(
         beta_early: float,
         gamma_miss: float,
         kappa_early_magnitude: float,
-        min_trigger_rate: float
+        min_trigger_rate: float,
+        grid_from: float = 0.01,
+        grid_to: float = 0.30,
+        grid_step: float = 0.01
 ) -> dict:
     if signal_rule == 'argmax_per_event':
         raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
@@ -166,6 +169,9 @@ def calibrate_threshold_on_val(
 
         threshold, sweep_df = threshold_sweep(
             predictions,
+            grid_from=grid_from,
+            grid_to=grid_to,
+            grid_step=grid_step,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
@@ -208,7 +214,10 @@ def calibrate_threshold_on_val_by_cluster(
         gamma_miss: float,
         kappa_early_magnitude: float,
         min_trigger_rate: float,
-        artifacts: RunArtifacts
+        artifacts: RunArtifacts,
+        grid_from: float = 0.01,
+        grid_to: float = 0.30,
+        grid_step: float = 0.01
 ) -> dict:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time', 'cluster_id']].drop_duplicates(
         'event_id')
@@ -260,6 +269,9 @@ def calibrate_threshold_on_val_by_cluster(
 
             threshold, sweep_df = threshold_sweep(
                 cluster_predictions,
+                grid_from=grid_from,
+                grid_to=grid_to,
+                grid_step=grid_step,
                 alpha_hit1=alpha_hit1,
                 beta_early=beta_early,
                 gamma_miss=gamma_miss,
@@ -274,6 +286,9 @@ def calibrate_threshold_on_val_by_cluster(
 
             best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
             score = best_row['score']
+
+            if best_sweep_df is None:
+                best_sweep_df = sweep_df
 
             if score > best_score:
                 best_score = score
@@ -388,7 +403,7 @@ def extract_signals_by_cluster(
             all_signals.append(signals)
 
     if not all_signals:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=['symbol', 'open_time', 'cluster_id'])
 
     return pd.concat(all_signals, ignore_index=True)
 
@@ -939,7 +954,10 @@ def run_tune(args, artifacts: RunArtifacts):
                     args.gamma_miss,
                     args.kappa_early_magnitude,
                     args.min_trigger_rate,
-                    artifacts
+                    artifacts,
+                    grid_from=args.threshold_grid_from,
+                    grid_to=args.threshold_grid_to,
+                    grid_step=args.threshold_grid_step
                 )
 
                 features_df = time_split(features_df, train_end, val_end)
@@ -1038,7 +1056,10 @@ def run_tune(args, artifacts: RunArtifacts):
                     args.beta_early,
                     args.gamma_miss,
                     args.kappa_early_magnitude,
-                    args.min_trigger_rate
+                    args.min_trigger_rate,
+                    grid_from=args.threshold_grid_from,
+                    grid_to=args.threshold_grid_to,
+                    grid_step=args.threshold_grid_step
                 )
 
                 best_threshold = calibration_result['threshold']

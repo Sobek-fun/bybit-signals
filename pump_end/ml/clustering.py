@@ -100,7 +100,7 @@ def filter_cluster_features_by_nan_rate(
             continue
 
         nan_rate = train_events[feat].isna().mean()
-        if nan_rate > (1 - nan_rate_threshold):
+        if nan_rate > nan_rate_threshold:
             dropped_features[feat] = {'nan_rate': float(nan_rate), 'reason': 'high_nan_rate'}
         else:
             used_features.append(feat)
