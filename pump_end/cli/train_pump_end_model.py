@@ -14,7 +14,14 @@ from pump_end.ml.evaluate import evaluate, evaluate_with_trade_quality
 from pump_end.ml.predict import predict_proba, extract_signals
 from pump_end.ml.tuning import tune_model, tune_model_both_strategies, train_final_model, get_rule_parameter_grid
 from pump_end.ml.feature_schema import prune_feature_columns
+from pump_end.ml.clustering import (
+    fit_event_clusterer, assign_event_clusters, get_available_cluster_features,
+    compute_cluster_feature_summary, compute_cluster_examples, compute_cluster_drift_by_month
+)
 from pump_end.infra.clickhouse import DataLoader
+
+MAX_EARLY_RATE = 0.35
+MAX_MISS_RATE = 0.65
 
 
 def log(level: str, component: str, message: str):
@@ -118,7 +125,9 @@ def calibrate_threshold_on_val(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float
+        gamma_miss: float,
+        kappa_early_magnitude: float,
+        min_trigger_rate: float
 ) -> dict:
     if signal_rule == 'argmax_per_event':
         raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
@@ -136,7 +145,7 @@ def calibrate_threshold_on_val(
         ].copy()
 
     if len(val_df) == 0:
-        return {'threshold': 0.1, 'min_pending_bars': 1, 'drop_delta': 0.0}
+        return {'threshold': 0.1, 'min_pending_bars': 1, 'drop_delta': 0.0, 'min_pending_peak': 0.0}
 
     val_df['split'] = 'val'
     predictions = predict_proba(model, val_df, feature_columns)
@@ -148,20 +157,25 @@ def calibrate_threshold_on_val(
     best_threshold = 0.1
     best_min_pending_bars = 1
     best_drop_delta = 0.0
+    best_min_pending_peak = 0.0
 
     for rule_params in rule_combinations:
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
+        min_pending_peak = rule_params['min_pending_peak']
 
         threshold, sweep_df = threshold_sweep(
             predictions,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            kappa_early_magnitude=kappa_early_magnitude,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            min_pending_peak=min_pending_peak,
+            event_data=event_data,
+            min_trigger_rate=min_trigger_rate
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -172,12 +186,244 @@ def calibrate_threshold_on_val(
             best_threshold = threshold
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
+            best_min_pending_peak = min_pending_peak
 
     return {
         'threshold': best_threshold,
         'min_pending_bars': best_min_pending_bars,
-        'drop_delta': best_drop_delta
+        'drop_delta': best_drop_delta,
+        'min_pending_peak': best_min_pending_peak
     }
+
+
+def calibrate_threshold_on_val_by_cluster(
+        model,
+        features_df: pd.DataFrame,
+        feature_columns: list,
+        train_end: datetime,
+        val_end: datetime,
+        signal_rule: str,
+        alpha_hit1: float,
+        beta_early: float,
+        gamma_miss: float,
+        kappa_early_magnitude: float,
+        min_trigger_rate: float,
+        artifacts: RunArtifacts
+) -> dict:
+    event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time', 'cluster_id']].drop_duplicates(
+        'event_id')
+    val_events = event_times[
+        (event_times['open_time'] >= train_end) &
+        (event_times['open_time'] < val_end)
+        ]
+
+    val_df = features_df[
+        (features_df['event_id'].isin(val_events['event_id'])) &
+        (features_df['open_time'] >= train_end) &
+        (features_df['open_time'] < val_end)
+        ].copy()
+
+    if len(val_df) == 0:
+        return {}
+
+    val_df['split'] = 'val'
+    predictions = predict_proba(model, val_df, feature_columns)
+
+    cluster_ids = sorted(val_events['cluster_id'].dropna().unique())
+    thresholds_by_cluster = {}
+
+    for cluster_id in cluster_ids:
+        cluster_events = val_events[val_events['cluster_id'] == cluster_id]['event_id']
+        cluster_predictions = predictions[predictions['event_id'].isin(cluster_events)]
+
+        if len(cluster_predictions) == 0:
+            continue
+
+        n_events = cluster_predictions['event_id'].nunique()
+        if n_events < 5:
+            continue
+
+        event_data = _prepare_event_data(cluster_predictions)
+        rule_combinations = get_rule_parameter_grid()
+
+        best_score = -float('inf')
+        best_threshold = 0.1
+        best_min_pending_bars = 1
+        best_drop_delta = 0.0
+        best_min_pending_peak = 0.0
+        best_sweep_df = None
+
+        for rule_params in rule_combinations:
+            min_pending_bars = rule_params['min_pending_bars']
+            drop_delta = rule_params['drop_delta']
+            min_pending_peak = rule_params['min_pending_peak']
+
+            threshold, sweep_df = threshold_sweep(
+                cluster_predictions,
+                alpha_hit1=alpha_hit1,
+                beta_early=beta_early,
+                gamma_miss=gamma_miss,
+                kappa_early_magnitude=kappa_early_magnitude,
+                signal_rule=signal_rule,
+                min_pending_bars=min_pending_bars,
+                drop_delta=drop_delta,
+                min_pending_peak=min_pending_peak,
+                event_data=event_data,
+                min_trigger_rate=min_trigger_rate
+            )
+
+            best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
+            score = best_row['score']
+
+            if score > best_score:
+                best_score = score
+                best_threshold = threshold
+                best_min_pending_bars = min_pending_bars
+                best_drop_delta = drop_delta
+                best_min_pending_peak = min_pending_peak
+                best_sweep_df = sweep_df
+
+        thresholds_by_cluster[int(cluster_id)] = {
+            'threshold': best_threshold,
+            'min_pending_bars': best_min_pending_bars,
+            'drop_delta': best_drop_delta,
+            'min_pending_peak': best_min_pending_peak,
+            'n_events': n_events,
+            'best_score': best_score
+        }
+
+        if best_sweep_df is not None:
+            artifacts.save_threshold_sweep_by_cluster(int(cluster_id), best_sweep_df)
+
+    return thresholds_by_cluster
+
+
+def evaluate_clusters_selectivity(
+        thresholds_by_cluster: dict,
+        val_metrics_by_cluster: dict,
+        min_events: int = 10
+) -> tuple:
+    enabled_clusters = []
+    selectivity_report = {}
+
+    for cluster_id, params in thresholds_by_cluster.items():
+        cluster_report = {
+            'n_events': params['n_events'],
+            'best_score': params['best_score'],
+            'enabled': False,
+            'reason': None
+        }
+
+        if params['n_events'] < min_events:
+            cluster_report['reason'] = f'n_events < {min_events}'
+            selectivity_report[cluster_id] = cluster_report
+            continue
+
+        if params['best_score'] <= -float('inf'):
+            cluster_report['reason'] = 'best_score is -inf'
+            selectivity_report[cluster_id] = cluster_report
+            continue
+
+        if cluster_id in val_metrics_by_cluster:
+            metrics = val_metrics_by_cluster[cluster_id]
+            early_rate = metrics['event_level']['early_rate']
+            miss_rate = metrics['event_level']['miss_rate']
+
+            cluster_report['early_rate'] = early_rate
+            cluster_report['miss_rate'] = miss_rate
+
+            if early_rate > MAX_EARLY_RATE:
+                cluster_report['reason'] = f'early_rate {early_rate:.3f} > {MAX_EARLY_RATE}'
+                selectivity_report[cluster_id] = cluster_report
+                continue
+
+            if miss_rate > MAX_MISS_RATE:
+                cluster_report['reason'] = f'miss_rate {miss_rate:.3f} > {MAX_MISS_RATE}'
+                selectivity_report[cluster_id] = cluster_report
+                continue
+
+        cluster_report['enabled'] = True
+        cluster_report['reason'] = 'passed all checks'
+        selectivity_report[cluster_id] = cluster_report
+        enabled_clusters.append(cluster_id)
+
+    return enabled_clusters, selectivity_report
+
+
+def extract_signals_by_cluster(
+        predictions_df: pd.DataFrame,
+        thresholds_by_cluster: dict,
+        enabled_clusters: list,
+        features_df: pd.DataFrame
+) -> pd.DataFrame:
+    event_cluster_map = features_df[features_df['offset'] == 0][['event_id', 'cluster_id']].drop_duplicates('event_id')
+    event_cluster_map = dict(zip(event_cluster_map['event_id'], event_cluster_map['cluster_id']))
+
+    predictions_df = predictions_df.copy()
+    predictions_df['cluster_id'] = predictions_df['event_id'].map(event_cluster_map)
+
+    all_signals = []
+
+    for cluster_id in enabled_clusters:
+        if cluster_id not in thresholds_by_cluster:
+            continue
+
+        params = thresholds_by_cluster[cluster_id]
+        cluster_preds = predictions_df[predictions_df['cluster_id'] == cluster_id]
+
+        if len(cluster_preds) == 0:
+            continue
+
+        signals = extract_signals(
+            cluster_preds,
+            threshold=params['threshold'],
+            signal_rule='pending_turn_down',
+            min_pending_bars=params['min_pending_bars'],
+            drop_delta=params['drop_delta'],
+            min_pending_peak=params['min_pending_peak']
+        )
+
+        if not signals.empty:
+            signals['cluster_id'] = cluster_id
+            all_signals.append(signals)
+
+    if not all_signals:
+        return pd.DataFrame()
+
+    return pd.concat(all_signals, ignore_index=True)
+
+
+def evaluate_by_cluster(
+        predictions_df: pd.DataFrame,
+        thresholds_by_cluster: dict,
+        features_df: pd.DataFrame
+) -> dict:
+    event_cluster_map = features_df[features_df['offset'] == 0][['event_id', 'cluster_id']].drop_duplicates('event_id')
+    event_cluster_map = dict(zip(event_cluster_map['event_id'], event_cluster_map['cluster_id']))
+
+    predictions_df = predictions_df.copy()
+    predictions_df['cluster_id'] = predictions_df['event_id'].map(event_cluster_map)
+
+    metrics_by_cluster = {}
+
+    for cluster_id, params in thresholds_by_cluster.items():
+        cluster_preds = predictions_df[predictions_df['cluster_id'] == cluster_id]
+
+        if len(cluster_preds) == 0:
+            continue
+
+        metrics = evaluate(
+            cluster_preds,
+            threshold=params['threshold'],
+            signal_rule='pending_turn_down',
+            min_pending_bars=params['min_pending_bars'],
+            drop_delta=params['drop_delta'],
+            min_pending_peak=params['min_pending_peak']
+        )
+
+        metrics_by_cluster[int(cluster_id)] = metrics
+
+    return metrics_by_cluster
 
 
 def prepare_signals_for_backtest(signals_df: pd.DataFrame) -> list[dict]:
@@ -455,22 +701,27 @@ def run_train_only(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        kappa_early_magnitude=args.kappa_early_magnitude,
         signal_rule=args.signal_rule,
         min_pending_bars=args.min_pending_bars,
-        drop_delta=args.drop_delta
+        drop_delta=args.drop_delta,
+        min_pending_peak=args.min_pending_peak,
+        min_trigger_rate=args.min_trigger_rate
     )
 
     artifacts.save_threshold_sweep(sweep_df)
     artifacts.save_best_threshold(best_threshold, {
         'signal_rule': args.signal_rule,
         'min_pending_bars': args.min_pending_bars,
-        'drop_delta': args.drop_delta
+        'drop_delta': args.drop_delta,
+        'min_pending_peak': args.min_pending_peak
     })
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set")
     val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule,
-                           min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
+                           min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
+                           min_pending_peak=args.min_pending_peak)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} early={val_metrics['event_level']['early_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
@@ -485,14 +736,16 @@ def run_train_only(args, artifacts: RunArtifacts):
 
     log("INFO", "TRAIN", "evaluating on test set")
     test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
+                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
+                            min_pending_peak=args.min_pending_peak)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
     log("INFO", "TRAIN", "extracting holdout signals")
     signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
+                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
+                                 min_pending_peak=args.min_pending_peak)
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
 
@@ -540,6 +793,8 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
+            kappa_early_magnitude=args.kappa_early_magnitude,
+            min_trigger_rate=args.min_trigger_rate,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
@@ -575,6 +830,8 @@ def run_tune(args, artifacts: RunArtifacts):
             alpha_hit1=args.alpha_hit1,
             beta_early=args.beta_early,
             gamma_miss=args.gamma_miss,
+            kappa_early_magnitude=args.kappa_early_magnitude,
+            min_trigger_rate=args.min_trigger_rate,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
@@ -620,109 +877,266 @@ def run_tune(args, artifacts: RunArtifacts):
         artifacts.save_feature_importance_grouped(importance_grouped_df)
 
         if val_end:
-            log("INFO", "TUNE", f"calibrating threshold on val window [{args.train_end}, {args.val_end})")
+            if args.cluster_k > 0:
+                log("INFO", "CLUSTER", f"fitting event clusterer with k={args.cluster_k}")
 
-            calibration_result = calibrate_threshold_on_val(
-                final_model,
-                features_df,
-                feature_columns,
-                train_end,
-                val_end,
-                actual_signal_rule,
-                args.alpha_hit1,
-                args.beta_early,
-                args.gamma_miss
-            )
+                cluster_features = get_available_cluster_features(features_df)
+                log("INFO", "CLUSTER", f"available cluster features: {len(cluster_features)}")
 
-            best_threshold = calibration_result['threshold']
-            best_min_pending_bars = calibration_result['min_pending_bars']
-            best_drop_delta = calibration_result['drop_delta']
+                clusterer, train_event_clusters, cluster_reports = fit_event_clusterer(
+                    features_df,
+                    train_end,
+                    cluster_features=cluster_features,
+                    k=args.cluster_k,
+                    n_components=args.cluster_n_components,
+                    random_state=args.seed
+                )
 
-            log("INFO", "TUNE",
-                f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
+                artifacts.save_cluster_model(clusterer)
+                artifacts.save_event_clusters(train_event_clusters)
+                artifacts.save_cluster_quality(cluster_reports)
 
-            artifacts.save_best_threshold(best_threshold, {
-                'signal_rule': actual_signal_rule,
-                'min_pending_bars': best_min_pending_bars,
-                'drop_delta': best_drop_delta
-            })
+                if cluster_reports.get('cluster_features_dropped'):
+                    artifacts.save_cluster_features_dropped(cluster_reports['cluster_features_dropped'])
 
-            features_df = time_split(features_df, train_end, val_end)
+                cluster_features_used = cluster_reports.get('cluster_features_used', cluster_features)
 
-            if args.embargo_bars > 0:
-                features_df = apply_embargo(features_df, train_end, val_end, args.embargo_bars)
+                cluster_config = {
+                    'cluster_features': cluster_features_used,
+                    'k': args.cluster_k,
+                    'n_components': args.cluster_n_components,
+                    'train_end': str(train_end),
+                    'n_train_events': cluster_reports['n_train_events']
+                }
+                artifacts.save_cluster_config(cluster_config)
 
-            features_df = clip_points_to_split_bounds(features_df, train_end, val_end, test_end)
+                log("INFO", "CLUSTER",
+                    f"cluster quality: silhouette={cluster_reports['silhouette']:.3f} sizes={cluster_reports['cluster_sizes']}")
 
-            val_predictions = predict_proba(
-                final_model,
-                features_df[features_df['split'] == 'val'],
-                feature_columns
-            )
-            artifacts.save_predictions(val_predictions, 'val')
+                features_df = assign_event_clusters(clusterer, features_df, cluster_features_used)
 
-            test_predictions = predict_proba(
-                final_model,
-                features_df[features_df['split'] == 'test'],
-                feature_columns
-            )
-            artifacts.save_predictions(test_predictions, 'test')
+                cluster_feature_summary = compute_cluster_feature_summary(features_df, cluster_features_used)
+                artifacts.save_cluster_feature_summary(cluster_feature_summary)
 
-            if args.clickhouse_dsn:
-                log("INFO", "TUNE", "evaluating with trade quality metrics")
-                loader = DataLoader(args.clickhouse_dsn)
-                test_metrics = evaluate_with_trade_quality(
-                    test_predictions,
+                cluster_examples = compute_cluster_examples(features_df, n_examples=5)
+                artifacts.save_cluster_examples(cluster_examples)
+
+                cluster_drift = compute_cluster_drift_by_month(features_df)
+                artifacts.save_cluster_drift_by_month(cluster_drift)
+
+                log("INFO", "CLUSTER",
+                    f"calibrating thresholds by cluster on val window [{args.train_end}, {args.val_end})")
+
+                thresholds_by_cluster = calibrate_threshold_on_val_by_cluster(
+                    final_model,
+                    features_df,
+                    feature_columns,
+                    train_end,
+                    val_end,
+                    actual_signal_rule,
+                    args.alpha_hit1,
+                    args.beta_early,
+                    args.gamma_miss,
+                    args.kappa_early_magnitude,
+                    args.min_trigger_rate,
+                    artifacts
+                )
+
+                features_df = time_split(features_df, train_end, val_end)
+
+                if args.embargo_bars > 0:
+                    features_df = apply_embargo(features_df, train_end, val_end, args.embargo_bars)
+
+                features_df = clip_points_to_split_bounds(features_df, train_end, val_end, test_end)
+
+                val_predictions = predict_proba(
+                    final_model,
+                    features_df[features_df['split'] == 'val'],
+                    feature_columns
+                )
+                artifacts.save_predictions(val_predictions, 'val')
+
+                val_metrics_by_cluster = evaluate_by_cluster(val_predictions, thresholds_by_cluster, features_df)
+                artifacts.save_metrics_by_cluster(val_metrics_by_cluster, 'val')
+
+                enabled_clusters, selectivity_report = evaluate_clusters_selectivity(
+                    thresholds_by_cluster,
+                    val_metrics_by_cluster
+                )
+                thresholds_by_cluster['enabled_clusters'] = enabled_clusters
+
+                artifacts.save_thresholds_by_cluster(thresholds_by_cluster)
+                artifacts.save_cluster_selectivity_report(selectivity_report)
+                log("INFO", "CLUSTER", f"enabled clusters: {enabled_clusters} / {len(thresholds_by_cluster) - 1}")
+
+                artifacts.save_best_threshold(0.10, {
+                    'signal_rule': 'pending_turn_down',
+                    'min_pending_bars': 2,
+                    'drop_delta': 0.02,
+                    'min_pending_peak': 0.15,
+                    'note': 'fallback_only__cluster_mode'
+                })
+
+                test_predictions = predict_proba(
+                    final_model,
+                    features_df[features_df['split'] == 'test'],
+                    feature_columns
+                )
+                artifacts.save_predictions(test_predictions, 'test')
+
+                test_metrics_by_cluster = evaluate_by_cluster(test_predictions, thresholds_by_cluster, features_df)
+                artifacts.save_metrics_by_cluster(test_metrics_by_cluster, 'test')
+
+                val_signals_df = extract_signals_by_cluster(val_predictions, thresholds_by_cluster, enabled_clusters,
+                                                            features_df)
+                artifacts.save_predicted_signals_val(val_signals_df)
+                log("INFO", "CLUSTER", f"saved {len(val_signals_df)} VAL predicted signals (clustered)")
+
+                for cluster_id in enabled_clusters:
+                    cluster_signals = val_signals_df[val_signals_df[
+                                                         'cluster_id'] == cluster_id] if 'cluster_id' in val_signals_df.columns else pd.DataFrame()
+                    if not cluster_signals.empty:
+                        artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'val')
+
+                test_signals_df = extract_signals_by_cluster(test_predictions, thresholds_by_cluster, enabled_clusters,
+                                                             features_df)
+                log("INFO", "CLUSTER", f"extracted {len(test_signals_df)} TEST predicted signals (clustered)")
+
+                for cluster_id in enabled_clusters:
+                    cluster_signals = test_signals_df[test_signals_df[
+                                                          'cluster_id'] == cluster_id] if 'cluster_id' in test_signals_df.columns else pd.DataFrame()
+                    if not cluster_signals.empty:
+                        artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'test')
+
+                holdout_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
+                if 'cluster_id' in holdout_signals_df.columns:
+                    holdout_signals_df = holdout_signals_df.drop(columns=['cluster_id'])
+                holdout_signals_df = holdout_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
+                holdout_signals_df = holdout_signals_df.sort_values('open_time').reset_index(drop=True)
+                artifacts.save_predicted_signals(holdout_signals_df)
+                log("INFO", "CLUSTER", f"saved {len(holdout_signals_df)} HOLDOUT predicted signals (val + test)")
+
+                total_val_hit0 = sum(m['event_level']['hit0'] for m in val_metrics_by_cluster.values())
+                total_val_events = sum(m['event_level']['n_events'] for m in val_metrics_by_cluster.values())
+                total_test_hit0 = sum(m['event_level']['hit0'] for m in test_metrics_by_cluster.values())
+                total_test_events = sum(m['event_level']['n_events'] for m in test_metrics_by_cluster.values())
+
+                log("INFO", "CLUSTER", f"val aggregate: hit0={total_val_hit0}/{total_val_events}")
+                log("INFO", "CLUSTER", f"test aggregate: hit0={total_test_hit0}/{total_test_events}")
+
+            else:
+                log("INFO", "TUNE", f"calibrating threshold on val window [{args.train_end}, {args.val_end})")
+
+                calibration_result = calibrate_threshold_on_val(
+                    final_model,
+                    features_df,
+                    feature_columns,
+                    train_end,
+                    val_end,
+                    actual_signal_rule,
+                    args.alpha_hit1,
+                    args.beta_early,
+                    args.gamma_miss,
+                    args.kappa_early_magnitude,
+                    args.min_trigger_rate
+                )
+
+                best_threshold = calibration_result['threshold']
+                best_min_pending_bars = calibration_result['min_pending_bars']
+                best_drop_delta = calibration_result['drop_delta']
+                best_min_pending_peak = calibration_result['min_pending_peak']
+
+                log("INFO", "TUNE",
+                    f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta} min_pending_peak={best_min_pending_peak}")
+
+                artifacts.save_best_threshold(best_threshold, {
+                    'signal_rule': actual_signal_rule,
+                    'min_pending_bars': best_min_pending_bars,
+                    'drop_delta': best_drop_delta,
+                    'min_pending_peak': best_min_pending_peak
+                })
+
+                features_df = time_split(features_df, train_end, val_end)
+
+                if args.embargo_bars > 0:
+                    features_df = apply_embargo(features_df, train_end, val_end, args.embargo_bars)
+
+                features_df = clip_points_to_split_bounds(features_df, train_end, val_end, test_end)
+
+                val_predictions = predict_proba(
+                    final_model,
+                    features_df[features_df['split'] == 'val'],
+                    feature_columns
+                )
+                artifacts.save_predictions(val_predictions, 'val')
+
+                test_predictions = predict_proba(
+                    final_model,
+                    features_df[features_df['split'] == 'test'],
+                    feature_columns
+                )
+                artifacts.save_predictions(test_predictions, 'test')
+
+                if args.clickhouse_dsn:
+                    log("INFO", "TUNE", "evaluating with trade quality metrics")
+                    loader = DataLoader(args.clickhouse_dsn)
+                    test_metrics = evaluate_with_trade_quality(
+                        test_predictions,
+                        best_threshold,
+                        loader,
+                        signal_rule=actual_signal_rule,
+                        min_pending_bars=best_min_pending_bars,
+                        drop_delta=best_drop_delta,
+                        min_pending_peak=best_min_pending_peak,
+                        horizons=[16, 32]
+                    )
+                    log("INFO", "TUNE",
+                        f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
+                    if 'mfe_short_32' in test_metrics['trade_quality'] and test_metrics['trade_quality'][
+                        'mfe_short_32']:
+                        mfe_stats = test_metrics['trade_quality']['mfe_short_32']
+                        log("INFO", "TUNE",
+                            f"MFE_32: median={mfe_stats.get('median', 0):.4f} pct_above_2pct={mfe_stats.get('pct_above_2pct', 0):.2f}")
+                else:
+                    test_metrics = evaluate(
+                        test_predictions,
+                        best_threshold,
+                        signal_rule=actual_signal_rule,
+                        min_pending_bars=best_min_pending_bars,
+                        drop_delta=best_drop_delta,
+                        min_pending_peak=best_min_pending_peak
+                    )
+
+                artifacts.save_metrics(test_metrics, 'test')
+                log("INFO", "TUNE",
+                    f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
+
+                val_signals_df = extract_signals(
+                    val_predictions,
                     best_threshold,
-                    loader,
                     signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
                     drop_delta=best_drop_delta,
-                    horizons=[16, 32]
+                    min_pending_peak=best_min_pending_peak
                 )
-                log("INFO", "TUNE",
-                    f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
-                if 'mfe_short_32' in test_metrics['trade_quality'] and test_metrics['trade_quality']['mfe_short_32']:
-                    mfe_stats = test_metrics['trade_quality']['mfe_short_32']
-                    log("INFO", "TUNE",
-                        f"MFE_32: median={mfe_stats.get('median', 0):.4f} pct_above_2pct={mfe_stats.get('pct_above_2pct', 0):.2f}")
-            else:
-                test_metrics = evaluate(
+                artifacts.save_predicted_signals_val(val_signals_df)
+                log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
+
+                test_signals_df = extract_signals(
                     test_predictions,
                     best_threshold,
                     signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
-                    drop_delta=best_drop_delta
+                    drop_delta=best_drop_delta,
+                    min_pending_peak=best_min_pending_peak
                 )
+                log("INFO", "TUNE", f"extracted {len(test_signals_df)} TEST predicted signals")
 
-            artifacts.save_metrics(test_metrics, 'test')
-            log("INFO", "TUNE",
-                f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
-
-            val_signals_df = extract_signals(
-                val_predictions,
-                best_threshold,
-                signal_rule=actual_signal_rule,
-                min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta
-            )
-            artifacts.save_predicted_signals_val(val_signals_df)
-            log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
-
-            test_signals_df = extract_signals(
-                test_predictions,
-                best_threshold,
-                signal_rule=actual_signal_rule,
-                min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta
-            )
-            log("INFO", "TUNE", f"extracted {len(test_signals_df)} TEST predicted signals")
-
-            holdout_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
-            holdout_signals_df = holdout_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
-            holdout_signals_df = holdout_signals_df.sort_values('open_time').reset_index(drop=True)
-            artifacts.save_predicted_signals(holdout_signals_df)
-            log("INFO", "TUNE", f"saved {len(holdout_signals_df)} HOLDOUT predicted signals (val + test)")
+                holdout_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
+                holdout_signals_df = holdout_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
+                holdout_signals_df = holdout_signals_df.sort_values('open_time').reset_index(drop=True)
+                artifacts.save_predicted_signals(holdout_signals_df)
+                log("INFO", "TUNE", f"saved {len(holdout_signals_df)} HOLDOUT predicted signals (val + test)")
 
             backtest_url = args.backtest_url
             backtest_api_key = args.backtest_api_key
@@ -874,11 +1288,14 @@ def main():
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
+    parser.add_argument("--kappa-early-magnitude", type=float, default=0.03)
+    parser.add_argument("--min-trigger-rate", type=float, default=0.10)
 
     parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
     parser.add_argument("--min-pending-bars", type=int, default=1)
     parser.add_argument("--drop-delta", type=float, default=0.0)
+    parser.add_argument("--min-pending-peak", type=float, default=0.0)
 
     parser.add_argument("--tune-strategy", type=str, choices=["threshold", "ranking", "both"],
                         default="threshold")
@@ -887,6 +1304,9 @@ def main():
     parser.add_argument("--min-train-months", type=int, default=3)
 
     parser.add_argument("--prune-features", action="store_true", default=False)
+
+    parser.add_argument("--cluster-k", type=int, default=0)
+    parser.add_argument("--cluster-n-components", type=int, default=10)
 
     parser.add_argument("--backtest-url", type=str, default=None)
     parser.add_argument("--backtest-api-key", type=str, default=None)

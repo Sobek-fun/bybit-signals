@@ -24,7 +24,8 @@ def extract_signals(
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        drop_delta: float = 0.0,
+        min_pending_peak: float = 0.0
 ) -> pd.DataFrame:
     event_data = _prepare_event_data(predictions_df)
 
@@ -59,7 +60,7 @@ def extract_signals(
                     pending_count += 1
                     pending_max = max(pending_max, p_end[i])
 
-                    if pending_count >= min_pending_bars and i > 0:
+                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
                         drop_from_peak = pending_max - p_end[i]
                         if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
                             offset = offsets_arr[i]

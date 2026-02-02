@@ -18,6 +18,7 @@ from pump_end.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 from pump_end.infra.clickhouse import DataLoader
 from pump_end.ml.feature_schema import prune_feature_columns
 from pump_end.ml.predict import extract_signals
+from pump_end.ml.clustering import load_clusterer, get_available_cluster_features
 
 
 def log(level: str, component: str, message: str):
@@ -33,7 +34,36 @@ def load_run_config(model_dir: Path) -> dict:
 
 def load_threshold_config(model_dir: Path) -> dict:
     threshold_path = model_dir / "best_threshold.json"
+    if not threshold_path.exists():
+        return {}
     with open(threshold_path, 'r') as f:
+        return json.load(f)
+
+
+def load_thresholds_by_cluster(model_dir: Path) -> dict:
+    threshold_path = model_dir / "clusters" / "threshold_by_cluster.json"
+    if not threshold_path.exists():
+        return None
+    with open(threshold_path, 'r') as f:
+        data = json.load(f)
+
+    normalized = {}
+    for key, value in data.items():
+        if key == 'enabled_clusters':
+            normalized[key] = value
+        else:
+            try:
+                normalized[int(key)] = value
+            except ValueError:
+                normalized[key] = value
+    return normalized
+
+
+def load_cluster_config(model_dir: Path) -> dict:
+    config_path = model_dir / "clusters" / "cluster_config.json"
+    if not config_path.exists():
+        return None
+    with open(config_path, 'r') as f:
         return json.load(f)
 
 
@@ -250,10 +280,15 @@ def process_symbol_chunk(args_tuple):
         signal_rule,
         min_pending_bars,
         drop_delta,
+        min_pending_peak,
         neg_before,
         neg_after,
         pos_offsets,
-        params_dict
+        params_dict,
+        clusterer_path,
+        cluster_features,
+        thresholds_by_cluster,
+        enabled_clusters
     ) = args_tuple
 
     params = PumpParams(**params_dict) if params_dict else DEFAULT_PUMP_PARAMS
@@ -269,6 +304,17 @@ def process_symbol_chunk(args_tuple):
 
     model = CatBoostClassifier()
     model.load_model(model_path)
+
+    clusterer = None
+    use_cluster_mode = (
+            clusterer_path is not None and
+            os.path.exists(clusterer_path) and
+            thresholds_by_cluster is not None and
+            enabled_clusters is not None and
+            len(enabled_clusters) > 0
+    )
+    if use_cluster_mode:
+        clusterer = load_clusterer(clusterer_path)
 
     csv_filename = f"signals_part_{worker_id}.csv"
     csv_file = open(csv_filename, 'w', newline='')
@@ -344,18 +390,80 @@ def process_symbol_chunk(args_tuple):
             predictions_df['p_end'] = p_end
             predictions_df['split'] = 'test'
 
-            signals_df = extract_signals(
-                predictions_df,
-                threshold,
-                signal_rule=signal_rule,
-                min_pending_bars=min_pending_bars,
-                drop_delta=drop_delta
-            )
+            if use_cluster_mode:
+                offset_zero = features_df[features_df['offset'] == 0].copy()
+                if len(offset_zero) > 0 and cluster_features:
+                    available_cluster_features = [f for f in cluster_features if f in offset_zero.columns]
+                    if len(available_cluster_features) == len(cluster_features):
+                        X_cluster = offset_zero[cluster_features].values
+                        cluster_labels = clusterer.predict(X_cluster)
+                        event_to_cluster = dict(zip(offset_zero['event_id'].values, cluster_labels))
+                        predictions_df['cluster_id'] = predictions_df['event_id'].map(event_to_cluster)
 
-            for _, row in signals_df.iterrows():
-                timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
-                csv_writer.writerow([row['symbol'], timestamp_str])
-                total_signals += 1
+                        for cluster_id in enabled_clusters:
+                            if cluster_id not in thresholds_by_cluster:
+                                continue
+                            cluster_params = thresholds_by_cluster[cluster_id]
+                            cluster_preds = predictions_df[predictions_df['cluster_id'] == cluster_id]
+
+                            if len(cluster_preds) == 0:
+                                continue
+
+                            signals_df = extract_signals(
+                                cluster_preds,
+                                threshold=cluster_params['threshold'],
+                                signal_rule='pending_turn_down',
+                                min_pending_bars=cluster_params['min_pending_bars'],
+                                drop_delta=cluster_params['drop_delta'],
+                                min_pending_peak=cluster_params['min_pending_peak']
+                            )
+
+                            for _, row in signals_df.iterrows():
+                                timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
+                                csv_writer.writerow([row['symbol'], timestamp_str])
+                                total_signals += 1
+                    else:
+                        signals_df = extract_signals(
+                            predictions_df,
+                            threshold,
+                            signal_rule=signal_rule,
+                            min_pending_bars=min_pending_bars,
+                            drop_delta=drop_delta,
+                            min_pending_peak=min_pending_peak
+                        )
+
+                        for _, row in signals_df.iterrows():
+                            timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
+                            csv_writer.writerow([row['symbol'], timestamp_str])
+                            total_signals += 1
+                else:
+                    signals_df = extract_signals(
+                        predictions_df,
+                        threshold,
+                        signal_rule=signal_rule,
+                        min_pending_bars=min_pending_bars,
+                        drop_delta=drop_delta,
+                        min_pending_peak=min_pending_peak
+                    )
+
+                    for _, row in signals_df.iterrows():
+                        timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
+                        csv_writer.writerow([row['symbol'], timestamp_str])
+                        total_signals += 1
+            else:
+                signals_df = extract_signals(
+                    predictions_df,
+                    threshold,
+                    signal_rule=signal_rule,
+                    min_pending_bars=min_pending_bars,
+                    drop_delta=drop_delta,
+                    min_pending_peak=min_pending_peak
+                )
+
+                for _, row in signals_df.iterrows():
+                    timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
+                    csv_writer.writerow([row['symbol'], timestamp_str])
+                    total_signals += 1
 
             symbols_processed += 1
 
@@ -426,17 +534,36 @@ def main():
     pos_offsets_str = run_config.get('pos_offsets', '0')
     pos_offsets = [int(x.strip()) for x in pos_offsets_str.split(',')]
 
-    threshold = threshold_config['threshold']
+    threshold = threshold_config.get('threshold', 0.10)
     signal_rule = threshold_config.get('signal_rule', 'pending_turn_down')
-    min_pending_bars = threshold_config.get('min_pending_bars', 1)
-    drop_delta = threshold_config.get('drop_delta', 0.0)
+    min_pending_bars = threshold_config.get('min_pending_bars', 2)
+    drop_delta = threshold_config.get('drop_delta', 0.02)
+    min_pending_peak = threshold_config.get('min_pending_peak', 0.15)
 
     log("INFO", "EXPORT",
         f"config: window_bars={window_bars} warmup_bars={warmup_bars} feature_set={feature_set} prune={do_prune}")
     log("INFO", "EXPORT",
-        f"threshold={threshold} signal_rule={signal_rule} min_pending_bars={min_pending_bars} drop_delta={drop_delta}")
+        f"threshold={threshold} signal_rule={signal_rule} min_pending_bars={min_pending_bars} drop_delta={drop_delta} min_pending_peak={min_pending_peak}")
     log("INFO", "EXPORT",
         f"neg_before={neg_before} neg_after={neg_after} pos_offsets={pos_offsets}")
+
+    thresholds_by_cluster = load_thresholds_by_cluster(model_dir)
+    cluster_config = load_cluster_config(model_dir)
+
+    clusterer_path = None
+    cluster_features = None
+    enabled_clusters = None
+
+    if thresholds_by_cluster is not None and cluster_config is not None:
+        raw_enabled = thresholds_by_cluster.get('enabled_clusters', [])
+        if raw_enabled and len(raw_enabled) > 0:
+            clusterer_path = str(model_dir / "clusters" / "cluster_model.joblib")
+            cluster_features = cluster_config.get('cluster_features', [])
+            enabled_clusters = raw_enabled
+            log("INFO", "EXPORT",
+                f"cluster mode enabled: k={cluster_config.get('k')} enabled_clusters={enabled_clusters}")
+        else:
+            log("INFO", "EXPORT", "cluster mode disabled: enabled_clusters is empty, using global threshold")
 
     model = load_model(model_dir)
     feature_columns = list(model.feature_names_)
@@ -532,10 +659,15 @@ def main():
             signal_rule,
             min_pending_bars,
             drop_delta,
+            min_pending_peak,
             neg_before,
             neg_after,
             pos_offsets,
-            params_dict
+            params_dict,
+            clusterer_path,
+            cluster_features,
+            thresholds_by_cluster,
+            enabled_clusters
         ))
 
     log("INFO", "EXPORT", f"starting {num_workers} workers")

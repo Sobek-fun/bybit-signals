@@ -120,7 +120,8 @@ def get_hyperparameter_grid() -> list:
 def get_rule_parameter_grid() -> list:
     rule_grid = {
         'min_pending_bars': [1, 2, 3, 4],
-        'drop_delta': [0.00, 0.01, 0.02, 0.03, 0.04, 0.05]
+        'drop_delta': [0.00, 0.01, 0.02, 0.03, 0.04, 0.05],
+        'min_pending_peak': [0.0, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35]
     }
 
     keys = list(rule_grid.keys())
@@ -203,6 +204,8 @@ def evaluate_fold(
         alpha_hit1: float,
         beta_early: float,
         gamma_miss: float,
+        kappa_early_magnitude: float = 0.03,
+        min_trigger_rate: float = 0.10,
         early_penalty_threshold: int = -5
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
@@ -265,6 +268,7 @@ def evaluate_fold(
             'threshold': 0.0,
             'min_pending_bars': 1,
             'drop_delta': 0.0,
+            'min_pending_peak': 0.0,
             'hit0_rate': best_metrics['hit0_rate'],
             'early_rate': best_metrics['early_rate'],
             'miss_rate': best_metrics['miss_rate'],
@@ -278,21 +282,26 @@ def evaluate_fold(
     best_threshold = None
     best_min_pending_bars = None
     best_drop_delta = None
+    best_min_pending_peak = None
     best_metrics = None
 
     for rule_params in rule_combinations:
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
+        min_pending_peak = rule_params['min_pending_peak']
 
         threshold, sweep_df = threshold_sweep(
             predictions,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            kappa_early_magnitude=kappa_early_magnitude,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            min_pending_peak=min_pending_peak,
+            event_data=event_data,
+            min_trigger_rate=min_trigger_rate
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -325,6 +334,7 @@ def evaluate_fold(
             best_threshold = threshold
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
+            best_min_pending_peak = min_pending_peak
             best_metrics = metrics
 
     return {
@@ -332,6 +342,7 @@ def evaluate_fold(
         'threshold': best_threshold,
         'min_pending_bars': best_min_pending_bars,
         'drop_delta': best_drop_delta,
+        'min_pending_peak': best_min_pending_peak,
         'hit0_rate': best_metrics['hit0_rate'] if best_metrics else 0,
         'early_rate': best_metrics['early_rate'] if best_metrics else 0,
         'miss_rate': best_metrics['miss_rate'] if best_metrics else 0,
@@ -349,6 +360,8 @@ def run_cv(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        kappa_early_magnitude: float = 0.03,
+        min_trigger_rate: float = 0.10,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -383,7 +396,9 @@ def run_cv(
             actual_signal_rule,
             alpha_hit1,
             beta_early,
-            gamma_miss
+            gamma_miss,
+            kappa_early_magnitude,
+            min_trigger_rate
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -418,6 +433,8 @@ def tune_model(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        kappa_early_magnitude: float = 0.03,
+        min_trigger_rate: float = 0.10,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -453,6 +470,8 @@ def tune_model(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            kappa_early_magnitude=kappa_early_magnitude,
+            min_trigger_rate=min_trigger_rate,
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
@@ -499,6 +518,8 @@ def tune_model_both_strategies(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        kappa_early_magnitude: float = 0.03,
+        min_trigger_rate: float = 0.10,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -516,6 +537,8 @@ def tune_model_both_strategies(
         alpha_hit1=alpha_hit1,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
+        kappa_early_magnitude=kappa_early_magnitude,
+        min_trigger_rate=min_trigger_rate,
         embargo_bars=embargo_bars,
         iterations=iterations,
         early_stopping_rounds=early_stopping_rounds,
@@ -533,6 +556,8 @@ def tune_model_both_strategies(
         alpha_hit1=alpha_hit1,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
+        kappa_early_magnitude=kappa_early_magnitude,
+        min_trigger_rate=min_trigger_rate,
         embargo_bars=embargo_bars,
         iterations=iterations,
         early_stopping_rounds=early_stopping_rounds,

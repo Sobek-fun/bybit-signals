@@ -17,6 +17,7 @@ def compute_event_level_metrics(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
+        min_pending_peak: float = 0.0,
         event_data: dict = None
 ) -> dict:
     if event_data is None:
@@ -54,7 +55,7 @@ def compute_event_level_metrics(
                     pending_count += 1
                     pending_max = max(pending_max, p_end[i])
 
-                    if pending_count >= min_pending_bars and i > 0:
+                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
                         drop_from_peak = pending_max - p_end[i]
                         if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
                             offset = offsets_arr[i]
@@ -257,7 +258,8 @@ def compute_offset_distribution(
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
-        drop_delta: float = 0.0
+        drop_delta: float = 0.0,
+        min_pending_peak: float = 0.0
 ) -> dict:
     event_data = _prepare_event_data(predictions_df)
 
@@ -286,7 +288,7 @@ def compute_offset_distribution(
                     pending_count += 1
                     pending_max = max(pending_max, p_end[i])
 
-                    if pending_count >= min_pending_bars and i > 0:
+                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
                         drop_from_peak = pending_max - p_end[i]
                         if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
                             offset = offsets_arr[i]
@@ -331,10 +333,11 @@ def evaluate(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
+        min_pending_peak: float = 0.0,
         event_data: dict = None
 ) -> dict:
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                event_data)
+                                                min_pending_peak, event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {
@@ -350,16 +353,17 @@ def evaluate_with_trade_quality(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
+        min_pending_peak: float = 0.0,
         horizons: list = None,
         event_data: dict = None
 ) -> dict:
     from pump_end.ml.predict import extract_signals
 
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                event_data)
+                                                min_pending_peak, event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
-    signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta)
+    signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta, min_pending_peak)
     trade_metrics = compute_trade_quality_metrics(signals_df, candles_loader, horizons)
     trade_score = compute_trade_quality_score(trade_metrics)
 

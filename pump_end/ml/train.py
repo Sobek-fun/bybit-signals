@@ -7,7 +7,8 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     exclude_cols = {
         'event_id', 'symbol', 'open_time', 'offset', 'y',
         'pump_la_type', 'runup_pct', 'split', 'target',
-        'timeframe', 'window_bars', 'warmup_bars'
+        'timeframe', 'window_bars', 'warmup_bars',
+        'cluster_id', 'cluster_dist', 'cluster_confidence'
     }
     return [col for col in df.columns if col not in exclude_cols]
 
