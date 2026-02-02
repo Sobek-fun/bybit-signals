@@ -141,7 +141,8 @@ def threshold_sweep(
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
         event_data: dict = None,
-        min_trigger_rate: float = 0.10
+        min_trigger_rate: float = 0.10,
+        max_trigger_rate: float = 1.0
 ) -> tuple:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
@@ -155,6 +156,8 @@ def threshold_sweep(
 
         trigger_rate = 1 - metrics['miss_rate']
         if trigger_rate < min_trigger_rate:
+            score = -np.inf
+        elif trigger_rate > max_trigger_rate:
             score = -np.inf
         else:
             score = (

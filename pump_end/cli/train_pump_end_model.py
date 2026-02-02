@@ -128,6 +128,7 @@ def calibrate_threshold_on_val(
         gamma_miss: float,
         kappa_early_magnitude: float,
         min_trigger_rate: float,
+        max_trigger_rate: float = 1.0,
         grid_from: float = 0.01,
         grid_to: float = 0.30,
         grid_step: float = 0.01
@@ -181,7 +182,8 @@ def calibrate_threshold_on_val(
             drop_delta=drop_delta,
             min_pending_peak=min_pending_peak,
             event_data=event_data,
-            min_trigger_rate=min_trigger_rate
+            min_trigger_rate=min_trigger_rate,
+            max_trigger_rate=max_trigger_rate
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -214,7 +216,9 @@ def calibrate_threshold_on_val_by_cluster(
         gamma_miss: float,
         kappa_early_magnitude: float,
         min_trigger_rate: float,
+        max_trigger_rate: float,
         artifacts: RunArtifacts,
+        cluster_debug_artifacts: bool = False,
         grid_from: float = 0.01,
         grid_to: float = 0.30,
         grid_step: float = 0.01
@@ -281,7 +285,8 @@ def calibrate_threshold_on_val_by_cluster(
                 drop_delta=drop_delta,
                 min_pending_peak=min_pending_peak,
                 event_data=event_data,
-                min_trigger_rate=min_trigger_rate
+                min_trigger_rate=min_trigger_rate,
+                max_trigger_rate=max_trigger_rate
             )
 
             best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -307,7 +312,7 @@ def calibrate_threshold_on_val_by_cluster(
             'best_score': best_score
         }
 
-        if best_sweep_df is not None:
+        if cluster_debug_artifacts and best_sweep_df is not None:
             artifacts.save_threshold_sweep_by_cluster(int(cluster_id), best_sweep_df)
 
     return thresholds_by_cluster
@@ -721,7 +726,8 @@ def run_train_only(args, artifacts: RunArtifacts):
         min_pending_bars=args.min_pending_bars,
         drop_delta=args.drop_delta,
         min_pending_peak=args.min_pending_peak,
-        min_trigger_rate=args.min_trigger_rate
+        min_trigger_rate=args.min_trigger_rate,
+        max_trigger_rate=args.max_trigger_rate
     )
 
     artifacts.save_threshold_sweep(sweep_df)
@@ -810,6 +816,7 @@ def run_tune(args, artifacts: RunArtifacts):
             gamma_miss=args.gamma_miss,
             kappa_early_magnitude=args.kappa_early_magnitude,
             min_trigger_rate=args.min_trigger_rate,
+            max_trigger_rate=args.max_trigger_rate,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
@@ -847,6 +854,7 @@ def run_tune(args, artifacts: RunArtifacts):
             gamma_miss=args.gamma_miss,
             kappa_early_magnitude=args.kappa_early_magnitude,
             min_trigger_rate=args.min_trigger_rate,
+            max_trigger_rate=args.max_trigger_rate,
             embargo_bars=args.embargo_bars,
             iterations=args.iterations,
             early_stopping_rounds=args.early_stopping_rounds,
@@ -908,8 +916,10 @@ def run_tune(args, artifacts: RunArtifacts):
                 )
 
                 artifacts.save_cluster_model(clusterer)
-                artifacts.save_event_clusters(train_event_clusters)
                 artifacts.save_cluster_quality(cluster_reports)
+
+                if args.cluster_debug_artifacts:
+                    artifacts.save_event_clusters(train_event_clusters)
 
                 if cluster_reports.get('cluster_features_dropped'):
                     artifacts.save_cluster_features_dropped(cluster_reports['cluster_features_dropped'])
@@ -919,6 +929,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 cluster_config = {
                     'cluster_features': cluster_features_used,
                     'k': args.cluster_k,
+                    'k_used': cluster_reports.get('k_used', args.cluster_k),
                     'n_components': args.cluster_n_components,
                     'train_end': str(train_end),
                     'n_train_events': cluster_reports['n_train_events']
@@ -933,8 +944,9 @@ def run_tune(args, artifacts: RunArtifacts):
                 cluster_feature_summary = compute_cluster_feature_summary(features_df, cluster_features_used)
                 artifacts.save_cluster_feature_summary(cluster_feature_summary)
 
-                cluster_examples = compute_cluster_examples(features_df, n_examples=5)
-                artifacts.save_cluster_examples(cluster_examples)
+                if args.cluster_debug_artifacts:
+                    cluster_examples = compute_cluster_examples(features_df, n_examples=5)
+                    artifacts.save_cluster_examples(cluster_examples)
 
                 cluster_drift = compute_cluster_drift_by_month(features_df)
                 artifacts.save_cluster_drift_by_month(cluster_drift)
@@ -954,7 +966,9 @@ def run_tune(args, artifacts: RunArtifacts):
                     args.gamma_miss,
                     args.kappa_early_magnitude,
                     args.min_trigger_rate,
+                    args.max_trigger_rate,
                     artifacts,
+                    cluster_debug_artifacts=args.cluster_debug_artifacts,
                     grid_from=args.threshold_grid_from,
                     grid_to=args.threshold_grid_to,
                     grid_step=args.threshold_grid_step
@@ -1010,21 +1024,23 @@ def run_tune(args, artifacts: RunArtifacts):
                 artifacts.save_predicted_signals_val(val_signals_df)
                 log("INFO", "CLUSTER", f"saved {len(val_signals_df)} VAL predicted signals (clustered)")
 
-                for cluster_id in enabled_clusters:
-                    cluster_signals = val_signals_df[val_signals_df[
-                                                         'cluster_id'] == cluster_id] if 'cluster_id' in val_signals_df.columns else pd.DataFrame()
-                    if not cluster_signals.empty:
-                        artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'val')
+                if args.cluster_debug_artifacts:
+                    for cluster_id in enabled_clusters:
+                        cluster_signals = val_signals_df[val_signals_df[
+                                                             'cluster_id'] == cluster_id] if 'cluster_id' in val_signals_df.columns else pd.DataFrame()
+                        if not cluster_signals.empty:
+                            artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'val')
 
                 test_signals_df = extract_signals_by_cluster(test_predictions, thresholds_by_cluster, enabled_clusters,
                                                              features_df)
                 log("INFO", "CLUSTER", f"extracted {len(test_signals_df)} TEST predicted signals (clustered)")
 
-                for cluster_id in enabled_clusters:
-                    cluster_signals = test_signals_df[test_signals_df[
-                                                          'cluster_id'] == cluster_id] if 'cluster_id' in test_signals_df.columns else pd.DataFrame()
-                    if not cluster_signals.empty:
-                        artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'test')
+                if args.cluster_debug_artifacts:
+                    for cluster_id in enabled_clusters:
+                        cluster_signals = test_signals_df[test_signals_df[
+                                                              'cluster_id'] == cluster_id] if 'cluster_id' in test_signals_df.columns else pd.DataFrame()
+                        if not cluster_signals.empty:
+                            artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'test')
 
                 holdout_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
                 if 'cluster_id' in holdout_signals_df.columns:
@@ -1057,6 +1073,7 @@ def run_tune(args, artifacts: RunArtifacts):
                     args.gamma_miss,
                     args.kappa_early_magnitude,
                     args.min_trigger_rate,
+                    args.max_trigger_rate,
                     grid_from=args.threshold_grid_from,
                     grid_to=args.threshold_grid_to,
                     grid_step=args.threshold_grid_step
@@ -1304,13 +1321,14 @@ def main():
     parser.add_argument("--thread-count", type=int, default=-1)
 
     parser.add_argument("--threshold-grid-from", type=float, default=0.01)
-    parser.add_argument("--threshold-grid-to", type=float, default=0.30)
+    parser.add_argument("--threshold-grid-to", type=float, default=0.95)
     parser.add_argument("--threshold-grid-step", type=float, default=0.01)
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
     parser.add_argument("--kappa-early-magnitude", type=float, default=0.03)
     parser.add_argument("--min-trigger-rate", type=float, default=0.10)
+    parser.add_argument("--max-trigger-rate", type=float, default=1.0)
 
     parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
@@ -1327,7 +1345,8 @@ def main():
     parser.add_argument("--prune-features", action="store_true", default=False)
 
     parser.add_argument("--cluster-k", type=int, default=0)
-    parser.add_argument("--cluster-n-components", type=int, default=10)
+    parser.add_argument("--cluster-n-components", type=int, default=5)
+    parser.add_argument("--cluster-debug-artifacts", action="store_true", default=False)
 
     parser.add_argument("--backtest-url", type=str, default=None)
     parser.add_argument("--backtest-api-key", type=str, default=None)

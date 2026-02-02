@@ -24,11 +24,17 @@ CLUSTER_FEATURES = [
     'pump_score', 'predump_peak', 'blowoff_exhaustion'
 ]
 
+LOG1P_FEATURES = [
+    'vol_ratio_mean_30', 'vol_ratio_std_30', 'vol_ratio_slope_5', 'vol_ratio_max_10',
+    'climax_vr_lag_0', 'range_over_atr_lag_0', 'upper_wick_over_atr_lag_0',
+    'liq_sweep_overshoot_lag_0'
+]
+
 NAN_RATE_THRESHOLD = 0.10
 
 
 class EventClusterer:
-    def __init__(self, k: int = 5, n_components: int = 10, random_state: int = 42):
+    def __init__(self, k: int = 5, n_components: int = 5, random_state: int = 42):
         self.k = k
         self.n_components = n_components
         self.random_state = random_state
@@ -38,9 +44,40 @@ class EventClusterer:
         self.kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
         self.cluster_features = None
         self.fitted = False
+        self.log1p_indices = []
+        self.clip_lower = None
+        self.clip_upper = None
+
+    def _apply_log1p(self, X: np.ndarray) -> np.ndarray:
+        if not self.log1p_indices:
+            return X
+        X = X.copy()
+        for idx in self.log1p_indices:
+            X[:, idx] = np.log1p(np.abs(X[:, idx])) * np.sign(X[:, idx])
+        return X
+
+    def _apply_clip(self, X: np.ndarray) -> np.ndarray:
+        if self.clip_lower is None or self.clip_upper is None:
+            return X
+        X = X.copy()
+        X = np.clip(X, self.clip_lower, self.clip_upper)
+        return X
+
+    def _compute_log1p_indices(self, cluster_features: list):
+        self.log1p_indices = [
+            i for i, f in enumerate(cluster_features) if f in LOG1P_FEATURES
+        ]
+
+    def _compute_clip_bounds(self, X: np.ndarray):
+        self.clip_lower = np.nanquantile(X, 0.01, axis=0)
+        self.clip_upper = np.nanquantile(X, 0.99, axis=0)
 
     def fit(self, X: np.ndarray, cluster_features: list):
         self.cluster_features = cluster_features
+        self._compute_log1p_indices(cluster_features)
+        X = self._apply_log1p(X)
+        self._compute_clip_bounds(X)
+        X = self._apply_clip(X)
         X_imputed = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_imputed)
         actual_components = min(self.n_components, X_scaled.shape[1], X_scaled.shape[0])
@@ -52,12 +89,16 @@ class EventClusterer:
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        X = self._apply_log1p(X)
+        X = self._apply_clip(X)
         X_imputed = self.imputer.transform(X)
         X_scaled = self.scaler.transform(X_imputed)
         X_pca = self.pca.transform(X_scaled)
         return self.kmeans.predict(X_pca)
 
     def transform(self, X: np.ndarray) -> np.ndarray:
+        X = self._apply_log1p(X)
+        X = self._apply_clip(X)
         X_imputed = self.imputer.transform(X)
         X_scaled = self.scaler.transform(X_imputed)
         X_pca = self.pca.transform(X_scaled)
@@ -108,12 +149,19 @@ def filter_cluster_features_by_nan_rate(
     return used_features, dropped_features
 
 
+def _is_degenerate(labels: np.ndarray, max_pct: float = 0.85, min_pct: float = 0.02) -> bool:
+    counts = np.bincount(labels)
+    total = len(labels)
+    fractions = counts / total
+    return fractions.max() > max_pct and fractions.min() < min_pct
+
+
 def fit_event_clusterer(
         features_df: pd.DataFrame,
         train_end,
         cluster_features: list = None,
         k: int = 5,
-        n_components: int = 10,
+        n_components: int = 5,
         random_state: int = 42
 ) -> tuple:
     if cluster_features is None:
@@ -131,10 +179,23 @@ def fit_event_clusterer(
 
     X_train = train_events[cluster_features].values
 
-    clusterer = EventClusterer(k=k, n_components=n_components, random_state=random_state)
-    clusterer.fit(X_train, cluster_features)
+    degenerate = False
+    degenerate_reason = None
+    k_used = k
 
-    labels = clusterer.predict(X_train)
+    for try_k in range(k, 1, -1):
+        clusterer = EventClusterer(k=try_k, n_components=n_components, random_state=random_state)
+        clusterer.fit(X_train, cluster_features)
+        labels = clusterer.predict(X_train)
+
+        if not _is_degenerate(labels):
+            k_used = try_k
+            break
+    else:
+        degenerate = True
+        degenerate_reason = f"all k from {k} to 2 degenerate"
+        k_used = 2
+
     distances = clusterer.get_distances(X_train)
 
     event_clusters_df = pd.DataFrame({
@@ -160,6 +221,15 @@ def fit_event_clusterer(
 
     cluster_sizes = pd.Series(labels).value_counts().sort_index().to_dict()
 
+    log1p_applied = [cluster_features[i] for i in clusterer.log1p_indices]
+    clip_quantiles = {}
+    if clusterer.clip_lower is not None:
+        for i, feat in enumerate(cluster_features):
+            clip_quantiles[feat] = {
+                'lower': float(clusterer.clip_lower[i]),
+                'upper': float(clusterer.clip_upper[i])
+            }
+
     cluster_reports = {
         'silhouette': silhouette,
         'davies_bouldin': davies_bouldin,
@@ -169,7 +239,12 @@ def fit_event_clusterer(
         'n_components': clusterer.pca.n_components_,
         'explained_variance_ratio': clusterer.pca.explained_variance_ratio_.tolist(),
         'cluster_features_used': cluster_features,
-        'cluster_features_dropped': dropped_features
+        'cluster_features_dropped': dropped_features,
+        'log1p_features': log1p_applied,
+        'clip_quantiles': clip_quantiles,
+        'degenerate': degenerate,
+        'degenerate_reason': degenerate_reason,
+        'k_used': k_used
     }
 
     return clusterer, event_clusters_df, cluster_reports
