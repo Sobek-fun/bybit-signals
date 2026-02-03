@@ -29,7 +29,8 @@ def _compute_event_metrics_from_data(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        min_pending_peak: float = 0.0
+        min_pending_peak: float = 0.0,
+        min_turn_down_bars: int = 1
 ) -> dict:
     hit0 = 0
     hit1 = 0
@@ -57,21 +58,28 @@ def _compute_event_metrics_from_data(
             triggered = False
             pending_count = 0
             pending_max = -np.inf
+            turn_down_count = 0
 
             for i in range(len(offsets_arr)):
                 if p_end[i] >= threshold:
                     pending_count += 1
                     pending_max = max(pending_max, p_end[i])
 
+                    if i > 0 and p_end[i] < p_end[i - 1]:
+                        turn_down_count += 1
+                    else:
+                        turn_down_count = 0
+
                     if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
                         drop_from_peak = pending_max - p_end[i]
-                        if drop_from_peak >= drop_delta and p_end[i] < p_end[i - 1]:
+                        if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
                             offset = offsets_arr[i]
                             triggered = True
                             break
                 else:
                     pending_count = 0
                     pending_max = -np.inf
+                    turn_down_count = 0
 
             if not triggered:
                 miss += 1
@@ -119,12 +127,13 @@ def compute_event_metrics_for_threshold(
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
+        min_turn_down_bars: int = 1,
         event_data: dict = None
 ) -> dict:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
     return _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta,
-                                            min_pending_peak)
+                                            min_pending_peak, min_turn_down_bars)
 
 
 def threshold_sweep(
@@ -140,6 +149,7 @@ def threshold_sweep(
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
+        min_turn_down_bars: int = 1,
         event_data: dict = None,
         min_trigger_rate: float = 0.10,
         max_trigger_rate: float = 1.0
@@ -152,7 +162,7 @@ def threshold_sweep(
 
     for threshold in thresholds:
         metrics = _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                   min_pending_peak)
+                                                   min_pending_peak, min_turn_down_bars)
 
         trigger_rate = 1 - metrics['miss_rate']
         if trigger_rate < min_trigger_rate:
@@ -168,6 +178,7 @@ def threshold_sweep(
                     kappa_early_magnitude * metrics['early_magnitude']
             )
         metrics['score'] = score
+        metrics['trigger_rate'] = trigger_rate
 
         results.append(metrics)
 
@@ -175,6 +186,28 @@ def threshold_sweep(
 
     valid_scores = results_df[results_df['score'] > -np.inf]
     if valid_scores.empty:
+        best_fallback_idx = None
+        min_distance = np.inf
+        target_rate = (min_trigger_rate + max_trigger_rate) / 2
+
+        for idx, row in results_df.iterrows():
+            tr = row['trigger_rate']
+            if tr < min_trigger_rate:
+                distance = min_trigger_rate - tr
+            elif tr > max_trigger_rate:
+                distance = tr - max_trigger_rate
+            else:
+                distance = 0
+
+            if distance < min_distance:
+                min_distance = distance
+                best_fallback_idx = idx
+
+        if best_fallback_idx is not None:
+            results_df.loc[best_fallback_idx, 'fallback_reason'] = 'no_threshold_in_corridor'
+            best_threshold = results_df.loc[best_fallback_idx, 'threshold']
+            return best_threshold, results_df
+
         fallback_metrics = {
             'threshold': grid_from,
             'n_events': len(event_data),
@@ -191,6 +224,7 @@ def threshold_sweep(
             'avg_offset': None,
             'median_offset': None,
             'early_magnitude': 0.0,
+            'trigger_rate': 0.0,
             'score': -np.inf,
             'fallback_reason': 'empty_sweep_fallback'
         }

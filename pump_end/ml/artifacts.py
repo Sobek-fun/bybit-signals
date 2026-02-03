@@ -216,6 +216,12 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(report, f, indent=2, default=str)
 
+    def save_trade_quality_by_cluster(self, metrics: dict):
+        self._ensure_clusters_dir()
+        path = self.clusters_dir / "trade_quality_by_cluster.json"
+        with open(path, 'w') as f:
+            json.dump(metrics, f, indent=2, default=str)
+
     def get_path(self) -> Path:
         return self.run_dir
 

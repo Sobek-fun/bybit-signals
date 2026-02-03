@@ -119,9 +119,10 @@ def get_hyperparameter_grid() -> list:
 
 def get_rule_parameter_grid() -> list:
     rule_grid = {
-        'min_pending_bars': [2, 3, 4, 5],
+        'min_turn_down_bars': [1, 2],
+        'min_pending_bars': [2, 3, 4],
         'drop_delta': [0.02, 0.04, 0.06, 0.08, 0.10],
-        'min_pending_peak': [0.40, 0.50, 0.60, 0.70, 0.80]
+        'min_pending_peak': [0.3, 0.4, 0.5, 0.6, 0.7]
     }
 
     keys = list(rule_grid.keys())
@@ -267,6 +268,7 @@ def evaluate_fold(
             'min_pending_bars': 1,
             'drop_delta': 0.0,
             'min_pending_peak': 0.0,
+            'min_turn_down_bars': 1,
             'hit0_rate': best_metrics['hit0_rate'],
             'early_rate': best_metrics['early_rate'],
             'miss_rate': best_metrics['miss_rate'],
@@ -281,9 +283,11 @@ def evaluate_fold(
     best_min_pending_bars = None
     best_drop_delta = None
     best_min_pending_peak = None
+    best_min_turn_down_bars = None
     best_metrics = None
 
     for rule_params in rule_combinations:
+        min_turn_down_bars = rule_params['min_turn_down_bars']
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
         min_pending_peak = rule_params['min_pending_peak']
@@ -298,6 +302,7 @@ def evaluate_fold(
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
             min_pending_peak=min_pending_peak,
+            min_turn_down_bars=min_turn_down_bars,
             event_data=event_data,
             min_trigger_rate=min_trigger_rate,
             max_trigger_rate=max_trigger_rate
@@ -334,6 +339,7 @@ def evaluate_fold(
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
             best_min_pending_peak = min_pending_peak
+            best_min_turn_down_bars = min_turn_down_bars
             best_metrics = metrics
 
     return {
@@ -342,6 +348,7 @@ def evaluate_fold(
         'min_pending_bars': best_min_pending_bars,
         'drop_delta': best_drop_delta,
         'min_pending_peak': best_min_pending_peak,
+        'min_turn_down_bars': best_min_turn_down_bars,
         'hit0_rate': best_metrics['hit0_rate'] if best_metrics else 0,
         'early_rate': best_metrics['early_rate'] if best_metrics else 0,
         'miss_rate': best_metrics['miss_rate'] if best_metrics else 0,

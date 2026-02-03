@@ -281,6 +281,7 @@ def process_symbol_chunk(args_tuple):
         min_pending_bars,
         drop_delta,
         min_pending_peak,
+        min_turn_down_bars,
         neg_before,
         neg_after,
         pos_offsets,
@@ -415,7 +416,8 @@ def process_symbol_chunk(args_tuple):
                                 signal_rule='pending_turn_down',
                                 min_pending_bars=cluster_params['min_pending_bars'],
                                 drop_delta=cluster_params['drop_delta'],
-                                min_pending_peak=cluster_params['min_pending_peak']
+                                min_pending_peak=cluster_params['min_pending_peak'],
+                                min_turn_down_bars=cluster_params.get('min_turn_down_bars', 1)
                             )
 
                             for _, row in signals_df.iterrows():
@@ -429,7 +431,8 @@ def process_symbol_chunk(args_tuple):
                             signal_rule=signal_rule,
                             min_pending_bars=min_pending_bars,
                             drop_delta=drop_delta,
-                            min_pending_peak=min_pending_peak
+                            min_pending_peak=min_pending_peak,
+                            min_turn_down_bars=min_turn_down_bars
                         )
 
                         for _, row in signals_df.iterrows():
@@ -443,7 +446,8 @@ def process_symbol_chunk(args_tuple):
                         signal_rule=signal_rule,
                         min_pending_bars=min_pending_bars,
                         drop_delta=drop_delta,
-                        min_pending_peak=min_pending_peak
+                        min_pending_peak=min_pending_peak,
+                        min_turn_down_bars=min_turn_down_bars
                     )
 
                     for _, row in signals_df.iterrows():
@@ -457,7 +461,8 @@ def process_symbol_chunk(args_tuple):
                     signal_rule=signal_rule,
                     min_pending_bars=min_pending_bars,
                     drop_delta=drop_delta,
-                    min_pending_peak=min_pending_peak
+                    min_pending_peak=min_pending_peak,
+                    min_turn_down_bars=min_turn_down_bars
                 )
 
                 for _, row in signals_df.iterrows():
@@ -539,11 +544,12 @@ def main():
     min_pending_bars = threshold_config.get('min_pending_bars', 2)
     drop_delta = threshold_config.get('drop_delta', 0.02)
     min_pending_peak = threshold_config.get('min_pending_peak', 0.15)
+    min_turn_down_bars = threshold_config.get('min_turn_down_bars', 1)
 
     log("INFO", "EXPORT",
         f"config: window_bars={window_bars} warmup_bars={warmup_bars} feature_set={feature_set} prune={do_prune}")
     log("INFO", "EXPORT",
-        f"threshold={threshold} signal_rule={signal_rule} min_pending_bars={min_pending_bars} drop_delta={drop_delta} min_pending_peak={min_pending_peak}")
+        f"threshold={threshold} signal_rule={signal_rule} min_pending_bars={min_pending_bars} drop_delta={drop_delta} min_pending_peak={min_pending_peak} min_turn_down_bars={min_turn_down_bars}")
     log("INFO", "EXPORT",
         f"neg_before={neg_before} neg_after={neg_after} pos_offsets={pos_offsets}")
 
@@ -660,6 +666,7 @@ def main():
             min_pending_bars,
             drop_delta,
             min_pending_peak,
+            min_turn_down_bars,
             neg_before,
             neg_after,
             pos_offsets,

@@ -149,7 +149,7 @@ def calibrate_threshold_on_val(
         ].copy()
 
     if len(val_df) == 0:
-        return {'threshold': 0.1, 'min_pending_bars': 1, 'drop_delta': 0.0, 'min_pending_peak': 0.0}
+        return {'threshold': 0.1, 'min_pending_bars': 1, 'drop_delta': 0.0, 'min_pending_peak': 0.0, 'min_turn_down_bars': 1}
 
     val_df['split'] = 'val'
     predictions = predict_proba(model, val_df, feature_columns)
@@ -162,8 +162,10 @@ def calibrate_threshold_on_val(
     best_min_pending_bars = 1
     best_drop_delta = 0.0
     best_min_pending_peak = 0.0
+    best_min_turn_down_bars = 1
 
     for rule_params in rule_combinations:
+        min_turn_down_bars = rule_params['min_turn_down_bars']
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
         min_pending_peak = rule_params['min_pending_peak']
@@ -181,6 +183,7 @@ def calibrate_threshold_on_val(
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
             min_pending_peak=min_pending_peak,
+            min_turn_down_bars=min_turn_down_bars,
             event_data=event_data,
             min_trigger_rate=min_trigger_rate,
             max_trigger_rate=max_trigger_rate
@@ -195,12 +198,14 @@ def calibrate_threshold_on_val(
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
             best_min_pending_peak = min_pending_peak
+            best_min_turn_down_bars = min_turn_down_bars
 
     return {
         'threshold': best_threshold,
         'min_pending_bars': best_min_pending_bars,
         'drop_delta': best_drop_delta,
-        'min_pending_peak': best_min_pending_peak
+        'min_pending_peak': best_min_pending_peak,
+        'min_turn_down_bars': best_min_turn_down_bars
     }
 
 
@@ -264,9 +269,11 @@ def calibrate_threshold_on_val_by_cluster(
         best_min_pending_bars = 1
         best_drop_delta = 0.0
         best_min_pending_peak = 0.0
+        best_min_turn_down_bars = 1
         best_sweep_df = None
 
         for rule_params in rule_combinations:
+            min_turn_down_bars = rule_params['min_turn_down_bars']
             min_pending_bars = rule_params['min_pending_bars']
             drop_delta = rule_params['drop_delta']
             min_pending_peak = rule_params['min_pending_peak']
@@ -284,6 +291,7 @@ def calibrate_threshold_on_val_by_cluster(
                 min_pending_bars=min_pending_bars,
                 drop_delta=drop_delta,
                 min_pending_peak=min_pending_peak,
+                min_turn_down_bars=min_turn_down_bars,
                 event_data=event_data,
                 min_trigger_rate=min_trigger_rate,
                 max_trigger_rate=max_trigger_rate
@@ -301,6 +309,7 @@ def calibrate_threshold_on_val_by_cluster(
                 best_min_pending_bars = min_pending_bars
                 best_drop_delta = drop_delta
                 best_min_pending_peak = min_pending_peak
+                best_min_turn_down_bars = min_turn_down_bars
                 best_sweep_df = sweep_df
 
         thresholds_by_cluster[int(cluster_id)] = {
@@ -308,6 +317,7 @@ def calibrate_threshold_on_val_by_cluster(
             'min_pending_bars': best_min_pending_bars,
             'drop_delta': best_drop_delta,
             'min_pending_peak': best_min_pending_peak,
+            'min_turn_down_bars': best_min_turn_down_bars,
             'n_events': n_events,
             'best_score': best_score
         }
@@ -321,12 +331,24 @@ def calibrate_threshold_on_val_by_cluster(
 def evaluate_clusters_selectivity(
         thresholds_by_cluster: dict,
         val_metrics_by_cluster: dict,
-        min_events: int = 10
+        trade_quality_by_cluster: dict = None,
+        min_events: int = 10,
+        min_triggered: int = 25,
+        min_precision_triggered: float = 0.30,
+        max_early_share: float = 0.70,
+        min_avg_pred_offset: float = -8.0,
+        max_mae_short_16: float = None
 ) -> tuple:
     enabled_clusters = []
     selectivity_report = {}
 
+    if trade_quality_by_cluster is None:
+        trade_quality_by_cluster = {}
+
     for cluster_id, params in thresholds_by_cluster.items():
+        if cluster_id == 'enabled_clusters':
+            continue
+
         cluster_report = {
             'n_events': params['n_events'],
             'best_score': params['best_score'],
@@ -346,21 +368,62 @@ def evaluate_clusters_selectivity(
 
         if cluster_id in val_metrics_by_cluster:
             metrics = val_metrics_by_cluster[cluster_id]
-            early_rate = metrics['event_level']['early_rate']
-            miss_rate = metrics['event_level']['miss_rate']
+            n_events = metrics['event_level']['n_events']
+            miss = metrics['event_level']['miss']
+            early = metrics['event_level']['early']
+            hit0 = metrics['event_level']['hit0']
+            hit1 = metrics['event_level'].get('hit0_or_hit1', hit0)
+            avg_pred_offset = metrics['event_level'].get('avg_pred_offset')
+            median_pred_offset = metrics['event_level'].get('median_pred_offset')
 
-            cluster_report['early_rate'] = early_rate
-            cluster_report['miss_rate'] = miss_rate
+            triggered = n_events - miss
+            precision_triggered = (hit1) / triggered if triggered > 0 else 0.0
+            early_share = early / triggered if triggered > 0 else 0.0
 
-            if early_rate > MAX_EARLY_RATE:
-                cluster_report['reason'] = f'early_rate {early_rate:.3f} > {MAX_EARLY_RATE}'
+            cluster_report['triggered'] = triggered
+            cluster_report['precision_triggered'] = precision_triggered
+            cluster_report['early_share'] = early_share
+            cluster_report['hit0_or_hit1'] = hit1
+            cluster_report['avg_pred_offset'] = avg_pred_offset
+            cluster_report['median_pred_offset'] = median_pred_offset
+            cluster_report['early_rate'] = metrics['event_level']['early_rate']
+            cluster_report['miss_rate'] = metrics['event_level']['miss_rate']
+
+            if triggered < min_triggered:
+                cluster_report['reason'] = f'triggered {triggered} < {min_triggered}'
                 selectivity_report[cluster_id] = cluster_report
                 continue
 
-            if miss_rate > MAX_MISS_RATE:
-                cluster_report['reason'] = f'miss_rate {miss_rate:.3f} > {MAX_MISS_RATE}'
+            if precision_triggered < min_precision_triggered:
+                cluster_report['reason'] = f'precision_triggered {precision_triggered:.3f} < {min_precision_triggered}'
                 selectivity_report[cluster_id] = cluster_report
                 continue
+
+            if early_share > max_early_share:
+                cluster_report['reason'] = f'early_share {early_share:.3f} > {max_early_share}'
+                selectivity_report[cluster_id] = cluster_report
+                continue
+
+            if avg_pred_offset is not None and avg_pred_offset < min_avg_pred_offset:
+                cluster_report['reason'] = f'avg_pred_offset {avg_pred_offset:.2f} < {min_avg_pred_offset}'
+                selectivity_report[cluster_id] = cluster_report
+                continue
+
+        if cluster_id in trade_quality_by_cluster and max_mae_short_16 is not None:
+            tq = trade_quality_by_cluster[cluster_id]
+            mae_16 = tq.get('mae_short_16', {})
+            if mae_16:
+                mae_median = mae_16.get('median', 0)
+                cluster_report['mae_short_16_median'] = mae_median
+                if mae_median > max_mae_short_16:
+                    cluster_report['reason'] = f'mae_short_16_median {mae_median:.4f} > {max_mae_short_16}'
+                    selectivity_report[cluster_id] = cluster_report
+                    continue
+
+            mfe_32 = tq.get('mfe_short_32', {})
+            if mfe_32:
+                cluster_report['mfe_short_32_median'] = mfe_32.get('median')
+                cluster_report['mfe_short_32_pct_above_2pct'] = mfe_32.get('pct_above_2pct')
 
         cluster_report['enabled'] = True
         cluster_report['reason'] = 'passed all checks'
@@ -400,7 +463,8 @@ def extract_signals_by_cluster(
             signal_rule='pending_turn_down',
             min_pending_bars=params['min_pending_bars'],
             drop_delta=params['drop_delta'],
-            min_pending_peak=params['min_pending_peak']
+            min_pending_peak=params['min_pending_peak'],
+            min_turn_down_bars=params.get('min_turn_down_bars', 1)
         )
 
         if not signals.empty:
@@ -427,6 +491,9 @@ def evaluate_by_cluster(
     metrics_by_cluster = {}
 
     for cluster_id, params in thresholds_by_cluster.items():
+        if cluster_id == 'enabled_clusters':
+            continue
+
         cluster_preds = predictions_df[predictions_df['cluster_id'] == cluster_id]
 
         if len(cluster_preds) == 0:
@@ -438,7 +505,8 @@ def evaluate_by_cluster(
             signal_rule='pending_turn_down',
             min_pending_bars=params['min_pending_bars'],
             drop_delta=params['drop_delta'],
-            min_pending_peak=params['min_pending_peak']
+            min_pending_peak=params['min_pending_peak'],
+            min_turn_down_bars=params.get('min_turn_down_bars', 1)
         )
 
         metrics_by_cluster[int(cluster_id)] = metrics
@@ -726,6 +794,7 @@ def run_train_only(args, artifacts: RunArtifacts):
         min_pending_bars=args.min_pending_bars,
         drop_delta=args.drop_delta,
         min_pending_peak=args.min_pending_peak,
+        min_turn_down_bars=args.min_turn_down_bars,
         min_trigger_rate=args.min_trigger_rate,
         max_trigger_rate=args.max_trigger_rate
     )
@@ -735,14 +804,15 @@ def run_train_only(args, artifacts: RunArtifacts):
         'signal_rule': args.signal_rule,
         'min_pending_bars': args.min_pending_bars,
         'drop_delta': args.drop_delta,
-        'min_pending_peak': args.min_pending_peak
+        'min_pending_peak': args.min_pending_peak,
+        'min_turn_down_bars': args.min_turn_down_bars
     })
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set")
     val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule,
                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                           min_pending_peak=args.min_pending_peak)
+                           min_pending_peak=args.min_pending_peak, min_turn_down_bars=args.min_turn_down_bars)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} early={val_metrics['event_level']['early_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
@@ -758,7 +828,7 @@ def run_train_only(args, artifacts: RunArtifacts):
     log("INFO", "TRAIN", "evaluating on test set")
     test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule,
                             min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                            min_pending_peak=args.min_pending_peak)
+                            min_pending_peak=args.min_pending_peak, min_turn_down_bars=args.min_turn_down_bars)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
@@ -766,7 +836,7 @@ def run_train_only(args, artifacts: RunArtifacts):
     log("INFO", "TRAIN", "extracting holdout signals")
     signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule,
                                  min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                                 min_pending_peak=args.min_pending_peak)
+                                 min_pending_peak=args.min_pending_peak, min_turn_down_bars=args.min_turn_down_bars)
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
 
@@ -991,9 +1061,38 @@ def run_tune(args, artifacts: RunArtifacts):
                 val_metrics_by_cluster = evaluate_by_cluster(val_predictions, thresholds_by_cluster, features_df)
                 artifacts.save_metrics_by_cluster(val_metrics_by_cluster, 'val')
 
+                trade_quality_by_cluster = {}
+                if args.clickhouse_dsn:
+                    from pump_end.ml.evaluate import compute_trade_quality_metrics
+                    loader = DataLoader(args.clickhouse_dsn)
+                    for cluster_id in thresholds_by_cluster.keys():
+                        if cluster_id == 'enabled_clusters':
+                            continue
+                        params = thresholds_by_cluster[cluster_id]
+                        cluster_preds = val_predictions[val_predictions['event_id'].isin(
+                            features_df[(features_df['offset'] == 0) & (features_df['cluster_id'] == cluster_id)]['event_id']
+                        )]
+                        if len(cluster_preds) == 0:
+                            continue
+                        cluster_signals = extract_signals(
+                            cluster_preds,
+                            threshold=params['threshold'],
+                            signal_rule='pending_turn_down',
+                            min_pending_bars=params['min_pending_bars'],
+                            drop_delta=params['drop_delta'],
+                            min_pending_peak=params['min_pending_peak'],
+                            min_turn_down_bars=params.get('min_turn_down_bars', 1)
+                        )
+                        if not cluster_signals.empty:
+                            tq = compute_trade_quality_metrics(cluster_signals, loader, horizons=[16, 32])
+                            trade_quality_by_cluster[int(cluster_id)] = tq
+                    if trade_quality_by_cluster:
+                        artifacts.save_trade_quality_by_cluster(trade_quality_by_cluster)
+
                 enabled_clusters, selectivity_report = evaluate_clusters_selectivity(
                     thresholds_by_cluster,
-                    val_metrics_by_cluster
+                    val_metrics_by_cluster,
+                    trade_quality_by_cluster=trade_quality_by_cluster
                 )
                 thresholds_by_cluster['enabled_clusters'] = enabled_clusters
 
@@ -1006,6 +1105,7 @@ def run_tune(args, artifacts: RunArtifacts):
                     'min_pending_bars': 2,
                     'drop_delta': 0.02,
                     'min_pending_peak': 0.15,
+                    'min_turn_down_bars': 1,
                     'note': 'fallback_only__cluster_mode'
                 })
 
@@ -1083,15 +1183,17 @@ def run_tune(args, artifacts: RunArtifacts):
                 best_min_pending_bars = calibration_result['min_pending_bars']
                 best_drop_delta = calibration_result['drop_delta']
                 best_min_pending_peak = calibration_result['min_pending_peak']
+                best_min_turn_down_bars = calibration_result['min_turn_down_bars']
 
                 log("INFO", "TUNE",
-                    f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta} min_pending_peak={best_min_pending_peak}")
+                    f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta} min_pending_peak={best_min_pending_peak} min_turn_down_bars={best_min_turn_down_bars}")
 
                 artifacts.save_best_threshold(best_threshold, {
                     'signal_rule': actual_signal_rule,
                     'min_pending_bars': best_min_pending_bars,
                     'drop_delta': best_drop_delta,
-                    'min_pending_peak': best_min_pending_peak
+                    'min_pending_peak': best_min_pending_peak,
+                    'min_turn_down_bars': best_min_turn_down_bars
                 })
 
                 features_df = time_split(features_df, train_end, val_end)
@@ -1126,6 +1228,7 @@ def run_tune(args, artifacts: RunArtifacts):
                         min_pending_bars=best_min_pending_bars,
                         drop_delta=best_drop_delta,
                         min_pending_peak=best_min_pending_peak,
+                        min_turn_down_bars=best_min_turn_down_bars,
                         horizons=[16, 32]
                     )
                     log("INFO", "TUNE",
@@ -1142,7 +1245,8 @@ def run_tune(args, artifacts: RunArtifacts):
                         signal_rule=actual_signal_rule,
                         min_pending_bars=best_min_pending_bars,
                         drop_delta=best_drop_delta,
-                        min_pending_peak=best_min_pending_peak
+                        min_pending_peak=best_min_pending_peak,
+                        min_turn_down_bars=best_min_turn_down_bars
                     )
 
                 artifacts.save_metrics(test_metrics, 'test')
@@ -1155,7 +1259,8 @@ def run_tune(args, artifacts: RunArtifacts):
                     signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
                     drop_delta=best_drop_delta,
-                    min_pending_peak=best_min_pending_peak
+                    min_pending_peak=best_min_pending_peak,
+                    min_turn_down_bars=best_min_turn_down_bars
                 )
                 artifacts.save_predicted_signals_val(val_signals_df)
                 log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
@@ -1166,7 +1271,8 @@ def run_tune(args, artifacts: RunArtifacts):
                     signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
                     drop_delta=best_drop_delta,
-                    min_pending_peak=best_min_pending_peak
+                    min_pending_peak=best_min_pending_peak,
+                    min_turn_down_bars=best_min_turn_down_bars
                 )
                 log("INFO", "TUNE", f"extracted {len(test_signals_df)} TEST predicted signals")
 
@@ -1326,15 +1432,16 @@ def main():
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
-    parser.add_argument("--kappa-early-magnitude", type=float, default=0.03)
-    parser.add_argument("--min-trigger-rate", type=float, default=0.10)
-    parser.add_argument("--max-trigger-rate", type=float, default=1.0)
+    parser.add_argument("--kappa-early-magnitude", type=float, default=0.22)
+    parser.add_argument("--min-trigger-rate", type=float, default=0.05)
+    parser.add_argument("--max-trigger-rate", type=float, default=0.12)
 
     parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
                         default="pending_turn_down")
     parser.add_argument("--min-pending-bars", type=int, default=1)
     parser.add_argument("--drop-delta", type=float, default=0.0)
     parser.add_argument("--min-pending-peak", type=float, default=0.0)
+    parser.add_argument("--min-turn-down-bars", type=int, default=1)
 
     parser.add_argument("--tune-strategy", type=str, choices=["threshold", "ranking", "both"],
                         default="threshold")
