@@ -119,10 +119,10 @@ def get_hyperparameter_grid() -> list:
 
 def get_rule_parameter_grid() -> list:
     rule_grid = {
-        'min_turn_down_bars': [1, 2],
-        'min_pending_bars': [2, 3, 4],
-        'drop_delta': [0.02, 0.04, 0.06, 0.08, 0.10],
-        'min_pending_peak': [0.3, 0.4, 0.5, 0.6, 0.7]
+        'min_turn_down_bars': [1, 2, 3],
+        'min_pending_bars': [2, 3, 4, 5],
+        'drop_delta': [0.04, 0.06, 0.08, 0.10, 0.12, 0.15],
+        'min_pending_peak': [0.25, 0.30, 0.40, 0.50, 0.60]
     }
 
     keys = list(rule_grid.keys())
@@ -203,6 +203,7 @@ def evaluate_fold(
         feature_columns: list,
         signal_rule: str,
         alpha_hit1: float,
+        alpha_hit_pre: float,
         beta_early: float,
         gamma_miss: float,
         kappa_early_magnitude: float = 0.03,
@@ -295,6 +296,7 @@ def evaluate_fold(
         threshold, sweep_df = threshold_sweep(
             predictions,
             alpha_hit1=alpha_hit1,
+            alpha_hit_pre=alpha_hit_pre,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
             kappa_early_magnitude=kappa_early_magnitude,
@@ -364,6 +366,7 @@ def run_cv(
         params: dict,
         signal_rule: str = 'pending_turn_down',
         alpha_hit1: float = 0.5,
+        alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
         kappa_early_magnitude: float = 0.03,
@@ -402,6 +405,7 @@ def run_cv(
             feature_columns,
             actual_signal_rule,
             alpha_hit1,
+            alpha_hit_pre,
             beta_early,
             gamma_miss,
             kappa_early_magnitude,
@@ -439,6 +443,7 @@ def tune_model(
         min_train_months: int = 3,
         signal_rule: str = 'pending_turn_down',
         alpha_hit1: float = 0.5,
+        alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
         kappa_early_magnitude: float = 0.03,
@@ -477,6 +482,7 @@ def tune_model(
             params,
             signal_rule=signal_rule,
             alpha_hit1=alpha_hit1,
+            alpha_hit_pre=alpha_hit_pre,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
             kappa_early_magnitude=kappa_early_magnitude,
@@ -526,6 +532,7 @@ def tune_model_both_strategies(
         min_train_months: int = 3,
         signal_rule: str = 'pending_turn_down',
         alpha_hit1: float = 0.5,
+        alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
         kappa_early_magnitude: float = 0.03,
@@ -546,6 +553,7 @@ def tune_model_both_strategies(
         min_train_months=min_train_months,
         signal_rule=signal_rule,
         alpha_hit1=alpha_hit1,
+        alpha_hit_pre=alpha_hit_pre,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
         kappa_early_magnitude=kappa_early_magnitude,
@@ -566,6 +574,7 @@ def tune_model_both_strategies(
         min_train_months=min_train_months,
         signal_rule=signal_rule,
         alpha_hit1=alpha_hit1,
+        alpha_hit_pre=alpha_hit_pre,
         beta_early=beta_early,
         gamma_miss=gamma_miss,
         kappa_early_magnitude=kappa_early_magnitude,

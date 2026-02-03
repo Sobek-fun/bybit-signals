@@ -23,6 +23,9 @@ def _prepare_event_data(predictions_df: pd.DataFrame) -> dict:
     return event_data
 
 
+HIT_PRE_WINDOW = 2
+
+
 def _compute_event_metrics_from_data(
         event_data: dict,
         threshold: float,
@@ -34,11 +37,14 @@ def _compute_event_metrics_from_data(
 ) -> dict:
     hit0 = 0
     hit1 = 0
+    hit_pre = 0
     early = 0
+    early_far = 0
     late = 0
     miss = 0
     offsets = []
     early_offsets = []
+    early_far_offsets = []
 
     for event_id, data in event_data.items():
         if signal_rule == 'first_cross':
@@ -91,32 +97,60 @@ def _compute_event_metrics_from_data(
             hit0 += 1
         elif offset == 1:
             hit1 += 1
-        elif offset < 0:
-            early += 1
-            early_offsets.append(offset)
+        elif -HIT_PRE_WINDOW <= offset <= -1:
+            hit_pre += 1
+        elif offset < -HIT_PRE_WINDOW:
+            early_far += 1
+            early_far_offsets.append(offset)
         else:
             late += 1
+
+        if offset < 0:
+            early += 1
+            early_offsets.append(offset)
 
     n_events = len(event_data)
 
     early_magnitude = np.mean([max(0, -o) for o in early_offsets]) if early_offsets else 0.0
+    early_far_magnitude = np.mean([max(0, -o - HIT_PRE_WINDOW) for o in early_far_offsets]) if early_far_offsets else 0.0
+
+    hit_window = hit_pre + hit0 + hit1
+    triggered = n_events - miss
+
+    offset_minus2_to_plus2_rate = 0.0
+    tail_le_minus10_rate = 0.0
+    if offsets:
+        offsets_arr = np.array(offsets)
+        in_range = np.sum((offsets_arr >= -2) & (offsets_arr <= 2))
+        tail_early = np.sum(offsets_arr <= -10)
+        offset_minus2_to_plus2_rate = in_range / len(offsets_arr)
+        tail_le_minus10_rate = tail_early / len(offsets_arr)
 
     return {
         'threshold': threshold,
         'n_events': n_events,
         'hit0': hit0,
         'hit1': hit1,
+        'hit_pre': hit_pre,
+        'hit_window': hit_window,
         'early': early,
+        'early_far': early_far,
         'late': late,
         'miss': miss,
         'hit0_rate': hit0 / n_events if n_events > 0 else 0,
         'hit1_rate': hit1 / n_events if n_events > 0 else 0,
+        'hit_pre_rate': hit_pre / n_events if n_events > 0 else 0,
+        'hit_window_rate': hit_window / n_events if n_events > 0 else 0,
         'early_rate': early / n_events if n_events > 0 else 0,
+        'early_far_rate': early_far / n_events if n_events > 0 else 0,
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss_rate': miss / n_events if n_events > 0 else 0,
         'avg_offset': np.mean(offsets) if offsets else None,
         'median_offset': np.median(offsets) if offsets else None,
-        'early_magnitude': early_magnitude
+        'early_magnitude': early_magnitude,
+        'early_far_magnitude': early_far_magnitude,
+        'offset_minus2_to_plus2_rate': offset_minus2_to_plus2_rate,
+        'tail_le_minus10_rate': tail_le_minus10_rate
     }
 
 
@@ -142,6 +176,7 @@ def threshold_sweep(
         grid_to: float = 0.30,
         grid_step: float = 0.01,
         alpha_hit1: float = 0.5,
+        alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
         kappa_early_magnitude: float = 0.03,
@@ -172,10 +207,11 @@ def threshold_sweep(
         else:
             score = (
                     metrics['hit0_rate'] +
-                    alpha_hit1 * metrics['hit1_rate'] -
-                    beta_early * metrics['early_rate'] -
+                    alpha_hit1 * metrics['hit1_rate'] +
+                    alpha_hit_pre * metrics['hit_pre_rate'] -
+                    beta_early * metrics['early_far_rate'] -
                     gamma_miss * metrics['miss_rate'] -
-                    kappa_early_magnitude * metrics['early_magnitude']
+                    kappa_early_magnitude * metrics['early_far_magnitude']
             )
         metrics['score'] = score
         metrics['trigger_rate'] = trigger_rate

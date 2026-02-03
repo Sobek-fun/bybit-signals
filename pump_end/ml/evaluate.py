@@ -11,6 +11,9 @@ from sklearn.metrics import (
 from pump_end.ml.threshold import _prepare_event_data, _compute_event_metrics_from_data
 
 
+HIT_PRE_WINDOW = 2
+
+
 def compute_event_level_metrics(
         predictions_df: pd.DataFrame,
         threshold: float,
@@ -26,11 +29,14 @@ def compute_event_level_metrics(
 
     hit0 = 0
     hit1 = 0
+    hit_pre = 0
     early = 0
+    early_far = 0
     late = 0
     miss = 0
     offsets = []
     early_offsets = []
+    early_far_offsets = []
 
     for event_id, data in event_data.items():
         if signal_rule == 'first_cross':
@@ -83,28 +89,60 @@ def compute_event_level_metrics(
             hit0 += 1
         elif offset == 1:
             hit1 += 1
-        elif offset < 0:
-            early += 1
-            early_offsets.append(offset)
+        elif -HIT_PRE_WINDOW <= offset <= -1:
+            hit_pre += 1
+        elif offset < -HIT_PRE_WINDOW:
+            early_far += 1
+            early_far_offsets.append(offset)
         else:
             late += 1
 
+        if offset < 0:
+            early += 1
+            early_offsets.append(offset)
+
     n_events = len(event_data)
+
+    early_magnitude = np.mean([max(0, -o) for o in early_offsets]) if early_offsets else 0.0
+    early_far_magnitude = np.mean([max(0, -o - HIT_PRE_WINDOW) for o in early_far_offsets]) if early_far_offsets else 0.0
+
+    hit_window = hit_pre + hit0 + hit1
+
+    offset_minus2_to_plus2_rate = 0.0
+    tail_le_minus10_rate = 0.0
+    if offsets:
+        offsets_arr = np.array(offsets)
+        in_range = np.sum((offsets_arr >= -2) & (offsets_arr <= 2))
+        tail_early = np.sum(offsets_arr <= -10)
+        offset_minus2_to_plus2_rate = in_range / len(offsets_arr)
+        tail_le_minus10_rate = tail_early / len(offsets_arr)
 
     return {
         'n_events': n_events,
         'hit0': hit0,
         'hit0_rate': hit0 / n_events if n_events > 0 else 0,
+        'hit1': hit1,
+        'hit1_rate': hit1 / n_events if n_events > 0 else 0,
+        'hit_pre': hit_pre,
+        'hit_pre_rate': hit_pre / n_events if n_events > 0 else 0,
+        'hit_window': hit_window,
+        'hit_window_rate': hit_window / n_events if n_events > 0 else 0,
         'hit0_or_hit1': hit0 + hit1,
         'hit0_or_hit1_rate': (hit0 + hit1) / n_events if n_events > 0 else 0,
         'early': early,
         'early_rate': early / n_events if n_events > 0 else 0,
+        'early_far': early_far,
+        'early_far_rate': early_far / n_events if n_events > 0 else 0,
+        'early_magnitude': early_magnitude,
+        'early_far_magnitude': early_far_magnitude,
         'late': late,
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss': miss,
         'miss_rate': miss / n_events if n_events > 0 else 0,
         'avg_pred_offset': np.mean(offsets) if offsets else None,
-        'median_pred_offset': np.median(offsets) if offsets else None
+        'median_pred_offset': np.median(offsets) if offsets else None,
+        'offset_minus2_to_plus2_rate': offset_minus2_to_plus2_rate,
+        'tail_le_minus10_rate': tail_le_minus10_rate
     }
 
 

@@ -58,10 +58,14 @@ class RunArtifacts:
     def save_feature_importance(self, df: pd.DataFrame):
         path = self.run_dir / "feature_importance.csv"
         df.to_csv(path, index=False)
+        path_detail = self.run_dir / "feature_importance_detail.csv"
+        df.to_csv(path_detail, index=False)
 
     def save_feature_importance_grouped(self, df: pd.DataFrame):
         path = self.run_dir / "feature_importance_grouped.csv"
         df.to_csv(path, index=False)
+        path_typo = self.run_dir / "feature_importance_gruped.csv"
+        df.to_csv(path_typo, index=False)
 
     def save_predicted_signals(self, df: pd.DataFrame):
         path = self.run_dir / "predicted_signals_holdout.csv"
@@ -69,6 +73,18 @@ class RunArtifacts:
 
     def save_predicted_signals_val(self, df: pd.DataFrame):
         path = self.run_dir / "predicted_signals_val.csv"
+        df.to_csv(path, index=False)
+
+    def save_predicted_signals_test(self, df: pd.DataFrame):
+        path = self.run_dir / "predicted_signals_test.csv"
+        df.to_csv(path, index=False)
+
+    def save_predicted_signals_pool(self, df: pd.DataFrame):
+        path = self.run_dir / "predicted_signals_val_test_pool.csv"
+        df.to_csv(path, index=False)
+
+    def save_predicted_signals_raw(self, df: pd.DataFrame, split: str):
+        path = self.run_dir / f"predicted_signals_{split}_raw.csv"
         df.to_csv(path, index=False)
 
     def save_predictions(self, df: pd.DataFrame, split_name: str):
