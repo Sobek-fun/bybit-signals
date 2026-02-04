@@ -469,8 +469,12 @@ def evaluate_clusters_selectivity(
             if cluster_id not in val_metrics_by_cluster:
                 continue
             metrics = val_metrics_by_cluster[cluster_id]
-            triggered = metrics['event_level']['n_events'] - metrics['event_level']['miss']
-            if triggered <= 0:
+            n_events = metrics['event_level']['n_events']
+            triggered = n_events - metrics['event_level']['miss']
+            hit_window = metrics['event_level'].get('hit_window', 0)
+
+            min_triggered_required = max(min_triggered_abs, ceil(min_triggered_frac * n_events))
+            if triggered < min_triggered_required:
                 continue
 
             if cluster_id in trade_quality_by_cluster:
@@ -479,15 +483,33 @@ def evaluate_clusters_selectivity(
             else:
                 utility = params['best_score']
 
-            candidates.append((cluster_id, utility))
+            candidates.append((cluster_id, hit_window, triggered, utility))
 
         if candidates:
-            candidates.sort(key=lambda x: x[1], reverse=True)
+            candidates.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
             for i in range(min(fallback_topk_if_empty, len(candidates))):
-                best_cluster_id, best_utility = candidates[i]
+                best_cluster_id, best_hit_window, best_triggered, best_utility = candidates[i]
                 enabled_clusters.append(best_cluster_id)
                 selectivity_report[best_cluster_id]['enabled'] = True
-                selectivity_report[best_cluster_id]['reason'] = f'fallback_enable_best_cluster (utility={best_utility:.4f})'
+                selectivity_report[best_cluster_id]['reason'] = f'fallback_enable_best_cluster (hit_window={best_hit_window}, triggered={best_triggered}, utility={best_utility:.4f})'
+
+    if enabled_clusters:
+        total_val_events = sum(
+            val_metrics_by_cluster[cid]['event_level']['n_events']
+            for cid in val_metrics_by_cluster
+        )
+        enabled_events = sum(
+            val_metrics_by_cluster[cid]['event_level']['n_events']
+            for cid in enabled_clusters
+            if cid in val_metrics_by_cluster
+        )
+        enabled_coverage = enabled_events / total_val_events if total_val_events > 0 else 0.0
+
+        if enabled_coverage < 0.20:
+            for cid in enabled_clusters:
+                selectivity_report[cid]['enabled'] = False
+                selectivity_report[cid]['reason'] = f'enabled_coverage_too_low__fallback_to_global (coverage={enabled_coverage:.3f})'
+            enabled_clusters = []
 
     return enabled_clusters, selectivity_report
 
