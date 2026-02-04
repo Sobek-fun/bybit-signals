@@ -190,7 +190,10 @@ def calibrate_threshold(
         alpha_hitM1: float,
         beta_early: float,
         beta_late: float,
-        gamma_miss: float
+        gamma_miss: float,
+        grid_from: float = 0.01,
+        grid_to: float = 0.99,
+        grid_step: float = 0.01
 ) -> tuple:
     val_df = features_df[features_df['split'] == 'val'].copy()
 
@@ -202,6 +205,9 @@ def calibrate_threshold(
 
     best_threshold, sweep_df = threshold_sweep_long(
         val_predictions,
+        grid_from=grid_from,
+        grid_to=grid_to,
+        grid_step=grid_step,
         alpha_hitM1=alpha_hitM1,
         beta_early=beta_early,
         beta_late=beta_late,
@@ -349,8 +355,8 @@ def run_holdout_scan(
         feature_columns: list,
         scan_workers: int,
         labels_path: str = None,
-        neg_before: int = 60,
-        neg_after: int = 10
+        match_before_bars: int = 4,
+        match_after_bars: int = 0
 ) -> tuple:
     log("INFO", "SCAN", f"holdout period: [{holdout_start}, {holdout_end})")
 
@@ -404,8 +410,8 @@ def run_holdout_scan(
             labels_df,
             holdout_start,
             holdout_end,
-            window_before=neg_before,
-            window_after=neg_after
+            window_before=match_before_bars,
+            window_after=match_after_bars
         )
 
         log("INFO", "SCAN", f"stream metrics:")
@@ -441,6 +447,9 @@ def main():
     parser.add_argument("--beta-early", type=float, default=1.0)
     parser.add_argument("--beta-late", type=float, default=3.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
+    parser.add_argument("--thr-grid-from", type=float, default=0.01)
+    parser.add_argument("--thr-grid-to", type=float, default=0.99)
+    parser.add_argument("--thr-grid-step", type=float, default=0.01)
 
     parser.add_argument("--clickhouse-dsn", type=str, default=None)
     parser.add_argument("--holdout-start", type=str, default=None)
@@ -450,6 +459,8 @@ def main():
     parser.add_argument("--labels", type=str, default=None)
     parser.add_argument("--neg-before", type=int, default=60)
     parser.add_argument("--neg-after", type=int, default=10)
+    parser.add_argument("--match-before-bars", type=int, default=4)
+    parser.add_argument("--match-after-bars", type=int, default=0)
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
@@ -532,7 +543,10 @@ def main():
         args.alpha_hitM1,
         args.beta_early,
         args.beta_late,
-        args.gamma_miss
+        args.gamma_miss,
+        args.thr_grid_from,
+        args.thr_grid_to,
+        args.thr_grid_step
     )
 
     threshold_path = run_dir / "best_threshold.json"
@@ -583,7 +597,7 @@ def main():
     log("INFO", "TRAIN", f"saved {len(signals_df)} event-window signals")
 
     if args.holdout_start and args.holdout_end and args.clickhouse_dsn:
-        holdout_start = parse_date_exclusive(args.holdout_start)
+        holdout_start = datetime.strptime(args.holdout_start, '%Y-%m-%d')
         holdout_end = parse_date_exclusive(args.holdout_end)
 
         holdout_signals_df, stream_metrics = run_holdout_scan(
@@ -599,8 +613,8 @@ def main():
             feature_columns=feature_columns,
             scan_workers=args.scan_workers,
             labels_path=args.labels,
-            neg_before=args.neg_before,
-            neg_after=args.neg_after
+            match_before_bars=args.match_before_bars,
+            match_after_bars=args.match_after_bars
         )
 
         holdout_signals_path = run_dir / "predicted_signals_holdout.csv"

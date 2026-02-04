@@ -19,16 +19,34 @@ def compute_event_level_metrics_long(
     early = 0
     late = 0
     miss = 0
+    pre_window = 0
     offsets = []
 
     for event_id, data in event_data.items():
-        mask = data['p_long'] >= threshold
-        if not mask.any():
+        p_arr = data['p_long']
+        offsets_arr = data['offsets']
+
+        if len(p_arr) == 0:
             miss += 1
             continue
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
 
+        if p_arr[0] >= threshold:
+            pre_window += 1
+            continue
+
+        cross_idx = None
+        for i in range(1, len(p_arr)):
+            prev_p = p_arr[i - 1]
+            curr_p = p_arr[i]
+            if prev_p < threshold <= curr_p:
+                cross_idx = i
+                break
+
+        if cross_idx is None:
+            miss += 1
+            continue
+
+        offset = offsets_arr[cross_idx]
         offsets.append(offset)
 
         if offset == 0:
@@ -56,6 +74,8 @@ def compute_event_level_metrics_long(
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss': miss,
         'miss_rate': miss / n_events if n_events > 0 else 0,
+        'pre_window': pre_window,
+        'pre_window_rate': pre_window / n_events if n_events > 0 else 0,
         'avg_pred_offset': np.mean(offsets) if offsets else None,
         'median_pred_offset': np.median(offsets) if offsets else None
     }
@@ -119,11 +139,27 @@ def extract_signals_event_windows_long(
     signals = []
 
     for event_id, data in event_data.items():
-        mask = data['p_long'] >= threshold
-        if not mask.any():
+        p_arr = data['p_long']
+        offsets_arr = data['offsets']
+
+        if len(p_arr) == 0:
             continue
-        first_idx = np.argmax(mask)
-        offset = data['offsets'][first_idx]
+
+        if p_arr[0] >= threshold:
+            continue
+
+        cross_idx = None
+        for i in range(1, len(p_arr)):
+            prev_p = p_arr[i - 1]
+            curr_p = p_arr[i]
+            if prev_p < threshold <= curr_p:
+                cross_idx = i
+                break
+
+        if cross_idx is None:
+            continue
+
+        offset = offsets_arr[cross_idx]
 
         signals.append({
             'symbol': symbol_map[event_id],
@@ -208,15 +244,33 @@ def match_signals_to_events(
 
         symbol_events = labels_df[labels_df['symbol'] == symbol]
 
+        best_event_id = None
+        best_event_time = None
+        best_offset = None
+        best_abs_offset = float('inf')
+
         for _, event in symbol_events.iterrows():
             event_time = event['event_time']
             offset_bars = int((signal_time - event_time).total_seconds() / (15 * 60))
 
             if -window_before <= offset_bars <= window_after:
-                signals_df.at[idx, 'matched_event_id'] = event['event_id']
-                signals_df.at[idx, 'matched_event_time'] = event_time
-                signals_df.at[idx, 'offset_to_event'] = offset_bars
-                break
+                abs_offset = abs(offset_bars)
+                is_better = False
+                if abs_offset < best_abs_offset:
+                    is_better = True
+                elif abs_offset == best_abs_offset and offset_bars <= 0 and (best_offset is None or best_offset > 0):
+                    is_better = True
+
+                if is_better:
+                    best_event_id = event['event_id']
+                    best_event_time = event_time
+                    best_offset = offset_bars
+                    best_abs_offset = abs_offset
+
+        if best_event_id is not None:
+            signals_df.at[idx, 'matched_event_id'] = best_event_id
+            signals_df.at[idx, 'matched_event_time'] = best_event_time
+            signals_df.at[idx, 'offset_to_event'] = best_offset
 
     return signals_df
 
@@ -250,7 +304,8 @@ def compute_stream_metrics_long(
     caught_event_ids = matched_signals['matched_event_id'].dropna().unique()
     caught_events = len(caught_event_ids)
 
-    holdout_days = (holdout_end - holdout_start).days
+    holdout_seconds = (holdout_end - holdout_start).total_seconds()
+    holdout_days = holdout_seconds / 86400
     if holdout_days <= 0:
         holdout_days = 1
 

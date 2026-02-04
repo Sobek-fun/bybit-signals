@@ -23,24 +23,34 @@ def _compute_event_metrics_long(
     early = 0
     late = 0
     miss = 0
+    pre_window = 0
     offsets = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_long'] >= threshold
-            if not mask.any():
-                miss += 1
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        else:
-            mask = data['p_long'] >= threshold
-            if not mask.any():
-                miss += 1
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
+        p_arr = data['p_long']
+        offsets_arr = data['offsets']
 
+        if len(p_arr) == 0:
+            miss += 1
+            continue
+
+        if p_arr[0] >= threshold:
+            pre_window += 1
+            continue
+
+        cross_idx = None
+        for i in range(1, len(p_arr)):
+            prev_p = p_arr[i - 1]
+            curr_p = p_arr[i]
+            if prev_p < threshold <= curr_p:
+                cross_idx = i
+                break
+
+        if cross_idx is None:
+            miss += 1
+            continue
+
+        offset = offsets_arr[cross_idx]
         offsets.append(offset)
 
         if offset == 0:
@@ -62,11 +72,13 @@ def _compute_event_metrics_long(
         'early': early,
         'late': late,
         'miss': miss,
+        'pre_window': pre_window,
         'hit0_rate': hit0 / n_events if n_events > 0 else 0,
         'hitM1_rate': hitM1 / n_events if n_events > 0 else 0,
         'early_rate': early / n_events if n_events > 0 else 0,
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss_rate': miss / n_events if n_events > 0 else 0,
+        'pre_window_rate': pre_window / n_events if n_events > 0 else 0,
         'avg_offset': np.mean(offsets) if offsets else None,
         'median_offset': np.median(offsets) if offsets else None
     }
@@ -75,7 +87,7 @@ def _compute_event_metrics_long(
 def threshold_sweep_long(
         predictions_df: pd.DataFrame,
         grid_from: float = 0.01,
-        grid_to: float = 0.50,
+        grid_to: float = 0.99,
         grid_step: float = 0.01,
         alpha_hitM1: float = 0.8,
         beta_early: float = 1.0,

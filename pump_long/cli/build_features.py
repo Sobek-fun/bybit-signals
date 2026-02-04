@@ -159,8 +159,11 @@ def main():
 
     features_df = builder.build(feature_input, max_workers=args.workers)
 
+    if 'runup_pct' in features_df.columns:
+        features_df = features_df.drop(columns=['runup_pct'])
+
     features_df = features_df.merge(
-        points_df[['symbol', 'open_time', 'event_id', 'offset', 'y']],
+        points_df[['symbol', 'open_time', 'event_id', 'offset', 'y', 'runup_pct']],
         on=['symbol', 'open_time'],
         how='inner'
     )
