@@ -10,14 +10,14 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from pump_long.infra.clickhouse import DataLoader
-from pump_long.features.feature_builder import PumpFeatureBuilder
-from pump_long.labeler import PumpStartLabelerLookahead
-from pump_long.threshold import threshold_sweep_long, _prepare_event_data
-from pump_long.evaluate import evaluate_long, extract_signals_long
-from pump_long.tuning import (
+from src.shared.clickhouse import DataLoader
+from src.shared.pump_end.feature_builder import PumpFeatureBuilder
+from src.dev.pump_long.labeler import PumpStartLabelerLookahead
+from src.dev.pump_long.threshold import threshold_sweep_long, _prepare_event_data
+from src.dev.pump_long.evaluate import evaluate_long, extract_signals_long
+from src.dev.pump_long.tuning import (
     tune_model_long, train_final_model_long, predict_proba_long,
-    generate_walk_forward_folds, compute_sample_weights
+    generate_walk_forward_folds
 )
 
 
@@ -88,8 +88,8 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(params, f, indent=2, default=str)
 
-    def save_best_threshold(self, threshold: float, signal_rule: str = 'cross_up', hysteresis_delta: float = 0.05):
-        data = {'threshold': threshold, 'signal_rule': signal_rule, 'hysteresis_delta': hysteresis_delta}
+    def save_best_threshold(self, threshold: float, signal_rule: str = 'first_cross'):
+        data = {'threshold': threshold, 'signal_rule': signal_rule}
         path = self.run_dir / "best_threshold.json"
         with open(path, 'w') as f:
             json.dump(data, f, indent=2, default=str)
@@ -301,80 +301,8 @@ def build_training_points(
         'open_time': open_times,
         'offset': offsets,
         'y': y_values,
-        'runup_pct': runup_pcts,
-        'is_background': False
+        'runup_pct': runup_pcts
     })
-
-    return points_df
-
-
-def add_background_negatives(
-        points_df: pd.DataFrame,
-        labels_df: pd.DataFrame,
-        num_per_symbol: int = 50,
-        min_distance_bars: int = 300,
-        seed: int = 42
-) -> pd.DataFrame:
-    if num_per_symbol <= 0:
-        return points_df
-
-    rng = np.random.default_rng(seed)
-
-    events = labels_df[labels_df['pump_la_type'] == 'A'].copy()
-    events['event_open_time'] = pd.to_datetime(events['event_open_time'])
-
-    symbols = events['symbol'].unique()
-    min_distance = timedelta(minutes=min_distance_bars * 15)
-
-    background_points = []
-
-    for symbol in symbols:
-        symbol_events = events[events['symbol'] == symbol]['event_open_time'].values
-        symbol_events = pd.to_datetime(symbol_events)
-
-        if len(symbol_events) < 2:
-            continue
-
-        min_time = symbol_events.min()
-        max_time = symbol_events.max()
-
-        time_range = (max_time - min_time).total_seconds() / 60 / 15
-
-        if time_range < min_distance_bars * 2:
-            continue
-
-        generated = 0
-        attempts = 0
-        max_attempts = num_per_symbol * 10
-
-        while generated < num_per_symbol and attempts < max_attempts:
-            attempts += 1
-
-            random_offset = int(rng.integers(0, int(time_range)))
-            candidate_time = min_time + timedelta(minutes=random_offset * 15)
-
-            is_far = True
-            for event_time in symbol_events:
-                if abs((candidate_time - event_time).total_seconds()) < min_distance.total_seconds():
-                    is_far = False
-                    break
-
-            if is_far:
-                background_points.append({
-                    'event_id': f'bg_{symbol}_{generated}',
-                    'symbol': symbol,
-                    'open_time': candidate_time,
-                    'offset': 0,
-                    'y': 0,
-                    'runup_pct': 0,
-                    'is_background': True
-                })
-                generated += 1
-
-    if background_points:
-        bg_df = pd.DataFrame(background_points)
-        log("INFO", "BUILD", f"added {len(bg_df)} background negative points")
-        points_df = pd.concat([points_df, bg_df], ignore_index=True)
 
     return points_df
 
@@ -459,15 +387,12 @@ def get_split_info(points_df: pd.DataFrame) -> dict:
         n_points = len(split_points)
         n_positive = len(split_points[split_points['y'] == 1])
         n_negative = len(split_points[split_points['y'] == 0])
-        n_background = len(
-            split_points[split_points['is_background'] == True]) if 'is_background' in split_points.columns else 0
 
         info[split_name] = {
             'n_events': n_events,
             'n_points': n_points,
             'n_positive': n_positive,
-            'n_negative': n_negative,
-            'n_background': n_background
+            'n_negative': n_negative
         }
 
     return info
@@ -477,7 +402,7 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     exclude_cols = {
         'event_id', 'symbol', 'open_time', 'offset', 'y',
         'pump_la_type', 'runup_pct', 'split', 'target',
-        'timeframe', 'window_bars', 'warmup_bars', 'is_background'
+        'timeframe', 'window_bars', 'warmup_bars'
     }
     return [col for col in df.columns if col not in exclude_cols]
 
@@ -491,9 +416,7 @@ def train_model(
         l2_leaf_reg: float = 3.0,
         early_stopping_rounds: int = 50,
         thread_count: int = -1,
-        seed: int = 42,
-        use_sample_weights: bool = True,
-        neg_before: int = 60
+        seed: int = 42
 ) -> CatBoostClassifier:
     train_df = features_df[features_df['split'] == 'train']
     val_df = features_df[features_df['split'] == 'val']
@@ -503,16 +426,7 @@ def train_model(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    if use_sample_weights:
-        train_weights = compute_sample_weights(
-            train_df['offset'].values,
-            train_df['y'].values,
-            neg_before
-        )
-        train_pool = Pool(X_train, y_train, weight=train_weights)
-    else:
-        train_pool = Pool(X_train, y_train)
-
+    train_pool = Pool(X_train, y_train)
     val_pool = Pool(X_val, y_val)
 
     model = CatBoostClassifier(
@@ -571,9 +485,7 @@ def calibrate_threshold_on_val(
         alpha_hitM1: float,
         beta_early: float,
         beta_late: float,
-        gamma_miss: float,
-        lambda_offset: float,
-        hysteresis_delta: float
+        gamma_miss: float
 ) -> float:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     val_events = event_times[
@@ -588,7 +500,7 @@ def calibrate_threshold_on_val(
         ].copy()
 
     if len(val_df) == 0:
-        return 0.5
+        return 0.1
 
     val_df['split'] = 'val'
     predictions = predict_proba_long(model, val_df, feature_columns)
@@ -601,9 +513,7 @@ def calibrate_threshold_on_val(
         beta_early=beta_early,
         beta_late=beta_late,
         gamma_miss=gamma_miss,
-        lambda_offset=lambda_offset,
         signal_rule=signal_rule,
-        hysteresis_delta=hysteresis_delta,
         event_data=event_data
     )
 
@@ -634,16 +544,6 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         neg_after=args.neg_after,
         pos_offsets=pos_offsets
     )
-
-    if args.background_negatives > 0:
-        points_df = add_background_negatives(
-            points_df,
-            labels_df,
-            num_per_symbol=args.background_negatives,
-            min_distance_bars=args.background_distance,
-            seed=args.seed
-        )
-
     log("INFO", "BUILD",
         f"training points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
 
@@ -665,12 +565,8 @@ def run_build_dataset(args, artifacts: RunArtifacts):
 
     features_df = builder.build(feature_input, max_workers=args.build_workers)
 
-    merge_cols = ['symbol', 'open_time', 'event_id', 'offset', 'y']
-    if 'is_background' in points_df.columns:
-        merge_cols.append('is_background')
-
     features_df = features_df.merge(
-        points_df[merge_cols],
+        points_df[['symbol', 'open_time', 'event_id', 'offset', 'y']],
         on=['symbol', 'open_time'],
         how='inner'
     )
@@ -714,9 +610,7 @@ def run_train(args, artifacts: RunArtifacts):
         l2_leaf_reg=args.l2_leaf_reg,
         early_stopping_rounds=args.early_stopping_rounds,
         thread_count=args.thread_count,
-        seed=args.seed,
-        use_sample_weights=args.use_sample_weights,
-        neg_before=args.neg_before
+        seed=args.seed
     )
 
     artifacts.save_model(model)
@@ -742,22 +636,20 @@ def run_train(args, artifacts: RunArtifacts):
         beta_early=args.beta_early,
         beta_late=args.beta_late,
         gamma_miss=args.gamma_miss,
-        lambda_offset=args.lambda_offset,
         signal_rule=args.signal_rule,
-        hysteresis_delta=args.hysteresis_delta,
         event_data=val_event_data
     )
 
     artifacts.save_threshold_sweep(sweep_df)
-    artifacts.save_best_threshold(best_threshold, args.signal_rule, args.hysteresis_delta)
+    artifacts.save_best_threshold(best_threshold, args.signal_rule)
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set")
     val_metrics = evaluate_long(val_predictions, best_threshold, signal_rule=args.signal_rule,
-                                hysteresis_delta=args.hysteresis_delta, event_data=val_event_data)
+                                event_data=val_event_data)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
-        f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} hitM1={val_metrics['event_level']['hitM1_rate']:.3f} late={val_metrics['event_level']['late_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
+        f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} hitM1={val_metrics['event_level']['hitM1_rate']:.3f} late={val_metrics['event_level']['late_rate']:.3f}")
 
     log("INFO", "TRAIN", "predicting on test set")
     test_predictions = predict_proba_long(
@@ -771,14 +663,13 @@ def run_train(args, artifacts: RunArtifacts):
 
     log("INFO", "TRAIN", "evaluating on test set")
     test_metrics = evaluate_long(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                 hysteresis_delta=args.hysteresis_delta, event_data=test_event_data)
+                                 event_data=test_event_data)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
-        f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
+        f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f}")
 
     log("INFO", "TRAIN", "extracting holdout signals")
-    signals_df = extract_signals_long(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                      hysteresis_delta=args.hysteresis_delta)
+    signals_df = extract_signals_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals")
 
@@ -801,7 +692,7 @@ def run_tune(args, artifacts: RunArtifacts):
     else:
         cv_features_df = features_df
 
-    log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min signal_rule={args.signal_rule}")
+    log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min")
 
     tune_result = tune_model_long(
         cv_features_df,
@@ -814,15 +705,11 @@ def run_tune(args, artifacts: RunArtifacts):
         beta_early=args.beta_early,
         beta_late=args.beta_late,
         gamma_miss=args.gamma_miss,
-        lambda_offset=args.lambda_offset,
         embargo_bars=args.embargo_bars,
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
         thread_count=args.thread_count,
-        seed=args.seed,
-        use_sample_weights=args.use_sample_weights,
-        neg_before=args.neg_before,
-        hysteresis_delta=args.hysteresis_delta
+        seed=args.seed
     )
 
     log("INFO", "TUNE",
@@ -845,9 +732,7 @@ def run_tune(args, artifacts: RunArtifacts):
             train_end,
             iterations=args.iterations,
             thread_count=args.thread_count,
-            seed=args.seed,
-            use_sample_weights=args.use_sample_weights,
-            neg_before=args.neg_before
+            seed=args.seed
         )
 
         artifacts.save_model(final_model)
@@ -869,13 +754,11 @@ def run_tune(args, artifacts: RunArtifacts):
                 args.alpha_hitM1,
                 args.beta_early,
                 args.beta_late,
-                args.gamma_miss,
-                args.lambda_offset,
-                args.hysteresis_delta
+                args.gamma_miss
             )
 
             log("INFO", "TUNE", f"calibrated threshold: {best_threshold:.3f}")
-            artifacts.save_best_threshold(best_threshold, args.signal_rule, args.hysteresis_delta)
+            artifacts.save_best_threshold(best_threshold, args.signal_rule)
 
             features_df = time_split(features_df, train_end, val_end)
 
@@ -894,13 +777,12 @@ def run_tune(args, artifacts: RunArtifacts):
             test_event_data = _prepare_event_data(test_predictions)
 
             test_metrics = evaluate_long(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                         hysteresis_delta=args.hysteresis_delta, event_data=test_event_data)
+                                         event_data=test_event_data)
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
-                f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
+                f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f}")
 
-            signals_df = extract_signals_long(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                              hysteresis_delta=args.hysteresis_delta)
+            signals_df = extract_signals_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
             artifacts.save_predicted_signals(signals_df)
             log("INFO", "TUNE", f"saved {len(signals_df)} predicted signals")
 
@@ -921,8 +803,6 @@ def main():
     parser.add_argument("--neg-before", type=int, default=60)
     parser.add_argument("--neg-after", type=int, default=10)
     parser.add_argument("--pos-offsets", type=str, default="0")
-    parser.add_argument("--background-negatives", type=int, default=30)
-    parser.add_argument("--background-distance", type=int, default=300)
 
     parser.add_argument("--window-bars", type=int, default=60)
     parser.add_argument("--warmup-bars", type=int, default=150)
@@ -941,18 +821,11 @@ def main():
     parser.add_argument("--early-stopping-rounds", type=int, default=50)
     parser.add_argument("--thread-count", type=int, default=-1)
 
-    parser.add_argument("--signal-rule", type=str,
-                        choices=["first_cross", "cross_up", "hysteresis", "pending_turn_up"],
-                        default="cross_up")
+    parser.add_argument("--signal-rule", type=str, choices=["first_cross"], default="first_cross")
     parser.add_argument("--alpha-hitM1", type=float, default=0.8)
-    parser.add_argument("--beta-early", type=float, default=5.0)
+    parser.add_argument("--beta-early", type=float, default=1.0)
     parser.add_argument("--beta-late", type=float, default=3.0)
-    parser.add_argument("--gamma-miss", type=float, default=0.3)
-    parser.add_argument("--lambda-offset", type=float, default=0.02)
-    parser.add_argument("--hysteresis-delta", type=float, default=0.05)
-
-    parser.add_argument("--use-sample-weights", action="store_true", default=True)
-    parser.add_argument("--no-sample-weights", action="store_false", dest="use_sample_weights")
+    parser.add_argument("--gamma-miss", type=float, default=1.0)
 
     parser.add_argument("--time-budget-min", type=int, default=60)
     parser.add_argument("--fold-months", type=int, default=1)

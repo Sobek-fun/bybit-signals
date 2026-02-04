@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from pump_long.pump.labeler_lookahead import PumpLabelerLookahead
+from src.shared.pump.labeler_lookahead import PumpLabelerLookahead
 
 
 class PumpStartLabelerLookahead:

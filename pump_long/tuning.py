@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from pump_long.threshold import threshold_sweep_long, _prepare_event_data
+from src.dev.pump_long.threshold import threshold_sweep_long, _prepare_event_data
 
 
 def generate_walk_forward_folds(
@@ -116,24 +116,6 @@ def get_hyperparameter_grid() -> list:
     return combinations
 
 
-def compute_sample_weights(offsets: np.ndarray, y: np.ndarray, neg_before: int = 60) -> np.ndarray:
-    weights = np.ones(len(offsets), dtype=np.float64)
-
-    for i in range(len(offsets)):
-        offset = offsets[i]
-        label = y[i]
-
-        if label == 1:
-            weights[i] = 5.0
-        elif offset < 0:
-            distance = abs(offset)
-            weights[i] = 1.0 + (distance / neg_before) * 2.0
-        else:
-            weights[i] = 1.5
-
-    return weights
-
-
 def predict_proba_long(
         model: CatBoostClassifier,
         features_df: pd.DataFrame,
@@ -155,9 +137,7 @@ def train_fold(
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         thread_count: int = -1,
-        seed: int = 42,
-        use_sample_weights: bool = True,
-        neg_before: int = 60
+        seed: int = 42
 ) -> tuple:
     train_df = features_df[features_df['split'] == 'train']
     val_df = features_df[features_df['split'] == 'val']
@@ -170,16 +150,7 @@ def train_fold(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    if use_sample_weights:
-        train_weights = compute_sample_weights(
-            train_df['offset'].values,
-            train_df['y'].values,
-            neg_before
-        )
-        train_pool = Pool(X_train, y_train, weight=train_weights)
-    else:
-        train_pool = Pool(X_train, y_train)
-
+    train_pool = Pool(X_train, y_train)
     val_pool = Pool(X_val, y_val)
 
     model = CatBoostClassifier(
@@ -210,9 +181,7 @@ def evaluate_fold_long(
         alpha_hitM1: float,
         beta_early: float,
         beta_late: float,
-        gamma_miss: float,
-        lambda_offset: float = 0.02,
-        hysteresis_delta: float = 0.05
+        gamma_miss: float
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -228,9 +197,7 @@ def evaluate_fold_long(
         beta_early=beta_early,
         beta_late=beta_late,
         gamma_miss=gamma_miss,
-        lambda_offset=lambda_offset,
         signal_rule=signal_rule,
-        hysteresis_delta=hysteresis_delta,
         event_data=event_data
     )
 
@@ -254,20 +221,16 @@ def run_cv_long(
         feature_columns: list,
         folds: list,
         params: dict,
-        signal_rule: str = 'cross_up',
+        signal_rule: str = 'first_cross',
         alpha_hitM1: float = 0.8,
-        beta_early: float = 5.0,
+        beta_early: float = 1.0,
         beta_late: float = 3.0,
-        gamma_miss: float = 0.3,
-        lambda_offset: float = 0.02,
+        gamma_miss: float = 1.0,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         thread_count: int = -1,
-        seed: int = 42,
-        use_sample_weights: bool = True,
-        neg_before: int = 60,
-        hysteresis_delta: float = 0.05
+        seed: int = 42
 ) -> dict:
     fold_results = []
 
@@ -283,9 +246,7 @@ def run_cv_long(
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
             thread_count=thread_count,
-            seed=seed,
-            use_sample_weights=use_sample_weights,
-            neg_before=neg_before
+            seed=seed
         )
 
         if model is None:
@@ -299,9 +260,7 @@ def run_cv_long(
             alpha_hitM1,
             beta_early,
             beta_late,
-            gamma_miss,
-            lambda_offset,
-            hysteresis_delta
+            gamma_miss
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -332,20 +291,16 @@ def tune_model_long(
         time_budget_min: int = 60,
         fold_months: int = 1,
         min_train_months: int = 3,
-        signal_rule: str = 'cross_up',
+        signal_rule: str = 'first_cross',
         alpha_hitM1: float = 0.8,
-        beta_early: float = 5.0,
+        beta_early: float = 1.0,
         beta_late: float = 3.0,
-        gamma_miss: float = 0.3,
-        lambda_offset: float = 0.02,
+        gamma_miss: float = 1.0,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         thread_count: int = -1,
-        seed: int = 42,
-        use_sample_weights: bool = True,
-        neg_before: int = 60,
-        hysteresis_delta: float = 0.05
+        seed: int = 42
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -377,15 +332,11 @@ def tune_model_long(
             beta_early=beta_early,
             beta_late=beta_late,
             gamma_miss=gamma_miss,
-            lambda_offset=lambda_offset,
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
             thread_count=thread_count,
-            seed=seed,
-            use_sample_weights=use_sample_weights,
-            neg_before=neg_before,
-            hysteresis_delta=hysteresis_delta
+            seed=seed
         )
 
         trial_record = {
@@ -423,9 +374,7 @@ def train_final_model_long(
         train_end: datetime,
         iterations: int = 1000,
         thread_count: int = -1,
-        seed: int = 42,
-        use_sample_weights: bool = True,
-        neg_before: int = 60
+        seed: int = 42
 ) -> CatBoostClassifier:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     train_events = event_times[event_times['open_time'] < train_end]['event_id']
@@ -437,16 +386,7 @@ def train_final_model_long(
 
     X_train = train_df[feature_columns]
     y_train = train_df['y']
-
-    if use_sample_weights:
-        train_weights = compute_sample_weights(
-            train_df['offset'].values,
-            train_df['y'].values,
-            neg_before
-        )
-        train_pool = Pool(X_train, y_train, weight=train_weights)
-    else:
-        train_pool = Pool(X_train, y_train)
+    train_pool = Pool(X_train, y_train)
 
     model = CatBoostClassifier(
         iterations=iterations,
