@@ -75,7 +75,7 @@ def _compute_event_metrics_long(
 def threshold_sweep_long(
         predictions_df: pd.DataFrame,
         grid_from: float = 0.01,
-        grid_to: float = 0.30,
+        grid_to: float = 0.50,
         grid_step: float = 0.01,
         alpha_hitM1: float = 0.8,
         beta_early: float = 1.0,

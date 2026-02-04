@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score
 
-from src.dev.pump_long.threshold import _prepare_event_data
+from pump_long.threshold import _prepare_event_data
 
 
 def compute_event_level_metrics_long(
@@ -103,7 +103,7 @@ def evaluate_long(
     }
 
 
-def extract_signals_long(
+def extract_signals_event_windows_long(
         predictions_df: pd.DataFrame,
         threshold: float,
         signal_rule: str = 'first_cross'
@@ -131,3 +131,154 @@ def extract_signals_long(
         })
 
     return pd.DataFrame(signals)
+
+
+def extract_signals_prodlike_long(
+        stream_df: pd.DataFrame,
+        threshold: float,
+        cooldown_bars: int = 8
+) -> pd.DataFrame:
+    signals = []
+
+    for symbol, group in stream_df.groupby('symbol'):
+        group = group.sort_values('open_time').reset_index(drop=True)
+        p_long = group['p_long'].values
+        open_times = group['open_time'].values
+
+        n = len(group)
+        last_signal_idx = -cooldown_bars - 1
+
+        for i in range(1, n):
+            prev_p = p_long[i - 1]
+            curr_p = p_long[i]
+
+            if np.isnan(prev_p) or np.isnan(curr_p):
+                continue
+
+            is_cross_up = prev_p < threshold <= curr_p
+            cooldown_ok = (i - last_signal_idx) > cooldown_bars
+
+            if is_cross_up and cooldown_ok:
+                signals.append({
+                    'open_time': open_times[i],
+                    'symbol': symbol,
+                    'p_long': curr_p,
+                    'prev_p_long': prev_p,
+                    'threshold': threshold,
+                    'rule': 'cross_up',
+                    'cooldown_bars': cooldown_bars
+                })
+                last_signal_idx = i
+
+    if not signals:
+        return pd.DataFrame(columns=['open_time', 'symbol', 'p_long', 'prev_p_long', 'threshold', 'rule', 'cooldown_bars'])
+
+    return pd.DataFrame(signals).sort_values(['open_time', 'symbol']).reset_index(drop=True)
+
+
+def match_signals_to_events(
+        signals_df: pd.DataFrame,
+        labels_df: pd.DataFrame,
+        window_before: int = 60,
+        window_after: int = 10
+) -> pd.DataFrame:
+    if signals_df.empty:
+        return signals_df.assign(
+            matched_event_id=None,
+            matched_event_time=pd.NaT,
+            offset_to_event=np.nan
+        )
+
+    signals_df = signals_df.copy()
+    signals_df['matched_event_id'] = None
+    signals_df['matched_event_time'] = pd.NaT
+    signals_df['offset_to_event'] = np.nan
+
+    labels_df = labels_df.copy()
+    if 'event_open_time' in labels_df.columns:
+        labels_df['event_time'] = pd.to_datetime(labels_df['event_open_time'])
+    else:
+        labels_df['event_time'] = pd.to_datetime(labels_df['open_time'])
+
+    labels_df['event_id'] = labels_df['symbol'] + '|' + labels_df['event_time'].dt.strftime('%Y%m%d_%H%M%S')
+
+    for idx, signal in signals_df.iterrows():
+        signal_time = pd.to_datetime(signal['open_time'])
+        symbol = signal['symbol']
+
+        symbol_events = labels_df[labels_df['symbol'] == symbol]
+
+        for _, event in symbol_events.iterrows():
+            event_time = event['event_time']
+            offset_bars = int((signal_time - event_time).total_seconds() / (15 * 60))
+
+            if -window_before <= offset_bars <= window_after:
+                signals_df.at[idx, 'matched_event_id'] = event['event_id']
+                signals_df.at[idx, 'matched_event_time'] = event_time
+                signals_df.at[idx, 'offset_to_event'] = offset_bars
+                break
+
+    return signals_df
+
+
+def compute_stream_metrics_long(
+        signals_df: pd.DataFrame,
+        labels_df: pd.DataFrame,
+        holdout_start: pd.Timestamp,
+        holdout_end: pd.Timestamp,
+        window_before: int = 60,
+        window_after: int = 10
+) -> dict:
+    matched_signals = match_signals_to_events(signals_df, labels_df, window_before, window_after)
+
+    total_signals = len(matched_signals)
+    tp_signals = matched_signals['matched_event_id'].notna().sum()
+    fp_signals = total_signals - tp_signals
+
+    labels_df = labels_df.copy()
+    if 'event_open_time' in labels_df.columns:
+        labels_df['event_time'] = pd.to_datetime(labels_df['event_open_time'])
+    else:
+        labels_df['event_time'] = pd.to_datetime(labels_df['open_time'])
+
+    holdout_events = labels_df[
+        (labels_df['event_time'] >= holdout_start) &
+        (labels_df['event_time'] < holdout_end)
+    ]
+    total_events = len(holdout_events)
+
+    caught_event_ids = matched_signals['matched_event_id'].dropna().unique()
+    caught_events = len(caught_event_ids)
+
+    holdout_days = (holdout_end - holdout_start).days
+    if holdout_days <= 0:
+        holdout_days = 1
+
+    signals_per_day = total_signals / holdout_days
+    precision = tp_signals / total_signals if total_signals > 0 else 0
+    event_recall = caught_events / total_events if total_events > 0 else 0
+
+    offsets = matched_signals['offset_to_event'].dropna().values
+    offset_distribution = {}
+    if len(offsets) > 0:
+        offset_distribution = {
+            'mean': float(np.mean(offsets)),
+            'median': float(np.median(offsets)),
+            'std': float(np.std(offsets)),
+            'min': float(np.min(offsets)),
+            'max': float(np.max(offsets))
+        }
+
+    return {
+        'total_signals': total_signals,
+        'tp_signals': int(tp_signals),
+        'fp_signals': int(fp_signals),
+        'total_events': total_events,
+        'caught_events': caught_events,
+        'missed_events': total_events - caught_events,
+        'signals_per_day': round(signals_per_day, 2),
+        'precision': round(precision, 4),
+        'event_recall': round(event_recall, 4),
+        'holdout_days': holdout_days,
+        'offset_distribution': offset_distribution
+    }

@@ -10,12 +10,15 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from src.shared.clickhouse import DataLoader
-from src.shared.pump_end.feature_builder import PumpFeatureBuilder
-from src.dev.pump_long.labeler import PumpStartLabelerLookahead
-from src.dev.pump_long.threshold import threshold_sweep_long, _prepare_event_data
-from src.dev.pump_long.evaluate import evaluate_long, extract_signals_long
-from src.dev.pump_long.tuning import (
+from pump_long.infra.clickhouse import DataLoader
+from pump_end.features.feature_builder import PumpFeatureBuilder
+from pump_long.labeler import PumpStartLabelerLookahead
+from pump_long.threshold import threshold_sweep_long, _prepare_event_data
+from pump_long.evaluate import (
+    evaluate_long, extract_signals_event_windows_long,
+    extract_signals_prodlike_long, compute_stream_metrics_long
+)
+from pump_long.tuning import (
     tune_model_long, train_final_model_long, predict_proba_long,
     generate_walk_forward_folds
 )
@@ -75,9 +78,18 @@ class RunArtifacts:
         path = self.run_dir / "feature_importance.csv"
         df.to_csv(path, index=False)
 
-    def save_predicted_signals(self, df: pd.DataFrame):
+    def save_predicted_signals_event_windows(self, df: pd.DataFrame):
+        path = self.run_dir / "predicted_signals_event_windows.csv"
+        df.to_csv(path, index=False)
+
+    def save_predicted_signals_holdout(self, df: pd.DataFrame):
         path = self.run_dir / "predicted_signals_holdout.csv"
         df.to_csv(path, index=False)
+
+    def save_stream_metrics(self, metrics: dict):
+        path = self.run_dir / "stream_metrics_holdout.json"
+        with open(path, 'w') as f:
+            json.dump(metrics, f, indent=2, default=str)
 
     def save_predictions(self, df: pd.DataFrame, split_name: str):
         path = self.run_dir / f"predictions_{split_name}.parquet"
@@ -668,10 +680,10 @@ def run_train(args, artifacts: RunArtifacts):
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f}")
 
-    log("INFO", "TRAIN", "extracting holdout signals")
-    signals_df = extract_signals_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
-    artifacts.save_predicted_signals(signals_df)
-    log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals")
+    log("INFO", "TRAIN", "extracting event-window signals")
+    signals_df = extract_signals_event_windows_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
+    artifacts.save_predicted_signals_event_windows(signals_df)
+    log("INFO", "TRAIN", f"saved {len(signals_df)} event-window signals")
 
     log("INFO", "TRAIN", f"done. artifacts saved to {artifacts.get_path()}")
 
@@ -782,17 +794,221 @@ def run_tune(args, artifacts: RunArtifacts):
             log("INFO", "TUNE",
                 f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} hitM1={test_metrics['event_level']['hitM1_rate']:.3f} late={test_metrics['event_level']['late_rate']:.3f}")
 
-            signals_df = extract_signals_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
-            artifacts.save_predicted_signals(signals_df)
-            log("INFO", "TUNE", f"saved {len(signals_df)} predicted signals")
+            signals_df = extract_signals_event_windows_long(test_predictions, best_threshold, signal_rule=args.signal_rule)
+            artifacts.save_predicted_signals_event_windows(signals_df)
+            log("INFO", "TUNE", f"saved {len(signals_df)} event-window signals")
 
     log("INFO", "TUNE", f"done. artifacts saved to {artifacts.get_path()}")
+
+
+def _get_all_symbols(ch_dsn: str, start_dt: datetime, end_dt: datetime) -> list:
+    parsed = urlparse(ch_dsn)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "default"
+    password = parsed.password or ""
+    database = parsed.path.lstrip("/") if parsed.path else "default"
+    secure = parsed.scheme == "https"
+
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        database=database,
+        secure=secure
+    )
+
+    query = """
+    SELECT DISTINCT symbol
+    FROM bybit.candles
+    WHERE open_time >= %(start)s
+      AND open_time < %(end)s
+      AND interval = 1
+      AND symbol LIKE '%%USDT'
+    ORDER BY symbol
+    """
+    result = client.query(query, parameters={
+        "start": start_dt,
+        "end": end_dt
+    })
+    return [row[0] for row in result.result_rows]
+
+
+def _scan_symbol_prodlike(args: tuple) -> list:
+    ch_dsn, symbol, start_dt, end_dt, model_path, threshold, cooldown_bars, window_bars, warmup_bars, feature_set = args
+
+    model = CatBoostClassifier()
+    model.load_model(model_path)
+
+    builder = PumpFeatureBuilder(
+        ch_dsn=ch_dsn,
+        window_bars=window_bars,
+        warmup_bars=warmup_bars,
+        feature_set=feature_set
+    )
+
+    loader = DataLoader(ch_dsn)
+    buffer_bars = warmup_bars + window_bars + 100
+    load_start = start_dt - timedelta(minutes=buffer_bars * 15)
+
+    df = loader.load_candles_range(symbol, load_start, end_dt)
+
+    if df.empty or len(df) < warmup_bars + window_bars:
+        return []
+
+    scan_times = []
+    for ts in df.index:
+        if ts >= start_dt and ts < end_dt:
+            scan_times.append(ts + timedelta(minutes=15))
+
+    if not scan_times:
+        return []
+
+    features_list = builder.build_many_for_inference(df, symbol, scan_times)
+
+    if not features_list:
+        return []
+
+    features_df = pd.DataFrame(features_list)
+    features_df['symbol'] = symbol
+
+    exclude_cols = {'symbol', 'open_time', 'pump_la_type', 'target', 'runup_pct', 'timeframe', 'window_bars', 'warmup_bars'}
+    feature_columns = [col for col in features_df.columns if col not in exclude_cols]
+
+    X = features_df[feature_columns]
+    p_long = model.predict_proba(X)[:, 1]
+
+    stream_df = pd.DataFrame({
+        'symbol': symbol,
+        'open_time': features_df['open_time'],
+        'p_long': p_long
+    })
+
+    signals = []
+    stream_df = stream_df.sort_values('open_time').reset_index(drop=True)
+    p_arr = stream_df['p_long'].values
+    times_arr = stream_df['open_time'].values
+
+    n = len(stream_df)
+    last_signal_idx = -cooldown_bars - 1
+
+    for i in range(1, n):
+        prev_p = p_arr[i - 1]
+        curr_p = p_arr[i]
+
+        if np.isnan(prev_p) or np.isnan(curr_p):
+            continue
+
+        is_cross_up = prev_p < threshold <= curr_p
+        cooldown_ok = (i - last_signal_idx) > cooldown_bars
+
+        if is_cross_up and cooldown_ok:
+            signals.append({
+                'open_time': times_arr[i],
+                'symbol': symbol,
+                'p_long': float(curr_p),
+                'prev_p_long': float(prev_p),
+                'threshold': threshold,
+                'rule': 'cross_up',
+                'cooldown_bars': cooldown_bars
+            })
+            last_signal_idx = i
+
+    return signals
+
+
+def run_scan_holdout(args, artifacts: RunArtifacts):
+    model_path = artifacts.run_dir / "catboost_model.cbm"
+    threshold_path = artifacts.run_dir / "best_threshold.json"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    if not threshold_path.exists():
+        raise FileNotFoundError(f"Threshold not found: {threshold_path}")
+
+    with open(threshold_path, 'r') as f:
+        threshold_data = json.load(f)
+    threshold = threshold_data['threshold']
+
+    log("INFO", "SCAN", f"loaded threshold: {threshold:.3f}")
+
+    holdout_start = parse_date_exclusive(args.holdout_start)
+    holdout_end = parse_date_exclusive(args.holdout_end)
+
+    log("INFO", "SCAN", f"holdout period: [{holdout_start}, {holdout_end})")
+
+    symbols = _get_all_symbols(args.clickhouse_dsn, holdout_start, holdout_end)
+    log("INFO", "SCAN", f"found {len(symbols)} USDT symbols")
+
+    tasks = [
+        (
+            args.clickhouse_dsn,
+            symbol,
+            holdout_start,
+            holdout_end,
+            str(model_path),
+            threshold,
+            args.cooldown_bars,
+            args.window_bars,
+            args.warmup_bars,
+            args.feature_set
+        )
+        for symbol in symbols
+    ]
+
+    all_signals = []
+    processed = 0
+
+    with ProcessPoolExecutor(max_workers=args.scan_workers) as executor:
+        for signals in executor.map(_scan_symbol_prodlike, tasks):
+            all_signals.extend(signals)
+            processed += 1
+            if processed % 50 == 0:
+                log("INFO", "SCAN", f"processed {processed}/{len(symbols)} symbols, signals so far: {len(all_signals)}")
+
+    log("INFO", "SCAN", f"total signals: {len(all_signals)}")
+
+    if all_signals:
+        signals_df = pd.DataFrame(all_signals)
+        signals_df = signals_df.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    else:
+        signals_df = pd.DataFrame(columns=['open_time', 'symbol', 'p_long', 'prev_p_long', 'threshold', 'rule', 'cooldown_bars'])
+
+    artifacts.save_predicted_signals_holdout(signals_df)
+    log("INFO", "SCAN", f"saved {len(signals_df)} prod-like signals to predicted_signals_holdout.csv")
+
+    if args.labels:
+        log("INFO", "SCAN", "computing stream metrics with label matching")
+        labels_df = load_labels(args.labels, holdout_start, holdout_end)
+        labels_df = labels_df[labels_df['pump_la_type'] == 'A']
+        log("INFO", "SCAN", f"loaded {len(labels_df)} type-A events in holdout period")
+
+        stream_metrics = compute_stream_metrics_long(
+            signals_df,
+            labels_df,
+            holdout_start,
+            holdout_end,
+            window_before=args.neg_before,
+            window_after=args.neg_after
+        )
+
+        artifacts.save_stream_metrics(stream_metrics)
+
+        log("INFO", "SCAN", f"stream metrics:")
+        log("INFO", "SCAN", f"  signals/day: {stream_metrics['signals_per_day']}")
+        log("INFO", "SCAN", f"  precision: {stream_metrics['precision']:.4f}")
+        log("INFO", "SCAN", f"  event_recall: {stream_metrics['event_recall']:.4f}")
+        log("INFO", "SCAN", f"  TP: {stream_metrics['tp_signals']}, FP: {stream_metrics['fp_signals']}")
+        log("INFO", "SCAN", f"  caught/total events: {stream_metrics['caught_events']}/{stream_metrics['total_events']}")
+
+    log("INFO", "SCAN", f"done. artifacts saved to {artifacts.get_path()}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train pump long prediction model")
 
-    parser.add_argument("--mode", type=str, choices=["build-dataset", "train", "tune"], required=True)
+    parser.add_argument("--mode", type=str, choices=["build-dataset", "train", "tune", "scan-holdout"], required=True)
 
     parser.add_argument("--labels", type=str, default=None)
     parser.add_argument("--start-date", type=str, default=None)
@@ -831,6 +1047,11 @@ def main():
     parser.add_argument("--fold-months", type=int, default=1)
     parser.add_argument("--min-train-months", type=int, default=3)
 
+    parser.add_argument("--holdout-start", type=str, default=None)
+    parser.add_argument("--holdout-end", type=str, default=None)
+    parser.add_argument("--cooldown-bars", type=int, default=8)
+    parser.add_argument("--scan-workers", type=int, default=4)
+
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
 
@@ -850,6 +1071,14 @@ def main():
         if not args.dataset_parquet:
             parser.error("--dataset-parquet required for tune mode")
 
+    if args.mode == "scan-holdout":
+        if not args.clickhouse_dsn:
+            parser.error("--clickhouse-dsn required for scan-holdout mode")
+        if not args.holdout_start or not args.holdout_end:
+            parser.error("--holdout-start and --holdout-end required for scan-holdout mode")
+        if not args.run_name:
+            parser.error("--run-name required for scan-holdout mode (must point to existing run with model)")
+
     artifacts = RunArtifacts(args.out_dir, args.run_name)
     log("INFO", "MAIN", f"run_dir={artifacts.get_path()}")
 
@@ -862,6 +1091,8 @@ def main():
         run_train(args, artifacts)
     elif args.mode == "tune":
         run_tune(args, artifacts)
+    elif args.mode == "scan-holdout":
+        run_scan_holdout(args, artifacts)
 
 
 if __name__ == "__main__":

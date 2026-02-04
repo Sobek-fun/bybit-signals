@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from src.dev.pump_long.threshold import threshold_sweep_long, _prepare_event_data
+from pump_long.threshold import threshold_sweep_long, _prepare_event_data
 
 
 def generate_walk_forward_folds(
