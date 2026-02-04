@@ -53,25 +53,36 @@ class DataLoader:
         """
 
         query_start = datetime.now()
-        result = self.client.query(query, parameters={
-            "symbols": symbols,
-            "start": start_bucket,
-            "end": end_bucket + timedelta(minutes=15)
-        })
+
+        try:
+            df_all = self.client.query_df(query, parameters={
+                "symbols": symbols,
+                "start": start_bucket,
+                "end": end_bucket + timedelta(minutes=15)
+            })
+        except AttributeError:
+            result = self.client.query(query, parameters={
+                "symbols": symbols,
+                "start": start_bucket,
+                "end": end_bucket + timedelta(minutes=15)
+            })
+            if not result.result_rows:
+                return {}
+            df_all = pd.DataFrame(
+                result.result_rows,
+                columns=["symbol", "bucket", "open", "high", "low", "close", "volume"]
+            )
+
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
         if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
             log("WARN", "DATA",
-                f"batch query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbols={len(symbols)}")
+                f"batch query slow: {query_duration_ms:.0f}ms rows={len(df_all)} symbols={len(symbols)}")
 
-        if not result.result_rows:
+        if df_all.empty:
             return {}
 
-        df_all = pd.DataFrame(
-            result.result_rows,
-            columns=["symbol", "bucket", "open", "high", "low", "close", "volume"]
-        )
-
+        df_all.columns = ["symbol", "bucket", "open", "high", "low", "close", "volume"]
         df_all["bucket"] = pd.to_datetime(df_all["bucket"])
 
         result_dict = {}
@@ -106,25 +117,38 @@ class DataLoader:
         """
 
         query_start = datetime.now()
-        result = self.client.query(query, parameters={
-            "symbol": symbol,
-            "start": start_time,
-            "end": t
-        })
+        try:
+            df = self.client.query_df(query, parameters={
+                "symbol": symbol,
+                "start": start_time,
+                "end": t
+            })
+            row_count = len(df)
+        except AttributeError:
+            result = self.client.query(query, parameters={
+                "symbol": symbol,
+                "start": start_time,
+                "end": t
+            })
+            row_count = len(result.result_rows)
+            if not result.result_rows:
+                log("WARN", "DATA", f"symbol={symbol} returned 0 rows for lookback={lookback}")
+                return pd.DataFrame()
+            df = pd.DataFrame(
+                result.result_rows,
+                columns=["bucket", "open", "high", "low", "close", "volume"]
+            )
+
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
         if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
-            log("WARN", "DATA", f"symbol={symbol} slow query: {query_duration_ms:.0f}ms rows={len(result.result_rows)}")
+            log("WARN", "DATA", f"symbol={symbol} slow query: {query_duration_ms:.0f}ms rows={row_count}")
 
-        if not result.result_rows:
+        if df.empty:
             log("WARN", "DATA", f"symbol={symbol} returned 0 rows for lookback={lookback}")
             return pd.DataFrame()
 
-        df = pd.DataFrame(
-            result.result_rows,
-            columns=["bucket", "open", "high", "low", "close", "volume"]
-        )
-
+        df.columns = ["bucket", "open", "high", "low", "close", "volume"]
         df["bucket"] = pd.to_datetime(df["bucket"])
         df.set_index("bucket", inplace=True)
 
@@ -148,20 +172,29 @@ class DataLoader:
         ORDER BY bucket
         """
 
-        result = self.client.query(query, parameters={
-            "symbol": symbol,
-            "start": start_bucket,
-            "end": end_bucket + timedelta(minutes=15)
-        })
+        try:
+            df = self.client.query_df(query, parameters={
+                "symbol": symbol,
+                "start": start_bucket,
+                "end": end_bucket + timedelta(minutes=15)
+            })
+        except AttributeError:
+            result = self.client.query(query, parameters={
+                "symbol": symbol,
+                "start": start_bucket,
+                "end": end_bucket + timedelta(minutes=15)
+            })
+            if not result.result_rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(
+                result.result_rows,
+                columns=["bucket", "open", "high", "low", "close", "volume"]
+            )
 
-        if not result.result_rows:
+        if df.empty:
             return pd.DataFrame()
 
-        df = pd.DataFrame(
-            result.result_rows,
-            columns=["bucket", "open", "high", "low", "close", "volume"]
-        )
-
+        df.columns = ["bucket", "open", "high", "low", "close", "volume"]
         df["bucket"] = pd.to_datetime(df["bucket"])
         df.set_index("bucket", inplace=True)
 

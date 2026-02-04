@@ -238,39 +238,82 @@ def match_signals_to_events(
 
     labels_df['event_id'] = labels_df['symbol'] + '|' + labels_df['event_time'].dt.strftime('%Y%m%d_%H%M%S')
 
-    for idx, signal in signals_df.iterrows():
-        signal_time = pd.to_datetime(signal['open_time'])
-        symbol = signal['symbol']
+    bar_seconds = 15 * 60
 
-        symbol_events = labels_df[labels_df['symbol'] == symbol]
+    symbol_events_map = {}
+    for symbol, group in labels_df.groupby('symbol'):
+        group = group.sort_values('event_time')
+        event_times = group['event_time'].values.astype('datetime64[s]').astype(np.int64)
+        event_ids = group['event_id'].values
+        event_times_dt = group['event_time'].values
+        symbol_events_map[symbol] = {
+            'times_int': event_times,
+            'event_ids': event_ids,
+            'event_times': event_times_dt
+        }
 
-        best_event_id = None
-        best_event_time = None
+    signal_times = pd.to_datetime(signals_df['open_time']).values.astype('datetime64[s]').astype(np.int64)
+    signal_symbols = signals_df['symbol'].values
+
+    matched_event_ids = np.empty(len(signals_df), dtype=object)
+    matched_event_times = np.empty(len(signals_df), dtype='datetime64[ns]')
+    matched_offsets = np.full(len(signals_df), np.nan)
+
+    matched_event_ids[:] = None
+    matched_event_times[:] = np.datetime64('NaT')
+
+    for i in range(len(signals_df)):
+        symbol = signal_symbols[i]
+        if symbol not in symbol_events_map:
+            continue
+
+        events_data = symbol_events_map[symbol]
+        event_times_int = events_data['times_int']
+        event_ids = events_data['event_ids']
+        event_times_dt = events_data['event_times']
+
+        signal_time_int = signal_times[i]
+
+        idx = np.searchsorted(event_times_int, signal_time_int)
+
+        candidates = []
+        for check_idx in [idx - 1, idx]:
+            if 0 <= check_idx < len(event_times_int):
+                event_time_int = event_times_int[check_idx]
+                offset_seconds = signal_time_int - event_time_int
+                offset_bars = int(offset_seconds / bar_seconds)
+
+                if -window_before <= offset_bars <= window_after:
+                    candidates.append((check_idx, offset_bars))
+
+        if not candidates:
+            continue
+
+        best_idx = None
         best_offset = None
         best_abs_offset = float('inf')
 
-        for _, event in symbol_events.iterrows():
-            event_time = event['event_time']
-            offset_bars = int((signal_time - event_time).total_seconds() / (15 * 60))
+        for check_idx, offset_bars in candidates:
+            abs_offset = abs(offset_bars)
+            is_better = False
+            if abs_offset < best_abs_offset:
+                is_better = True
+            elif abs_offset == best_abs_offset and offset_bars <= 0 and (best_offset is None or best_offset > 0):
+                is_better = True
 
-            if -window_before <= offset_bars <= window_after:
-                abs_offset = abs(offset_bars)
-                is_better = False
-                if abs_offset < best_abs_offset:
-                    is_better = True
-                elif abs_offset == best_abs_offset and offset_bars <= 0 and (best_offset is None or best_offset > 0):
-                    is_better = True
+            if is_better:
+                best_idx = check_idx
+                best_offset = offset_bars
+                best_abs_offset = abs_offset
 
-                if is_better:
-                    best_event_id = event['event_id']
-                    best_event_time = event_time
-                    best_offset = offset_bars
-                    best_abs_offset = abs_offset
+        if best_idx is not None:
+            matched_event_ids[i] = event_ids[best_idx]
+            matched_event_times[i] = event_times_dt[best_idx]
+            matched_offsets[i] = best_offset
 
-        if best_event_id is not None:
-            signals_df.at[idx, 'matched_event_id'] = best_event_id
-            signals_df.at[idx, 'matched_event_time'] = best_event_time
-            signals_df.at[idx, 'offset_to_event'] = best_offset
+    signals_df['matched_event_id'] = matched_event_ids
+    signals_df['matched_event_time'] = matched_event_times
+    signals_df['offset_to_event'] = matched_offsets
 
     return signals_df
 
@@ -289,16 +332,13 @@ def compute_stream_metrics_long(
     tp_signals = matched_signals['matched_event_id'].notna().sum()
     fp_signals = total_signals - tp_signals
 
-    labels_df = labels_df.copy()
     if 'event_open_time' in labels_df.columns:
-        labels_df['event_time'] = pd.to_datetime(labels_df['event_open_time'])
+        event_times = pd.to_datetime(labels_df['event_open_time'])
     else:
-        labels_df['event_time'] = pd.to_datetime(labels_df['open_time'])
+        event_times = pd.to_datetime(labels_df['open_time'])
 
-    holdout_events = labels_df[
-        (labels_df['event_time'] >= holdout_start) &
-        (labels_df['event_time'] < holdout_end)
-    ]
+    holdout_mask = (event_times >= holdout_start) & (event_times < holdout_end)
+    holdout_events = labels_df[holdout_mask]
     total_events = len(holdout_events)
 
     caught_event_ids = matched_signals['matched_event_id'].dropna().unique()

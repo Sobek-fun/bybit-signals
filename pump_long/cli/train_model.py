@@ -199,10 +199,10 @@ def calibrate_threshold(
         grid_to: float = 0.99,
         grid_step: float = 0.01
 ) -> tuple:
-    val_df = features_df[features_df['split'] == 'val'].copy()
+    val_df = features_df[features_df['split'] == 'val']
 
     if len(val_df) == 0:
-        return 0.1, pd.DataFrame()
+        return 0.1, pd.DataFrame(), None, None
 
     val_predictions = predict_proba_long(model, val_df, feature_columns)
     val_event_data = _prepare_event_data(val_predictions)
@@ -220,12 +220,15 @@ def calibrate_threshold(
         event_data=val_event_data
     )
 
-    return best_threshold, sweep_df
+    return best_threshold, sweep_df, val_predictions, val_event_data
 
 
 def parse_date_exclusive(date_str: str) -> datetime:
     dt = datetime.strptime(date_str, '%Y-%m-%d')
     return dt + timedelta(days=1)
+
+
+_scan_worker_cache = {}
 
 
 def _get_all_symbols(ch_dsn: str, start_dt: datetime, end_dt: datetime) -> list:
@@ -265,17 +268,32 @@ def _get_all_symbols(ch_dsn: str, start_dt: datetime, end_dt: datetime) -> list:
 def _scan_symbol_prodlike_stream(args: tuple) -> pd.DataFrame:
     ch_dsn, symbol, start_dt, end_dt, model_path, window_bars, warmup_bars, feature_set, feature_columns = args
 
-    model = CatBoostClassifier()
-    model.load_model(model_path)
+    cache_key = (ch_dsn, model_path, window_bars, warmup_bars, feature_set)
 
-    builder = PumpLongFeatureBuilder(
-        ch_dsn=ch_dsn,
-        window_bars=window_bars,
-        warmup_bars=warmup_bars,
-        feature_set=feature_set
-    )
+    if cache_key not in _scan_worker_cache:
+        model = CatBoostClassifier()
+        model.load_model(model_path)
 
-    loader = DataLoader(ch_dsn)
+        builder = PumpLongFeatureBuilder(
+            ch_dsn=ch_dsn,
+            window_bars=window_bars,
+            warmup_bars=warmup_bars,
+            feature_set=feature_set
+        )
+
+        loader = DataLoader(ch_dsn)
+
+        _scan_worker_cache[cache_key] = {
+            'model': model,
+            'builder': builder,
+            'loader': loader
+        }
+
+    cached = _scan_worker_cache[cache_key]
+    model = cached['model']
+    builder = cached['builder']
+    loader = cached['loader']
+
     buffer_bars = warmup_bars + window_bars + 100
     load_start = start_dt - timedelta(minutes=buffer_bars * 15)
 
@@ -327,44 +345,59 @@ def extract_signals_from_stream(
         threshold: float,
         cooldown_bars: int,
         gate_min_dollar_vol: float = None,
-        gate_min_vol_ratio: float = None
+        gate_min_vol_ratio: float = None,
+        precomputed_groups: dict = None
 ) -> pd.DataFrame:
     signals = []
 
-    for symbol, group in stream_df.groupby('symbol'):
-        group = group.sort_values('open_time').reset_index(drop=True)
-        p_arr = group['p_long'].values
-        times_arr = group['open_time'].values
-        dollar_vol_arr = group['dollar_vol_prev'].values if 'dollar_vol_prev' in group.columns else None
-        vol_ratio_arr = group['vol_ratio_prev'].values if 'vol_ratio_prev' in group.columns else None
+    if precomputed_groups is not None:
+        groups_iter = precomputed_groups.items()
+    else:
+        groups_iter = stream_df.groupby('symbol')
 
-        n = len(group)
+    for symbol, group_data in groups_iter:
+        if precomputed_groups is not None:
+            times_arr = group_data['times']
+            p_arr = group_data['p_long']
+            dollar_vol_arr = group_data.get('dollar_vol_prev')
+            vol_ratio_arr = group_data.get('vol_ratio_prev')
+        else:
+            group = group_data.sort_values('open_time').reset_index(drop=True)
+            p_arr = group['p_long'].values
+            times_arr = group['open_time'].values
+            dollar_vol_arr = group['dollar_vol_prev'].values if 'dollar_vol_prev' in group.columns else None
+            vol_ratio_arr = group['vol_ratio_prev'].values if 'vol_ratio_prev' in group.columns else None
+
+        n = len(p_arr)
+        if n < 2:
+            continue
+
+        prev_p = p_arr[:-1]
+        curr_p = p_arr[1:]
+
+        cross_mask = (prev_p < threshold) & (curr_p >= threshold) & ~np.isnan(prev_p) & ~np.isnan(curr_p)
+
+        if gate_min_dollar_vol is not None and dollar_vol_arr is not None:
+            gate_dv = (~np.isnan(dollar_vol_arr[1:])) & (dollar_vol_arr[1:] >= gate_min_dollar_vol)
+            cross_mask = cross_mask & gate_dv
+
+        if gate_min_vol_ratio is not None and vol_ratio_arr is not None:
+            gate_vr = (~np.isnan(vol_ratio_arr[1:])) & (vol_ratio_arr[1:] >= gate_min_vol_ratio)
+            cross_mask = cross_mask & gate_vr
+
+        candidate_indices = np.where(cross_mask)[0] + 1
+
+        if len(candidate_indices) == 0:
+            continue
+
         last_signal_idx = -cooldown_bars - 1
-
-        for i in range(1, n):
-            prev_p = p_arr[i - 1]
-            curr_p = p_arr[i]
-
-            if np.isnan(prev_p) or np.isnan(curr_p):
-                continue
-
-            if gate_min_dollar_vol is not None and dollar_vol_arr is not None:
-                if np.isnan(dollar_vol_arr[i]) or dollar_vol_arr[i] < gate_min_dollar_vol:
-                    continue
-
-            if gate_min_vol_ratio is not None and vol_ratio_arr is not None:
-                if np.isnan(vol_ratio_arr[i]) or vol_ratio_arr[i] < gate_min_vol_ratio:
-                    continue
-
-            is_cross_up = prev_p < threshold <= curr_p
-            cooldown_ok = (i - last_signal_idx) > cooldown_bars
-
-            if is_cross_up and cooldown_ok:
+        for i in candidate_indices:
+            if (i - last_signal_idx) > cooldown_bars:
                 signals.append({
                     'open_time': times_arr[i],
                     'symbol': symbol,
-                    'p_long': float(curr_p),
-                    'prev_p_long': float(prev_p),
+                    'p_long': float(p_arr[i]),
+                    'prev_p_long': float(p_arr[i - 1]),
                     'threshold': threshold,
                     'rule': 'cross_up',
                     'cooldown_bars': cooldown_bars
@@ -451,6 +484,16 @@ def stream_threshold_sweep(
     if holdout_days <= 0:
         holdout_days = 1
 
+    precomputed_groups = {}
+    for symbol, group in stream_df.groupby('symbol'):
+        group = group.sort_values('open_time').reset_index(drop=True)
+        precomputed_groups[symbol] = {
+            'times': group['open_time'].values,
+            'p_long': group['p_long'].values,
+            'dollar_vol_prev': group['dollar_vol_prev'].values if 'dollar_vol_prev' in group.columns else None,
+            'vol_ratio_prev': group['vol_ratio_prev'].values if 'vol_ratio_prev' in group.columns else None
+        }
+
     thresholds = np.arange(grid_from, grid_to + grid_step, grid_step)
     sweep_results = []
 
@@ -460,7 +503,8 @@ def stream_threshold_sweep(
             threshold=thr,
             cooldown_bars=cooldown_bars,
             gate_min_dollar_vol=gate_min_dollar_vol,
-            gate_min_vol_ratio=gate_min_vol_ratio
+            gate_min_vol_ratio=gate_min_vol_ratio,
+            precomputed_groups=precomputed_groups
         )
 
         metrics = compute_stream_metrics_long(
@@ -640,7 +684,12 @@ def main():
     log("INFO", "TRAIN", f"feature_columns from manifest: {len(feature_columns)} features")
 
     log("INFO", "TRAIN", f"loading features from {args.dataset_parquet}")
-    features_df = pd.read_parquet(args.dataset_parquet)
+    meta_columns = ['symbol', 'open_time', 'event_id', 'offset', 'y', 'pump_la_type', 'runup_pct', 'target']
+    columns_to_read = meta_columns + feature_columns
+    try:
+        features_df = pd.read_parquet(args.dataset_parquet, columns=columns_to_read)
+    except Exception:
+        features_df = pd.read_parquet(args.dataset_parquet)
     log("INFO", "TRAIN", f"loaded {len(features_df)} rows")
 
     missing_cols = [c for c in feature_columns if c not in features_df.columns]
@@ -692,7 +741,7 @@ def main():
     importance_df.to_csv(importance_path, index=False)
 
     log("INFO", "TRAIN", "calibrating threshold on val set (event-window)")
-    best_threshold_event, sweep_df_event = calibrate_threshold(
+    best_threshold_event, sweep_df_event, val_predictions, val_event_data = calibrate_threshold(
         model,
         features_df,
         feature_columns,
@@ -828,12 +877,13 @@ def main():
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
     log("INFO", "TRAIN", "evaluating on val set (event-window)")
-    val_predictions = predict_proba_long(
-        model,
-        features_df[features_df['split'] == 'val'],
-        feature_columns
-    )
-    val_event_data = _prepare_event_data(val_predictions)
+    if val_predictions is None:
+        val_predictions = predict_proba_long(
+            model,
+            features_df[features_df['split'] == 'val'],
+            feature_columns
+        )
+        val_event_data = _prepare_event_data(val_predictions)
     val_metrics = evaluate_long(val_predictions, best_threshold, signal_rule=args.signal_rule,
                                 event_data=val_event_data)
 

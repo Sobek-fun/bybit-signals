@@ -11,26 +11,34 @@ import pandas as pd
 from pump_long.labeler import PumpStartLabelerLookahead
 from pump_long.infra.logging import log
 
+_worker_client_cache = {}
+
+
+def _get_cached_client(ch_dsn: str):
+    if ch_dsn not in _worker_client_cache:
+        parsed = urlparse(ch_dsn)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 8123
+        username = parsed.username or "default"
+        password = parsed.password or ""
+        database = parsed.path.lstrip("/") if parsed.path else "default"
+        secure = parsed.scheme == "https"
+
+        _worker_client_cache[ch_dsn] = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            database=database,
+            secure=secure
+        )
+    return _worker_client_cache[ch_dsn]
+
 
 def _process_symbol_labels(args: tuple) -> list:
     ch_dsn, symbol, start_dt, end_dt = args
 
-    parsed = urlparse(ch_dsn)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 8123
-    username = parsed.username or "default"
-    password = parsed.password or ""
-    database = parsed.path.lstrip("/") if parsed.path else "default"
-    secure = parsed.scheme == "https"
-
-    client = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        username=username,
-        password=password,
-        database=database,
-        secure=secure
-    )
+    client = _get_cached_client(ch_dsn)
 
     query = """
             SELECT toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,

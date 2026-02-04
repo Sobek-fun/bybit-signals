@@ -471,16 +471,24 @@ def get_feature_columns(feature_set: str) -> list:
     return FEATURE_SETS[feature_set].copy()
 
 
+_worker_builder_cache = {}
+
+
 def _process_symbol_worker(args):
     ch_dsn, symbol, events_data, window_bars, warmup_bars, feature_set, params_dict = args
 
-    builder = PumpLongFeatureBuilder(
-        ch_dsn=ch_dsn,
-        window_bars=window_bars,
-        warmup_bars=warmup_bars,
-        feature_set=feature_set,
-        params=PumpParams(**params_dict) if params_dict else None
-    )
+    cache_key = (ch_dsn, window_bars, warmup_bars, feature_set, tuple(sorted(params_dict.items())) if params_dict else None)
+
+    if cache_key not in _worker_builder_cache:
+        _worker_builder_cache[cache_key] = PumpLongFeatureBuilder(
+            ch_dsn=ch_dsn,
+            window_bars=window_bars,
+            warmup_bars=warmup_bars,
+            feature_set=feature_set,
+            params=PumpParams(**params_dict) if params_dict else None
+        )
+
+    builder = _worker_builder_cache[cache_key]
 
     events = pd.DataFrame(events_data)
     events['open_time'] = pd.to_datetime(events['open_time'])
@@ -632,11 +640,14 @@ class PumpLongFeatureBuilder:
 
         df = df_candles.copy()
 
-        events_liq = pd.DataFrame([{
-            'open_time': dt - timedelta(minutes=15),
+        decision_times_arr = np.array(decision_open_times, dtype='datetime64[ns]')
+        liq_times_arr = decision_times_arr - np.timedelta64(15, 'm')
+
+        events_liq = pd.DataFrame({
+            'open_time': liq_times_arr,
             'pump_la_type': 'A',
             'runup_pct': 0
-        } for dt in decision_open_times])
+        })
 
         df = self._calculate_base_indicators(df)
         df = self._calculate_pump_detector_features(df)
@@ -645,18 +656,20 @@ class PumpLongFeatureBuilder:
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
 
-        for dt in decision_open_times:
-            if dt not in df.index:
-                df.loc[dt] = np.nan
+        existing_idx = df.index
+        missing_times = [dt for dt in decision_open_times if dt not in existing_idx]
 
-        df = df.sort_index()
+        if missing_times:
+            combined_idx = existing_idx.union(pd.DatetimeIndex(missing_times))
+            df = df.reindex(combined_idx)
+
         df = self._apply_decision_shift(df)
 
-        events_extract = pd.DataFrame([{
-            'open_time': dt,
+        events_extract = pd.DataFrame({
+            'open_time': decision_times_arr,
             'pump_la_type': 'A',
             'runup_pct': 0
-        } for dt in decision_open_times])
+        })
 
         rows = self._extract_features_vectorized(df, symbol, events_extract)
 
@@ -766,8 +779,8 @@ class PumpLongFeatureBuilder:
         mfi = df['mfi_14']
         macdh = df['macdh_12_26_9']
 
-        rsi_corridor_pd = rsi.rolling(window=p.corridor_window).quantile(p.corridor_quantile)
-        mfi_corridor_pd = mfi.rolling(window=p.corridor_window).quantile(p.corridor_quantile)
+        rsi_corridor_pd = df['rsi_corridor']
+        mfi_corridor_pd = df['mfi_corridor']
 
         df['rsi_hot'] = (
                     rsi.notna() & rsi_corridor_pd.notna() & (rsi >= np.maximum(p.rsi_hot, rsi_corridor_pd))).astype(int)
@@ -842,36 +855,24 @@ class PumpLongFeatureBuilder:
         df['pwh'] = np.nan
 
         if df.index.dtype == 'datetime64[ns]' or hasattr(df.index, 'date'):
-            dates = pd.to_datetime(df.index).date
-            df_temp = df.copy()
-            df_temp['_date'] = dates
+            idx_dt = pd.to_datetime(df.index)
+            dates = idx_dt.date
+            df['_date'] = dates
 
-            daily_highs = df_temp.groupby('_date')['high'].transform('max')
-            unique_dates = pd.Series(dates).unique()
-            date_to_prev_high = {}
+            daily_max = df.groupby('_date')['high'].transform('max')
+            daily_max_df = df.groupby('_date')['high'].max()
+            daily_max_shifted = daily_max_df.shift(1)
+            df['pdh'] = df['_date'].map(daily_max_shifted).values
 
-            for i, current_date in enumerate(unique_dates):
-                if i > 0:
-                    date_to_prev_high[current_date] = daily_highs[dates == unique_dates[i - 1]].iloc[0]
+            weeks = idx_dt.isocalendar()
+            year_week_key = weeks.year * 100 + weeks.week
+            df['_year_week'] = year_week_key.values
 
-            df['pdh'] = pd.Series(dates).map(date_to_prev_high).values
+            weekly_max = df.groupby('_year_week')['high'].max()
+            weekly_max_shifted = weekly_max.shift(1)
+            df['pwh'] = df['_year_week'].map(weekly_max_shifted).values
 
-            weeks = pd.to_datetime(df.index).isocalendar()
-            df_temp['_year_week'] = list(zip(weeks.year, weeks.week))
-
-            weekly_highs = {}
-            for (year, week), group in df_temp.groupby('_year_week'):
-                weekly_highs[(year, week)] = group['high'].max()
-
-            unique_weeks = list(dict.fromkeys(df_temp['_year_week'].tolist()))
-            week_to_prev_high = {}
-
-            for i, (year, week) in enumerate(unique_weeks):
-                if i > 0:
-                    prev_year, prev_week = unique_weeks[i - 1]
-                    week_to_prev_high[(year, week)] = weekly_highs[(prev_year, prev_week)]
-
-            df['pwh'] = df_temp['_year_week'].map(week_to_prev_high).values
+            df.drop(columns=['_date', '_year_week'], inplace=True)
 
         df['dist_to_pdh'] = np.where(df['pdh'].notna() & (df['pdh'] > 0), (df['pdh'] - df['close']) / df['close'],
                                      np.nan)
@@ -896,10 +897,6 @@ class PumpLongFeatureBuilder:
         eqh_atr_factor = p.eqh_atr_factor
         min_touches = p.eqh_min_touches
 
-        df['eqh_level'] = np.nan
-        df['eqh_strength'] = 0
-        df['eqh_age_bars'] = np.nan
-
         high_arr = df['high'].values
         atr_arr = df['atr_14'].values if 'atr_14' in df.columns else np.full(n, np.nan)
         close_arr = df['close'].values
@@ -916,57 +913,64 @@ class PumpLongFeatureBuilder:
                     if idx >= liq_window:
                         needed_indices.add(idx)
 
+        eqh_level_arr = np.full(n, np.nan)
+        eqh_strength_arr = np.zeros(n, dtype=int)
+        eqh_age_arr = np.full(n, np.nan)
+
         for i in sorted(needed_indices):
             if i < liq_window or i >= n:
                 continue
 
             window_highs = high_arr[i - liq_window:i]
+            original_indices = np.arange(liq_window)
             current_atr = atr_arr[i - 1] if i > 0 and not np.isnan(atr_arr[i - 1]) else 0
             current_close = close_arr[i - 1] if i > 0 else close_arr[i]
             tol = max(eqh_tol_base, eqh_atr_factor * current_atr / current_close if current_close > 0 else eqh_tol_base)
 
+            sorted_order = np.argsort(window_highs)[::-1]
+            sorted_highs = window_highs[sorted_order]
+            sorted_orig_idx = original_indices[sorted_order]
+
             clusters = []
-            used = np.zeros(liq_window, dtype=bool)
+            cluster_start = 0
 
-            sorted_indices = np.argsort(window_highs)[::-1]
-
-            for idx in sorted_indices:
-                if used[idx]:
-                    continue
-                level = window_highs[idx]
+            while cluster_start < liq_window:
+                level = sorted_highs[cluster_start]
                 if level <= 0:
+                    cluster_start += 1
                     continue
 
-                touches = []
-                for j in range(liq_window):
-                    if not used[j] and abs(window_highs[j] - level) / level <= tol:
-                        touches.append(j)
-                        used[j] = True
+                threshold = level * (1 - tol)
+                cluster_end = cluster_start + 1
+                while cluster_end < liq_window and sorted_highs[cluster_end] >= threshold:
+                    cluster_end += 1
 
-                if len(touches) >= min_touches:
-                    avg_level = np.mean([window_highs[t] for t in touches])
-                    last_touch_age = liq_window - max(touches) - 1
-                    clusters.append((avg_level, len(touches), last_touch_age))
+                cluster_size = cluster_end - cluster_start
+                if cluster_size >= min_touches:
+                    cluster_highs = sorted_highs[cluster_start:cluster_end]
+                    cluster_orig_indices = sorted_orig_idx[cluster_start:cluster_end]
+                    avg_level = np.mean(cluster_highs)
+                    last_touch_age = liq_window - np.max(cluster_orig_indices) - 1
+                    clusters.append((avg_level, cluster_size, last_touch_age))
+
+                cluster_start = cluster_end
 
             if clusters:
                 clusters.sort(key=lambda x: (-x[1], -x[0]))
                 best = clusters[0]
-                df.iloc[i, df.columns.get_loc('eqh_level')] = best[0]
-                df.iloc[i, df.columns.get_loc('eqh_strength')] = best[1]
-                df.iloc[i, df.columns.get_loc('eqh_age_bars')] = best[2]
+                eqh_level_arr[i] = best[0]
+                eqh_strength_arr[i] = best[1]
+                eqh_age_arr[i] = best[2]
+
+        df['eqh_level'] = eqh_level_arr
+        df['eqh_strength'] = eqh_strength_arr
+        df['eqh_age_bars'] = eqh_age_arr
 
         df['dist_to_eqh'] = np.where(df['eqh_level'].notna() & (df['eqh_level'] > 0),
                                      (df['eqh_level'] - df['close']) / df['close'], np.nan)
         df['sweep_eqh'] = ((df['high'] > df['eqh_level'] * 1.001) & (df['close'] < df['eqh_level'] * 0.999) & df[
             'eqh_level'].notna()).astype(int)
         df['overshoot_eqh'] = np.where(df['sweep_eqh'] == 1, (df['high'] - df['eqh_level']) / df['eqh_level'], 0)
-
-        df['liq_level_type_pwh'] = 0
-        df['liq_level_type_pdh'] = 0
-        df['liq_level_type_eqh'] = 0
-        df['liq_level_dist'] = np.nan
-        df['liq_sweep_flag'] = 0
-        df['liq_sweep_overshoot'] = 0.0
 
         sweep_pwh = df['sweep_pwh'].values
         sweep_pdh = df['sweep_pdh'].values
@@ -985,41 +989,40 @@ class PumpLongFeatureBuilder:
         liq_sweep = np.zeros(n, dtype=int)
         liq_overshoot = np.zeros(n, dtype=float)
 
-        for i in range(n):
-            if sweep_pwh[i] == 1:
-                liq_type_pwh[i] = 1
-                liq_dist[i] = dist_pwh[i]
-                liq_sweep[i] = 1
-                liq_overshoot[i] = overshoot_pwh[i]
-            elif sweep_pdh[i] == 1:
-                liq_type_pdh[i] = 1
-                liq_dist[i] = dist_pdh[i]
-                liq_sweep[i] = 1
-                liq_overshoot[i] = overshoot_pdh[i]
-            elif sweep_eqh[i] == 1:
-                liq_type_eqh[i] = 1
-                liq_dist[i] = dist_eqh[i]
-                liq_sweep[i] = 1
-                liq_overshoot[i] = overshoot_eqh[i]
-            else:
-                candidates = []
-                if not np.isnan(dist_pwh[i]) and dist_pwh[i] > 0:
-                    candidates.append(('pwh', dist_pwh[i]))
-                if not np.isnan(dist_pdh[i]) and dist_pdh[i] > 0:
-                    candidates.append(('pdh', dist_pdh[i]))
-                if not np.isnan(dist_eqh[i]) and dist_eqh[i] > 0:
-                    candidates.append(('eqh', dist_eqh[i]))
+        mask_pwh = sweep_pwh == 1
+        liq_type_pwh[mask_pwh] = 1
+        liq_dist[mask_pwh] = dist_pwh[mask_pwh]
+        liq_sweep[mask_pwh] = 1
+        liq_overshoot[mask_pwh] = overshoot_pwh[mask_pwh]
 
-                if candidates:
-                    candidates.sort(key=lambda x: x[1])
-                    best_type, best_dist = candidates[0]
-                    if best_type == 'pwh':
-                        liq_type_pwh[i] = 1
-                    elif best_type == 'pdh':
-                        liq_type_pdh[i] = 1
-                    else:
-                        liq_type_eqh[i] = 1
-                    liq_dist[i] = best_dist
+        mask_pdh = (sweep_pdh == 1) & ~mask_pwh
+        liq_type_pdh[mask_pdh] = 1
+        liq_dist[mask_pdh] = dist_pdh[mask_pdh]
+        liq_sweep[mask_pdh] = 1
+        liq_overshoot[mask_pdh] = overshoot_pdh[mask_pdh]
+
+        mask_eqh = (sweep_eqh == 1) & ~mask_pwh & ~mask_pdh
+        liq_type_eqh[mask_eqh] = 1
+        liq_dist[mask_eqh] = dist_eqh[mask_eqh]
+        liq_sweep[mask_eqh] = 1
+        liq_overshoot[mask_eqh] = overshoot_eqh[mask_eqh]
+
+        mask_no_sweep = ~mask_pwh & ~mask_pdh & ~mask_eqh
+
+        dist_pwh_clean = np.where((~np.isnan(dist_pwh)) & (dist_pwh > 0), dist_pwh, np.inf)
+        dist_pdh_clean = np.where((~np.isnan(dist_pdh)) & (dist_pdh > 0), dist_pdh, np.inf)
+        dist_eqh_clean = np.where((~np.isnan(dist_eqh)) & (dist_eqh > 0), dist_eqh, np.inf)
+
+        dist_stack = np.stack([dist_pwh_clean, dist_pdh_clean, dist_eqh_clean], axis=1)
+        min_idx = np.argmin(dist_stack, axis=1)
+        min_dist = np.min(dist_stack, axis=1)
+
+        has_candidate = mask_no_sweep & (min_dist < np.inf)
+
+        liq_type_pwh[has_candidate & (min_idx == 0)] = 1
+        liq_type_pdh[has_candidate & (min_idx == 1)] = 1
+        liq_type_eqh[has_candidate & (min_idx == 2)] = 1
+        liq_dist[has_candidate] = min_dist[has_candidate]
 
         df['liq_level_type_pwh'] = liq_type_pwh
         df['liq_level_type_pdh'] = liq_type_pdh
@@ -1088,14 +1091,12 @@ class PumpLongFeatureBuilder:
 
         extended_columns = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv', 'dollar_vol_prev']
 
-        for col in shift_columns:
-            if col in df.columns:
-                df[col] = df[col].shift(1)
-
+        cols_to_shift = [c for c in shift_columns if c in df.columns]
         if self.feature_set == "extended":
-            for col in extended_columns:
-                if col in df.columns:
-                    df[col] = df[col].shift(1)
+            cols_to_shift.extend([c for c in extended_columns if c in df.columns])
+
+        if cols_to_shift:
+            df[cols_to_shift] = df[cols_to_shift].shift(1)
 
         return df
 
@@ -1141,26 +1142,13 @@ class PumpLongFeatureBuilder:
         extended_features = ['atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'dollar_vol_prev']
 
         series_arrays = {}
-        for s in lag_series:
-            if s in df.columns:
-                series_arrays[s] = df[s].values
-
-        for s in compact_series:
-            if s in df.columns:
-                series_arrays[s] = df[s].values
-
-        for s in pump_detector_features:
-            if s in df.columns:
-                series_arrays[s] = df[s].values
-
-        for s in liquidity_features:
-            if s in df.columns:
-                series_arrays[s] = df[s].values
-
+        all_series = set(lag_series + compact_series + pump_detector_features + liquidity_features)
         if self.feature_set == "extended":
-            for s in extended_features:
-                if s in df.columns:
-                    series_arrays[s] = df[s].values
+            all_series.update(extended_features)
+
+        for s in all_series:
+            if s in df.columns:
+                series_arrays[s] = df[s].values
 
         close_arr = df['close'].values
         open_arr = df['open'].values
@@ -1174,128 +1162,125 @@ class PumpLongFeatureBuilder:
         num_events = len(valid_positions)
         w = self.window_bars
 
-        lag_matrix = np.zeros((num_events, w), dtype=np.int64)
-        for i, pos in enumerate(valid_positions):
-            lag_matrix[i] = np.arange(pos, pos - w, -1)
+        pos_arr = valid_positions
+        idx_matrix = pos_arr[:, None] - np.arange(w)[None, :]
 
-        event_symbols = np.full(num_events, symbol)
         event_open_times = df.index[valid_positions].values
         event_pump_types = valid_events['pump_la_type'].values
         event_targets = (valid_events['pump_la_type'].values == 'A').astype(int)
         event_runups = valid_events['runup_pct'].values
 
-        rows = []
-        for ev_idx in range(num_events):
-            row = {
-                'symbol': event_symbols[ev_idx],
-                'open_time': event_open_times[ev_idx],
-                'pump_la_type': event_pump_types[ev_idx],
-                'target': event_targets[ev_idx],
-                'runup_pct': event_runups[ev_idx],
-                'timeframe': '15m',
-                'window_bars': self.window_bars,
-                'warmup_bars': self.warmup_bars
-            }
+        result_data = {
+            'symbol': np.full(num_events, symbol),
+            'open_time': event_open_times,
+            'pump_la_type': event_pump_types,
+            'target': event_targets,
+            'runup_pct': event_runups,
+            'timeframe': np.full(num_events, '15m'),
+            'window_bars': np.full(num_events, self.window_bars),
+            'warmup_bars': np.full(num_events, self.warmup_bars)
+        }
 
-            window_indices = lag_matrix[ev_idx]
+        for series_name in lag_series:
+            if series_name not in series_arrays:
+                continue
+            arr = series_arrays[series_name]
+            values_matrix = arr[idx_matrix]
+            for lag in range(w):
+                result_data[f'{series_name}_lag_{lag}'] = values_matrix[:, lag]
 
-            for series_name in lag_series:
-                if series_name not in series_arrays:
-                    continue
-                values = series_arrays[series_name][window_indices]
-                for lag in range(w):
-                    row[f'{series_name}_lag_{lag}'] = values[lag]
+        for series_name in compact_series:
+            if series_name not in series_arrays:
+                continue
+            arr = series_arrays[series_name]
+            values_matrix = arr[idx_matrix]
 
-            for series_name in compact_series:
-                if series_name not in series_arrays:
-                    continue
-                values = series_arrays[series_name][window_indices]
+            result_data[f'{series_name}_max_{w}'] = np.nanmax(values_matrix, axis=1)
+            result_data[f'{series_name}_min_{w}'] = np.nanmin(values_matrix, axis=1)
+            result_data[f'{series_name}_mean_{w}'] = np.nanmean(values_matrix, axis=1)
+            result_data[f'{series_name}_std_{w}'] = np.nanstd(values_matrix, axis=1)
+            result_data[f'{series_name}_last_minus_max_{w}'] = values_matrix[:, 0] - np.nanmax(values_matrix, axis=1)
 
-                row[f'{series_name}_max_{w}'] = np.nanmax(values)
-                row[f'{series_name}_min_{w}'] = np.nanmin(values)
-                row[f'{series_name}_mean_{w}'] = np.nanmean(values)
-                row[f'{series_name}_std_{w}'] = np.nanstd(values)
-                row[f'{series_name}_last_minus_max_{w}'] = values[0] - np.nanmax(values)
+            if w >= 5:
+                result_data[f'{series_name}_slope_5'] = values_matrix[:, 0] - values_matrix[:, 4]
+            else:
+                result_data[f'{series_name}_slope_5'] = np.full(num_events, np.nan)
 
-                if len(values) >= 5:
-                    row[f'{series_name}_slope_5'] = values[0] - values[4]
-                else:
-                    row[f'{series_name}_slope_5'] = np.nan
+            result_data[f'{series_name}_delta_1'] = values_matrix[:, 0] - values_matrix[:, 1] if w >= 2 else np.full(num_events, np.nan)
+            result_data[f'{series_name}_delta_3'] = values_matrix[:, 0] - values_matrix[:, 2] if w >= 3 else np.full(num_events, np.nan)
+            result_data[f'{series_name}_delta_5'] = values_matrix[:, 0] - values_matrix[:, 4] if w >= 5 else np.full(num_events, np.nan)
 
-                row[f'{series_name}_delta_1'] = values[0] - values[1] if len(values) >= 2 else np.nan
-                row[f'{series_name}_delta_3'] = values[0] - values[2] if len(values) >= 3 else np.nan
-                row[f'{series_name}_delta_5'] = values[0] - values[4] if len(values) >= 5 else np.nan
+        point_idx = pos_arr
+        for corridor_name, base_name in [('rsi_corridor', 'rsi_14'), ('mfi_corridor', 'mfi_14'),
+                                         ('macdh_corridor', 'macdh_12_26_9')]:
+            if corridor_name in corridor_arrays and base_name in series_arrays:
+                corridor_vals = corridor_arrays[corridor_name][point_idx]
+                base_vals = series_arrays[base_name][point_idx]
+                result_data[f'{base_name}_minus_corridor'] = np.where(
+                    np.isnan(base_vals) | np.isnan(corridor_vals), np.nan, base_vals - corridor_vals
+                )
 
-            for corridor_name, base_name in [('rsi_corridor', 'rsi_14'), ('mfi_corridor', 'mfi_14'),
-                                             ('macdh_corridor', 'macdh_12_26_9')]:
-                if corridor_name in corridor_arrays and base_name in series_arrays:
-                    corridor_val = corridor_arrays[corridor_name][window_indices[0]]
-                    base_val = series_arrays[base_name][window_indices[0]]
-                    row[f'{base_name}_minus_corridor'] = base_val - corridor_val if pd.notna(base_val) and pd.notna(
-                        corridor_val) else np.nan
+        for feat_name in pump_detector_features:
+            if feat_name in series_arrays:
+                result_data[feat_name] = series_arrays[feat_name][point_idx]
 
-            for feat_name in pump_detector_features:
+        for feat_name in liquidity_features:
+            if feat_name in series_arrays:
+                result_data[feat_name] = series_arrays[feat_name][point_idx]
+
+        if self.feature_set == "extended":
+            for feat_name in extended_features:
                 if feat_name in series_arrays:
-                    row[feat_name] = series_arrays[feat_name][window_indices[0]]
+                    result_data[feat_name] = series_arrays[feat_name][point_idx]
 
-            for feat_name in liquidity_features:
-                if feat_name in series_arrays:
-                    row[feat_name] = series_arrays[feat_name][window_indices[0]]
+        cum_ret_5 = np.full(num_events, np.nan)
+        mask_5 = pos_arr >= 6
+        close_prev = close_arr[pos_arr[mask_5] - 1]
+        close_5_ago = close_arr[pos_arr[mask_5] - 5]
+        cum_ret_5[mask_5] = np.where(close_5_ago != 0, close_prev / close_5_ago - 1, np.nan)
+        result_data['cum_ret_5'] = cum_ret_5
 
-            if self.feature_set == "extended":
-                for feat_name in extended_features:
-                    if feat_name in series_arrays:
-                        row[feat_name] = series_arrays[feat_name][window_indices[0]]
+        cum_ret_10 = np.full(num_events, np.nan)
+        mask_10 = pos_arr >= 11
+        close_prev = close_arr[pos_arr[mask_10] - 1]
+        close_10_ago = close_arr[pos_arr[mask_10] - 10]
+        cum_ret_10[mask_10] = np.where(close_10_ago != 0, close_prev / close_10_ago - 1, np.nan)
+        result_data['cum_ret_10'] = cum_ret_10
 
-            pos = valid_positions[ev_idx]
-            if pos >= 6:
-                close_prev = close_arr[pos - 1]
-                close_5_ago = close_arr[pos - 5]
-                row['cum_ret_5'] = (close_prev / close_5_ago - 1) if close_5_ago != 0 else np.nan
-            else:
-                row['cum_ret_5'] = np.nan
+        cum_ret_w = np.full(num_events, np.nan)
+        mask_w = pos_arr >= w + 1
+        close_prev = close_arr[pos_arr[mask_w] - 1]
+        close_w_ago = close_arr[pos_arr[mask_w] - w]
+        cum_ret_w[mask_w] = np.where(close_w_ago != 0, close_prev / close_w_ago - 1, np.nan)
+        result_data[f'cum_ret_{w}'] = cum_ret_w
 
-            if pos >= 11:
-                close_prev = close_arr[pos - 1]
-                close_10_ago = close_arr[pos - 10]
-                row['cum_ret_10'] = (close_prev / close_10_ago - 1) if close_10_ago != 0 else np.nan
-            else:
-                row['cum_ret_10'] = np.nan
+        count_red = np.zeros(num_events, dtype=int)
+        mask_red = pos_arr >= 6
+        for i in np.where(mask_red)[0]:
+            p = pos_arr[i]
+            count_red[i] = np.sum(close_arr[p - 5:p] < open_arr[p - 5:p])
+        result_data['count_red_last_5'] = count_red
 
-            if pos >= w + 1:
-                close_prev = close_arr[pos - 1]
-                close_w_ago = close_arr[pos - w]
-                row[f'cum_ret_{w}'] = (close_prev / close_w_ago - 1) if close_w_ago != 0 else np.nan
-            else:
-                row[f'cum_ret_{w}'] = np.nan
+        if 'upper_wick_ratio' in series_arrays and w >= 5:
+            uw_matrix = series_arrays['upper_wick_ratio'][idx_matrix[:, :5]]
+            result_data['max_upper_wick_last_5'] = np.nanmax(uw_matrix, axis=1)
+        else:
+            result_data['max_upper_wick_last_5'] = np.full(num_events, np.nan)
 
-            if pos >= 6:
-                close_slice = close_arr[pos - 5:pos]
-                open_slice = open_arr[pos - 5:pos]
-                red_candles = close_slice < open_slice
-                row['count_red_last_5'] = int(np.sum(red_candles))
-            else:
-                row['count_red_last_5'] = 0
+        if 'vol_ratio' in series_arrays:
+            vr_matrix = series_arrays['vol_ratio'][idx_matrix]
+            result_data['vol_ratio_max_10'] = np.nanmax(vr_matrix[:, :10], axis=1) if w >= 10 else np.full(num_events, np.nan)
+            result_data['vol_ratio_slope_5'] = vr_matrix[:, 0] - vr_matrix[:, 4] if w >= 5 else np.full(num_events, np.nan)
 
-            if 'upper_wick_ratio' in series_arrays and w >= 5:
-                upper_wick_last_5 = series_arrays['upper_wick_ratio'][window_indices[:5]]
-                row['max_upper_wick_last_5'] = np.nanmax(upper_wick_last_5) if len(upper_wick_last_5) > 0 else np.nan
-            else:
-                row['max_upper_wick_last_5'] = np.nan
+        volume_fade = np.full(num_events, np.nan)
+        mask_vf = pos_arr >= 10
+        for i in np.where(mask_vf)[0]:
+            p = pos_arr[i]
+            vol_slice = volume_arr[p - 9:p + 1]
+            max_vol = np.nanmax(vol_slice)
+            if max_vol > 0:
+                volume_fade[i] = volume_arr[p] / max_vol
+        result_data['volume_fade'] = volume_fade
 
-            if 'vol_ratio' in series_arrays:
-                vol_ratio_window = series_arrays['vol_ratio'][window_indices]
-                row['vol_ratio_max_10'] = np.nanmax(vol_ratio_window[:10]) if w >= 10 else np.nan
-                row['vol_ratio_slope_5'] = vol_ratio_window[0] - vol_ratio_window[4] if w >= 5 else np.nan
-
-            if pos >= 10:
-                volume_slice = volume_arr[pos - 9:pos + 1]
-                max_vol_10 = np.nanmax(volume_slice)
-                vol_current = volume_arr[pos]
-                row['volume_fade'] = vol_current / max_vol_10 if max_vol_10 > 0 else np.nan
-            else:
-                row['volume_fade'] = np.nan
-
-            rows.append(row)
-
-        return rows
+        result_df = pd.DataFrame(result_data)
+        return result_df.to_dict('records')
