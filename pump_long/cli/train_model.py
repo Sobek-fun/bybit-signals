@@ -286,8 +286,9 @@ def _scan_symbol_prodlike_stream(args: tuple) -> pd.DataFrame:
 
     scan_times = []
     for ts in df.index:
-        if ts >= start_dt and ts < end_dt:
-            scan_times.append(ts + timedelta(minutes=15))
+        decision_time = ts + timedelta(minutes=15)
+        if decision_time >= start_dt and decision_time < end_dt:
+            scan_times.append(decision_time)
 
     if not scan_times:
         return pd.DataFrame(columns=['symbol', 'open_time', 'p_long', 'dollar_vol_prev', 'vol_ratio_prev'])
@@ -307,24 +308,12 @@ def _scan_symbol_prodlike_stream(args: tuple) -> pd.DataFrame:
     X = features_df[feature_columns]
     p_long = model.predict_proba(X)[:, 1]
 
-    df_shifted = df.shift(1)
-    dollar_vol_prev_map = (df_shifted['close'] * df_shifted['volume']).to_dict()
-
-    vol_median = df['volume'].rolling(window=50).median().shift(1)
-    vol_ratio_prev_map = (df['volume'].shift(1) / vol_median).to_dict()
-
-    open_times = features_df['open_time'].values
-    dollar_vol_prev = []
-    vol_ratio_prev = []
-
-    for ot in open_times:
-        bucket_start = pd.Timestamp(ot) - timedelta(minutes=15)
-        dollar_vol_prev.append(dollar_vol_prev_map.get(bucket_start, np.nan))
-        vol_ratio_prev.append(vol_ratio_prev_map.get(bucket_start, np.nan))
+    dollar_vol_prev = features_df['dollar_vol_prev'].values if 'dollar_vol_prev' in features_df.columns else np.full(len(features_df), np.nan)
+    vol_ratio_prev = features_df['vol_ratio_lag_0'].values if 'vol_ratio_lag_0' in features_df.columns else np.full(len(features_df), np.nan)
 
     stream_df = pd.DataFrame({
         'symbol': symbol,
-        'open_time': open_times,
+        'open_time': features_df['open_time'].values,
         'p_long': p_long,
         'dollar_vol_prev': dollar_vol_prev,
         'vol_ratio_prev': vol_ratio_prev

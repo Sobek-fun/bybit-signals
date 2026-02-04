@@ -80,7 +80,9 @@ def generate_random_negatives(
         neg_after: int,
         random_neg_mult: int,
         random_neg_seed: int,
-        random_neg_min_gap_bars: int
+        random_neg_min_gap_bars: int,
+        start_date: datetime = None,
+        end_date: datetime = None
 ) -> pd.DataFrame:
     events = labels_df[labels_df['pump_la_type'] == 'A'].copy()
 
@@ -100,8 +102,8 @@ def generate_random_negatives(
         sym_events = events[events['symbol'] == sym]['event_open_time'].values
         symbol_events[sym] = pd.to_datetime(sym_events)
 
-    global_min_time = events['event_open_time'].min()
-    global_max_time = events['event_open_time'].max()
+    global_min_time = pd.Timestamp(start_date) if start_date else events['event_open_time'].min()
+    global_max_time = pd.Timestamp(end_date) if end_date else events['event_open_time'].max()
 
     all_random_negatives = []
 
@@ -242,7 +244,9 @@ def main():
             neg_after=args.neg_after,
             random_neg_mult=args.random_neg_mult,
             random_neg_seed=args.random_neg_seed,
-            random_neg_min_gap_bars=args.random_neg_min_gap_bars
+            random_neg_min_gap_bars=args.random_neg_min_gap_bars,
+            start_date=start_date,
+            end_date=end_date
         )
 
         if not random_neg_df.empty:
@@ -287,6 +291,10 @@ def main():
 
     features_df = features_df.sort_values(['event_id', 'offset']).reset_index(drop=True)
 
+    random_neg_kept = 0
+    if random_neg_total > 0 and 'event_id' in features_df.columns:
+        random_neg_kept = features_df['event_id'].str.startswith('NEG|').sum()
+
     expected_feature_columns = get_feature_columns(args.feature_set)
     validate_feature_columns(features_df, expected_feature_columns, args.feature_set)
 
@@ -319,6 +327,7 @@ def main():
         'random_neg_seed': args.random_neg_seed,
         'random_neg_min_gap_bars': args.random_neg_min_gap_bars,
         'random_neg_total': random_neg_total,
+        'random_neg_kept': random_neg_kept,
         'created_at': datetime.now().isoformat()
     }
 
