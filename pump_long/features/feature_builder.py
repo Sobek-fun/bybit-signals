@@ -455,6 +455,7 @@ FEATURE_SETS = {
         "count_red_last_5", "max_upper_wick_last_5",
         "vol_ratio_max_10", "vol_ratio_slope_5", "volume_fade",
         "atr_norm", "bb_z", "bb_width", "vwap_dev",
+        "dollar_vol_prev",
     ]
 }
 
@@ -1057,6 +1058,8 @@ class PumpLongFeatureBuilder:
         vwap = cumulative_tp_vol / cumulative_vol
         df['vwap_dev'] = (df['close'] - vwap) / vwap
 
+        df['dollar_vol_prev'] = df['close'] * df['volume']
+
         df.ta.obv(append=True)
         df = df.rename(columns={'OBV': 'obv'})
 
@@ -1083,7 +1086,7 @@ class PumpLongFeatureBuilder:
             'range_over_atr', 'upper_wick_over_atr', 'signed_body', 'climax_vr', 'ret_accel'
         ]
 
-        extended_columns = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
+        extended_columns = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv', 'dollar_vol_prev']
 
         for col in shift_columns:
             if col in df.columns:
@@ -1135,7 +1138,7 @@ class PumpLongFeatureBuilder:
             'liq_level_dist'
         ]
 
-        extended_features = ['atr_norm', 'bb_z', 'bb_width', 'vwap_dev']
+        extended_features = ['atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'dollar_vol_prev']
 
         series_arrays = {}
         for s in lag_series:

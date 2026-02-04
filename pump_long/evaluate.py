@@ -324,6 +324,21 @@ def compute_stream_metrics_long(
             'max': float(np.max(offsets))
         }
 
+    unique_symbols_signaled = 0
+    avg_signals_per_symbol = 0.0
+    tp_symbols = 0
+    fp_symbols = 0
+
+    if total_signals > 0 and 'symbol' in matched_signals.columns:
+        unique_symbols_signaled = matched_signals['symbol'].nunique()
+        avg_signals_per_symbol = total_signals / unique_symbols_signaled if unique_symbols_signaled > 0 else 0
+
+        tp_mask = matched_signals['matched_event_id'].notna()
+        tp_symbols = matched_signals[tp_mask]['symbol'].nunique()
+
+        fp_mask = matched_signals['matched_event_id'].isna()
+        fp_symbols = matched_signals[fp_mask]['symbol'].nunique()
+
     return {
         'total_signals': total_signals,
         'tp_signals': int(tp_signals),
@@ -335,5 +350,9 @@ def compute_stream_metrics_long(
         'precision': round(precision, 4),
         'event_recall': round(event_recall, 4),
         'holdout_days': holdout_days,
-        'offset_distribution': offset_distribution
+        'offset_distribution': offset_distribution,
+        'unique_symbols_signaled': unique_symbols_signaled,
+        'avg_signals_per_symbol': round(avg_signals_per_symbol, 2),
+        'tp_symbols': tp_symbols,
+        'fp_symbols': fp_symbols
     }

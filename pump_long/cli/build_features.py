@@ -74,6 +74,98 @@ def build_training_points_from_labels(
     return points_df
 
 
+def generate_random_negatives(
+        labels_df: pd.DataFrame,
+        neg_before: int,
+        neg_after: int,
+        random_neg_mult: int,
+        random_neg_seed: int,
+        random_neg_min_gap_bars: int
+) -> pd.DataFrame:
+    events = labels_df[labels_df['pump_la_type'] == 'A'].copy()
+
+    if events.empty or random_neg_mult <= 0:
+        return pd.DataFrame()
+
+    events['event_open_time'] = pd.to_datetime(events['event_open_time'])
+
+    n_positives = len(events)
+    n_random_neg = n_positives * random_neg_mult
+
+    rng = np.random.default_rng(random_neg_seed)
+
+    symbols = events['symbol'].unique()
+    symbol_events = {}
+    for sym in symbols:
+        sym_events = events[events['symbol'] == sym]['event_open_time'].values
+        symbol_events[sym] = pd.to_datetime(sym_events)
+
+    global_min_time = events['event_open_time'].min()
+    global_max_time = events['event_open_time'].max()
+
+    all_random_negatives = []
+
+    neg_per_symbol = max(1, n_random_neg // len(symbols))
+
+    for sym in symbols:
+        sym_event_times = symbol_events[sym]
+
+        forbidden_zones = []
+        for evt in sym_event_times:
+            zone_start = evt - pd.Timedelta(minutes=neg_before * 15)
+            zone_end = evt + pd.Timedelta(minutes=neg_after * 15)
+            forbidden_zones.append((zone_start, zone_end))
+
+        candidates = []
+        attempt_count = 0
+        max_attempts = neg_per_symbol * 20
+
+        while len(candidates) < neg_per_symbol and attempt_count < max_attempts:
+            attempt_count += 1
+
+            random_minutes = rng.integers(0, int((global_max_time - global_min_time).total_seconds() / 60) + 1)
+            candidate_time = global_min_time + pd.Timedelta(minutes=int(random_minutes))
+
+            candidate_time = candidate_time.floor('15min')
+
+            in_forbidden = False
+            for zone_start, zone_end in forbidden_zones:
+                if zone_start <= candidate_time <= zone_end:
+                    in_forbidden = True
+                    break
+
+            if in_forbidden:
+                continue
+
+            too_close = False
+            for existing_time in candidates:
+                gap_bars = abs((candidate_time - existing_time).total_seconds()) / (15 * 60)
+                if gap_bars < random_neg_min_gap_bars:
+                    too_close = True
+                    break
+
+            if too_close:
+                continue
+
+            candidates.append(candidate_time)
+
+        for i, cand_time in enumerate(candidates):
+            event_id = f"NEG|{sym}|{cand_time.strftime('%Y%m%d_%H%M%S')}"
+            all_random_negatives.append({
+                'event_id': event_id,
+                'symbol': sym,
+                'open_time': cand_time,
+                'offset': 0,
+                'y': 0,
+                'runup_pct': np.nan
+            })
+
+    if not all_random_negatives:
+        return pd.DataFrame()
+
+    return pd.DataFrame(all_random_negatives)
+
+
 def parse_pos_offsets(offsets_str: str) -> list:
     return [int(x.strip()) for x in offsets_str.split(',')]
 
@@ -114,6 +206,10 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out-dir", type=str, required=True)
 
+    parser.add_argument("--random-neg-mult", type=int, default=0)
+    parser.add_argument("--random-neg-seed", type=int, default=42)
+    parser.add_argument("--random-neg-min-gap-bars", type=int, default=4)
+
     args = parser.parse_args()
 
     start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
@@ -134,7 +230,28 @@ def main():
         pos_offsets=pos_offsets
     )
     log("INFO", "BUILD",
-        f"training points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
+        f"event-window points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
+
+    random_neg_total = 0
+    if args.random_neg_mult > 0:
+        log("INFO", "BUILD", f"generating random negatives: mult={args.random_neg_mult}, seed={args.random_neg_seed}, min_gap={args.random_neg_min_gap_bars}")
+
+        random_neg_df = generate_random_negatives(
+            labels_df,
+            neg_before=args.neg_before,
+            neg_after=args.neg_after,
+            random_neg_mult=args.random_neg_mult,
+            random_neg_seed=args.random_neg_seed,
+            random_neg_min_gap_bars=args.random_neg_min_gap_bars
+        )
+
+        if not random_neg_df.empty:
+            random_neg_total = len(random_neg_df)
+            points_df = pd.concat([points_df, random_neg_df], ignore_index=True)
+            log("INFO", "BUILD", f"added {random_neg_total} random negatives")
+
+    log("INFO", "BUILD",
+        f"total training points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +315,10 @@ def main():
         'end_date': args.end_date,
         'total_rows': len(features_df),
         'total_events': features_df['event_id'].nunique() if 'event_id' in features_df.columns else 0,
+        'random_neg_mult': args.random_neg_mult,
+        'random_neg_seed': args.random_neg_seed,
+        'random_neg_min_gap_bars': args.random_neg_min_gap_bars,
+        'random_neg_total': random_neg_total,
         'created_at': datetime.now().isoformat()
     }
 

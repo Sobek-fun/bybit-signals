@@ -138,7 +138,8 @@ def train_catboost_model(
         l2_leaf_reg: float = 3.0,
         early_stopping_rounds: int = 50,
         thread_count: int = -1,
-        seed: int = 42
+        seed: int = 42,
+        pos_weight: float = None
 ) -> CatBoostClassifier:
     train_df = features_df[features_df['split'] == 'train']
     val_df = features_df[features_df['split'] == 'val']
@@ -148,7 +149,11 @@ def train_catboost_model(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    train_pool = Pool(X_train, y_train)
+    sample_weights = None
+    if pos_weight is not None and pos_weight > 0:
+        sample_weights = np.where(y_train == 1, pos_weight, 1.0)
+
+    train_pool = Pool(X_train, y_train, weight=sample_weights)
     val_pool = Pool(X_val, y_val)
 
     model = CatBoostClassifier(
@@ -161,8 +166,7 @@ def train_catboost_model(
         random_seed=seed,
         verbose=100,
         eval_metric='Logloss',
-        use_best_model=True,
-        auto_class_weights='Balanced'
+        use_best_model=True
     )
 
     model.fit(train_pool, eval_set=val_pool)
@@ -258,8 +262,8 @@ def _get_all_symbols(ch_dsn: str, start_dt: datetime, end_dt: datetime) -> list:
     return [row[0] for row in result.result_rows]
 
 
-def _scan_symbol_prodlike(args: tuple) -> list:
-    ch_dsn, symbol, start_dt, end_dt, model_path, threshold, cooldown_bars, window_bars, warmup_bars, feature_set, feature_columns = args
+def _scan_symbol_prodlike_stream(args: tuple) -> pd.DataFrame:
+    ch_dsn, symbol, start_dt, end_dt, model_path, window_bars, warmup_bars, feature_set, feature_columns = args
 
     model = CatBoostClassifier()
     model.load_model(model_path)
@@ -278,7 +282,7 @@ def _scan_symbol_prodlike(args: tuple) -> list:
     df = loader.load_candles_range(symbol, load_start, end_dt)
 
     if df.empty or len(df) < warmup_bars + window_bars:
-        return []
+        return pd.DataFrame(columns=['symbol', 'open_time', 'p_long', 'dollar_vol_prev', 'vol_ratio_prev'])
 
     scan_times = []
     for ts in df.index:
@@ -286,60 +290,230 @@ def _scan_symbol_prodlike(args: tuple) -> list:
             scan_times.append(ts + timedelta(minutes=15))
 
     if not scan_times:
-        return []
+        return pd.DataFrame(columns=['symbol', 'open_time', 'p_long', 'dollar_vol_prev', 'vol_ratio_prev'])
 
     features_list = builder.build_many_for_inference(df, symbol, scan_times)
 
     if not features_list:
-        return []
+        return pd.DataFrame(columns=['symbol', 'open_time', 'p_long', 'dollar_vol_prev', 'vol_ratio_prev'])
 
     features_df = pd.DataFrame(features_list)
     features_df['symbol'] = symbol
 
     available_features = [c for c in feature_columns if c in features_df.columns]
     if len(available_features) < len(feature_columns):
-        return []
+        return pd.DataFrame(columns=['symbol', 'open_time', 'p_long', 'dollar_vol_prev', 'vol_ratio_prev'])
 
     X = features_df[feature_columns]
     p_long = model.predict_proba(X)[:, 1]
 
+    df_shifted = df.shift(1)
+    dollar_vol_prev_map = (df_shifted['close'] * df_shifted['volume']).to_dict()
+
+    vol_median = df['volume'].rolling(window=50).median().shift(1)
+    vol_ratio_prev_map = (df['volume'].shift(1) / vol_median).to_dict()
+
+    open_times = features_df['open_time'].values
+    dollar_vol_prev = []
+    vol_ratio_prev = []
+
+    for ot in open_times:
+        bucket_start = pd.Timestamp(ot) - timedelta(minutes=15)
+        dollar_vol_prev.append(dollar_vol_prev_map.get(bucket_start, np.nan))
+        vol_ratio_prev.append(vol_ratio_prev_map.get(bucket_start, np.nan))
+
     stream_df = pd.DataFrame({
         'symbol': symbol,
-        'open_time': features_df['open_time'],
-        'p_long': p_long
+        'open_time': open_times,
+        'p_long': p_long,
+        'dollar_vol_prev': dollar_vol_prev,
+        'vol_ratio_prev': vol_ratio_prev
     })
 
+    return stream_df.sort_values('open_time').reset_index(drop=True)
+
+
+def extract_signals_from_stream(
+        stream_df: pd.DataFrame,
+        threshold: float,
+        cooldown_bars: int,
+        gate_min_dollar_vol: float = None,
+        gate_min_vol_ratio: float = None
+) -> pd.DataFrame:
     signals = []
-    stream_df = stream_df.sort_values('open_time').reset_index(drop=True)
-    p_arr = stream_df['p_long'].values
-    times_arr = stream_df['open_time'].values
 
-    n = len(stream_df)
-    last_signal_idx = -cooldown_bars - 1
+    for symbol, group in stream_df.groupby('symbol'):
+        group = group.sort_values('open_time').reset_index(drop=True)
+        p_arr = group['p_long'].values
+        times_arr = group['open_time'].values
+        dollar_vol_arr = group['dollar_vol_prev'].values if 'dollar_vol_prev' in group.columns else None
+        vol_ratio_arr = group['vol_ratio_prev'].values if 'vol_ratio_prev' in group.columns else None
 
-    for i in range(1, n):
-        prev_p = p_arr[i - 1]
-        curr_p = p_arr[i]
+        n = len(group)
+        last_signal_idx = -cooldown_bars - 1
 
-        if np.isnan(prev_p) or np.isnan(curr_p):
-            continue
+        for i in range(1, n):
+            prev_p = p_arr[i - 1]
+            curr_p = p_arr[i]
 
-        is_cross_up = prev_p < threshold <= curr_p
-        cooldown_ok = (i - last_signal_idx) > cooldown_bars
+            if np.isnan(prev_p) or np.isnan(curr_p):
+                continue
 
-        if is_cross_up and cooldown_ok:
-            signals.append({
-                'open_time': times_arr[i],
-                'symbol': symbol,
-                'p_long': float(curr_p),
-                'prev_p_long': float(prev_p),
-                'threshold': threshold,
-                'rule': 'cross_up',
-                'cooldown_bars': cooldown_bars
-            })
-            last_signal_idx = i
+            if gate_min_dollar_vol is not None and dollar_vol_arr is not None:
+                if np.isnan(dollar_vol_arr[i]) or dollar_vol_arr[i] < gate_min_dollar_vol:
+                    continue
 
-    return signals
+            if gate_min_vol_ratio is not None and vol_ratio_arr is not None:
+                if np.isnan(vol_ratio_arr[i]) or vol_ratio_arr[i] < gate_min_vol_ratio:
+                    continue
+
+            is_cross_up = prev_p < threshold <= curr_p
+            cooldown_ok = (i - last_signal_idx) > cooldown_bars
+
+            if is_cross_up and cooldown_ok:
+                signals.append({
+                    'open_time': times_arr[i],
+                    'symbol': symbol,
+                    'p_long': float(curr_p),
+                    'prev_p_long': float(prev_p),
+                    'threshold': threshold,
+                    'rule': 'cross_up',
+                    'cooldown_bars': cooldown_bars
+                })
+                last_signal_idx = i
+
+    if not signals:
+        return pd.DataFrame(columns=['open_time', 'symbol', 'p_long', 'prev_p_long', 'threshold', 'rule', 'cooldown_bars'])
+
+    return pd.DataFrame(signals).sort_values(['open_time', 'symbol']).reset_index(drop=True)
+
+
+def run_stream_scan(
+        ch_dsn: str,
+        model_path: str,
+        scan_start: datetime,
+        scan_end: datetime,
+        window_bars: int,
+        warmup_bars: int,
+        feature_set: str,
+        feature_columns: list,
+        scan_workers: int
+) -> pd.DataFrame:
+    log("INFO", "SCAN", f"stream scan period: [{scan_start}, {scan_end})")
+
+    symbols = _get_all_symbols(ch_dsn, scan_start, scan_end)
+    log("INFO", "SCAN", f"found {len(symbols)} USDT symbols")
+
+    tasks = [
+        (
+            ch_dsn,
+            symbol,
+            scan_start,
+            scan_end,
+            str(model_path),
+            window_bars,
+            warmup_bars,
+            feature_set,
+            feature_columns
+        )
+        for symbol in symbols
+    ]
+
+    all_streams = []
+    processed = 0
+
+    with ProcessPoolExecutor(max_workers=scan_workers) as executor:
+        for stream_df in executor.map(_scan_symbol_prodlike_stream, tasks):
+            if not stream_df.empty:
+                all_streams.append(stream_df)
+            processed += 1
+            if processed % 50 == 0:
+                log("INFO", "SCAN", f"processed {processed}/{len(symbols)} symbols")
+
+    if all_streams:
+        combined_stream = pd.concat(all_streams, ignore_index=True)
+        combined_stream = combined_stream.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    else:
+        combined_stream = pd.DataFrame(columns=['symbol', 'open_time', 'p_long', 'dollar_vol_prev', 'vol_ratio_prev'])
+
+    log("INFO", "SCAN", f"total stream rows: {len(combined_stream)}")
+    return combined_stream
+
+
+def stream_threshold_sweep(
+        stream_df: pd.DataFrame,
+        labels_df: pd.DataFrame,
+        scan_start: datetime,
+        scan_end: datetime,
+        cooldown_bars: int,
+        match_before_bars: int,
+        match_after_bars: int,
+        gate_min_dollar_vol: float = None,
+        gate_min_vol_ratio: float = None,
+        target_signals_per_day_min: float = 1.0,
+        target_signals_per_day_max: float = 5.0,
+        thr_objective: str = "precision",
+        grid_from: float = 0.01,
+        grid_to: float = 0.99,
+        grid_step: float = 0.01
+) -> tuple:
+    holdout_seconds = (scan_end - scan_start).total_seconds()
+    holdout_days = holdout_seconds / 86400
+    if holdout_days <= 0:
+        holdout_days = 1
+
+    thresholds = np.arange(grid_from, grid_to + grid_step, grid_step)
+    sweep_results = []
+
+    for thr in thresholds:
+        signals_df = extract_signals_from_stream(
+            stream_df,
+            threshold=thr,
+            cooldown_bars=cooldown_bars,
+            gate_min_dollar_vol=gate_min_dollar_vol,
+            gate_min_vol_ratio=gate_min_vol_ratio
+        )
+
+        metrics = compute_stream_metrics_long(
+            signals_df,
+            labels_df,
+            scan_start,
+            scan_end,
+            window_before=match_before_bars,
+            window_after=match_after_bars
+        )
+
+        sweep_results.append({
+            'threshold': round(thr, 3),
+            'signals_per_day': metrics['signals_per_day'],
+            'precision': metrics['precision'],
+            'event_recall': metrics['event_recall'],
+            'tp_signals': metrics['tp_signals'],
+            'fp_signals': metrics['fp_signals'],
+            'total_signals': metrics['total_signals'],
+            'caught_events': metrics['caught_events'],
+            'total_events': metrics['total_events']
+        })
+
+    sweep_df = pd.DataFrame(sweep_results)
+
+    valid_rows = sweep_df[
+        (sweep_df['signals_per_day'] >= target_signals_per_day_min) &
+        (sweep_df['signals_per_day'] <= target_signals_per_day_max)
+    ]
+
+    if valid_rows.empty:
+        closest_idx = (sweep_df['signals_per_day'] - target_signals_per_day_max).abs().idxmin()
+        best_threshold = sweep_df.loc[closest_idx, 'threshold']
+        log("WARN", "SWEEP", f"no threshold in target range, using closest: {best_threshold}")
+    else:
+        if thr_objective == "precision":
+            best_idx = valid_rows['precision'].idxmax()
+        else:
+            best_idx = valid_rows['precision'].idxmax()
+        best_threshold = sweep_df.loc[best_idx, 'threshold']
+
+    return best_threshold, sweep_df
 
 
 def run_holdout_scan(
@@ -356,47 +530,31 @@ def run_holdout_scan(
         scan_workers: int,
         labels_path: str = None,
         match_before_bars: int = 4,
-        match_after_bars: int = 0
+        match_after_bars: int = 0,
+        gate_min_dollar_vol: float = None,
+        gate_min_vol_ratio: float = None
 ) -> tuple:
-    log("INFO", "SCAN", f"holdout period: [{holdout_start}, {holdout_end})")
+    stream_df = run_stream_scan(
+        ch_dsn=ch_dsn,
+        model_path=model_path,
+        scan_start=holdout_start,
+        scan_end=holdout_end,
+        window_bars=window_bars,
+        warmup_bars=warmup_bars,
+        feature_set=feature_set,
+        feature_columns=feature_columns,
+        scan_workers=scan_workers
+    )
 
-    symbols = _get_all_symbols(ch_dsn, holdout_start, holdout_end)
-    log("INFO", "SCAN", f"found {len(symbols)} USDT symbols")
+    signals_df = extract_signals_from_stream(
+        stream_df,
+        threshold=threshold,
+        cooldown_bars=cooldown_bars,
+        gate_min_dollar_vol=gate_min_dollar_vol,
+        gate_min_vol_ratio=gate_min_vol_ratio
+    )
 
-    tasks = [
-        (
-            ch_dsn,
-            symbol,
-            holdout_start,
-            holdout_end,
-            str(model_path),
-            threshold,
-            cooldown_bars,
-            window_bars,
-            warmup_bars,
-            feature_set,
-            feature_columns
-        )
-        for symbol in symbols
-    ]
-
-    all_signals = []
-    processed = 0
-
-    with ProcessPoolExecutor(max_workers=scan_workers) as executor:
-        for signals in executor.map(_scan_symbol_prodlike, tasks):
-            all_signals.extend(signals)
-            processed += 1
-            if processed % 50 == 0:
-                log("INFO", "SCAN", f"processed {processed}/{len(symbols)} symbols, signals so far: {len(all_signals)}")
-
-    log("INFO", "SCAN", f"total signals: {len(all_signals)}")
-
-    if all_signals:
-        signals_df = pd.DataFrame(all_signals)
-        signals_df = signals_df.sort_values(['open_time', 'symbol']).reset_index(drop=True)
-    else:
-        signals_df = pd.DataFrame(columns=['open_time', 'symbol', 'p_long', 'prev_p_long', 'threshold', 'rule', 'cooldown_bars'])
+    log("INFO", "SCAN", f"total signals: {len(signals_df)}")
 
     stream_metrics = None
     if labels_path:
@@ -462,6 +620,15 @@ def main():
     parser.add_argument("--match-before-bars", type=int, default=4)
     parser.add_argument("--match-after-bars", type=int, default=0)
 
+    parser.add_argument("--pos-weight", type=float, default=None)
+
+    parser.add_argument("--target-signals-per-day-min", type=float, default=1.0)
+    parser.add_argument("--target-signals-per-day-max", type=float, default=5.0)
+    parser.add_argument("--thr-objective", type=str, choices=["precision"], default="precision")
+
+    parser.add_argument("--gate-min-dollar-vol", type=float, default=None)
+    parser.add_argument("--gate-min-vol-ratio", type=float, default=None)
+
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
 
@@ -518,7 +685,8 @@ def main():
         l2_leaf_reg=args.l2_leaf_reg,
         early_stopping_rounds=args.early_stopping_rounds,
         thread_count=args.thread_count,
-        seed=args.seed
+        seed=args.seed,
+        pos_weight=args.pos_weight
     )
 
     model_path = run_dir / "model.cbm"
@@ -534,8 +702,8 @@ def main():
     importance_path = run_dir / "feature_importance.csv"
     importance_df.to_csv(importance_path, index=False)
 
-    log("INFO", "TRAIN", "calibrating threshold on val set")
-    best_threshold, sweep_df = calibrate_threshold(
+    log("INFO", "TRAIN", "calibrating threshold on val set (event-window)")
+    best_threshold_event, sweep_df_event = calibrate_threshold(
         model,
         features_df,
         feature_columns,
@@ -549,17 +717,128 @@ def main():
         args.thr_grid_step
     )
 
+    if not sweep_df_event.empty:
+        sweep_path = run_dir / "threshold_sweep_event.csv"
+        sweep_df_event.to_csv(sweep_path, index=False)
+    log("INFO", "TRAIN", f"event-window threshold: {best_threshold_event:.3f}")
+
+    gates_config = {
+        'gate_min_dollar_vol': args.gate_min_dollar_vol,
+        'gate_min_vol_ratio': args.gate_min_vol_ratio
+    }
+    gates_path = run_dir / "gates.json"
+    with open(gates_path, 'w') as f:
+        json.dump(gates_config, f, indent=2)
+
+    best_threshold = best_threshold_event
+    stream_calibrated = False
+
+    if args.clickhouse_dsn and args.labels:
+        log("INFO", "TRAIN", "running stream calibration on VAL period")
+
+        val_scan_start = train_end
+        val_scan_end = val_end
+
+        val_stream_df = run_stream_scan(
+            ch_dsn=args.clickhouse_dsn,
+            model_path=str(model_path),
+            scan_start=val_scan_start,
+            scan_end=val_scan_end,
+            window_bars=manifest.get('window_bars', 60),
+            warmup_bars=manifest.get('warmup_bars', 150),
+            feature_set=manifest.get('feature_set', 'extended'),
+            feature_columns=feature_columns,
+            scan_workers=args.scan_workers
+        )
+
+        val_labels_df = load_labels(args.labels, val_scan_start, val_scan_end)
+        val_labels_df = val_labels_df[val_labels_df['pump_la_type'] == 'A']
+        log("INFO", "TRAIN", f"loaded {len(val_labels_df)} type-A events for VAL stream calibration")
+
+        if len(val_stream_df) > 0 and len(val_labels_df) > 0:
+            best_threshold_stream, sweep_df_stream = stream_threshold_sweep(
+                stream_df=val_stream_df,
+                labels_df=val_labels_df,
+                scan_start=val_scan_start,
+                scan_end=val_scan_end,
+                cooldown_bars=args.cooldown_bars,
+                match_before_bars=args.match_before_bars,
+                match_after_bars=args.match_after_bars,
+                gate_min_dollar_vol=args.gate_min_dollar_vol,
+                gate_min_vol_ratio=args.gate_min_vol_ratio,
+                target_signals_per_day_min=args.target_signals_per_day_min,
+                target_signals_per_day_max=args.target_signals_per_day_max,
+                thr_objective=args.thr_objective,
+                grid_from=args.thr_grid_from,
+                grid_to=args.thr_grid_to,
+                grid_step=args.thr_grid_step
+            )
+
+            sweep_stream_path = run_dir / "threshold_sweep_stream.csv"
+            sweep_df_stream.to_csv(sweep_stream_path, index=False)
+
+            best_threshold = best_threshold_stream
+            stream_calibrated = True
+            log("INFO", "TRAIN", f"stream-calibrated threshold: {best_threshold:.3f}")
+
+            best_threshold_stream_data = {
+                'threshold': best_threshold_stream,
+                'signal_rule': 'cross_up',
+                'cooldown_bars': args.cooldown_bars,
+                'match_before_bars': args.match_before_bars,
+                'match_after_bars': args.match_after_bars,
+                'gate_min_dollar_vol': args.gate_min_dollar_vol,
+                'gate_min_vol_ratio': args.gate_min_vol_ratio,
+                'target_signals_per_day_min': args.target_signals_per_day_min,
+                'target_signals_per_day_max': args.target_signals_per_day_max,
+                'calibration_period': f"{val_scan_start.date()} to {val_scan_end.date()}"
+            }
+            threshold_stream_path = run_dir / "best_threshold_stream.json"
+            with open(threshold_stream_path, 'w') as f:
+                json.dump(best_threshold_stream_data, f, indent=2, default=str)
+
+            val_signals_stream = extract_signals_from_stream(
+                val_stream_df,
+                threshold=best_threshold,
+                cooldown_bars=args.cooldown_bars,
+                gate_min_dollar_vol=args.gate_min_dollar_vol,
+                gate_min_vol_ratio=args.gate_min_vol_ratio
+            )
+
+            val_signals_stream_path = run_dir / "predicted_signals_val_stream.csv"
+            val_signals_stream.to_csv(val_signals_stream_path, index=False)
+
+            val_stream_metrics = compute_stream_metrics_long(
+                val_signals_stream,
+                val_labels_df,
+                val_scan_start,
+                val_scan_end,
+                window_before=args.match_before_bars,
+                window_after=args.match_after_bars
+            )
+
+            val_stream_metrics_path = run_dir / "stream_metrics_val.json"
+            with open(val_stream_metrics_path, 'w') as f:
+                json.dump(val_stream_metrics, f, indent=2, default=str)
+
+            log("INFO", "TRAIN", f"VAL stream: signals/day={val_stream_metrics['signals_per_day']}, precision={val_stream_metrics['precision']:.4f}, recall={val_stream_metrics['event_recall']:.4f}")
+
     threshold_path = run_dir / "best_threshold.json"
-    threshold_data = {'threshold': best_threshold, 'signal_rule': args.signal_rule}
+    threshold_data = {
+        'threshold': best_threshold,
+        'signal_rule': args.signal_rule if not stream_calibrated else 'cross_up',
+        'stream_calibrated': stream_calibrated,
+        'cooldown_bars': args.cooldown_bars,
+        'match_before_bars': args.match_before_bars,
+        'match_after_bars': args.match_after_bars,
+        'gate_min_dollar_vol': args.gate_min_dollar_vol,
+        'gate_min_vol_ratio': args.gate_min_vol_ratio
+    }
     with open(threshold_path, 'w') as f:
-        json.dump(threshold_data, f, indent=2)
+        json.dump(threshold_data, f, indent=2, default=str)
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
-    if not sweep_df.empty:
-        sweep_path = run_dir / "threshold_sweep.csv"
-        sweep_df.to_csv(sweep_path, index=False)
-
-    log("INFO", "TRAIN", "evaluating on val set")
+    log("INFO", "TRAIN", "evaluating on val set (event-window)")
     val_predictions = predict_proba_long(
         model,
         features_df[features_df['split'] == 'val'],
@@ -575,7 +854,7 @@ def main():
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} hitM1={val_metrics['event_level']['hitM1_rate']:.3f} late={val_metrics['event_level']['late_rate']:.3f}")
 
-    log("INFO", "TRAIN", "evaluating on test set")
+    log("INFO", "TRAIN", "evaluating on test set (event-window)")
     test_predictions = predict_proba_long(
         model,
         features_df[features_df['split'] == 'test'],
@@ -596,6 +875,59 @@ def main():
     signals_df.to_csv(signals_path, index=False)
     log("INFO", "TRAIN", f"saved {len(signals_df)} event-window signals")
 
+    if args.clickhouse_dsn and args.labels:
+        test_scan_start = val_end
+        test_times = features_df[features_df['split'] == 'test']['open_time']
+        if len(test_times) > 0:
+            test_scan_end = test_times.max() + timedelta(days=1)
+        else:
+            test_scan_end = val_end + timedelta(days=30)
+
+        log("INFO", "TRAIN", "running prod-like scan on TEST period")
+
+        test_stream_df = run_stream_scan(
+            ch_dsn=args.clickhouse_dsn,
+            model_path=str(model_path),
+            scan_start=test_scan_start,
+            scan_end=test_scan_end,
+            window_bars=manifest.get('window_bars', 60),
+            warmup_bars=manifest.get('warmup_bars', 150),
+            feature_set=manifest.get('feature_set', 'extended'),
+            feature_columns=feature_columns,
+            scan_workers=args.scan_workers
+        )
+
+        test_signals_stream = extract_signals_from_stream(
+            test_stream_df,
+            threshold=best_threshold,
+            cooldown_bars=args.cooldown_bars,
+            gate_min_dollar_vol=args.gate_min_dollar_vol,
+            gate_min_vol_ratio=args.gate_min_vol_ratio
+        )
+
+        test_signals_stream_path = run_dir / "predicted_signals_test_stream.csv"
+        test_signals_stream.to_csv(test_signals_stream_path, index=False)
+        log("INFO", "TRAIN", f"saved {len(test_signals_stream)} test stream signals")
+
+        test_labels_df = load_labels(args.labels, test_scan_start, test_scan_end)
+        test_labels_df = test_labels_df[test_labels_df['pump_la_type'] == 'A']
+
+        if len(test_labels_df) > 0:
+            test_stream_metrics = compute_stream_metrics_long(
+                test_signals_stream,
+                test_labels_df,
+                test_scan_start,
+                test_scan_end,
+                window_before=args.match_before_bars,
+                window_after=args.match_after_bars
+            )
+
+            test_stream_metrics_path = run_dir / "stream_metrics_test.json"
+            with open(test_stream_metrics_path, 'w') as f:
+                json.dump(test_stream_metrics, f, indent=2, default=str)
+
+            log("INFO", "TRAIN", f"TEST stream: signals/day={test_stream_metrics['signals_per_day']}, precision={test_stream_metrics['precision']:.4f}, recall={test_stream_metrics['event_recall']:.4f}")
+
     if args.holdout_start and args.holdout_end and args.clickhouse_dsn:
         holdout_start = datetime.strptime(args.holdout_start, '%Y-%m-%d')
         holdout_end = parse_date_exclusive(args.holdout_end)
@@ -614,7 +946,9 @@ def main():
             scan_workers=args.scan_workers,
             labels_path=args.labels,
             match_before_bars=args.match_before_bars,
-            match_after_bars=args.match_after_bars
+            match_after_bars=args.match_after_bars,
+            gate_min_dollar_vol=args.gate_min_dollar_vol,
+            gate_min_vol_ratio=args.gate_min_vol_ratio
         )
 
         holdout_signals_path = run_dir / "predicted_signals_holdout.csv"
