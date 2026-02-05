@@ -320,7 +320,7 @@ def process_symbol_chunk(args_tuple):
     csv_filename = f"signals_part_{worker_id}.csv"
     csv_file = open(csv_filename, 'w', newline='')
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['symbol', 'timestamp'])
+    csv_writer.writerow(['symbol', 'open_time'])
 
     total_signals = 0
     symbols_processed = 0
@@ -698,7 +698,7 @@ def main():
 
     with open(args.output, 'w', newline='') as outfile:
         csv_writer = csv.writer(outfile)
-        csv_writer.writerow(['symbol', 'timestamp'])
+        csv_writer.writerow(['symbol', 'open_time'])
 
         for part_csv in part_files:
             if os.path.exists(part_csv):

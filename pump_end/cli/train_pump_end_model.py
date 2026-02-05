@@ -1,5 +1,6 @@
 import argparse
 import os
+import subprocess
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -915,12 +916,21 @@ def run_train_only(args, artifacts: RunArtifacts):
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
-    log("INFO", "TRAIN", "extracting holdout signals")
-    signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                                 min_pending_peak=args.min_pending_peak, min_turn_down_bars=args.min_turn_down_bars)
-    artifacts.save_predicted_signals(signals_df)
-    log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
+    holdout_start = val_end
+    holdout_end = test_end
+    holdout_output = artifacts.get_path() / "predicted_signals_holdout.csv"
+    export_cmd = [
+        "python", "-m", "pump_end.cli.export_pump_end_signals",
+        "--start-date", holdout_start.strftime('%Y-%m-%d %H:%M:%S'),
+        "--end-date", holdout_end.strftime('%Y-%m-%d %H:%M:%S'),
+        "--clickhouse-dsn", args.clickhouse_dsn,
+        "--model-dir", str(artifacts.get_path()),
+        "--output", str(holdout_output),
+        "--workers", str(args.build_workers)
+    ]
+    log("INFO", "TRAIN", f"running prod-like holdout export for test window [{holdout_start}, {holdout_end})")
+    subprocess.run(export_cmd, check=True)
+    log("INFO", "TRAIN", f"saved HOLDOUT predicted signals (prod-like) for test window [{holdout_start}, {holdout_end}) to predicted_signals_holdout.csv")
 
     log("INFO", "TRAIN", f"done. artifacts saved to {artifacts.get_path()}")
 
@@ -1284,13 +1294,21 @@ def run_tune(args, artifacts: RunArtifacts):
                         if not cluster_signals.empty:
                             artifacts.save_signals_by_cluster(cluster_id, cluster_signals, 'test')
 
-                holdout_signals_df = test_signals_df.copy()
-                if 'cluster_id' in holdout_signals_df.columns:
-                    holdout_signals_df = holdout_signals_df.drop(columns=['cluster_id'])
-                holdout_signals_df = holdout_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
-                holdout_signals_df = holdout_signals_df.sort_values('open_time').reset_index(drop=True)
-                artifacts.save_predicted_signals(holdout_signals_df)
-                log("INFO", "CLUSTER", f"saved {len(holdout_signals_df)} HOLDOUT predicted signals (= test)")
+                holdout_start = val_end
+                holdout_end = test_end
+                holdout_output = artifacts.get_path() / "predicted_signals_holdout.csv"
+                export_cmd = [
+                    "python", "-m", "pump_end.cli.export_pump_end_signals",
+                    "--start-date", holdout_start.strftime('%Y-%m-%d %H:%M:%S'),
+                    "--end-date", holdout_end.strftime('%Y-%m-%d %H:%M:%S'),
+                    "--clickhouse-dsn", args.clickhouse_dsn,
+                    "--model-dir", str(artifacts.get_path()),
+                    "--output", str(holdout_output),
+                    "--workers", str(args.build_workers)
+                ]
+                log("INFO", "CLUSTER", f"running prod-like holdout export for test window [{holdout_start}, {holdout_end})")
+                subprocess.run(export_cmd, check=True)
+                log("INFO", "CLUSTER", f"saved HOLDOUT predicted signals (prod-like) for test window [{holdout_start}, {holdout_end}) to predicted_signals_holdout.csv")
 
                 pool_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
                 if 'cluster_id' in pool_signals_df.columns:
@@ -1428,11 +1446,21 @@ def run_tune(args, artifacts: RunArtifacts):
                 artifacts.save_predicted_signals_test(test_signals_df)
                 log("INFO", "TUNE", f"saved {len(test_signals_df)} TEST predicted signals")
 
-                holdout_signals_df = test_signals_df.copy()
-                holdout_signals_df = holdout_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
-                holdout_signals_df = holdout_signals_df.sort_values('open_time').reset_index(drop=True)
-                artifacts.save_predicted_signals(holdout_signals_df)
-                log("INFO", "TUNE", f"saved {len(holdout_signals_df)} HOLDOUT predicted signals (= test)")
+                holdout_start = val_end
+                holdout_end = test_end
+                holdout_output = artifacts.get_path() / "predicted_signals_holdout.csv"
+                export_cmd = [
+                    "python", "-m", "pump_end.cli.export_pump_end_signals",
+                    "--start-date", holdout_start.strftime('%Y-%m-%d %H:%M:%S'),
+                    "--end-date", holdout_end.strftime('%Y-%m-%d %H:%M:%S'),
+                    "--clickhouse-dsn", args.clickhouse_dsn,
+                    "--model-dir", str(artifacts.get_path()),
+                    "--output", str(holdout_output),
+                    "--workers", str(args.build_workers)
+                ]
+                log("INFO", "TUNE", f"running prod-like holdout export for test window [{holdout_start}, {holdout_end})")
+                subprocess.run(export_cmd, check=True)
+                log("INFO", "TUNE", f"saved HOLDOUT predicted signals (prod-like) for test window [{holdout_start}, {holdout_end}) to predicted_signals_holdout.csv")
 
                 pool_signals_df = pd.concat([val_signals_df, test_signals_df], ignore_index=True)
                 pool_signals_df = pool_signals_df.drop_duplicates(subset=['symbol', 'open_time'])
@@ -1657,6 +1685,16 @@ def main():
     if args.mode == "tune":
         if not args.dataset_parquet:
             parser.error("--dataset-parquet required for tune mode")
+        if not args.clickhouse_dsn:
+            parser.error("--clickhouse-dsn required for tune mode (needed for prod-like holdout export)")
+
+    if args.mode == "train":
+        if not args.clickhouse_dsn:
+            parser.error("--clickhouse-dsn required for train mode (needed for prod-like holdout export)")
+        if args.split_strategy != "time":
+            parser.error("--split-strategy=time required for train mode (needed for prod-like holdout export)")
+        if not args.test_end:
+            parser.error("--test-end required for train mode (needed for prod-like holdout export)")
 
     artifacts = RunArtifacts(args.out_dir, args.run_name)
     log("INFO", "MAIN", f"run_dir={artifacts.get_path()}")
