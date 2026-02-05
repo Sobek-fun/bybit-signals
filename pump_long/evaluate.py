@@ -230,26 +230,29 @@ def match_signals_to_events(
     signals_df['matched_event_time'] = pd.NaT
     signals_df['offset_to_event'] = np.nan
 
-    labels_df = labels_df.copy()
-    if 'event_open_time' in labels_df.columns:
-        labels_df['event_time'] = pd.to_datetime(labels_df['event_open_time'])
+    if 'event_time' in labels_df.columns:
+        event_time_series = pd.to_datetime(labels_df['event_time'])
+    elif 'event_open_time' in labels_df.columns:
+        event_time_series = pd.to_datetime(labels_df['event_open_time'])
     else:
-        labels_df['event_time'] = pd.to_datetime(labels_df['open_time'])
+        event_time_series = pd.to_datetime(labels_df['open_time'])
 
-    labels_df['event_id'] = labels_df['symbol'] + '|' + labels_df['event_time'].dt.strftime('%Y%m%d_%H%M%S')
+    event_id_series = labels_df['symbol'] + '|' + event_time_series.dt.strftime('%Y%m%d_%H%M%S')
 
     bar_seconds = 15 * 60
 
     symbol_events_map = {}
-    for symbol, group in labels_df.groupby('symbol'):
-        group = group.sort_values('event_time')
-        event_times = group['event_time'].values.astype('datetime64[s]').astype(np.int64)
-        event_ids = group['event_id'].values
-        event_times_dt = group['event_time'].values
+    for symbol in labels_df['symbol'].unique():
+        mask = labels_df['symbol'] == symbol
+        group_event_times = event_time_series[mask]
+        group_event_ids = event_id_series[mask]
+        sort_idx = group_event_times.argsort()
+        sorted_times = group_event_times.iloc[sort_idx]
+        sorted_ids = group_event_ids.iloc[sort_idx]
         symbol_events_map[symbol] = {
-            'times_int': event_times,
-            'event_ids': event_ids,
-            'event_times': event_times_dt
+            'times_int': sorted_times.values.astype('datetime64[s]').astype(np.int64),
+            'event_ids': sorted_ids.values,
+            'event_times': sorted_times.values
         }
 
     signal_times = pd.to_datetime(signals_df['open_time']).values.astype('datetime64[s]').astype(np.int64)

@@ -1095,6 +1095,9 @@ class PumpLongFeatureBuilder:
         if self.feature_set == "extended":
             cols_to_shift.extend([c for c in extended_columns if c in df.columns])
 
+        seen = set()
+        cols_to_shift = [c for c in cols_to_shift if not (c in seen or seen.add(c))]
+
         if cols_to_shift:
             df[cols_to_shift] = df[cols_to_shift].shift(1)
 

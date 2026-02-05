@@ -684,7 +684,7 @@ def main():
     log("INFO", "TRAIN", f"feature_columns from manifest: {len(feature_columns)} features")
 
     log("INFO", "TRAIN", f"loading features from {args.dataset_parquet}")
-    meta_columns = ['symbol', 'open_time', 'event_id', 'offset', 'y', 'pump_la_type', 'runup_pct', 'target']
+    meta_columns = ['symbol', 'open_time', 'event_id', 'offset', 'y', 'pump_la_type', 'runup_pct', 'target', 'split']
     columns_to_read = meta_columns + feature_columns
     try:
         features_df = pd.read_parquet(args.dataset_parquet, columns=columns_to_read)
