@@ -230,7 +230,7 @@ FEATURE_SETS = {
         "liq_level_dist",
         "cum_ret_5", "cum_ret_10", "cum_ret_60",
         "count_red_last_5", "max_upper_wick_last_5",
-        "vol_ratio_max_10", "vol_ratio_slope_5", "volume_fade",
+        "vol_ratio_max_10", "volume_fade",
     ],
     "extended": [
         "ret_1_lag_0", "ret_1_lag_1", "ret_1_lag_2", "ret_1_lag_3", "ret_1_lag_4",
@@ -453,7 +453,7 @@ FEATURE_SETS = {
         "liq_level_dist",
         "cum_ret_5", "cum_ret_10", "cum_ret_60",
         "count_red_last_5", "max_upper_wick_last_5",
-        "vol_ratio_max_10", "vol_ratio_slope_5", "volume_fade",
+        "vol_ratio_max_10", "volume_fade",
         "atr_norm", "bb_z", "bb_width", "vwap_dev",
         "dollar_vol_prev",
     ]
