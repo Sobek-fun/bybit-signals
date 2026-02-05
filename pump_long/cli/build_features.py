@@ -300,7 +300,12 @@ def main():
 
     meta_cols_present = [c for c in META_COLUMNS if c in features_df.columns]
     feature_cols_present = [c for c in expected_feature_columns if c in features_df.columns]
-    final_columns = meta_cols_present + feature_cols_present
+    seen = set()
+    final_columns = []
+    for c in meta_cols_present + feature_cols_present:
+        if c not in seen:
+            final_columns.append(c)
+            seen.add(c)
     features_df = features_df[final_columns]
 
     log("INFO", "BUILD", f"features shape: {features_df.shape}")
