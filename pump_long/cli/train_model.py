@@ -690,6 +690,7 @@ def main():
         features_df = pd.read_parquet(args.dataset_parquet, columns=columns_to_read)
     except Exception:
         features_df = pd.read_parquet(args.dataset_parquet)
+    features_df = features_df.loc[:, ~features_df.columns.duplicated()]
     log("INFO", "TRAIN", f"loaded {len(features_df)} rows")
 
     missing_cols = [c for c in feature_columns if c not in features_df.columns]
