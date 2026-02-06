@@ -7,7 +7,6 @@ import joblib
 from catboost import CatBoostClassifier
 
 from pump_end_clustering_prod.infra.logging import log
-from pump_end.ml.clustering import EventClusterer as _EventClusterer  # noqa: F401
 
 
 class PumpEndClusteringModel:
