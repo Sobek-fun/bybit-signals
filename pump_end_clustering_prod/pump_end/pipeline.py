@@ -353,6 +353,7 @@ class PumpEndClusteringPipeline:
                 if len(cached) >= self.min_candles:
                     cached = cached.iloc[1:]
                 cached = pd.concat([cached, new_df])
+                cached = cached[~cached.index.duplicated(keep='last')]
                 if len(cached) > self.min_candles:
                     cached = cached.iloc[-self.min_candles:]
                 self.candles_cache[symbol] = cached
