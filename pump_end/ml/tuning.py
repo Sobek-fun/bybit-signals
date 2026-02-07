@@ -201,14 +201,13 @@ def evaluate_fold(
         model: CatBoostClassifier,
         features_df: pd.DataFrame,
         feature_columns: list,
-        signal_rule: str,
         alpha_hit1: float,
         alpha_hit_pre: float,
         beta_early: float,
         gamma_miss: float,
-        kappa_early_magnitude: float = 0.03,
-        min_trigger_rate: float = 0.10,
-        max_trigger_rate: float = 1.0,
+        kappa_early_magnitude: float = 0.22,
+        min_trigger_rate: float = 0.05,
+        max_trigger_rate: float = 0.12,
         early_penalty_threshold: int = -5
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
@@ -218,64 +217,6 @@ def evaluate_fold(
 
     predictions = predict_proba(model, val_df, feature_columns)
     event_data = _prepare_event_data(predictions)
-
-    if signal_rule == 'argmax_per_event':
-        hit0 = 0
-        hit1 = 0
-        early = 0
-        late = 0
-        offsets_list = []
-
-        for event_id, data in event_data.items():
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-            offsets_list.append(offset)
-
-            if offset == 0:
-                hit0 += 1
-            elif offset == 1:
-                hit1 += 1
-            elif offset < 0:
-                early += 1
-            else:
-                late += 1
-
-        n_events = len(event_data)
-        best_metrics = {
-            'hit0_rate': hit0 / n_events if n_events > 0 else 0,
-            'hit1_rate': hit1 / n_events if n_events > 0 else 0,
-            'early_rate': early / n_events if n_events > 0 else 0,
-            'miss_rate': 0,
-            'median_pred_offset': np.median(offsets_list) if offsets_list else None,
-            'n_events': n_events
-        }
-
-        median_offset = best_metrics.get('median_pred_offset')
-        if median_offset is not None and median_offset < early_penalty_threshold:
-            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
-        else:
-            early_penalty = 0
-
-        best_score = (
-                best_metrics['hit0_rate'] +
-                alpha_hit1 * best_metrics['hit1_rate'] -
-                beta_early * best_metrics['early_rate'] -
-                early_penalty
-        )
-
-        return {
-            'score': best_score,
-            'threshold': 0.0,
-            'min_pending_bars': 1,
-            'drop_delta': 0.0,
-            'min_pending_peak': 0.0,
-            'min_turn_down_bars': 1,
-            'hit0_rate': best_metrics['hit0_rate'],
-            'early_rate': best_metrics['early_rate'],
-            'miss_rate': best_metrics['miss_rate'],
-            'median_pred_offset': best_metrics.get('median_pred_offset'),
-            'n_events': best_metrics['n_events']
-        }
 
     rule_combinations = get_rule_parameter_grid()
 
@@ -300,7 +241,6 @@ def evaluate_fold(
             beta_early=beta_early,
             gamma_miss=gamma_miss,
             kappa_early_magnitude=kappa_early_magnitude,
-            signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
             min_pending_peak=min_pending_peak,
@@ -364,23 +304,19 @@ def run_cv(
         feature_columns: list,
         folds: list,
         params: dict,
-        signal_rule: str = 'pending_turn_down',
         alpha_hit1: float = 0.5,
         alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
-        kappa_early_magnitude: float = 0.03,
-        min_trigger_rate: float = 0.10,
-        max_trigger_rate: float = 1.0,
+        kappa_early_magnitude: float = 0.22,
+        min_trigger_rate: float = 0.05,
+        max_trigger_rate: float = 0.12,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
-        seed: int = 42,
-        tune_strategy: str = 'threshold'
+        seed: int = 42
 ) -> dict:
     fold_results = []
-
-    actual_signal_rule = signal_rule
 
     for fold_idx, fold in enumerate(folds):
         fold_df = apply_fold_split(features_df, fold)
@@ -403,7 +339,6 @@ def run_cv(
             model,
             fold_df,
             feature_columns,
-            actual_signal_rule,
             alpha_hit1,
             alpha_hit_pre,
             beta_early,
@@ -438,22 +373,20 @@ def run_cv(
 def tune_model(
         features_df: pd.DataFrame,
         feature_columns: list,
-        time_budget_min: int = 60,
+        time_budget_min: int = 120,
         fold_months: int = 1,
         min_train_months: int = 3,
-        signal_rule: str = 'pending_turn_down',
         alpha_hit1: float = 0.5,
         alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
-        kappa_early_magnitude: float = 0.03,
-        min_trigger_rate: float = 0.10,
-        max_trigger_rate: float = 1.0,
+        kappa_early_magnitude: float = 0.22,
+        min_trigger_rate: float = 0.05,
+        max_trigger_rate: float = 0.12,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
-        seed: int = 42,
-        tune_strategy: str = 'threshold'
+        seed: int = 42
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -480,7 +413,6 @@ def tune_model(
             feature_columns,
             folds,
             params,
-            signal_rule=signal_rule,
             alpha_hit1=alpha_hit1,
             alpha_hit_pre=alpha_hit_pre,
             beta_early=beta_early,
@@ -491,8 +423,7 @@ def tune_model(
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
-            seed=seed,
-            tune_strategy=tune_strategy
+            seed=seed
         )
 
         trial_record = {
@@ -519,86 +450,7 @@ def tune_model(
         'leaderboard': leaderboard_df,
         'folds': folds,
         'trials_completed': len(leaderboard),
-        'time_elapsed_sec': time.time() - start_time,
-        'tune_strategy': tune_strategy
-    }
-
-
-def tune_model_both_strategies(
-        features_df: pd.DataFrame,
-        feature_columns: list,
-        time_budget_min: int = 60,
-        fold_months: int = 1,
-        min_train_months: int = 3,
-        signal_rule: str = 'pending_turn_down',
-        alpha_hit1: float = 0.5,
-        alpha_hit_pre: float = 0.25,
-        beta_early: float = 2.0,
-        gamma_miss: float = 1.0,
-        kappa_early_magnitude: float = 0.03,
-        min_trigger_rate: float = 0.10,
-        max_trigger_rate: float = 1.0,
-        embargo_bars: int = 0,
-        iterations: int = 1000,
-        early_stopping_rounds: int = 50,
-        seed: int = 42
-) -> dict:
-    half_budget = time_budget_min // 2
-
-    threshold_result = tune_model(
-        features_df,
-        feature_columns,
-        time_budget_min=half_budget,
-        fold_months=fold_months,
-        min_train_months=min_train_months,
-        signal_rule=signal_rule,
-        alpha_hit1=alpha_hit1,
-        alpha_hit_pre=alpha_hit_pre,
-        beta_early=beta_early,
-        gamma_miss=gamma_miss,
-        kappa_early_magnitude=kappa_early_magnitude,
-        min_trigger_rate=min_trigger_rate,
-        max_trigger_rate=max_trigger_rate,
-        embargo_bars=embargo_bars,
-        iterations=iterations,
-        early_stopping_rounds=early_stopping_rounds,
-        seed=seed,
-        tune_strategy='threshold'
-    )
-
-    ranking_result = tune_model(
-        features_df,
-        feature_columns,
-        time_budget_min=half_budget,
-        fold_months=fold_months,
-        min_train_months=min_train_months,
-        signal_rule=signal_rule,
-        alpha_hit1=alpha_hit1,
-        alpha_hit_pre=alpha_hit_pre,
-        beta_early=beta_early,
-        gamma_miss=gamma_miss,
-        kappa_early_magnitude=kappa_early_magnitude,
-        min_trigger_rate=min_trigger_rate,
-        max_trigger_rate=max_trigger_rate,
-        embargo_bars=embargo_bars,
-        iterations=iterations,
-        early_stopping_rounds=early_stopping_rounds,
-        seed=seed,
-        tune_strategy='ranking'
-    )
-
-    if threshold_result['best_score'] >= ranking_result['best_score']:
-        winner = 'threshold'
-        best_result = threshold_result
-    else:
-        winner = 'ranking'
-        best_result = ranking_result
-
-    return {
-        'winner': winner,
-        'threshold_result': threshold_result,
-        'ranking_result': ranking_result,
-        'best_result': best_result
+        'time_elapsed_sec': time.time() - start_time
     }
 
 
@@ -608,8 +460,7 @@ def train_final_model(
         params: dict,
         train_end: datetime,
         iterations: int = 1000,
-        seed: int = 42,
-        tune_strategy: str = 'threshold'
+        seed: int = 42
 ) -> CatBoostClassifier:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     train_events = event_times[event_times['open_time'] < train_end]['event_id']

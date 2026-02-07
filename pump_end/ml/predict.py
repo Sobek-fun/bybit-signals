@@ -22,7 +22,6 @@ def predict_proba(
 def extract_signals(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
@@ -39,47 +38,37 @@ def extract_signals(
     signals = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_end'] >= threshold
-            if not mask.any():
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        elif signal_rule == 'argmax_per_event':
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-        else:
-            offsets_arr = data['offsets']
-            p_end = data['p_end']
+        offsets_arr = data['offsets']
+        p_end = data['p_end']
 
-            triggered = False
-            pending_count = 0
-            pending_max = -np.inf
-            turn_down_count = 0
+        triggered = False
+        pending_count = 0
+        pending_max = -np.inf
+        turn_down_count = 0
 
-            for i in range(len(offsets_arr)):
-                if p_end[i] >= threshold:
-                    pending_count += 1
-                    pending_max = max(pending_max, p_end[i])
+        for i in range(len(offsets_arr)):
+            if p_end[i] >= threshold:
+                pending_count += 1
+                pending_max = max(pending_max, p_end[i])
 
-                    if i > 0 and p_end[i] < p_end[i - 1]:
-                        turn_down_count += 1
-                    else:
-                        turn_down_count = 0
-
-                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
-                        drop_from_peak = pending_max - p_end[i]
-                        if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
-                            offset = offsets_arr[i]
-                            triggered = True
-                            break
+                if i > 0 and p_end[i] < p_end[i - 1]:
+                    turn_down_count += 1
                 else:
-                    pending_count = 0
-                    pending_max = -np.inf
                     turn_down_count = 0
 
-            if not triggered:
-                continue
+                if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
+                    drop_from_peak = pending_max - p_end[i]
+                    if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+            else:
+                pending_count = 0
+                pending_max = -np.inf
+                turn_down_count = 0
+
+        if not triggered:
+            continue
 
         signals.append({
             'symbol': symbol_map[event_id],

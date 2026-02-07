@@ -29,7 +29,6 @@ HIT_PRE_WINDOW = 2
 def _compute_event_metrics_from_data(
         event_data: dict,
         threshold: float,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
@@ -47,49 +46,38 @@ def _compute_event_metrics_from_data(
     early_far_offsets = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_end'] >= threshold
-            if not mask.any():
-                miss += 1
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        elif signal_rule == 'argmax_per_event':
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-        else:
-            offsets_arr = data['offsets']
-            p_end = data['p_end']
+        offsets_arr = data['offsets']
+        p_end = data['p_end']
 
-            triggered = False
-            pending_count = 0
-            pending_max = -np.inf
-            turn_down_count = 0
+        triggered = False
+        pending_count = 0
+        pending_max = -np.inf
+        turn_down_count = 0
 
-            for i in range(len(offsets_arr)):
-                if p_end[i] >= threshold:
-                    pending_count += 1
-                    pending_max = max(pending_max, p_end[i])
+        for i in range(len(offsets_arr)):
+            if p_end[i] >= threshold:
+                pending_count += 1
+                pending_max = max(pending_max, p_end[i])
 
-                    if i > 0 and p_end[i] < p_end[i - 1]:
-                        turn_down_count += 1
-                    else:
-                        turn_down_count = 0
-
-                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
-                        drop_from_peak = pending_max - p_end[i]
-                        if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
-                            offset = offsets_arr[i]
-                            triggered = True
-                            break
+                if i > 0 and p_end[i] < p_end[i - 1]:
+                    turn_down_count += 1
                 else:
-                    pending_count = 0
-                    pending_max = -np.inf
                     turn_down_count = 0
 
-            if not triggered:
-                miss += 1
-                continue
+                if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
+                    drop_from_peak = pending_max - p_end[i]
+                    if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+            else:
+                pending_count = 0
+                pending_max = -np.inf
+                turn_down_count = 0
+
+        if not triggered:
+            miss += 1
+            continue
 
         offsets.append(offset)
 
@@ -157,7 +145,6 @@ def _compute_event_metrics_from_data(
 def compute_event_metrics_for_threshold(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
@@ -166,28 +153,27 @@ def compute_event_metrics_for_threshold(
 ) -> dict:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
-    return _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta,
+    return _compute_event_metrics_from_data(event_data, threshold, min_pending_bars, drop_delta,
                                             min_pending_peak, min_turn_down_bars)
 
 
 def threshold_sweep(
         predictions_df: pd.DataFrame,
         grid_from: float = 0.01,
-        grid_to: float = 0.30,
+        grid_to: float = 0.95,
         grid_step: float = 0.01,
         alpha_hit1: float = 0.5,
         alpha_hit_pre: float = 0.25,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
-        kappa_early_magnitude: float = 0.03,
-        signal_rule: str = 'pending_turn_down',
+        kappa_early_magnitude: float = 0.22,
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
         min_turn_down_bars: int = 1,
         event_data: dict = None,
-        min_trigger_rate: float = 0.10,
-        max_trigger_rate: float = 1.0
+        min_trigger_rate: float = 0.05,
+        max_trigger_rate: float = 0.12
 ) -> tuple:
     if event_data is None:
         event_data = _prepare_event_data(predictions_df)
@@ -196,7 +182,7 @@ def threshold_sweep(
     results = []
 
     for threshold in thresholds:
-        metrics = _compute_event_metrics_from_data(event_data, threshold, signal_rule, min_pending_bars, drop_delta,
+        metrics = _compute_event_metrics_from_data(event_data, threshold, min_pending_bars, drop_delta,
                                                    min_pending_peak, min_turn_down_bars)
 
         trigger_rate = 1 - metrics['miss_rate']
@@ -224,7 +210,6 @@ def threshold_sweep(
     if valid_scores.empty:
         best_fallback_idx = None
         min_distance = np.inf
-        target_rate = (min_trigger_rate + max_trigger_rate) / 2
 
         for idx, row in results_df.iterrows():
             tr = row['trigger_rate']

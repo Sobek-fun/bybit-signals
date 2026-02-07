@@ -129,21 +129,6 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(metrics, f, indent=2, default=str)
 
-    def save_backtest_opt_val(self, data: dict):
-        path = self.run_dir / "backtest_opt_val.json"
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
-
-    def save_backtest_eval_test(self, data: dict):
-        path = self.run_dir / "backtest_eval_test.json"
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
-
-    def save_backtest_summary(self, data: dict):
-        path = self.run_dir / "backtest_summary.json"
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
-
     def save_offset_distribution(self, data: dict, split_name: str):
         path = self.run_dir / f"offset_distribution_{split_name}.json"
         with open(path, 'w') as f:

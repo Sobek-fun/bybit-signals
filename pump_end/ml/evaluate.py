@@ -17,7 +17,6 @@ HIT_PRE_WINDOW = 2
 def compute_event_level_metrics(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
@@ -39,49 +38,38 @@ def compute_event_level_metrics(
     early_far_offsets = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_end'] >= threshold
-            if not mask.any():
-                miss += 1
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        elif signal_rule == 'argmax_per_event':
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-        else:
-            offsets_arr = data['offsets']
-            p_end = data['p_end']
+        offsets_arr = data['offsets']
+        p_end = data['p_end']
 
-            triggered = False
-            pending_count = 0
-            pending_max = -np.inf
-            turn_down_count = 0
+        triggered = False
+        pending_count = 0
+        pending_max = -np.inf
+        turn_down_count = 0
 
-            for i in range(len(offsets_arr)):
-                if p_end[i] >= threshold:
-                    pending_count += 1
-                    pending_max = max(pending_max, p_end[i])
+        for i in range(len(offsets_arr)):
+            if p_end[i] >= threshold:
+                pending_count += 1
+                pending_max = max(pending_max, p_end[i])
 
-                    if i > 0 and p_end[i] < p_end[i - 1]:
-                        turn_down_count += 1
-                    else:
-                        turn_down_count = 0
-
-                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
-                        drop_from_peak = pending_max - p_end[i]
-                        if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
-                            offset = offsets_arr[i]
-                            triggered = True
-                            break
+                if i > 0 and p_end[i] < p_end[i - 1]:
+                    turn_down_count += 1
                 else:
-                    pending_count = 0
-                    pending_max = -np.inf
                     turn_down_count = 0
 
-            if not triggered:
-                miss += 1
-                continue
+                if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
+                    drop_from_peak = pending_max - p_end[i]
+                    if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+            else:
+                pending_count = 0
+                pending_max = -np.inf
+                turn_down_count = 0
+
+        if not triggered:
+            miss += 1
+            continue
 
         offsets.append(offset)
 
@@ -302,7 +290,6 @@ def compute_trade_quality_score(trade_metrics: dict, horizon: int = 32) -> float
 def compute_offset_distribution(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
@@ -313,47 +300,37 @@ def compute_offset_distribution(
     offsets = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_end'] >= threshold
-            if not mask.any():
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        elif signal_rule == 'argmax_per_event':
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-        else:
-            offsets_arr = data['offsets']
-            p_end = data['p_end']
+        offsets_arr = data['offsets']
+        p_end = data['p_end']
 
-            triggered = False
-            pending_count = 0
-            pending_max = -np.inf
-            turn_down_count = 0
+        triggered = False
+        pending_count = 0
+        pending_max = -np.inf
+        turn_down_count = 0
 
-            for i in range(len(offsets_arr)):
-                if p_end[i] >= threshold:
-                    pending_count += 1
-                    pending_max = max(pending_max, p_end[i])
+        for i in range(len(offsets_arr)):
+            if p_end[i] >= threshold:
+                pending_count += 1
+                pending_max = max(pending_max, p_end[i])
 
-                    if i > 0 and p_end[i] < p_end[i - 1]:
-                        turn_down_count += 1
-                    else:
-                        turn_down_count = 0
-
-                    if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
-                        drop_from_peak = pending_max - p_end[i]
-                        if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
-                            offset = offsets_arr[i]
-                            triggered = True
-                            break
+                if i > 0 and p_end[i] < p_end[i - 1]:
+                    turn_down_count += 1
                 else:
-                    pending_count = 0
-                    pending_max = -np.inf
                     turn_down_count = 0
 
-            if not triggered:
-                continue
+                if pending_count >= min_pending_bars and pending_max >= min_pending_peak and i > 0:
+                    drop_from_peak = pending_max - p_end[i]
+                    if drop_from_peak >= drop_delta and turn_down_count >= min_turn_down_bars:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+            else:
+                pending_count = 0
+                pending_max = -np.inf
+                turn_down_count = 0
+
+        if not triggered:
+            continue
 
         offsets.append(offset)
 
@@ -384,14 +361,13 @@ def compute_offset_distribution(
 def evaluate(
         predictions_df: pd.DataFrame,
         threshold: float,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
         min_turn_down_bars: int = 1,
         event_data: dict = None
 ) -> dict:
-    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, min_pending_bars, drop_delta,
                                                 min_pending_peak, min_turn_down_bars, event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
@@ -405,7 +381,6 @@ def evaluate_with_trade_quality(
         predictions_df: pd.DataFrame,
         threshold: float,
         candles_loader,
-        signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         min_pending_peak: float = 0.0,
@@ -415,11 +390,11 @@ def evaluate_with_trade_quality(
 ) -> dict:
     from pump_end.ml.predict import extract_signals
 
-    event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
+    event_metrics = compute_event_level_metrics(predictions_df, threshold, min_pending_bars, drop_delta,
                                                 min_pending_peak, min_turn_down_bars, event_data)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
-    signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta, min_pending_peak, min_turn_down_bars)
+    signals_df = extract_signals(predictions_df, threshold, min_pending_bars, drop_delta, min_pending_peak, min_turn_down_bars)
     trade_metrics = compute_trade_quality_metrics(signals_df, candles_loader, horizons)
     trade_score = compute_trade_quality_score(trade_metrics)
 

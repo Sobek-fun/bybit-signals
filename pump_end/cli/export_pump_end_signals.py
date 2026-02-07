@@ -16,7 +16,6 @@ from catboost import CatBoostClassifier
 from pump_end.features.feature_builder import PumpFeatureBuilder
 from pump_end.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 from pump_end.infra.clickhouse import DataLoader
-from pump_end.ml.feature_schema import prune_feature_columns
 from pump_end.ml.predict import extract_signals
 from pump_end.ml.clustering import load_clusterer, get_available_cluster_features
 
@@ -277,7 +276,6 @@ def process_symbol_chunk(args_tuple):
         warmup_bars,
         feature_set,
         threshold,
-        signal_rule,
         min_pending_bars,
         drop_delta,
         min_pending_peak,
@@ -413,7 +411,6 @@ def process_symbol_chunk(args_tuple):
                             signals_df = extract_signals(
                                 cluster_preds,
                                 threshold=cluster_params['threshold'],
-                                signal_rule='pending_turn_down',
                                 min_pending_bars=cluster_params['min_pending_bars'],
                                 drop_delta=cluster_params['drop_delta'],
                                 min_pending_peak=cluster_params['min_pending_peak'],
@@ -428,7 +425,6 @@ def process_symbol_chunk(args_tuple):
                         signals_df = extract_signals(
                             predictions_df,
                             threshold,
-                            signal_rule=signal_rule,
                             min_pending_bars=min_pending_bars,
                             drop_delta=drop_delta,
                             min_pending_peak=min_pending_peak,
@@ -443,7 +439,6 @@ def process_symbol_chunk(args_tuple):
                     signals_df = extract_signals(
                         predictions_df,
                         threshold,
-                        signal_rule=signal_rule,
                         min_pending_bars=min_pending_bars,
                         drop_delta=drop_delta,
                         min_pending_peak=min_pending_peak,
@@ -458,7 +453,6 @@ def process_symbol_chunk(args_tuple):
                 signals_df = extract_signals(
                     predictions_df,
                     threshold,
-                    signal_rule=signal_rule,
                     min_pending_bars=min_pending_bars,
                     drop_delta=drop_delta,
                     min_pending_peak=min_pending_peak,
@@ -487,37 +481,31 @@ def main():
         "--start-date",
         type=str,
         required=True,
-        help="Start date (YYYY-MM-DD HH:MM:SS), inclusive"
     )
     parser.add_argument(
         "--end-date",
         type=str,
         required=True,
-        help="End date (YYYY-MM-DD HH:MM:SS), exclusive"
     )
     parser.add_argument(
         "--clickhouse-dsn",
         type=str,
         required=True,
-        help="ClickHouse DSN (e.g., http://user:pass@host:port/database)"
     )
     parser.add_argument(
         "--model-dir",
         type=str,
         required=True,
-        help="Path to model artifacts directory"
     )
     parser.add_argument(
         "--output",
         type=str,
         default="pump_end_signals.csv",
-        help="Output CSV file path (default: pump_end_signals.csv)"
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=4,
-        help="Number of parallel workers (default: 4)"
     )
 
     args = parser.parse_args()
@@ -532,24 +520,22 @@ def main():
 
     window_bars = run_config.get('window_bars', 30)
     warmup_bars = run_config.get('warmup_bars', 150)
-    feature_set = run_config.get('feature_set', 'base')
-    do_prune = run_config.get('prune_features', False)
-    neg_before = run_config.get('neg_before', 20)
-    neg_after = run_config.get('neg_after', 0)
+    feature_set = run_config.get('feature_set', 'extended')
+    neg_before = run_config.get('neg_before', 60)
+    neg_after = run_config.get('neg_after', 16)
     pos_offsets_str = run_config.get('pos_offsets', '0')
     pos_offsets = [int(x.strip()) for x in pos_offsets_str.split(',')]
 
     threshold = threshold_config.get('threshold', 0.10)
-    signal_rule = threshold_config.get('signal_rule', 'pending_turn_down')
     min_pending_bars = threshold_config.get('min_pending_bars', 2)
     drop_delta = threshold_config.get('drop_delta', 0.02)
     min_pending_peak = threshold_config.get('min_pending_peak', 0.15)
     min_turn_down_bars = threshold_config.get('min_turn_down_bars', 1)
 
     log("INFO", "EXPORT",
-        f"config: window_bars={window_bars} warmup_bars={warmup_bars} feature_set={feature_set} prune={do_prune}")
+        f"config: window_bars={window_bars} warmup_bars={warmup_bars} feature_set={feature_set}")
     log("INFO", "EXPORT",
-        f"threshold={threshold} signal_rule={signal_rule} min_pending_bars={min_pending_bars} drop_delta={drop_delta} min_pending_peak={min_pending_peak} min_turn_down_bars={min_turn_down_bars}")
+        f"threshold={threshold} min_pending_bars={min_pending_bars} drop_delta={drop_delta} min_pending_peak={min_pending_peak} min_turn_down_bars={min_turn_down_bars}")
     log("INFO", "EXPORT",
         f"neg_before={neg_before} neg_after={neg_after} pos_offsets={pos_offsets}")
 
@@ -573,11 +559,6 @@ def main():
 
     model = load_model(model_dir)
     feature_columns = list(model.feature_names_)
-
-    if do_prune:
-        original_count = len(feature_columns)
-        feature_columns = prune_feature_columns(feature_columns)
-        log("INFO", "EXPORT", f"pruned features: {original_count} -> {len(feature_columns)}")
 
     parsed = urlparse(args.clickhouse_dsn)
     host = parsed.hostname or "localhost"
@@ -662,7 +643,6 @@ def main():
             warmup_bars,
             feature_set,
             threshold,
-            signal_rule,
             min_pending_bars,
             drop_delta,
             min_pending_peak,
