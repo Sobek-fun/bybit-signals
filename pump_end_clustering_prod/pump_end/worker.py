@@ -51,7 +51,6 @@ class PumpEndSignalState:
     def __init__(self):
         self.active_events: dict[str, _EventState] = {}
         self.processed_candidates: dict[str, set] = {}
-        self.last_signal_time: dict[str, datetime] = {}
         self.last_update_time: dict[str, datetime] = {}
 
     def get_processed_candidates(self, symbol: str) -> set:
@@ -136,10 +135,8 @@ class PumpEndSignalState:
                 turn_down_count = 0
 
         if triggered:
-            if self.last_signal_time.get(symbol) != current_time:
-                ev.signal_fired = True
-                self.last_signal_time[symbol] = current_time
-                return True
+            ev.signal_fired = True
+            return True
 
         return False
 
@@ -398,6 +395,22 @@ class PumpEndWorker:
             already_processed = self.signal_state.get_processed_candidates(self.symbol)
             new_candidates = [c for c in candidates if c not in already_processed]
 
+            neg_before = self.model.neg_before
+            neg_after = self.model.neg_after
+            pos_offsets = self.model.pos_offsets
+            max_offset = max(pos_offsets) + neg_after
+
+            fresh_candidates = []
+            for c in new_candidates:
+                offset = int((self.expected_bucket_start - c) / timedelta(minutes=15))
+                if offset > max_offset:
+                    if self.symbol not in self.signal_state.processed_candidates:
+                        self.signal_state.processed_candidates[self.symbol] = set()
+                    self.signal_state.processed_candidates[self.symbol].add(c)
+                else:
+                    fresh_candidates.append(c)
+            new_candidates = fresh_candidates
+
             if not new_candidates:
                 active_event_ids = [
                     eid for eid in self.signal_state.active_events
@@ -411,12 +424,6 @@ class PumpEndWorker:
                         duration_total_ms=(time.time() - start_time) * 1000,
                         candles_count=len(self.df)
                     )
-
-            neg_before = self.model.neg_before
-            neg_after = self.model.neg_after
-            pos_offsets = self.model.pos_offsets
-
-            decision_open_time = self.expected_bucket_start + timedelta(minutes=15)
 
             for cand_time in new_candidates:
                 event_id = f"{self.symbol}|{cand_time.strftime('%Y%m%d_%H%M%S')}"
@@ -432,20 +439,45 @@ class PumpEndWorker:
                     continue
 
                 zero_time = offset_zero_rows.iloc[0]['open_time']
-                zero_decision_time = zero_time + timedelta(minutes=15)
 
                 features_start = time.time()
                 zero_features, _ = self.feature_builder.build_one_for_inference(
-                    self.df, self.symbol, zero_decision_time
+                    self.df, self.symbol, zero_time
                 )
                 if not zero_features:
                     continue
 
                 cluster_id, params, allowed = self.model.resolve_params(zero_features)
 
+                if not allowed:
+                    if self.symbol not in self.signal_state.processed_candidates:
+                        self.signal_state.processed_candidates[self.symbol] = set()
+                    self.signal_state.processed_candidates[self.symbol].add(cand_time)
+                    continue
+
                 self.signal_state.register_event(
                     self.symbol, event_id, cand_time, cluster_id, params, allowed
                 )
+
+                current_offset = int((self.expected_bucket_start - cand_time) / timedelta(minutes=15))
+                backfill_offsets = []
+                backfill_times = []
+                for o in range(-neg_before, current_offset):
+                    t = cand_time + timedelta(minutes=o * 15)
+                    if t in self.df.index:
+                        backfill_offsets.append(o)
+                        backfill_times.append(t)
+
+                if backfill_times:
+                    backfill_features = self.feature_builder.build_many_for_inference(
+                        self.df, self.symbol, backfill_times
+                    )
+                    if backfill_features and len(backfill_features) == len(backfill_times):
+                        backfill_probas = self.model.batch_predict(backfill_features)
+                        ev = self.signal_state.active_events[event_id]
+                        for i, o in enumerate(backfill_offsets):
+                            ev.offsets_processed.append(o)
+                            ev.p_end_series.append(float(backfill_probas[i]))
 
             triggered = False
             last_p_end = None
@@ -470,7 +502,6 @@ class PumpEndWorker:
                 candidate_time = ev.candidate_time
                 offset = int((current_offset_time - candidate_time) / timedelta(minutes=15))
 
-                max_offset = max(pos_offsets) + neg_after
                 min_offset = -neg_before
                 if offset < min_offset or offset > max_offset:
                     continue
@@ -480,7 +511,7 @@ class PumpEndWorker:
 
                 feat_start = time.time()
                 features_row, timings = self.feature_builder.build_one_for_inference(
-                    self.df, self.symbol, decision_open_time
+                    self.df, self.symbol, self.expected_bucket_start
                 )
                 feat_ms = (time.time() - feat_start) * 1000
                 total_features_ms += feat_ms
@@ -501,7 +532,7 @@ class PumpEndWorker:
                 last_params = ev.params
 
                 sig = self.signal_state.update_and_check(
-                    self.symbol, event_id, offset, p_end, decision_open_time
+                    self.symbol, event_id, offset, p_end, self.expected_bucket_start
                 )
 
                 if sig:
@@ -510,7 +541,7 @@ class PumpEndWorker:
 
                     self.signal_dispatcher.publish_pump_end_signal(
                         symbol=self.symbol,
-                        event_time=decision_open_time,
+                        event_time=self.expected_bucket_start,
                         p_end=p_end,
                         threshold=ev.params['threshold'],
                         close_price=last_close,

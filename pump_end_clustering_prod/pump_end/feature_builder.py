@@ -128,10 +128,8 @@ class PumpFeatureBuilder:
         timings = {}
         df = df_candles
 
-        expected_bucket_start = decision_open_time - timedelta(minutes=15)
-
         events = pd.DataFrame([{
-            'open_time': expected_bucket_start,
+            'open_time': decision_open_time,
             'pump_la_type': 'A',
             'runup_pct': 0
         }])
@@ -153,7 +151,8 @@ class PumpFeatureBuilder:
             df = self._calculate_extended_indicators(df)
             timings['extended_ms'] = (time.time() - t0) * 1000
 
-        df.loc[decision_open_time] = np.nan
+        if decision_open_time not in df.index:
+            df.loc[decision_open_time] = np.nan
 
         t0 = time.time()
         df = self._apply_decision_shift(df)
@@ -186,7 +185,7 @@ class PumpFeatureBuilder:
         df = df_candles.copy()
 
         events_liq = pd.DataFrame([{
-            'open_time': dt - timedelta(minutes=15),
+            'open_time': dt,
             'pump_la_type': 'A',
             'runup_pct': 0
         } for dt in decision_open_times])

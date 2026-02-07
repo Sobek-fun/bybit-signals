@@ -215,21 +215,20 @@ class PumpEndClusteringPipeline:
         if points_df.empty:
             return 0
 
-        decision_times = (points_df['open_time'] + timedelta(minutes=15)).tolist()
+        decision_times = points_df['open_time'].tolist()
 
         valid_decision_times = []
         valid_indices = []
         for i, dt in enumerate(decision_times):
-            expected_bucket_start = dt - timedelta(minutes=15)
-            if expected_bucket_start not in df.index:
+            if dt not in df.index:
                 continue
-            idx = df.index.get_loc(expected_bucket_start)
+            idx = df.index.get_loc(dt)
             if idx < self.min_candles - 1:
                 continue
             start_idx = idx - (self.min_candles - 1)
             expected_range = pd.date_range(
                 start=df.index[start_idx],
-                end=expected_bucket_start,
+                end=dt,
                 freq='15min'
             )
             actual_range = df.index[start_idx:idx + 1]
@@ -267,6 +266,12 @@ class PumpEndClusteringPipeline:
                 first_global_idx = event_mask[event_mask].index[0]
                 first_features = feature_rows[first_global_idx]
                 cluster_id, params, allowed = self.model.resolve_params(first_features)
+
+            if not allowed:
+                if symbol not in self.signal_state.processed_candidates:
+                    self.signal_state.processed_candidates[symbol] = set()
+                self.signal_state.processed_candidates[symbol].add(cand_time)
+                continue
 
             self.signal_state.register_event(
                 symbol, event_id, cand_time, cluster_id, params, allowed
