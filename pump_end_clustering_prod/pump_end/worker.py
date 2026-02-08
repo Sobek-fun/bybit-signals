@@ -86,7 +86,7 @@ class PumpEndSignalState:
             current_time: datetime
     ) -> bool:
         last_t = self.last_update_time.get(symbol)
-        if last_t is not None and current_time <= last_t:
+        if last_t is not None and current_time < last_t:
             return False
         self.last_update_time[symbol] = current_time
 
@@ -390,6 +390,8 @@ class PumpEndWorker:
                     candles_count=len(self.df)
                 )
 
+            decision_open_time = self.expected_bucket_start + timedelta(minutes=15)
+
             candidates = detect_candidates(self.df, DEFAULT_PUMP_PARAMS)
 
             already_processed = self.signal_state.get_processed_candidates(self.symbol)
@@ -402,7 +404,7 @@ class PumpEndWorker:
 
             fresh_candidates = []
             for c in new_candidates:
-                offset = int((self.expected_bucket_start - c) / timedelta(minutes=15))
+                offset = int((decision_open_time - c) / timedelta(minutes=15))
                 if offset > max_offset:
                     if self.symbol not in self.signal_state.processed_candidates:
                         self.signal_state.processed_candidates[self.symbol] = set()
@@ -459,7 +461,7 @@ class PumpEndWorker:
                     self.symbol, event_id, cand_time, cluster_id, params, allowed
                 )
 
-                current_offset = int((self.expected_bucket_start - cand_time) / timedelta(minutes=15))
+                current_offset = int((decision_open_time - cand_time) / timedelta(minutes=15))
                 backfill_offsets = []
                 backfill_times = []
                 for o in range(-neg_before, current_offset):
@@ -498,7 +500,7 @@ class PumpEndWorker:
                 if ev is None or ev.signal_fired:
                     continue
 
-                current_offset_time = self.expected_bucket_start
+                current_offset_time = decision_open_time
                 candidate_time = ev.candidate_time
                 offset = int((current_offset_time - candidate_time) / timedelta(minutes=15))
 
@@ -511,7 +513,7 @@ class PumpEndWorker:
 
                 feat_start = time.time()
                 features_row, timings = self.feature_builder.build_one_for_inference(
-                    self.df, self.symbol, self.expected_bucket_start
+                    self.df, self.symbol, decision_open_time
                 )
                 feat_ms = (time.time() - feat_start) * 1000
                 total_features_ms += feat_ms
@@ -532,7 +534,7 @@ class PumpEndWorker:
                 last_params = ev.params
 
                 sig = self.signal_state.update_and_check(
-                    self.symbol, event_id, offset, p_end, self.expected_bucket_start
+                    self.symbol, event_id, offset, p_end, decision_open_time
                 )
 
                 if sig:
@@ -541,7 +543,7 @@ class PumpEndWorker:
 
                     self.signal_dispatcher.publish_pump_end_signal(
                         symbol=self.symbol,
-                        event_time=self.expected_bucket_start,
+                        event_time=decision_open_time,
                         p_end=p_end,
                         threshold=ev.params['threshold'],
                         close_price=last_close,
@@ -551,6 +553,7 @@ class PumpEndWorker:
                         min_turn_down_bars=ev.params['min_turn_down_bars'],
                         cluster_id=ev.cluster_id
                     )
+                    break
 
             self.signal_state.cleanup_finished_events(self.symbol, neg_after)
 

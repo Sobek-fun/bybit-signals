@@ -128,8 +128,9 @@ class PumpFeatureBuilder:
         timings = {}
         df = df_candles
 
+        expected_bucket_start = decision_open_time - timedelta(minutes=15)
         events = pd.DataFrame([{
-            'open_time': decision_open_time,
+            'open_time': expected_bucket_start,
             'pump_la_type': 'A',
             'runup_pct': 0
         }])
@@ -185,7 +186,7 @@ class PumpFeatureBuilder:
         df = df_candles.copy()
 
         events_liq = pd.DataFrame([{
-            'open_time': dt,
+            'open_time': dt - timedelta(minutes=15),
             'pump_la_type': 'A',
             'runup_pct': 0
         } for dt in decision_open_times])

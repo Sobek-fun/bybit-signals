@@ -215,20 +215,21 @@ class PumpEndClusteringPipeline:
         if points_df.empty:
             return 0
 
-        decision_times = points_df['open_time'].tolist()
+        decision_times = [(dt + timedelta(minutes=15)) for dt in points_df['open_time'].tolist()]
 
         valid_decision_times = []
         valid_indices = []
         for i, dt in enumerate(decision_times):
-            if dt not in df.index:
+            bucket_time = dt - timedelta(minutes=15)
+            if bucket_time not in df.index:
                 continue
-            idx = df.index.get_loc(dt)
+            idx = df.index.get_loc(bucket_time)
             if idx < self.min_candles - 1:
                 continue
             start_idx = idx - (self.min_candles - 1)
             expected_range = pd.date_range(
                 start=df.index[start_idx],
-                end=dt,
+                end=bucket_time,
                 freq='15min'
             )
             actual_range = df.index[start_idx:idx + 1]
