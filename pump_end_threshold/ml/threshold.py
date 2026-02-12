@@ -49,18 +49,27 @@ def _compute_event_metrics_from_data(
 
         triggered = False
         pending_count = 0
+        best_p = -1.0
+        best_offset = None
 
         for i in range(len(offsets_arr)):
             if p_end[i] >= threshold_high:
                 pending_count += 1
-                if pending_count >= min_pending_bars and i > 0:
-                    drop = p_end[i - 1] - p_end[i]
-                    if p_end[i] < p_end[i - 1] and drop >= drop_delta:
-                        offset = offsets_arr[i]
-                        triggered = True
-                        break
-            elif p_end[i] < threshold_low:
+                if p_end[i] > best_p:
+                    best_p = p_end[i]
+                    best_offset = offsets_arr[i]
+
+            if pending_count >= min_pending_bars and best_offset is not None:
+                drop_from_peak = best_p - p_end[i]
+                if p_end[i] < threshold_low or (drop_from_peak > 0 and drop_from_peak >= drop_delta):
+                    offset = best_offset
+                    triggered = True
+                    break
+
+            if p_end[i] < threshold_low:
                 pending_count = 0
+                best_p = -1.0
+                best_offset = None
 
         if event_type == 'B':
             n_b += 1

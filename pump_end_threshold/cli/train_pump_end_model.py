@@ -562,7 +562,7 @@ def main():
     parser.add_argument("--dataset-parquet", type=str, default=None)
 
     parser.add_argument("--neg-before", type=int, default=20)
-    parser.add_argument("--neg-after", type=int, default=0)
+    parser.add_argument("--neg-after", type=int, default=16)
     parser.add_argument("--pos-offsets", type=str, default="0")
     parser.add_argument("--include-b", action="store_true", default=False)
 
