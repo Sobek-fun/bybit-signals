@@ -37,36 +37,26 @@ def extract_signals(
     signals = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_end'] >= threshold
-            if not mask.any():
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        elif signal_rule == 'argmax_per_event':
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-        else:
-            offsets_arr = data['offsets']
-            p_end = data['p_end']
+        offsets_arr = data['offsets']
+        p_end = data['p_end']
 
-            triggered = False
-            pending_count = 0
+        triggered = False
+        pending_count = 0
 
-            for i in range(len(offsets_arr)):
-                if p_end[i] >= threshold:
-                    pending_count += 1
-                    if pending_count >= min_pending_bars and i > 0:
-                        drop = p_end[i - 1] - p_end[i]
-                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
-                            offset = offsets_arr[i]
-                            triggered = True
-                            break
-                else:
-                    pending_count = 0
+        for i in range(len(offsets_arr)):
+            if p_end[i] >= threshold:
+                pending_count += 1
+                if pending_count >= min_pending_bars and i > 0:
+                    drop = p_end[i - 1] - p_end[i]
+                    if p_end[i] < p_end[i - 1] and drop >= drop_delta:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+            else:
+                pending_count = 0
 
-            if not triggered:
-                continue
+        if not triggered:
+            continue
 
         signals.append({
             'symbol': symbol_map[event_id],

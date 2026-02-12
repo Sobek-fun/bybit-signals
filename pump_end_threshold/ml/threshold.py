@@ -2,16 +2,6 @@ import numpy as np
 import pandas as pd
 
 
-def find_first_signal_offset(event_df: pd.DataFrame, threshold: float) -> int:
-    event_df = event_df.sort_values('offset')
-    triggered = event_df[event_df['p_end'] >= threshold]
-
-    if triggered.empty:
-        return None
-
-    return triggered.iloc[0]['offset']
-
-
 def _prepare_event_data(predictions_df: pd.DataFrame) -> dict:
     event_data = {}
     for event_id, group in predictions_df.groupby('event_id'):
@@ -38,38 +28,27 @@ def _compute_event_metrics_from_data(
     offsets = []
 
     for event_id, data in event_data.items():
-        if signal_rule == 'first_cross':
-            mask = data['p_end'] >= threshold
-            if not mask.any():
-                miss += 1
-                continue
-            first_idx = np.argmax(mask)
-            offset = data['offsets'][first_idx]
-        elif signal_rule == 'argmax_per_event':
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-        else:
-            offsets_arr = data['offsets']
-            p_end = data['p_end']
+        offsets_arr = data['offsets']
+        p_end = data['p_end']
 
-            triggered = False
-            pending_count = 0
+        triggered = False
+        pending_count = 0
 
-            for i in range(len(offsets_arr)):
-                if p_end[i] >= threshold:
-                    pending_count += 1
-                    if pending_count >= min_pending_bars and i > 0:
-                        drop = p_end[i - 1] - p_end[i]
-                        if p_end[i] < p_end[i - 1] and drop >= drop_delta:
-                            offset = offsets_arr[i]
-                            triggered = True
-                            break
-                else:
-                    pending_count = 0
+        for i in range(len(offsets_arr)):
+            if p_end[i] >= threshold:
+                pending_count += 1
+                if pending_count >= min_pending_bars and i > 0:
+                    drop = p_end[i - 1] - p_end[i]
+                    if p_end[i] < p_end[i - 1] and drop >= drop_delta:
+                        offset = offsets_arr[i]
+                        triggered = True
+                        break
+            else:
+                pending_count = 0
 
-            if not triggered:
-                miss += 1
-                continue
+        if not triggered:
+            miss += 1
+            continue
 
         offsets.append(offset)
 

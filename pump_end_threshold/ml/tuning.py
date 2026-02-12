@@ -192,65 +192,6 @@ def evaluate_fold(
     predictions = predict_proba(model, val_df, feature_columns)
     event_data = _prepare_event_data(predictions)
 
-    if signal_rule == 'argmax_per_event':
-        best_score = -np.inf
-        best_metrics = None
-
-        hit0 = 0
-        hit1 = 0
-        early = 0
-        late = 0
-        offsets_list = []
-
-        for event_id, data in event_data.items():
-            argmax_idx = np.argmax(data['p_end'])
-            offset = data['offsets'][argmax_idx]
-            offsets_list.append(offset)
-
-            if offset == 0:
-                hit0 += 1
-            elif offset == 1:
-                hit1 += 1
-            elif offset < 0:
-                early += 1
-            else:
-                late += 1
-
-        n_events = len(event_data)
-        best_metrics = {
-            'hit0_rate': hit0 / n_events if n_events > 0 else 0,
-            'hit1_rate': hit1 / n_events if n_events > 0 else 0,
-            'early_rate': early / n_events if n_events > 0 else 0,
-            'miss_rate': 0,
-            'median_pred_offset': np.median(offsets_list) if offsets_list else None,
-            'n_events': n_events
-        }
-
-        median_offset = best_metrics.get('median_pred_offset')
-        if median_offset is not None and median_offset < early_penalty_threshold:
-            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
-        else:
-            early_penalty = 0
-
-        best_score = (
-                best_metrics['hit0_rate'] +
-                alpha_hit1 * best_metrics['hit1_rate'] -
-                beta_early * best_metrics['early_rate'] -
-                early_penalty
-        )
-
-        return {
-            'score': best_score,
-            'threshold': 0.0,
-            'min_pending_bars': 1,
-            'drop_delta': 0.0,
-            'hit0_rate': best_metrics['hit0_rate'],
-            'early_rate': best_metrics['early_rate'],
-            'miss_rate': best_metrics['miss_rate'],
-            'median_pred_offset': best_metrics.get('median_pred_offset'),
-            'n_events': best_metrics['n_events']
-        }
-
     rule_combinations = get_rule_parameter_grid()
 
     best_score = -np.inf
@@ -465,72 +406,6 @@ def tune_model(
         'trials_completed': len(leaderboard),
         'time_elapsed_sec': time.time() - start_time,
         'tune_strategy': tune_strategy
-    }
-
-
-def tune_model_both_strategies(
-        features_df: pd.DataFrame,
-        feature_columns: list,
-        time_budget_min: int = 60,
-        fold_months: int = 1,
-        min_train_months: int = 3,
-        signal_rule: str = 'pending_turn_down',
-        alpha_hit1: float = 0.5,
-        beta_early: float = 2.0,
-        gamma_miss: float = 1.0,
-        embargo_bars: int = 0,
-        iterations: int = 1000,
-        early_stopping_rounds: int = 50,
-        seed: int = 42
-) -> dict:
-    half_budget = time_budget_min // 2
-
-    threshold_result = tune_model(
-        features_df,
-        feature_columns,
-        time_budget_min=half_budget,
-        fold_months=fold_months,
-        min_train_months=min_train_months,
-        signal_rule=signal_rule,
-        alpha_hit1=alpha_hit1,
-        beta_early=beta_early,
-        gamma_miss=gamma_miss,
-        embargo_bars=embargo_bars,
-        iterations=iterations,
-        early_stopping_rounds=early_stopping_rounds,
-        seed=seed,
-        tune_strategy='threshold'
-    )
-
-    ranking_result = tune_model(
-        features_df,
-        feature_columns,
-        time_budget_min=half_budget,
-        fold_months=fold_months,
-        min_train_months=min_train_months,
-        signal_rule=signal_rule,
-        alpha_hit1=alpha_hit1,
-        beta_early=beta_early,
-        gamma_miss=gamma_miss,
-        embargo_bars=embargo_bars,
-        iterations=iterations,
-        early_stopping_rounds=early_stopping_rounds,
-        seed=seed,
-        tune_strategy='ranking'
-    )
-
-    if threshold_result['best_score'] >= ranking_result['best_score']:
-        winner = 'threshold'
-        best_result = threshold_result
-    else:
-        winner = 'ranking'
-        best_result = ranking_result
-
-    return {
-        'winner': winner,
-        'threshold_result': threshold_result,
-        'ranking_result': ranking_result,
-        'best_result': best_result
     }
 
 

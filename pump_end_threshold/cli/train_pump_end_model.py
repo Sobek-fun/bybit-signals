@@ -12,7 +12,7 @@ from pump_end.ml.train import train_model, get_feature_columns, get_feature_impo
 from pump_end.ml.threshold import threshold_sweep, _prepare_event_data
 from pump_end.ml.evaluate import evaluate, evaluate_with_trade_quality
 from pump_end.ml.predict import predict_proba, extract_signals
-from pump_end.ml.tuning import tune_model, tune_model_both_strategies, train_final_model, get_rule_parameter_grid
+from pump_end.ml.tuning import tune_model, train_final_model, get_rule_parameter_grid
 from pump_end.ml.feature_schema import prune_feature_columns
 from pump_end.infra.clickhouse import DataLoader
 
@@ -94,9 +94,6 @@ def calibrate_threshold_on_val(
         beta_early: float,
         gamma_miss: float
 ) -> dict:
-    if signal_rule == 'argmax_per_event':
-        raise ValueError("argmax_per_event is offline-only and must not be used for threshold calibration.")
-
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     val_events = event_times[
         (event_times['open_time'] >= train_end) &
@@ -152,138 +149,6 @@ def calibrate_threshold_on_val(
         'min_pending_bars': best_min_pending_bars,
         'drop_delta': best_drop_delta
     }
-
-
-def prepare_signals_for_backtest(signals_df: pd.DataFrame) -> list[dict]:
-    signals_df = signals_df.copy()
-    signals_df['open_time'] = pd.to_datetime(signals_df['open_time'])
-    signals_df = signals_df.drop_duplicates(subset=['symbol', 'open_time'])
-    signals_df = signals_df.sort_values('open_time')
-
-    result = []
-    for _, row in signals_df.iterrows():
-        result.append({
-            'timestamp': row['open_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            'symbol': row['symbol']
-        })
-    return result
-
-
-def run_backtest_optimize(
-        signals: list[dict],
-        run_name: str,
-        base_url: str,
-        api_key: str,
-        jobs: int,
-        timeout_sec: int,
-        poll_interval_sec: int,
-        artifact_policy: str
-) -> dict:
-    from backtester.client import submit_experiment, poll_job, get_result
-
-    strategy_grid = {
-        "tp_pct": [0.04, 0.05, 0.06, 0.07],
-        "sl_pct": [0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2],
-        "max_holding_hours": [48, 72],
-        "notional_usdt": 1000,
-        "fee_pct_per_side": 0.0
-    }
-
-    meta = {
-        "name": f"{run_name}__bt_opt_val",
-        "signals_tf": "15m",
-        "artifact_policy": artifact_policy,
-        "jobs": jobs
-    }
-
-    submit_response = submit_experiment(signals, strategy_grid, meta, base_url, api_key)
-    job_id = submit_response['job_id']
-    run_id = submit_response['run_id']
-
-    log("INFO", "BACKTEST", f"submitted optimize job_id={job_id} signals={len(signals)}")
-
-    status = poll_job(job_id, base_url, api_key, timeout_sec, poll_interval_sec)
-
-    if status['status'] == 'failed':
-        raise RuntimeError(f"Backtest job failed: {status.get('error')}")
-
-    result = get_result(job_id, base_url, api_key)
-
-    return {
-        'job_id': job_id,
-        'run_id': run_id,
-        'result': result
-    }
-
-
-def run_backtest_evaluate(
-        signals: list[dict],
-        run_name: str,
-        tp_pct: float,
-        sl_pct: float,
-        max_holding_hours: int,
-        base_url: str,
-        api_key: str,
-        jobs: int,
-        timeout_sec: int,
-        poll_interval_sec: int
-) -> dict:
-    from backtester.client import submit_experiment, poll_job, get_result
-
-    strategy_grid = {
-        "tp_pct": [tp_pct],
-        "sl_pct": [sl_pct],
-        "max_holding_hours": [max_holding_hours],
-        "notional_usdt": 1000,
-        "fee_pct_per_side": 0.0
-    }
-
-    meta = {
-        "name": f"{run_name}__bt_eval_test",
-        "signals_tf": "15m",
-        "artifact_policy": "best_only",
-        "jobs": jobs
-    }
-
-    submit_response = submit_experiment(signals, strategy_grid, meta, base_url, api_key)
-    job_id = submit_response['job_id']
-    run_id = submit_response['run_id']
-
-    log("INFO", "BACKTEST", f"submitted evaluate job_id={job_id} signals={len(signals)}")
-
-    status = poll_job(job_id, base_url, api_key, timeout_sec, poll_interval_sec)
-
-    if status['status'] == 'failed':
-        raise RuntimeError(f"Backtest job failed: {status.get('error')}")
-
-    result = get_result(job_id, base_url, api_key)
-
-    return {
-        'job_id': job_id,
-        'run_id': run_id,
-        'result': result
-    }
-
-
-def select_strategy_from_result(
-        opt_result: dict,
-        base_url: str,
-        api_key: str,
-        artifact_policy: str,
-        min_trades: int = 300,
-        max_sl_pct: float = 0.2,
-        min_tp_pct: float = 0.04
-) -> dict:
-    from backtester.client import download_artifact, select_best_strategy_constrained
-
-    if artifact_policy == 'full':
-        experiments_csv_path = opt_result['result']['artifacts'].get('experiments_csv')
-        if experiments_csv_path:
-            csv_content = download_artifact(experiments_csv_path, base_url, api_key)
-            return select_best_strategy_constrained(csv_content, min_trades=min_trades, max_sl_pct=max_sl_pct,
-                                                    min_tp_pct=min_tp_pct)
-
-    return None
 
 
 def run_build_dataset(args, artifacts: RunArtifacts):
@@ -490,71 +355,35 @@ def run_tune(args, artifacts: RunArtifacts):
 
     log("INFO", "TUNE", f"starting tuning with time_budget={args.time_budget_min}min strategy={args.tune_strategy}")
 
-    if args.tune_strategy == 'both':
-        tune_result = tune_model_both_strategies(
-            cv_features_df,
-            feature_columns,
-            time_budget_min=args.time_budget_min,
-            fold_months=args.fold_months,
-            min_train_months=args.min_train_months,
-            signal_rule=args.signal_rule,
-            alpha_hit1=args.alpha_hit1,
-            beta_early=args.beta_early,
-            gamma_miss=args.gamma_miss,
-            embargo_bars=args.embargo_bars,
-            iterations=args.iterations,
-            early_stopping_rounds=args.early_stopping_rounds,
-            seed=args.seed
-        )
+    tune_result = tune_model(
+        cv_features_df,
+        feature_columns,
+        time_budget_min=args.time_budget_min,
+        fold_months=args.fold_months,
+        min_train_months=args.min_train_months,
+        signal_rule=args.signal_rule,
+        alpha_hit1=args.alpha_hit1,
+        beta_early=args.beta_early,
+        gamma_miss=args.gamma_miss,
+        embargo_bars=args.embargo_bars,
+        iterations=args.iterations,
+        early_stopping_rounds=args.early_stopping_rounds,
+        seed=args.seed,
+        tune_strategy=args.tune_strategy
+    )
 
-        log("INFO", "TUNE", f"winner strategy: {tune_result['winner']}")
-        log("INFO", "TUNE", f"threshold score: {tune_result['threshold_result']['best_score']:.4f}")
-        log("INFO", "TUNE", f"ranking score: {tune_result['ranking_result']['best_score']:.4f}")
+    best_result = tune_result
+    actual_strategy = args.tune_strategy
 
-        best_result = tune_result['best_result']
-        actual_strategy = tune_result['winner']
+    log("INFO", "TUNE",
+        f"tuning completed: {tune_result['trials_completed']} trials in {tune_result['time_elapsed_sec']:.1f}s")
+    log("INFO", "TUNE", f"best score: {tune_result['best_score']:.4f}")
+    log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
 
-        artifacts.save_best_params({
-            **best_result['best_params'],
-            'tune_strategy': actual_strategy,
-            'winner': tune_result['winner'],
-            'threshold_score': tune_result['threshold_result']['best_score'],
-            'ranking_score': tune_result['ranking_result']['best_score']
-        })
-        artifacts.save_leaderboard(best_result['leaderboard'])
-        artifacts.save_cv_report(best_result['best_cv_result'])
-        artifacts.save_folds(best_result['folds'])
-
-    else:
-        tune_result = tune_model(
-            cv_features_df,
-            feature_columns,
-            time_budget_min=args.time_budget_min,
-            fold_months=args.fold_months,
-            min_train_months=args.min_train_months,
-            signal_rule=args.signal_rule,
-            alpha_hit1=args.alpha_hit1,
-            beta_early=args.beta_early,
-            gamma_miss=args.gamma_miss,
-            embargo_bars=args.embargo_bars,
-            iterations=args.iterations,
-            early_stopping_rounds=args.early_stopping_rounds,
-            seed=args.seed,
-            tune_strategy=args.tune_strategy
-        )
-
-        best_result = tune_result
-        actual_strategy = args.tune_strategy
-
-        log("INFO", "TUNE",
-            f"tuning completed: {tune_result['trials_completed']} trials in {tune_result['time_elapsed_sec']:.1f}s")
-        log("INFO", "TUNE", f"best score: {tune_result['best_score']:.4f}")
-        log("INFO", "TUNE", f"best params: {tune_result['best_params']}")
-
-        artifacts.save_best_params({**tune_result['best_params'], 'tune_strategy': actual_strategy})
-        artifacts.save_leaderboard(tune_result['leaderboard'])
-        artifacts.save_cv_report(tune_result['best_cv_result'])
-        artifacts.save_folds(tune_result['folds'])
+    artifacts.save_best_params({**tune_result['best_params'], 'tune_strategy': actual_strategy})
+    artifacts.save_leaderboard(tune_result['leaderboard'])
+    artifacts.save_cv_report(tune_result['best_cv_result'])
+    artifacts.save_folds(tune_result['folds'])
 
     actual_signal_rule = args.signal_rule
 
@@ -680,109 +509,6 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_predicted_signals(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
 
-            backtest_url = args.backtest_url
-            backtest_api_key = args.backtest_api_key
-
-            if backtest_url and backtest_api_key and len(val_signals_df) > 0 and len(test_signals_df) > 0:
-                log("INFO", "BACKTEST", f"starting backtest integration")
-
-                run_name = artifacts.get_path().name
-
-                val_signals = prepare_signals_for_backtest(val_signals_df)
-                test_signals = prepare_signals_for_backtest(test_signals_df)
-
-                log("INFO", "BACKTEST", f"val_signals={len(val_signals)} test_signals={len(test_signals)}")
-
-                opt_result = run_backtest_optimize(
-                    signals=val_signals,
-                    run_name=run_name,
-                    base_url=backtest_url,
-                    api_key=backtest_api_key,
-                    jobs=args.backtest_jobs,
-                    timeout_sec=args.backtest_timeout_sec,
-                    poll_interval_sec=args.backtest_poll_interval_sec,
-                    artifact_policy=args.backtest_artifact_policy
-                )
-
-                artifacts.save_backtest_opt_val(opt_result)
-
-                selected_strategy = select_strategy_from_result(
-                    opt_result,
-                    backtest_url,
-                    backtest_api_key,
-                    args.backtest_artifact_policy,
-                    min_trades=args.backtest_min_trades,
-                    max_sl_pct=args.backtest_max_sl_pct,
-                    min_tp_pct=args.backtest_min_tp_pct
-                )
-
-                if selected_strategy is None:
-                    log("WARN", "BACKTEST", "no strategy satisfies constraints, skipping test evaluation")
-
-                    backtest_summary = {
-                        'val_optimization': {
-                            'job_id': opt_result['job_id'],
-                            'run_id': opt_result['run_id'],
-                            'signals_count': len(val_signals),
-                            'selected_strategy': None,
-                            'status': 'no_strategy_satisfies_constraints'
-                        },
-                        'test_evaluation': None
-                    }
-
-                    artifacts.save_backtest_summary(backtest_summary)
-                else:
-                    log("INFO", "BACKTEST",
-                        f"selected strategy: tp={selected_strategy['tp_pct']} sl={selected_strategy['sl_pct']} "
-                        f"holding={selected_strategy['max_holding_hours']}h winrate={selected_strategy['winrate_all_pct']:.2f}%")
-
-                    eval_result = run_backtest_evaluate(
-                        signals=test_signals,
-                        run_name=run_name,
-                        tp_pct=selected_strategy['tp_pct'],
-                        sl_pct=selected_strategy['sl_pct'],
-                        max_holding_hours=selected_strategy['max_holding_hours'],
-                        base_url=backtest_url,
-                        api_key=backtest_api_key,
-                        jobs=args.backtest_jobs,
-                        timeout_sec=args.backtest_timeout_sec,
-                        poll_interval_sec=args.backtest_poll_interval_sec
-                    )
-
-                    artifacts.save_backtest_eval_test(eval_result)
-
-                    eval_best = eval_result['result']['best_strategy']['best']
-
-                    backtest_summary = {
-                        'val_optimization': {
-                            'job_id': opt_result['job_id'],
-                            'run_id': opt_result['run_id'],
-                            'signals_count': len(val_signals),
-                            'selected_strategy': selected_strategy
-                        },
-                        'test_evaluation': {
-                            'job_id': eval_result['job_id'],
-                            'run_id': eval_result['run_id'],
-                            'signals_count': len(test_signals),
-                            'total_trades': eval_best['total_trades'],
-                            'winrate_all_pct': eval_best['winrate_all_pct'],
-                            'total_pnl_usdt': eval_best['total_pnl_usdt'],
-                            'profit_factor': eval_best['profit_factor'],
-                            'max_dd_pct': eval_best['max_dd_pct'],
-                            'worst_trade_usdt': eval_best['worst_trade_usdt'],
-                            'timeout_pct': eval_best['timeout_pct']
-                        }
-                    }
-
-                    artifacts.save_backtest_summary(backtest_summary)
-
-                    log("INFO", "BACKTEST",
-                        f"test results: trades={eval_best['total_trades']} winrate={eval_best['winrate_all_pct']:.2f}% "
-                        f"pnl={eval_best['total_pnl_usdt']:.2f} pf={eval_best['profit_factor']:.2f}")
-
-            elif backtest_url and backtest_api_key:
-                log("WARN", "BACKTEST", "skipping backtest: not enough signals")
-
     log("INFO", "TUNE", f"done. artifacts saved to {artifacts.get_path()}")
 
 
@@ -831,12 +557,12 @@ def main():
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
 
-    parser.add_argument("--signal-rule", type=str, choices=["first_cross", "pending_turn_down", "argmax_per_event"],
+    parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")
     parser.add_argument("--min-pending-bars", type=int, default=1)
     parser.add_argument("--drop-delta", type=float, default=0.0)
 
-    parser.add_argument("--tune-strategy", type=str, choices=["threshold", "ranking", "both"],
+    parser.add_argument("--tune-strategy", type=str, choices=["threshold"],
                         default="threshold")
     parser.add_argument("--time-budget-min", type=int, default=60)
     parser.add_argument("--fold-months", type=int, default=1)
@@ -844,24 +570,10 @@ def main():
 
     parser.add_argument("--prune-features", action="store_true", default=False)
 
-    parser.add_argument("--backtest-url", type=str, default=None)
-    parser.add_argument("--backtest-api-key", type=str, default=None)
-    parser.add_argument("--backtest-jobs", type=int, default=8)
-    parser.add_argument("--backtest-timeout-sec", type=int, default=600)
-    parser.add_argument("--backtest-poll-interval-sec", type=int, default=1)
-    parser.add_argument("--backtest-artifact-policy", type=str, choices=["best_only", "full"], default="full")
-    parser.add_argument("--backtest-min-trades", type=int, default=300)
-    parser.add_argument("--backtest-max-sl-pct", type=float, default=0.2)
-    parser.add_argument("--backtest-min-tp-pct", type=float, default=0.04)
-
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
 
     args = parser.parse_args()
-
-    if args.mode in ("train", "tune") and args.signal_rule == "argmax_per_event":
-        parser.error(
-            "--signal-rule argmax_per_event is offline-only and non-causal. Use pending_turn_down or first_cross.")
 
     if args.mode == "build-dataset":
         if not args.labels or not args.clickhouse_dsn:
