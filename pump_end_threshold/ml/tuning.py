@@ -152,8 +152,11 @@ def train_fold(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    train_pool = Pool(X_train, y_train)
-    val_pool = Pool(X_val, y_val)
+    w_train = train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
+    w_val = val_df['sample_weight'].values if 'sample_weight' in val_df.columns else None
+
+    train_pool = Pool(X_train, y_train, weight=w_train)
+    val_pool = Pool(X_val, y_val, weight=w_val)
 
     model = CatBoostClassifier(
         iterations=iterations,
@@ -182,7 +185,9 @@ def evaluate_fold(
         alpha_hit1: float,
         beta_early: float,
         gamma_miss: float,
-        early_penalty_threshold: int = -5
+        early_penalty_threshold: int = -5,
+        delta_fp_b: float = 3.0,
+        abstain_margin: float = 0.0
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -209,10 +214,12 @@ def evaluate_fold(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            delta_fp_b=delta_fp_b,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            event_data=event_data,
+            abstain_margin=abstain_margin
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -222,6 +229,7 @@ def evaluate_fold(
             'hit1_rate': best_row['hit1_rate'],
             'early_rate': best_row['early_rate'],
             'miss_rate': best_row['miss_rate'],
+            'fp_b_rate': best_row.get('fp_b_rate', 0),
             'median_pred_offset': best_row['median_offset'],
             'n_events': best_row['n_events']
         }
@@ -237,6 +245,7 @@ def evaluate_fold(
                 alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate'] + metrics['hit1_rate']) -
                 beta_early * metrics['early_rate'] -
                 gamma_miss * metrics['miss_rate'] -
+                delta_fp_b * metrics['fp_b_rate'] -
                 early_penalty
         )
 
@@ -269,6 +278,8 @@ def run_cv(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        delta_fp_b: float = 3.0,
+        abstain_margin: float = 0.0,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -303,7 +314,9 @@ def run_cv(
             actual_signal_rule,
             alpha_hit1,
             beta_early,
-            gamma_miss
+            gamma_miss,
+            delta_fp_b=delta_fp_b,
+            abstain_margin=abstain_margin
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -338,6 +351,8 @@ def tune_model(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        delta_fp_b: float = 3.0,
+        abstain_margin: float = 0.0,
         embargo_bars: int = 0,
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
@@ -373,6 +388,8 @@ def tune_model(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            delta_fp_b=delta_fp_b,
+            abstain_margin=abstain_margin,
             embargo_bars=embargo_bars,
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
@@ -428,7 +445,8 @@ def train_final_model(
 
     X_train = train_df[feature_columns]
     y_train = train_df['y']
-    train_pool = Pool(X_train, y_train)
+    w_train = train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
+    train_pool = Pool(X_train, y_train, weight=w_train)
 
     model = CatBoostClassifier(
         iterations=iterations,

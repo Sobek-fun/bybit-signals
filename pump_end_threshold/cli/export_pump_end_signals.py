@@ -252,7 +252,8 @@ def process_symbol_chunk(args_tuple):
         neg_before,
         neg_after,
         pos_offsets,
-        params_dict
+        params_dict,
+        abstain_margin
     ) = args_tuple
 
     params = PumpParams(**params_dict) if params_dict else DEFAULT_PUMP_PARAMS
@@ -347,7 +348,8 @@ def process_symbol_chunk(args_tuple):
                 predictions_df,
                 threshold,
                 min_pending_bars=min_pending_bars,
-                drop_delta=drop_delta
+                drop_delta=drop_delta,
+                abstain_margin=abstain_margin
             )
 
             for _, row in signals_df.iterrows():
@@ -427,11 +429,12 @@ def main():
     threshold = threshold_config['threshold']
     min_pending_bars = threshold_config.get('min_pending_bars', 1)
     drop_delta = threshold_config.get('drop_delta', 0.0)
+    abstain_margin = threshold_config.get('abstain_margin', 0.0)
 
     log("INFO", "EXPORT",
         f"config: window_bars={window_bars} warmup_bars={warmup_bars} feature_set={feature_set} prune={do_prune}")
     log("INFO", "EXPORT",
-        f"threshold={threshold} min_pending_bars={min_pending_bars} drop_delta={drop_delta}")
+        f"threshold={threshold} min_pending_bars={min_pending_bars} drop_delta={drop_delta} abstain_margin={abstain_margin}")
     log("INFO", "EXPORT",
         f"neg_before={neg_before} neg_after={neg_after} pos_offsets={pos_offsets}")
 
@@ -531,7 +534,8 @@ def main():
             neg_before,
             neg_after,
             pos_offsets,
-            params_dict
+            params_dict,
+            abstain_margin
         ))
 
     log("INFO", "EXPORT", f"starting {num_workers} workers")

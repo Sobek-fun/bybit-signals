@@ -92,7 +92,9 @@ def calibrate_threshold_on_val(
         signal_rule: str,
         alpha_hit1: float,
         beta_early: float,
-        gamma_miss: float
+        gamma_miss: float,
+        delta_fp_b: float = 3.0,
+        abstain_margin: float = 0.0
 ) -> dict:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     val_events = event_times[
@@ -129,10 +131,12 @@ def calibrate_threshold_on_val(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            delta_fp_b=delta_fp_b,
             signal_rule=signal_rule,
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
-            event_data=event_data
+            event_data=event_data,
+            abstain_margin=abstain_margin
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
@@ -194,13 +198,36 @@ def run_build_dataset(args, artifacts: RunArtifacts):
     features_df = builder.build(feature_input, max_workers=args.build_workers)
 
     features_df = features_df.merge(
-        points_df[['symbol', 'open_time', 'event_id', 'offset', 'y']],
+        points_df[['symbol', 'open_time', 'event_id', 'offset', 'y', 'pump_la_type', 'runup_pct']],
         on=['symbol', 'open_time'],
-        how='inner'
+        how='inner',
+        suffixes=('_feat', '')
     )
+    if 'pump_la_type_feat' in features_df.columns:
+        features_df = features_df.drop(columns=['pump_la_type_feat'])
+    if 'runup_pct_feat' in features_df.columns:
+        features_df = features_df.drop(columns=['runup_pct_feat'])
 
     features_df = check_event_integrity(features_df)
     features_df = features_df.sort_values(['event_id', 'offset']).reset_index(drop=True)
+
+    features_df['sample_weight'] = 1.0
+
+    b_offset0_mask = (features_df['pump_la_type'] == 'B') & (features_df['offset'] == 0)
+    features_df.loc[b_offset0_mask, 'sample_weight'] *= 10.0
+
+    if 'pump_ctx' in features_df.columns:
+        neg_pump_ctx_mask = (features_df['y'] == 0) & (features_df['pump_ctx'] == 1)
+        features_df.loc[neg_pump_ctx_mask, 'sample_weight'] *= 2.0
+
+        neg_no_pump_ctx_mask = (features_df['y'] == 0) & (features_df['pump_ctx'] == 0)
+        features_df.loc[neg_no_pump_ctx_mask, 'sample_weight'] *= 0.2
+
+    near_peak_mask = features_df['offset'].abs() <= 3
+    features_df.loc[near_peak_mask, 'sample_weight'] *= 1.5
+
+    pos_offset0_mask = (features_df['y'] == 1) & (features_df['offset'] == 0)
+    features_df.loc[pos_offset0_mask, 'sample_weight'] *= 2.0
 
     log("INFO", "BUILD", f"features shape: {features_df.shape}")
     artifacts.save_features(features_df)
@@ -286,16 +313,19 @@ def run_train_only(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        delta_fp_b=args.delta_fp_b,
         signal_rule=args.signal_rule,
         min_pending_bars=args.min_pending_bars,
-        drop_delta=args.drop_delta
+        drop_delta=args.drop_delta,
+        abstain_margin=args.abstain_margin
     )
 
     artifacts.save_threshold_sweep(sweep_df)
     artifacts.save_best_threshold(best_threshold, {
         'signal_rule': args.signal_rule,
         'min_pending_bars': args.min_pending_bars,
-        'drop_delta': args.drop_delta
+        'drop_delta': args.drop_delta,
+        'abstain_margin': args.abstain_margin
     })
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
@@ -323,7 +353,8 @@ def run_train_only(args, artifacts: RunArtifacts):
 
     log("INFO", "TRAIN", "extracting holdout signals")
     signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
+                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
+                                 abstain_margin=args.abstain_margin)
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
 
@@ -365,6 +396,8 @@ def run_tune(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        delta_fp_b=args.delta_fp_b,
+        abstain_margin=args.abstain_margin,
         embargo_bars=args.embargo_bars,
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
@@ -421,7 +454,9 @@ def run_tune(args, artifacts: RunArtifacts):
                 actual_signal_rule,
                 args.alpha_hit1,
                 args.beta_early,
-                args.gamma_miss
+                args.gamma_miss,
+                delta_fp_b=args.delta_fp_b,
+                abstain_margin=args.abstain_margin
             )
 
             best_threshold = calibration_result['threshold']
@@ -434,7 +469,8 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_best_threshold(best_threshold, {
                 'signal_rule': actual_signal_rule,
                 'min_pending_bars': best_min_pending_bars,
-                'drop_delta': best_drop_delta
+                'drop_delta': best_drop_delta,
+                'abstain_margin': args.abstain_margin
             })
 
             features_df = time_split(features_df, train_end, val_end)
@@ -494,7 +530,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 best_threshold,
                 signal_rule=actual_signal_rule,
                 min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta
+                drop_delta=best_drop_delta,
+                abstain_margin=args.abstain_margin
             )
             artifacts.save_predicted_signals_val(val_signals_df)
             log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
@@ -504,7 +541,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 best_threshold,
                 signal_rule=actual_signal_rule,
                 min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta
+                drop_delta=best_drop_delta,
+                abstain_margin=args.abstain_margin
             )
             artifacts.save_predicted_signals(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
@@ -556,6 +594,8 @@ def main():
     parser.add_argument("--alpha-hit1", type=float, default=0.5)
     parser.add_argument("--beta-early", type=float, default=2.0)
     parser.add_argument("--gamma-miss", type=float, default=1.0)
+    parser.add_argument("--delta-fp-b", type=float, default=3.0)
+    parser.add_argument("--abstain-margin", type=float, default=0.0)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")

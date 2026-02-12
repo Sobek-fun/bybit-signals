@@ -6,7 +6,8 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     exclude_cols = {
         'event_id', 'symbol', 'open_time', 'offset', 'y',
         'pump_la_type', 'runup_pct', 'split', 'target',
-        'timeframe', 'window_bars', 'warmup_bars'
+        'timeframe', 'window_bars', 'warmup_bars',
+        'sample_weight'
     }
     return [col for col in df.columns if col not in exclude_cols]
 
@@ -30,8 +31,11 @@ def train_model(
     X_val = val_df[feature_columns]
     y_val = val_df['y']
 
-    train_pool = Pool(X_train, y_train)
-    val_pool = Pool(X_val, y_val)
+    w_train = train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
+    w_val = val_df['sample_weight'].values if 'sample_weight' in val_df.columns else None
+
+    train_pool = Pool(X_train, y_train, weight=w_train)
+    val_pool = Pool(X_val, y_val, weight=w_val)
 
     model = CatBoostClassifier(
         iterations=iterations,
@@ -114,6 +118,12 @@ def get_feature_importance_grouped(importance_df: pd.DataFrame) -> pd.DataFrame:
             ('sweep_', 'liquidity'),
             ('overshoot_', 'liquidity'),
             ('touched_', 'liquidity'),
+            ('btc_', 'market'),
+            ('rel_', 'market'),
+            ('runup_age', 'pump_age'),
+            ('pump_ctx_age', 'pump_age'),
+            ('bars_since_new_high', 'pump_age'),
+            ('near_peak_streak', 'pump_age'),
         ]
 
         for prefix, group in prefixes:

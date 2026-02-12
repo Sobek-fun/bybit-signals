@@ -35,6 +35,12 @@ def main():
         default="pump_labels.csv",
         help="Output CSV file path (default: pump_labels.csv)"
     )
+    parser.add_argument("--pullback-lookahead", type=int, default=10)
+    parser.add_argument("--squeeze-lookahead", type=int, default=32)
+    parser.add_argument("--base-pullback-pct", type=float, default=0.05)
+    parser.add_argument("--base-squeeze-pct", type=float, default=0.02)
+    parser.add_argument("--k1", type=float, default=2.5)
+    parser.add_argument("--k2", type=float, default=1.2)
 
     args = parser.parse_args()
 
@@ -80,7 +86,14 @@ def main():
     print(f"Found {len(symbols)} symbols")
 
     loader = DataLoader(args.clickhouse_dsn)
-    labeler = PumpLabelerLookahead()
+    labeler = PumpLabelerLookahead(
+        pullback_lookahead=args.pullback_lookahead,
+        squeeze_lookahead=args.squeeze_lookahead,
+        base_pullback_pct=args.base_pullback_pct,
+        base_squeeze_pct=args.base_squeeze_pct,
+        k1=args.k1,
+        k2=args.k2
+    )
 
     all_labels = []
 

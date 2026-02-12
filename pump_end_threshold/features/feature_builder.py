@@ -9,14 +9,15 @@ from pump_end.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 
 
 def _process_symbol_worker(args):
-    ch_dsn, symbol, events_data, window_bars, warmup_bars, feature_set, params_dict = args
+    ch_dsn, symbol, events_data, window_bars, warmup_bars, feature_set, params_dict, market_symbol = args
 
     builder = PumpFeatureBuilder(
         ch_dsn=ch_dsn,
         window_bars=window_bars,
         warmup_bars=warmup_bars,
         feature_set=feature_set,
-        params=PumpParams(**params_dict) if params_dict else None
+        params=PumpParams(**params_dict) if params_dict else None,
+        market_symbol=market_symbol
     )
 
     events = pd.DataFrame(events_data)
@@ -32,7 +33,8 @@ class PumpFeatureBuilder:
             window_bars: int = 30,
             warmup_bars: int = 150,
             feature_set: str = "base",
-            params: PumpParams = None
+            params: PumpParams = None,
+            market_symbol: str = "BTCUSDT"
     ):
         self.ch_dsn = ch_dsn
         self.loader = DataLoader(ch_dsn) if ch_dsn else None
@@ -44,6 +46,8 @@ class PumpFeatureBuilder:
         self.vwap_period = 30
         self.corridor_window = self.params.corridor_window
         self.corridor_quantile = self.params.corridor_quantile
+        self.market_symbol = market_symbol
+        self._btc_cache = {}
 
     def build(self, labels_df: pd.DataFrame, max_workers: int = 4) -> pd.DataFrame:
         labels_df = labels_df[labels_df['pump_la_type'].isin(['A', 'B'])].copy()
@@ -104,7 +108,8 @@ class PumpFeatureBuilder:
                     self.window_bars,
                     self.warmup_bars,
                     self.feature_set,
-                    params_dict
+                    params_dict,
+                    self.market_symbol
                 ))
 
             all_rows = []
@@ -122,7 +127,8 @@ class PumpFeatureBuilder:
             self,
             df_candles: pd.DataFrame,
             symbol: str,
-            decision_open_time: pd.Timestamp
+            decision_open_time: pd.Timestamp,
+            btc_candles: pd.DataFrame = None
     ) -> dict:
         df = df_candles
 
@@ -141,7 +147,27 @@ class PumpFeatureBuilder:
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
 
+        if self.market_symbol:
+            if symbol == self.market_symbol:
+                df = self._join_btc_features_self(df)
+            elif btc_candles is not None and not btc_candles.empty:
+                btc_df = btc_candles.copy()
+                btc_df['btc_ret_1'] = btc_df['close'] / btc_df['close'].shift(1) - 1
+                w = min(self.window_bars, 16)
+                btc_df[f'btc_cum_ret_{w}'] = btc_df['close'] / btc_df['close'].shift(w) - 1
+                tr = pd.concat([btc_df['high'] - btc_df['low'], (btc_df['high'] - btc_df['close'].shift(1)).abs(), (btc_df['low'] - btc_df['close'].shift(1)).abs()], axis=1).max(axis=1)
+                btc_df['btc_atr_norm'] = tr.rolling(window=14).mean() / btc_df['close']
+                rolling_max = btc_df['close'].rolling(window=self.window_bars).max()
+                btc_df['btc_drawdown'] = (btc_df['close'] - rolling_max) / rolling_max
+                sma_20 = btc_df['close'].rolling(window=20).mean()
+                std_20 = btc_df['close'].rolling(window=20).std()
+                btc_df['btc_bb_width'] = std_20 / sma_20
+                df = self._join_btc_features(df, btc_df)
+            else:
+                df = self._join_btc_features(df, pd.DataFrame())
+
         df.loc[decision_open_time] = np.nan
+        df = df.sort_index()
 
         df = self._apply_decision_shift(df)
 
@@ -162,7 +188,8 @@ class PumpFeatureBuilder:
             self,
             df_candles: pd.DataFrame,
             symbol: str,
-            decision_open_times: list
+            decision_open_times: list,
+            btc_candles: pd.DataFrame = None
     ) -> list:
         if not decision_open_times:
             return []
@@ -181,6 +208,25 @@ class PumpFeatureBuilder:
 
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
+
+        if self.market_symbol:
+            if symbol == self.market_symbol:
+                df = self._join_btc_features_self(df)
+            elif btc_candles is not None and not btc_candles.empty:
+                btc_df = btc_candles.copy()
+                btc_df['btc_ret_1'] = btc_df['close'] / btc_df['close'].shift(1) - 1
+                w = min(self.window_bars, 16)
+                btc_df[f'btc_cum_ret_{w}'] = btc_df['close'] / btc_df['close'].shift(w) - 1
+                tr = pd.concat([btc_df['high'] - btc_df['low'], (btc_df['high'] - btc_df['close'].shift(1)).abs(), (btc_df['low'] - btc_df['close'].shift(1)).abs()], axis=1).max(axis=1)
+                btc_df['btc_atr_norm'] = tr.rolling(window=14).mean() / btc_df['close']
+                rolling_max = btc_df['close'].rolling(window=self.window_bars).max()
+                btc_df['btc_drawdown'] = (btc_df['close'] - rolling_max) / rolling_max
+                sma_20 = btc_df['close'].rolling(window=20).mean()
+                std_20 = btc_df['close'].rolling(window=20).std()
+                btc_df['btc_bb_width'] = std_20 / sma_20
+                df = self._join_btc_features(df, btc_df)
+            else:
+                df = self._join_btc_features(df, pd.DataFrame())
 
         for dt in decision_open_times:
             if dt not in df.index:
@@ -218,6 +264,13 @@ class PumpFeatureBuilder:
 
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
+
+        if self.market_symbol:
+            if symbol == self.market_symbol:
+                df = self._join_btc_features_self(df)
+            else:
+                btc_df = self._load_btc_data(start_bucket, end_bucket)
+                df = self._join_btc_features(df, btc_df)
 
         df = self._apply_decision_shift(df)
 
@@ -351,6 +404,37 @@ class PumpFeatureBuilder:
         df['strong_cond'] = (df['pump_ctx'].astype(bool) & df['near_peak'].astype(bool) & (df['blowoff_exhaustion'].astype(bool) | df['predump_peak'].astype(bool))).astype(int)
 
         df['pump_score'] = df['pump_ctx'] + df['near_peak'] + (df['blowoff_exhaustion'] | df['predump_peak']).astype(int)
+
+        runup_met_arr = df['runup_met'].values.astype(int)
+        runup_age = np.zeros(len(df), dtype=int)
+        for i in range(1, len(df)):
+            if runup_met_arr[i] == 1:
+                runup_age[i] = runup_age[i - 1] + 1
+        df['runup_age_bars'] = runup_age
+
+        pump_ctx_arr = df['pump_ctx'].values.astype(int)
+        pump_ctx_age = np.zeros(len(df), dtype=int)
+        for i in range(1, len(df)):
+            if pump_ctx_arr[i] == 1:
+                pump_ctx_age[i] = pump_ctx_age[i - 1] + 1
+        df['pump_ctx_age_bars'] = pump_ctx_age
+
+        high_max_arr = df['high_max'].values
+        high_arr = df['high'].values
+        bars_since = np.zeros(len(df), dtype=int)
+        for i in range(1, len(df)):
+            if not np.isnan(high_max_arr[i]) and high_arr[i] >= high_max_arr[i]:
+                bars_since[i] = 0
+            else:
+                bars_since[i] = bars_since[i - 1] + 1
+        df['bars_since_new_high'] = bars_since
+
+        near_peak_arr = df['near_peak'].values.astype(int)
+        np_streak = np.zeros(len(df), dtype=int)
+        for i in range(1, len(df)):
+            if near_peak_arr[i] == 1:
+                np_streak[i] = np_streak[i - 1] + 1
+        df['near_peak_streak'] = np_streak
 
         return df
 
@@ -575,6 +659,78 @@ class PumpFeatureBuilder:
 
         return df
 
+    def _load_btc_data(self, start_bucket, end_bucket) -> pd.DataFrame:
+        cache_key = (str(start_bucket), str(end_bucket))
+        if cache_key in self._btc_cache:
+            return self._btc_cache[cache_key]
+
+        if self.loader is None:
+            return pd.DataFrame()
+
+        btc_df = self.loader.load_candles_range(self.market_symbol, start_bucket, end_bucket)
+        if not btc_df.empty:
+            btc_df['btc_ret_1'] = btc_df['close'] / btc_df['close'].shift(1) - 1
+
+            w = min(self.window_bars, 16)
+            btc_df[f'btc_cum_ret_{w}'] = btc_df['close'] / btc_df['close'].shift(w) - 1
+
+            tr = pd.concat([
+                btc_df['high'] - btc_df['low'],
+                (btc_df['high'] - btc_df['close'].shift(1)).abs(),
+                (btc_df['low'] - btc_df['close'].shift(1)).abs()
+            ], axis=1).max(axis=1)
+            btc_atr_14 = tr.rolling(window=14).mean()
+            btc_df['btc_atr_norm'] = btc_atr_14 / btc_df['close']
+
+            rolling_max = btc_df['close'].rolling(window=self.window_bars).max()
+            btc_df['btc_drawdown'] = (btc_df['close'] - rolling_max) / rolling_max
+
+            sma_20 = btc_df['close'].rolling(window=20).mean()
+            std_20 = btc_df['close'].rolling(window=20).std()
+            btc_df['btc_bb_width'] = std_20 / sma_20
+
+            self._btc_cache[cache_key] = btc_df
+
+        return btc_df
+
+    def _join_btc_features_self(self, df: pd.DataFrame) -> pd.DataFrame:
+        w = min(self.window_bars, 16)
+        df['btc_ret_1'] = df['ret_1']
+        df[f'btc_cum_ret_{w}'] = df['close'] / df['close'].shift(w) - 1
+        if 'atr_14' in df.columns:
+            df['btc_atr_norm'] = df['atr_14'] / df['close']
+        else:
+            tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
+            df['btc_atr_norm'] = tr.rolling(window=14).mean() / df['close']
+        df['btc_drawdown'] = df['drawdown']
+        sma_20 = df['close'].rolling(window=20).mean()
+        std_20 = df['close'].rolling(window=20).std()
+        df['btc_bb_width'] = std_20 / sma_20
+        df['rel_ret_1'] = 0.0
+        df[f'rel_cum_ret_{w}'] = 0.0
+        return df
+
+    def _join_btc_features(self, df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
+        if btc_df.empty:
+            w = min(self.window_bars, 16)
+            for col in ['btc_ret_1', f'btc_cum_ret_{w}', 'btc_atr_norm', 'btc_drawdown', 'btc_bb_width',
+                         'rel_ret_1', f'rel_cum_ret_{w}']:
+                df[col] = np.nan
+            return df
+
+        btc_cols = ['btc_ret_1', f'btc_cum_ret_{min(self.window_bars, 16)}', 'btc_atr_norm', 'btc_drawdown', 'btc_bb_width']
+        btc_subset = btc_df[btc_cols].copy()
+
+        df = df.join(btc_subset, how='left')
+
+        w = min(self.window_bars, 16)
+        df['rel_ret_1'] = df['ret_1'] - df['btc_ret_1']
+        btc_cum_col = f'btc_cum_ret_{w}'
+        token_cum_ret = df['close'] / df['close'].shift(w) - 1
+        df[f'rel_cum_ret_{w}'] = token_cum_ret - df[btc_cum_col]
+
+        return df
+
     def _apply_decision_shift(self, df: pd.DataFrame) -> pd.DataFrame:
         shift_columns = [
             'ret_1', 'range', 'upper_wick_ratio', 'lower_wick_ratio', 'body_ratio',
@@ -592,7 +748,14 @@ class PumpFeatureBuilder:
             'overshoot_pdh', 'overshoot_pwh',
             'eqh_level', 'eqh_strength', 'eqh_age_bars', 'dist_to_eqh', 'sweep_eqh', 'overshoot_eqh',
             'liq_level_type_pwh', 'liq_level_type_pdh', 'liq_level_type_eqh',
-            'liq_level_dist', 'liq_sweep_flag', 'liq_sweep_overshoot', 'liq_reject_strength'
+            'liq_level_dist', 'liq_sweep_flag', 'liq_sweep_overshoot', 'liq_reject_strength',
+            'runup_age_bars', 'pump_ctx_age_bars', 'bars_since_new_high', 'near_peak_streak'
+        ]
+
+        w = min(self.window_bars, 16)
+        btc_columns = [
+            'btc_ret_1', f'btc_cum_ret_{w}', 'btc_atr_norm', 'btc_drawdown', 'btc_bb_width',
+            'rel_ret_1', f'rel_cum_ret_{w}'
         ]
 
         extended_columns = ['atr_14', 'atr_norm', 'bb_z', 'bb_width', 'vwap_dev', 'obv']
@@ -605,6 +768,10 @@ class PumpFeatureBuilder:
             for col in extended_columns:
                 if col in df.columns:
                     df[col] = df[col].shift(1)
+
+        for col in btc_columns:
+            if col in df.columns:
+                df[col] = df[col].shift(1)
 
         return df
 
@@ -634,7 +801,8 @@ class PumpFeatureBuilder:
             'rsi_hot', 'mfi_hot', 'osc_hot_recent', 'macd_pos_recent',
             'pump_ctx', 'near_peak', 'blowoff_exhaustion',
             'osc_extreme', 'predump_mask', 'vol_fade', 'rsi_fade', 'macd_fade',
-            'predump_peak', 'strong_cond', 'pump_score'
+            'predump_peak', 'strong_cond', 'pump_score',
+            'runup_age_bars', 'pump_ctx_age_bars', 'bars_since_new_high', 'near_peak_streak'
         ]
 
         liquidity_features = [
@@ -644,6 +812,12 @@ class PumpFeatureBuilder:
             'eqh_strength', 'eqh_age_bars',
             'liq_level_type_pwh', 'liq_level_type_pdh', 'liq_level_type_eqh',
             'liq_level_dist'
+        ]
+
+        w_btc = min(self.window_bars, 16)
+        market_features = [
+            'btc_ret_1', f'btc_cum_ret_{w_btc}', 'btc_atr_norm', 'btc_drawdown', 'btc_bb_width',
+            'rel_ret_1', f'rel_cum_ret_{w_btc}'
         ]
 
         extended_features = ['atr_norm', 'bb_z', 'bb_width', 'vwap_dev']
@@ -669,6 +843,10 @@ class PumpFeatureBuilder:
             for s in extended_features:
                 if s in df.columns:
                     series_arrays[s] = df[s].values
+
+        for s in market_features:
+            if s in df.columns:
+                series_arrays[s] = df[s].values
 
         close_arr = df['close'].values
         open_arr = df['open'].values
@@ -752,6 +930,10 @@ class PumpFeatureBuilder:
                 for feat_name in extended_features:
                     if feat_name in series_arrays:
                         row[feat_name] = series_arrays[feat_name][window_indices[0]]
+
+            for feat_name in market_features:
+                if feat_name in series_arrays:
+                    row[feat_name] = series_arrays[feat_name][window_indices[0]]
 
             pos = valid_positions[ev_idx]
             if pos >= 6:
