@@ -4,17 +4,17 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from pump_end.features.feature_builder import PumpFeatureBuilder
-from pump_end.ml.artifacts import RunArtifacts
-from pump_end.ml.dataset import load_labels, build_training_points, deduplicate_points
-from pump_end.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
-from pump_end.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
-from pump_end.ml.threshold import threshold_sweep, _prepare_event_data
-from pump_end.ml.evaluate import evaluate, evaluate_with_trade_quality
-from pump_end.ml.predict import predict_proba, extract_signals
-from pump_end.ml.tuning import tune_model, train_final_model, get_rule_parameter_grid
-from pump_end.ml.feature_schema import prune_feature_columns
-from pump_end.infra.clickhouse import DataLoader
+from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
+from pump_end_threshold.ml.artifacts import RunArtifacts
+from pump_end_threshold.ml.dataset import load_labels, build_training_points, deduplicate_points
+from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
+from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
+from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
+from pump_end_threshold.ml.evaluate import evaluate, evaluate_with_trade_quality
+from pump_end_threshold.ml.predict import predict_proba, extract_signals
+from pump_end_threshold.ml.tuning import tune_model, train_final_model, get_rule_parameter_grid
+from pump_end_threshold.ml.feature_schema import prune_feature_columns
+from pump_end_threshold.infra.clickhouse import DataLoader
 
 
 def log(level: str, component: str, message: str):

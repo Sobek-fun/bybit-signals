@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 import clickhouse_connect
 import pandas as pd
 
-from pump_end.infra.logging import log
+from pump_end_threshold.infra.logging import log
 
 
 class DataLoader:

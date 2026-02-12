@@ -4,8 +4,8 @@ import pandas_ta as ta
 from concurrent.futures import ProcessPoolExecutor
 from datetime import timedelta
 
-from pump_end.infra.clickhouse import DataLoader
-from pump_end.features.params import PumpParams, DEFAULT_PUMP_PARAMS
+from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 
 
 def _process_symbol_worker(args):

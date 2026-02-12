@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-from pump_end.infra.clickhouse import DataLoader
-from pump_end.infra.logging import log
-from pump_end.tools.pump_start_detection.indicators import IndicatorCalculator
-from pump_end.tools.pump_start_detection.detector import PumpDetector
+from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.infra.logging import log
+from pump_end_threshold.tools.pump_start_detection.indicators import IndicatorCalculator
+from pump_end_threshold.tools.pump_start_detection.detector import PumpDetector
 
 
 @dataclass

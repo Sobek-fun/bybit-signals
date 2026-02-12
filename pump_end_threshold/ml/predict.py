@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from pump_end.ml.threshold import _prepare_event_data
+from pump_end_threshold.ml.threshold import _prepare_event_data
 
 
 def predict_proba(

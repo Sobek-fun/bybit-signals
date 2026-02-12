@@ -1,9 +1,9 @@
 import json
 from datetime import datetime, timedelta
 
-from pump_end.infra.clickhouse import DataLoader
-from pump_end.tools.pump_start_detection.indicators import IndicatorCalculator
-from pump_end.tools.pump_start_detection.detector import PumpDetector
+from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.tools.pump_start_detection.indicators import IndicatorCalculator
+from pump_end_threshold.tools.pump_start_detection.detector import PumpDetector
 
 
 def get_indicator_snapshot(ch_dsn: str, symbol: str, timestamp_str: str, timestamp_kind: str, lookback_candles: int):

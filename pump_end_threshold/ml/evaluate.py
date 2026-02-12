@@ -8,7 +8,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from pump_end.ml.threshold import _prepare_event_data
+from pump_end_threshold.ml.threshold import _prepare_event_data
 
 
 def compute_event_level_metrics(
@@ -286,7 +286,7 @@ def evaluate_with_trade_quality(
         event_data: dict = None,
         abstain_margin: float = 0.0
 ) -> dict:
-    from pump_end.ml.predict import extract_signals
+    from pump_end_threshold.ml.predict import extract_signals
 
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
                                                 event_data, abstain_margin=abstain_margin)
