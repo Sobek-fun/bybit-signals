@@ -3,7 +3,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from pump_end.features.params import PumpParams, DEFAULT_PUMP_PARAMS
+from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 
 
 class PumpDetector:

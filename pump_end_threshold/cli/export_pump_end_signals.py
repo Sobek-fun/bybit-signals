@@ -13,11 +13,11 @@ import pandas as pd
 import pandas_ta as ta
 from catboost import CatBoostClassifier
 
-from pump_end.features.feature_builder import PumpFeatureBuilder
-from pump_end.features.params import PumpParams, DEFAULT_PUMP_PARAMS
-from pump_end.infra.clickhouse import DataLoader
-from pump_end.ml.feature_schema import prune_feature_columns
-from pump_end.ml.predict import extract_signals
+from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
+from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
+from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.ml.feature_schema import prune_feature_columns
+from pump_end_threshold.ml.predict import extract_signals
 
 
 def log(level: str, component: str, message: str):

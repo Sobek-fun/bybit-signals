@@ -8,7 +8,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from pump_end.ml.threshold import _prepare_event_data
+from pump_end_threshold.ml.threshold import _prepare_event_data
 
 
 def compute_event_level_metrics(

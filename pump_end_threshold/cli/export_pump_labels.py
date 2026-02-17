@@ -5,8 +5,8 @@ from urllib.parse import urlparse
 import clickhouse_connect
 import pandas as pd
 
-from pump_end.infra.clickhouse import DataLoader
-from pump_end.tools.pump_start_detection.labeler_lookahead import PumpLabelerLookahead
+from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.tools.pump_start_detection.labeler_lookahead import PumpLabelerLookahead
 
 
 def main():

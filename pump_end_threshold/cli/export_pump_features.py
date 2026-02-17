@@ -3,7 +3,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from pump_end.features.feature_builder import PumpFeatureBuilder
+from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
 
 
 def main():
