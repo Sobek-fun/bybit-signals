@@ -196,6 +196,59 @@ class DataLoader:
         return result.result_rows[0][0]
 
 
+def get_liquid_universe(ch_dsn: str, start_dt: datetime, end_dt: datetime, top_n: int = 120,
+                        exclude: list[str] = None) -> list[str]:
+    if exclude is None:
+        exclude = ["BTCUSDT", "ETHUSDT"]
+
+    parsed = urlparse(ch_dsn)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "default"
+    password = parsed.password or ""
+    database = parsed.path.lstrip("/") if parsed.path else "default"
+    secure = parsed.scheme == "https"
+
+    client = clickhouse_connect.get_client(
+        host=host, port=port, username=username,
+        password=password, database=database, secure=secure
+    )
+
+    exclude_clause = ""
+    if exclude:
+        placeholders = ", ".join([f"'{s}'" for s in exclude])
+        exclude_clause = f"AND symbol NOT IN ({placeholders})"
+
+    query = f"""
+    SELECT symbol, avg(volume * close) AS avg_dollar_volume
+    FROM (
+        SELECT
+            symbol,
+            toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+            sum(volume) AS volume,
+            argMax(close, open_time) AS close
+        FROM bybit.candles
+        WHERE interval = 1
+          AND open_time >= %(start)s
+          AND open_time < %(end)s
+          AND endsWith(symbol, 'USDT')
+          {exclude_clause}
+        GROUP BY symbol, bucket
+    )
+    GROUP BY symbol
+    ORDER BY avg_dollar_volume DESC
+    LIMIT %(top_n)s
+    """
+
+    result = client.query(query, parameters={
+        "start": start_dt,
+        "end": end_dt,
+        "top_n": top_n,
+    })
+
+    return [row[0] for row in result.result_rows]
+
+
 def list_all_usdt_tokens(ch_dsn: str) -> list[str]:
     parsed = urlparse(ch_dsn)
     host = parsed.hostname or "localhost"

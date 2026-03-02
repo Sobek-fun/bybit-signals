@@ -11,8 +11,12 @@ from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info,
 from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
 from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
 from pump_end_threshold.ml.evaluate import evaluate, evaluate_with_trade_quality
-from pump_end_threshold.ml.predict import predict_proba, extract_signals
-from pump_end_threshold.ml.tuning import tune_model, train_final_model, get_rule_parameter_grid
+from pump_end_threshold.ml.predict import predict_proba, extract_signals, extract_signals_verbose
+from pump_end_threshold.ml.tuning import (
+    tune_model, train_final_model, get_rule_parameter_grid,
+    generate_walk_forward_folds, apply_fold_split, apply_fold_embargo,
+    clip_fold_points, train_fold, evaluate_fold,
+)
 from pump_end_threshold.ml.feature_schema import prune_feature_columns
 from pump_end_threshold.infra.clickhouse import DataLoader
 
@@ -547,6 +551,67 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_predicted_signals(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
 
+    if args.save_oos_signals:
+        log("INFO", "TUNE", "collecting OOS verbose signals from walk-forward folds")
+        oos_feature_columns = feature_columns
+        oos_folds = tune_result['folds']
+        best_params = tune_result['best_params']
+
+        best_threshold_val = None
+        best_mpb_val = 1
+        best_dd_val = 0.0
+
+        if train_end and val_end:
+            best_threshold_val = best_threshold
+            best_mpb_val = best_min_pending_bars
+            best_dd_val = best_drop_delta
+        elif tune_result.get('best_cv_result') and tune_result['best_cv_result'].get('mean_threshold'):
+            best_threshold_val = tune_result['best_cv_result']['mean_threshold']
+
+        if best_threshold_val is None:
+            best_threshold_val = 0.1
+
+        all_oos_signals = []
+        for fold_idx, fold in enumerate(oos_folds):
+            fold_df = apply_fold_split(cv_features_df if not train_end else features_df, fold)
+            fold_df = apply_fold_embargo(fold_df, fold, args.embargo_bars)
+            fold_df = clip_fold_points(fold_df, fold)
+
+            fold_model, _ = train_fold(
+                fold_df, oos_feature_columns, best_params,
+                iterations=args.iterations,
+                early_stopping_rounds=args.early_stopping_rounds,
+                seed=args.seed,
+            )
+            if fold_model is None:
+                continue
+
+            val_data = fold_df[fold_df['split'] == 'val']
+            if val_data.empty:
+                continue
+
+            val_preds = predict_proba(fold_model, val_data, oos_feature_columns)
+            verbose_sigs = extract_signals_verbose(
+                val_preds,
+                best_threshold_val,
+                min_pending_bars=best_mpb_val,
+                drop_delta=best_dd_val,
+                abstain_margin=args.abstain_margin,
+            )
+
+            if not verbose_sigs.empty:
+                verbose_sigs['fold_idx'] = fold_idx
+                verbose_sigs['split'] = 'oos'
+                all_oos_signals.append(verbose_sigs)
+
+        if all_oos_signals:
+            oos_df = pd.concat(all_oos_signals, ignore_index=True)
+            oos_path = artifacts.get_path() / "cv_oos_signals_verbose.parquet"
+            oos_df.to_parquet(str(oos_path), index=False)
+            log("INFO", "TUNE", f"saved {len(oos_df)} OOS verbose signals to {oos_path}")
+        else:
+            log("WARN", "TUNE", "no OOS signals collected across folds")
+
     log("INFO", "TUNE", f"done. artifacts saved to {artifacts.get_path()}")
 
 
@@ -609,6 +674,8 @@ def main():
     parser.add_argument("--min-train-months", type=int, default=3)
 
     parser.add_argument("--prune-features", action="store_true", default=False)
+    parser.add_argument("--save-oos-signals", action="store_true", default=False,
+                        help="Save OOS verbose signals from walk-forward CV folds (for regime guard dataset)")
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)

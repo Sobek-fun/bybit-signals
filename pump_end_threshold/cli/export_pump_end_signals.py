@@ -17,7 +17,7 @@ from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
 from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 from pump_end_threshold.infra.clickhouse import DataLoader
 from pump_end_threshold.ml.feature_schema import prune_feature_columns
-from pump_end_threshold.ml.predict import extract_signals
+from pump_end_threshold.ml.predict import extract_signals_verbose
 
 
 def log(level: str, component: str, message: str):
@@ -270,11 +270,7 @@ def process_symbol_chunk(args_tuple):
     model = CatBoostClassifier()
     model.load_model(model_path)
 
-    csv_filename = f"signals_part_{worker_id}.csv"
-    csv_file = open(csv_filename, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['symbol', 'timestamp'])
-
+    all_signals = []
     total_signals = 0
     symbols_processed = 0
     candidates_found = 0
@@ -344,7 +340,7 @@ def process_symbol_chunk(args_tuple):
             predictions_df['p_end'] = p_end
             predictions_df['split'] = 'test'
 
-            signals_df = extract_signals(
+            signals_df = extract_signals_verbose(
                 predictions_df,
                 threshold,
                 min_pending_bars=min_pending_bars,
@@ -352,20 +348,82 @@ def process_symbol_chunk(args_tuple):
                 abstain_margin=abstain_margin
             )
 
-            for _, row in signals_df.iterrows():
-                timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
-                csv_writer.writerow([row['symbol'], timestamp_str])
-                total_signals += 1
+            if not signals_df.empty:
+                all_signals.append(signals_df)
+                total_signals += len(signals_df)
 
             symbols_processed += 1
 
-        except Exception as e:
+        except Exception:
             symbols_processed += 1
             continue
 
-    csv_file.close()
+    part_file = f"signals_part_{worker_id}.parquet"
+    if all_signals:
+        combined = pd.concat(all_signals, ignore_index=True)
+        combined.to_parquet(part_file, index=False)
+    else:
+        pd.DataFrame().to_parquet(part_file, index=False)
 
-    return worker_id, symbols_processed, candidates_found, total_signals, csv_filename
+    return worker_id, symbols_processed, candidates_found, total_signals, part_file
+
+
+def run_guard_stage(
+        raw_signals_df: pd.DataFrame,
+        guard_model_dir: Path,
+        ch_dsn: str,
+) -> pd.DataFrame:
+    from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
+    from pump_end_threshold.ml.regime_policy import RegimePolicy
+    from pump_end_threshold.infra.clickhouse import get_liquid_universe
+
+    guard_model_path = guard_model_dir / "regime_guard_model.cbm"
+    guard_model = CatBoostClassifier()
+    guard_model.load_model(str(guard_model_path))
+
+    policy_path = guard_model_dir / "best_policy_params.json"
+    with open(policy_path, 'r') as f:
+        policy_params = json.load(f)
+
+    feature_cols_path = guard_model_dir / "feature_columns.json"
+    with open(feature_cols_path, 'r') as f:
+        guard_feature_columns = json.load(f)
+
+    signals = raw_signals_df.sort_values('open_time').reset_index(drop=True)
+    t_min = signals['open_time'].min()
+    t_max = signals['open_time'].max()
+
+    liquid_universe = get_liquid_universe(
+        ch_dsn, t_min - timedelta(days=7), t_max, top_n=120
+    )
+
+    builder = RegimeFeatureBuilder(
+        ch_dsn=ch_dsn,
+        liquid_universe=liquid_universe,
+    )
+
+    guard_features = builder.build(signals)
+
+    available = [c for c in guard_feature_columns if c in guard_features.columns]
+    if len(available) < len(guard_feature_columns):
+        missing = set(guard_feature_columns) - set(available)
+        for col in missing:
+            guard_features[col] = np.nan
+
+    X_guard = guard_features[guard_feature_columns]
+    p_bad = guard_model.predict_proba(X_guard)[:, 1]
+
+    signals['p_bad'] = p_bad
+
+    policy = RegimePolicy(**policy_params)
+    result = policy.apply(signals, p_bad_col='p_bad')
+
+    accepted = result[~result['blocked_by_policy']].copy()
+
+    n_blocked = result['blocked_by_policy'].sum()
+    log("INFO", "GUARD", f"guard applied: {len(result)} raw -> {len(accepted)} accepted ({n_blocked} blocked)")
+
+    return accepted
 
 
 def main():
@@ -392,13 +450,25 @@ def main():
         "--model-dir",
         type=str,
         required=True,
-        help="Path to model artifacts directory"
+        help="Path to detector model artifacts directory"
+    )
+    parser.add_argument(
+        "--guard-model-dir",
+        type=str,
+        default=None,
+        help="Path to regime guard model directory (optional, enables guard stage)"
     )
     parser.add_argument(
         "--output",
         type=str,
         default="pump_end_signals.csv",
         help="Output CSV file path (default: pump_end_signals.csv)"
+    )
+    parser.add_argument(
+        "--raw-signals-output",
+        type=str,
+        default=None,
+        help="Optional: save raw detector signals (before guard) to this parquet path"
     )
     parser.add_argument(
         "--workers",
@@ -538,7 +608,7 @@ def main():
             abstain_margin
         ))
 
-    log("INFO", "EXPORT", f"starting {num_workers} workers")
+    log("INFO", "EXPORT", f"stage A: starting {num_workers} detector workers")
 
     part_files = []
     total_processed = 0
@@ -549,29 +619,57 @@ def main():
         futures = {executor.submit(process_symbol_chunk, task): task[0] for task in tasks}
 
         for future in as_completed(futures):
-            worker_id, processed, candidates, signals, csv_file = future.result()
-            part_files.append(csv_file)
+            worker_id, processed, candidates, signals, part_file = future.result()
+            part_files.append(part_file)
             total_processed += processed
             total_candidates += candidates
             total_signals += signals
             log("INFO", "EXPORT",
                 f"worker={worker_id} done symbols={processed} candidates={candidates} signals={signals}")
 
+    log("INFO", "EXPORT", f"stage A done: {total_signals} raw detector signals from {total_candidates} candidates")
+
+    all_raw = []
+    for pf in part_files:
+        if os.path.exists(pf):
+            part_df = pd.read_parquet(pf)
+            if not part_df.empty:
+                all_raw.append(part_df)
+            os.remove(pf)
+
+    if not all_raw:
+        log("WARN", "EXPORT", "no raw signals produced")
+        with open(args.output, 'w', newline='') as outfile:
+            csv.writer(outfile).writerow(['symbol', 'timestamp'])
+        return
+
+    raw_signals = pd.concat(all_raw, ignore_index=True)
+    raw_signals = raw_signals.sort_values('open_time').reset_index(drop=True)
+
+    log("INFO", "EXPORT", f"combined {len(raw_signals)} raw detector signals")
+
+    if args.raw_signals_output:
+        raw_signals.to_parquet(args.raw_signals_output, index=False)
+        log("INFO", "EXPORT", f"raw signals saved to {args.raw_signals_output}")
+
+    if args.guard_model_dir:
+        guard_dir = Path(args.guard_model_dir)
+        log("INFO", "EXPORT", f"stage B: applying regime guard from {guard_dir}")
+        final_signals = run_guard_stage(raw_signals, guard_dir, args.clickhouse_dsn)
+    else:
+        log("INFO", "EXPORT", "stage B: no guard model, passing all raw signals through")
+        final_signals = raw_signals
+
     with open(args.output, 'w', newline='') as outfile:
         csv_writer = csv.writer(outfile)
         csv_writer.writerow(['symbol', 'timestamp'])
-
-        for part_csv in part_files:
-            if os.path.exists(part_csv):
-                with open(part_csv, 'r') as infile:
-                    reader = csv.reader(infile)
-                    next(reader)
-                    for row in reader:
-                        csv_writer.writerow(row)
-                os.remove(part_csv)
+        for _, row in final_signals.iterrows():
+            timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
+            csv_writer.writerow([row['symbol'], timestamp_str])
 
     log("INFO", "EXPORT",
-        f"done symbols={total_processed} candidates={total_candidates} signals={total_signals} output={args.output}")
+        f"done symbols={total_processed} candidates={total_candidates} "
+        f"raw_signals={total_signals} final_signals={len(final_signals)} output={args.output}")
 
 
 if __name__ == "__main__":
