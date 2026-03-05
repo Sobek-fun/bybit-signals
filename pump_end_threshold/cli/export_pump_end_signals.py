@@ -374,6 +374,9 @@ def run_guard_stage(
         guard_model_dir: Path,
         ch_dsn: str,
         run_dir: Path = None,
+        guard_debug_output: str = None,
+        blocked_signals_output: str = None,
+        accepted_signals_output: str = None,
 ) -> pd.DataFrame:
     from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
     from pump_end_threshold.ml.regime_policy import RegimePolicy
@@ -441,7 +444,9 @@ def run_guard_stage(
 
     signals['p_bad'] = p_bad
 
-    if run_dir:
+    if guard_debug_output:
+        signals.to_parquet(guard_debug_output, index=False)
+    elif run_dir:
         guard_scored_path = run_dir / "guard_scored_signals.parquet"
         signals.to_parquet(guard_scored_path, index=False)
 
@@ -451,8 +456,14 @@ def run_guard_stage(
     accepted = result[~result['blocked_by_policy']].copy()
     blocked = result[result['blocked_by_policy']].copy()
 
-    if run_dir:
+    if accepted_signals_output:
+        accepted.to_parquet(accepted_signals_output, index=False)
+    elif run_dir:
         accepted.to_parquet(run_dir / "accepted_signals.parquet", index=False)
+
+    if blocked_signals_output:
+        blocked.to_parquet(blocked_signals_output, index=False)
+    elif run_dir:
         blocked.to_parquet(run_dir / "blocked_signals.parquet", index=False)
 
     n_blocked = result['blocked_by_policy'].sum()
@@ -494,6 +505,11 @@ def main():
         help="Path to regime guard model directory (optional, enables guard stage)"
     )
     parser.add_argument(
+        "--skip-guard",
+        action="store_true",
+        help="Skip guard stage even if guard model exists in run-dir"
+    )
+    parser.add_argument(
         "--run-dir",
         type=str,
         default=None,
@@ -510,6 +526,24 @@ def main():
         type=str,
         default=None,
         help="Optional: save raw detector signals to this parquet path (default: RUN_DIR/raw_detector_signals.parquet if --run-dir set)"
+    )
+    parser.add_argument(
+        "--guard-debug-output",
+        type=str,
+        default=None,
+        help="Optional: save guard scored signals to this parquet path"
+    )
+    parser.add_argument(
+        "--blocked-signals-output",
+        type=str,
+        default=None,
+        help="Optional: save blocked signals to this parquet path"
+    )
+    parser.add_argument(
+        "--accepted-signals-output",
+        type=str,
+        default=None,
+        help="Optional: save accepted signals to this parquet path"
     )
     parser.add_argument(
         "--workers",
@@ -710,10 +744,26 @@ def main():
         raw_signals.to_parquet(args.raw_signals_output, index=False)
         log("INFO", "EXPORT", f"raw signals saved to {args.raw_signals_output}")
 
-    if args.guard_model_dir:
+    if args.skip_guard:
+        log("INFO", "EXPORT", "stage B: skipping guard stage as requested")
+        final_signals = raw_signals
+    elif args.guard_model_dir:
         guard_dir = Path(args.guard_model_dir)
         log("INFO", "EXPORT", f"stage B: applying regime guard from {guard_dir}")
-        final_signals = run_guard_stage(raw_signals, guard_dir, args.clickhouse_dsn, run_dir=run_dir)
+        final_signals = run_guard_stage(
+            raw_signals, guard_dir, args.clickhouse_dsn, run_dir=run_dir,
+            guard_debug_output=args.guard_debug_output,
+            blocked_signals_output=args.blocked_signals_output,
+            accepted_signals_output=args.accepted_signals_output
+        )
+    elif run_dir and (run_dir / "regime_guard_model.cbm").exists():
+        log("INFO", "EXPORT", f"stage B: applying regime guard from {run_dir}")
+        final_signals = run_guard_stage(
+            raw_signals, run_dir, args.clickhouse_dsn, run_dir=run_dir,
+            guard_debug_output=args.guard_debug_output,
+            blocked_signals_output=args.blocked_signals_output,
+            accepted_signals_output=args.accepted_signals_output
+        )
     else:
         log("INFO", "EXPORT", "stage B: no guard model, passing all raw signals through")
         final_signals = raw_signals

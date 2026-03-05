@@ -41,8 +41,18 @@ def main():
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--early-stopping-rounds", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--embargo-signals", type=int, default=5,
+                        help="Number of signals to embargo at train/val boundary")
     parser.add_argument("--max-blocked-share", type=float, default=0.35)
     parser.add_argument("--min-signal-keep-rate", type=float, default=0.45)
+    parser.add_argument("--min-valid-folds", type=int, default=2,
+                        help="Minimum number of valid folds required")
+    parser.add_argument("--score-mode", type=str, default="pnl_improvement",
+                        choices=["pnl_after", "pnl_improvement", "block_value"],
+                        help="Scoring mode for hyperparameter optimization")
+    parser.add_argument("--policy-grid", type=str, default="default",
+                        choices=["default", "conservative", "aggressive"],
+                        help="Policy parameter grid preset")
     parser.add_argument("--run-dir", type=str, default=None,
                         help="Directory for all artifacts (if not provided, creates timestamped dir)")
     parser.add_argument("--out-dir", type=str, default=None,
@@ -107,8 +117,12 @@ def main():
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
         seed=args.seed,
+        embargo_signals=args.embargo_signals,
         max_blocked_share=args.max_blocked_share,
         min_signal_keep_rate=args.min_signal_keep_rate,
+        min_valid_folds=args.min_valid_folds,
+        score_mode=args.score_mode,
+        policy_grid_preset=args.policy_grid,
     )
 
     log("INFO", "REGIME",

@@ -64,12 +64,25 @@ def get_regime_hyperparameter_grid() -> list:
     return [dict(zip(keys, combo)) for combo in product(*values)]
 
 
-def get_policy_parameter_grid() -> list:
-    policy_grid = {
-        'pause_on_threshold': [0.60, 0.65, 0.70],
-        'resume_threshold': [0.25, 0.30, 0.35],
-        'resume_confirm_signals': [2, 3],
-    }
+def get_policy_parameter_grid(preset: str = 'default') -> list:
+    if preset == 'conservative':
+        policy_grid = {
+            'pause_on_threshold': [0.65, 0.70, 0.75],
+            'resume_threshold': [0.20, 0.25, 0.30],
+            'resume_confirm_signals': [2, 3, 4],
+        }
+    elif preset == 'aggressive':
+        policy_grid = {
+            'pause_on_threshold': [0.55, 0.60, 0.65],
+            'resume_threshold': [0.35, 0.40, 0.45],
+            'resume_confirm_signals': [1, 2],
+        }
+    else:
+        policy_grid = {
+            'pause_on_threshold': [0.60, 0.65, 0.70],
+            'resume_threshold': [0.25, 0.30, 0.35],
+            'resume_confirm_signals': [2, 3],
+        }
     keys = list(policy_grid.keys())
     values = list(policy_grid.values())
     return [dict(zip(keys, combo)) for combo in product(*values)]
@@ -127,6 +140,7 @@ def evaluate_regime_fold(
         policy_params: dict,
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
+        score_mode: str = 'pnl_improvement',
 ) -> dict:
     if model is None or val_df is None or len(val_df) == 0:
         return {'score': -np.inf, 'valid': False}
@@ -168,11 +182,16 @@ def evaluate_regime_fold(
 
     tp_block_share_total = tp_blocked / max(1, result.get('tp_kept', 0) + tp_blocked)
 
-    score = pnl_improvement
-    if tp_block_share_total > 0.30:
-        score -= (tp_block_share_total - 0.30) * 50
-    if blocked_share > 0.25:
-        score -= (blocked_share - 0.25) * 100
+    if score_mode == 'pnl_after':
+        score = pnl_after
+    elif score_mode == 'block_value':
+        score = block_value
+    else:
+        score = pnl_improvement
+        if tp_block_share_total > 0.30:
+            score -= (tp_block_share_total - 0.30) * 50
+        if blocked_share > 0.25:
+            score -= (blocked_share - 0.25) * 100
 
     return {
         'score': score,
@@ -228,6 +247,7 @@ def run_regime_cv(
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         embargo_signals: int = 5,
+        score_mode: str = 'pnl_improvement',
 ) -> dict:
     fold_results = []
 
@@ -243,6 +263,7 @@ def run_regime_cv(
             model, val_df, feature_columns, policy_params,
             max_blocked_share=max_blocked_share,
             min_signal_keep_rate=min_signal_keep_rate,
+            score_mode=score_mode,
         )
         fold_eval['fold_idx'] = fold_idx
         fold_results.append(fold_eval)
@@ -279,6 +300,9 @@ def tune_regime_guard(
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         embargo_signals: int = 5,
+        min_valid_folds: int = 2,
+        score_mode: str = 'pnl_improvement',
+        policy_grid_preset: str = 'default',
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -294,7 +318,7 @@ def tune_regime_guard(
         raise ValueError("Not enough data to generate walk-forward folds")
 
     model_grid = get_regime_hyperparameter_grid()
-    policy_grid = get_policy_parameter_grid()
+    policy_grid = get_policy_parameter_grid(preset=policy_grid_preset)
 
     leaderboard = []
     best_score = -np.inf
@@ -321,6 +345,7 @@ def tune_regime_guard(
                 max_blocked_share=max_blocked_share,
                 min_signal_keep_rate=min_signal_keep_rate,
                 embargo_signals=embargo_signals,
+                score_mode=score_mode,
             )
 
             trial_record = {
@@ -333,7 +358,7 @@ def tune_regime_guard(
             }
             leaderboard.append(trial_record)
 
-            if cv_result['mean_score'] > best_score:
+            if cv_result['n_valid_folds'] >= min_valid_folds and cv_result['mean_score'] > best_score:
                 best_score = cv_result['mean_score']
                 best_model_params = model_params
                 best_policy_params = policy_params

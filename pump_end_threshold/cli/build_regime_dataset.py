@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
@@ -37,6 +38,16 @@ def main():
     parser.add_argument("--target-horizon-signals", type=int, default=5)
     parser.add_argument("--target-min-resolved", type=int, default=3)
     parser.add_argument("--target-sl-rate-threshold", type=float, default=0.60)
+    parser.add_argument("--target-col", type=str, default="target_bad_next_5",
+                        help="Name of the target column to use for training")
+    parser.add_argument("--include-detector-snapshot", action="store_true",
+                        help="Include detector snapshot features from PumpFeatureBuilder")
+    parser.add_argument("--high-lookback-bars", type=int, default=None,
+                        help="Lookback bars for high calculations (default: 8 weeks)")
+    parser.add_argument("--breadth-lookback-bars", type=int, default=None,
+                        help="Lookback bars for breadth calculations (default: 8 weeks)")
+    parser.add_argument("--save-debug-sample", action="store_true",
+                        help="Save debug sample of dataset")
 
     args = parser.parse_args()
 
@@ -104,6 +115,12 @@ def main():
         log("INFO", "REGIME-DS", f"outcomes: TP={tp_count} SL={sl_count} UNKNOWN={unknown} TIMEOUT={timeout}")
 
     log("INFO", "REGIME-DS", "building regime features")
+
+    if args.high_lookback_bars or args.breadth_lookback_bars:
+        from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
+        if args.high_lookback_bars:
+            RegimeFeatureBuilder.HIGH_8W_BARS = args.high_lookback_bars
+
     builder = RegimeFeatureBuilder(
         ch_dsn=args.clickhouse_dsn,
         liquid_universe=liquid_universe,
@@ -116,6 +133,17 @@ def main():
     log("INFO", "REGIME-DS", "building regime features in batch mode")
     feature_rows = []
     batch_size = 50
+
+    pump_builder = None
+    if args.include_detector_snapshot:
+        from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
+        pump_builder = PumpFeatureBuilder(
+            ch_dsn=args.clickhouse_dsn,
+            window_bars=30,
+            warmup_bars=150,
+            feature_set='snapshot'
+        )
+        log("INFO", "REGIME-DS", "including detector snapshot features")
 
     for batch_start in range(0, len(signals_df), batch_size):
         batch_end = min(batch_start + batch_size, len(signals_df))
@@ -130,6 +158,20 @@ def main():
 
             sig_for_builder = pd.DataFrame([sig])
             feats = builder.build(sig_for_builder, strategy_state=strategy_state)
+
+            if pump_builder and not feats.empty:
+                sig_input = sig_for_builder.copy()
+                sig_input = sig_input.rename(columns={'open_time': 'event_open_time'})
+                sig_input['pump_la_type'] = 'A'
+                sig_input['runup_pct'] = 0
+                try:
+                    pump_feats = pump_builder.build(sig_input, max_workers=1)
+                    if not pump_feats.empty:
+                        for col in pump_feats.columns:
+                            if col not in feats.columns:
+                                feats[col] = pump_feats[col].values[0] if len(pump_feats) > 0 else np.nan
+                except:
+                    pass
             if feats.empty:
                 continue
 
@@ -214,8 +256,9 @@ def main():
         if len(na_report) > 0:
             na_report.to_csv(run_dir / "feature_na_report.csv")
 
-        if len(dataset) > 10:
-            dataset.head(10).to_parquet(run_dir / "sample_rows.parquet", index=False)
+        if args.save_debug_sample and len(dataset) > 10:
+            dataset.head(50).to_parquet(run_dir / "debug_sample.parquet", index=False)
+            log("INFO", "REGIME-DS", "saved debug sample to debug_sample.parquet")
 
 
 if __name__ == "__main__":
