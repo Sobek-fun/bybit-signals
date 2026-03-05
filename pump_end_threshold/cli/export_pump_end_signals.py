@@ -253,7 +253,8 @@ def process_symbol_chunk(args_tuple):
         neg_after,
         pos_offsets,
         params_dict,
-        abstain_margin
+        abstain_margin,
+        temp_dir
     ) = args_tuple
 
     params = PumpParams(**params_dict) if params_dict else DEFAULT_PUMP_PARAMS
@@ -358,7 +359,7 @@ def process_symbol_chunk(args_tuple):
             symbols_processed += 1
             continue
 
-    part_file = f"signals_part_{worker_id}.parquet"
+    part_file = str(Path(temp_dir) / f"signals_part_{worker_id}.parquet")
     if all_signals:
         combined = pd.concat(all_signals, ignore_index=True)
         combined.to_parquet(part_file, index=False)
@@ -372,10 +373,12 @@ def run_guard_stage(
         raw_signals_df: pd.DataFrame,
         guard_model_dir: Path,
         ch_dsn: str,
+        run_dir: Path = None,
 ) -> pd.DataFrame:
     from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
     from pump_end_threshold.ml.regime_policy import RegimePolicy
-    from pump_end_threshold.infra.clickhouse import get_liquid_universe
+    from pump_end_threshold.infra.clickhouse import get_liquid_universe, DataLoader
+    from pump_end_threshold.ml.regime_dataset import build_strategy_state, compute_strategy_state_at
 
     guard_model_path = guard_model_dir / "regime_guard_model.cbm"
     guard_model = CatBoostClassifier()
@@ -402,7 +405,30 @@ def run_guard_stage(
         liquid_universe=liquid_universe,
     )
 
-    guard_features = builder.build(signals)
+    log("INFO", "GUARD", "simulating trades for strategy state")
+    loader = DataLoader(ch_dsn)
+    trades_df = build_strategy_state(signals, loader, tp_pct=4.5, sl_pct=10.0)
+    trades_sorted = trades_df.sort_values('open_time').reset_index(drop=True)
+    all_signal_times = signals['open_time'].tolist()
+
+    log("INFO", "GUARD", "building regime features with strategy state")
+    feature_rows = []
+    for i in range(len(signals)):
+        sig = signals.iloc[i]
+        t = sig['open_time']
+
+        strategy_state = compute_strategy_state_at(trades_sorted, t, all_signal_times)
+
+        sig_for_builder = pd.DataFrame([sig])
+        feats = builder.build(sig_for_builder, strategy_state=strategy_state)
+        if not feats.empty:
+            feature_rows.append(feats)
+
+    if not feature_rows:
+        log("WARN", "GUARD", "no features built")
+        return raw_signals_df
+
+    guard_features = pd.concat(feature_rows, ignore_index=True)
 
     available = [c for c in guard_feature_columns if c in guard_features.columns]
     if len(available) < len(guard_feature_columns):
@@ -415,10 +441,19 @@ def run_guard_stage(
 
     signals['p_bad'] = p_bad
 
+    if run_dir:
+        guard_scored_path = run_dir / "guard_scored_signals.parquet"
+        signals.to_parquet(guard_scored_path, index=False)
+
     policy = RegimePolicy(**policy_params)
     result = policy.apply(signals, p_bad_col='p_bad')
 
     accepted = result[~result['blocked_by_policy']].copy()
+    blocked = result[result['blocked_by_policy']].copy()
+
+    if run_dir:
+        accepted.to_parquet(run_dir / "accepted_signals.parquet", index=False)
+        blocked.to_parquet(run_dir / "blocked_signals.parquet", index=False)
 
     n_blocked = result['blocked_by_policy'].sum()
     log("INFO", "GUARD", f"guard applied: {len(result)} raw -> {len(accepted)} accepted ({n_blocked} blocked)")
@@ -459,16 +494,22 @@ def main():
         help="Path to regime guard model directory (optional, enables guard stage)"
     )
     parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Directory for all artifacts (if not provided, uses individual output paths)"
+    )
+    parser.add_argument(
         "--output",
         type=str,
-        default="pump_end_signals.csv",
-        help="Output CSV file path (default: pump_end_signals.csv)"
+        default=None,
+        help="Output CSV file path (default: RUN_DIR/final_signals.csv or pump_end_signals.csv)"
     )
     parser.add_argument(
         "--raw-signals-output",
         type=str,
         default=None,
-        help="Optional: save raw detector signals (before guard) to this parquet path"
+        help="Optional: save raw detector signals to this parquet path (default: RUN_DIR/raw_detector_signals.parquet if --run-dir set)"
     )
     parser.add_argument(
         "--workers",
@@ -482,6 +523,22 @@ def main():
     start_dt = datetime.strptime(args.start_date, '%Y-%m-%d %H:%M:%S')
     end_dt = datetime.strptime(args.end_date, '%Y-%m-%d %H:%M:%S')
     model_dir = Path(args.model_dir)
+
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = run_dir / "temp"
+        temp_dir.mkdir(exist_ok=True)
+
+        if not args.output:
+            args.output = str(run_dir / "final_signals.csv")
+        if not args.raw_signals_output:
+            args.raw_signals_output = str(run_dir / "raw_detector_signals.parquet")
+    else:
+        run_dir = None
+        temp_dir = Path(".")
+        if not args.output:
+            args.output = "pump_end_signals.csv"
 
     log("INFO", "EXPORT", f"loading artifacts from {model_dir}")
     run_config = load_run_config(model_dir)
@@ -605,7 +662,8 @@ def main():
             neg_after,
             pos_offsets,
             params_dict,
-            abstain_margin
+            abstain_margin,
+            str(temp_dir)
         ))
 
     log("INFO", "EXPORT", f"stage A: starting {num_workers} detector workers")
@@ -655,7 +713,7 @@ def main():
     if args.guard_model_dir:
         guard_dir = Path(args.guard_model_dir)
         log("INFO", "EXPORT", f"stage B: applying regime guard from {guard_dir}")
-        final_signals = run_guard_stage(raw_signals, guard_dir, args.clickhouse_dsn)
+        final_signals = run_guard_stage(raw_signals, guard_dir, args.clickhouse_dsn, run_dir=run_dir)
     else:
         log("INFO", "EXPORT", "stage B: no guard model, passing all raw signals through")
         final_signals = raw_signals

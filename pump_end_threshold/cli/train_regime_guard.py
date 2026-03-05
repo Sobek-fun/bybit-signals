@@ -43,16 +43,26 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-blocked-share", type=float, default=0.35)
     parser.add_argument("--min-signal-keep-rate", type=float, default=0.45)
-    parser.add_argument("--out-dir", type=str, required=True)
-    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--run-dir", type=str, default=None,
+                        help="Directory for all artifacts (if not provided, creates timestamped dir)")
+    parser.add_argument("--out-dir", type=str, default=None,
+                        help="Parent directory for run-dir (deprecated, use --run-dir)")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Run name for subdirectory (deprecated, use --run-dir)")
 
     args = parser.parse_args()
 
-    if args.run_name:
-        run_dir = Path(args.out_dir) / args.run_name
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    elif args.out_dir:
+        if args.run_name:
+            run_dir = Path(args.out_dir) / args.run_name
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_dir = Path(args.out_dir) / f"regime_run_{timestamp}"
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        run_dir = Path(args.out_dir) / f"regime_run_{timestamp}"
+        run_dir = Path(f"regime_run_{timestamp}")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     log("INFO", "REGIME", f"run_dir={run_dir}")
@@ -129,6 +139,22 @@ def main():
             }
             json.dump(serializable, f, indent=2, default=str)
 
+        if cv_result.get('fold_results'):
+            fold_metrics = pd.DataFrame(cv_result['fold_results'])
+            fold_metrics.to_csv(run_dir / "fold_metrics.csv", index=False)
+
+    with open(run_dir / "policy_report.json", 'w') as f:
+        policy_report = {
+            'policy_params': tune_result['best_policy_params'],
+            'defaults': {
+                'pause_on_threshold': 0.65,
+                'resume_threshold': 0.30,
+                'resume_confirm_signals': 2,
+            },
+            'description': 'Regime guard policy controls when to pause/resume trading based on market conditions',
+        }
+        json.dump(policy_report, f, indent=2, default=str)
+
     if train_end:
         log("INFO", "REGIME", f"training final model on data before {args.train_end}")
 
@@ -149,6 +175,20 @@ def main():
         importance_df = get_feature_importance(final_model, tune_result['feature_columns'])
         importance_df.to_csv(run_dir / "feature_importance.csv", index=False)
 
+        grouped_importance = importance_df.copy()
+        grouped_importance['feature_group'] = grouped_importance['feature'].apply(lambda x:
+            'strategy_state' if x.startswith(('raw_signals_', 'resolved_', 'open_trades_', 'prev_closed_')) else
+            'market_breadth' if x.startswith('breadth_') else
+            'token_context' if x.startswith('token_') else
+            'btc_context' if x.startswith('btc_') else
+            'eth_context' if x.startswith('eth_') else
+            'detector_confidence' if x.startswith('det_') else
+            'other'
+        )
+        grouped_summary = grouped_importance.groupby('feature_group')['importance'].agg(['sum', 'mean', 'count'])
+        grouped_summary = grouped_summary.sort_values('sum', ascending=False)
+        grouped_summary.to_csv(run_dir / "feature_importance_grouped.csv")
+
         test_df = dataset[dataset['open_time'] >= train_end].copy()
         if len(test_df) > 0:
             X_test = test_df[tune_result['feature_columns']]
@@ -168,6 +208,32 @@ def main():
 
             filtered = policy.apply(test_df, p_bad_col='p_bad')
             filtered.to_parquet(run_dir / "test_predictions.parquet", index=False)
+            filtered.to_parquet(run_dir / "test_scored.parquet", index=False)
+
+            accepted = filtered[~filtered['blocked_by_policy']]
+            blocked = filtered[filtered['blocked_by_policy']]
+            accepted.to_parquet(run_dir / "test_accepted.parquet", index=False)
+            blocked.to_parquet(run_dir / "test_blocked.parquet", index=False)
+
+            if 'open_time' in test_df.columns:
+                monthly_results = []
+                test_df['month'] = pd.to_datetime(test_df['open_time']).dt.to_period('M')
+                for month, month_df in test_df.groupby('month'):
+                    month_policy = RegimePolicy(**tune_result['best_policy_params'])
+                    month_result = month_policy.simulate_pnl(month_df, p_bad_col='p_bad')
+                    monthly_results.append({
+                        'month': str(month),
+                        'signals': month_result.get('signals_before', 0),
+                        'pnl_before': month_result.get('pnl_before', 0),
+                        'pnl_after': month_result.get('pnl_after', 0),
+                        'pnl_improvement': month_result.get('pnl_improvement', 0),
+                        'blocked_share': month_result.get('blocked_share', 0),
+                        'sl_blocked': month_result.get('sl_blocked', 0),
+                        'tp_blocked': month_result.get('tp_blocked', 0),
+                    })
+                if monthly_results:
+                    monthly_backtest = pd.DataFrame(monthly_results)
+                    monthly_backtest.to_csv(run_dir / "monthly_backtest.csv", index=False)
 
         with open(run_dir / "feature_columns.json", 'w') as f:
             json.dump(tune_result['feature_columns'], f, indent=2)

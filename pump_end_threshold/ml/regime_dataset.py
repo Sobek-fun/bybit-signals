@@ -127,15 +127,24 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
 
 
 def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
-                         tp_pct: float = TP_PCT, sl_pct: float = SL_PCT) -> pd.DataFrame:
+                         tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
+                         max_horizon_bars: int = 200) -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trade_results = []
 
     for i, sig in signals.iterrows():
-        result = simulate_trade(loader, sig['symbol'], sig['open_time'], tp_pct, sl_pct)
+        result = simulate_trade(
+            loader, sig['symbol'], sig['open_time'],
+            tp_pct, sl_pct,
+            max_horizon_bars=max_horizon_bars
+        )
         result['signal_idx'] = i
         result['symbol'] = sig['symbol']
         result['open_time'] = sig['open_time']
+        if 'signal_id' in sig.index:
+            result['signal_id'] = sig['signal_id']
+        else:
+            result['signal_id'] = f"{sig['symbol']}|{sig['open_time'].strftime('%Y%m%d_%H%M%S')}"
         trade_results.append(result)
 
     trades_df = pd.DataFrame(trade_results)
@@ -172,7 +181,9 @@ def compute_strategy_state_at(trades_df: pd.DataFrame, t: datetime,
 
 
 def compute_targets(trades_df: pd.DataFrame, current_idx: int,
-                    window_sizes: list[int] = None) -> dict:
+                    window_sizes: list[int] = None,
+                    min_resolved: int = 3,
+                    sl_rate_threshold: float = 0.60) -> dict:
     if window_sizes is None:
         window_sizes = [3, 5]
 
@@ -189,7 +200,7 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
         n_sl = int((resolved['trade_outcome'] == 'SL').sum())
         sl_rate = n_sl / max(1, n_resolved)
 
-        targets[f'target_bad_next_{w}'] = 1 if (n_resolved >= 3 and sl_rate >= 0.60) else 0
+        targets[f'target_bad_next_{w}'] = 1 if (n_resolved >= min_resolved and sl_rate >= sl_rate_threshold) else 0
         targets[f'target_next_{w}_sl_rate'] = sl_rate
         targets[f'target_next_{w}_pnl_sum'] = float(resolved['pnl_pct'].sum()) if n_resolved > 0 else 0.0
 
@@ -202,7 +213,7 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
     n_res_12h = len(future_12h)
     n_sl_12h = int((future_12h['trade_outcome'] == 'SL').sum()) if n_res_12h > 0 else 0
     sl_rate_12h = n_sl_12h / max(1, n_res_12h)
-    targets['target_bad_next_12h'] = 1 if (n_res_12h >= 3 and sl_rate_12h >= 0.60) else 0
+    targets['target_bad_next_12h'] = 1 if (n_res_12h >= min_resolved and sl_rate_12h >= sl_rate_threshold) else 0
 
     return targets
 
@@ -217,16 +228,35 @@ def build_regime_dataset(
 
     all_signal_times = signals['open_time'].tolist()
 
+    if 'signal_id' not in signals.columns:
+        signals['signal_id'] = [
+            f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
+            for _, row in signals.iterrows()
+        ]
+
+    if 'signal_id' not in trades.columns:
+        trades['signal_id'] = [
+            f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
+            for _, row in trades.iterrows()
+        ]
+
+    if 'signal_id' not in features_df.columns:
+        features_df['signal_id'] = [
+            f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
+            for _, row in features_df.iterrows()
+        ]
+
     rows = []
     for i in range(len(signals)):
         sig = signals.iloc[i]
+        signal_id = sig['signal_id']
 
-        trade_row = trades[trades['open_time'] == sig['open_time']]
+        trade_row = trades[trades['signal_id'] == signal_id]
         if trade_row.empty:
             continue
         trade = trade_row.iloc[0]
 
-        feature_row = features_df[features_df['open_time'] == sig['open_time']]
+        feature_row = features_df[features_df['signal_id'] == signal_id]
         if feature_row.empty:
             continue
         feats = feature_row.iloc[0].to_dict()
@@ -235,6 +265,7 @@ def build_regime_dataset(
 
         row = {}
         row.update(feats)
+        row['signal_id'] = signal_id
         row['trade_outcome'] = trade['trade_outcome']
         row['tp_hit'] = trade['tp_hit']
         row['sl_hit'] = trade['sl_hit']

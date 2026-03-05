@@ -8,7 +8,7 @@ class RegimePolicy:
     def __init__(
             self,
             pause_on_threshold: float = 0.65,
-            resume_threshold: float = 0.35,
+            resume_threshold: float = 0.30,
             resume_confirm_signals: int = 2,
     ):
         self.pause_on_threshold = pause_on_threshold
@@ -79,6 +79,7 @@ class RegimePolicy:
         blocked = df[df['blocked_by_policy']]
         tp_blocked = int((blocked['trade_outcome'] == 'TP').sum()) if has_outcome else 0
         sl_blocked = int((blocked['trade_outcome'] == 'SL').sum()) if has_outcome else 0
+        blocked_total = tp_blocked + sl_blocked
 
         def max_losing_streak(outcomes):
             streak = 0
@@ -94,16 +95,23 @@ class RegimePolicy:
         max_streak_before = max_losing_streak(all_outcomes['trade_outcome'].tolist())
         max_streak_after = max_losing_streak(accepted['trade_outcome'].tolist()) if len(accepted) > 0 else 0
 
+        blocked_bad_precision = sl_blocked / max(1, blocked_total)
+        tp_block_share_total = tp_blocked / max(1, before_tp)
+        sl_block_share_total = sl_blocked / max(1, before_sl)
+
         return {
             'signals_before': len(df),
             'signals_after': len(accepted),
             'blocked_share': float(df['blocked_by_policy'].mean()),
             'pnl_before': pnl_before,
             'pnl_after': pnl_after,
+            'pnl_improvement': pnl_after - pnl_before,
             'tp_kept': after_tp,
             'sl_blocked': sl_blocked,
             'tp_blocked': tp_blocked,
-            'tp_block_rate': tp_blocked / max(1, tp_blocked + sl_blocked),
+            'blocked_bad_precision': blocked_bad_precision,
+            'tp_block_share_total': tp_block_share_total,
+            'sl_block_share_total': sl_block_share_total,
             'max_losing_streak_before': max_streak_before,
             'max_losing_streak_after': max_streak_after,
         }

@@ -66,9 +66,9 @@ def get_regime_hyperparameter_grid() -> list:
 
 def get_policy_parameter_grid() -> list:
     policy_grid = {
-        'pause_on_threshold': [0.55, 0.65, 0.75],
-        'resume_threshold': [0.25, 0.35, 0.45],
-        'resume_confirm_signals': [1, 2, 3],
+        'pause_on_threshold': [0.60, 0.65, 0.70],
+        'resume_threshold': [0.25, 0.30, 0.35],
+        'resume_confirm_signals': [2, 3],
     }
     keys = list(policy_grid.keys())
     values = list(policy_grid.values())
@@ -160,31 +160,58 @@ def evaluate_regime_fold(
 
     pnl_after = result.get('pnl_after', 0)
     pnl_before = result.get('pnl_before', 0)
+    pnl_improvement = pnl_after - pnl_before
+
+    sl_blocked = result.get('sl_blocked', 0)
+    tp_blocked = result.get('tp_blocked', 0)
+    block_value = 10.0 * sl_blocked - 4.5 * tp_blocked
+
+    tp_block_share_total = tp_blocked / max(1, result.get('tp_kept', 0) + tp_blocked)
+
+    score = pnl_improvement
+    if tp_block_share_total > 0.30:
+        score -= (tp_block_share_total - 0.30) * 50
+    if blocked_share > 0.25:
+        score -= (blocked_share - 0.25) * 100
 
     return {
-        'score': pnl_after,
+        'score': score,
         'valid': True,
         'pnl_before': pnl_before,
         'pnl_after': pnl_after,
-        'pnl_improvement': pnl_after - pnl_before,
+        'pnl_improvement': pnl_improvement,
+        'block_value': block_value,
         **result,
         'signal_keep_rate': signal_keep_rate,
     }
 
 
-def apply_regime_fold_split(dataset_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
+def apply_regime_fold_split(
+        dataset_df: pd.DataFrame,
+        fold: dict,
+        embargo_signals: int = 0
+) -> pd.DataFrame:
     df = dataset_df.copy()
     df['split'] = None
+
     df.loc[
         (df['open_time'] >= fold['train_start']) &
         (df['open_time'] < fold['train_end']),
         'split'
     ] = 'train'
+
     df.loc[
         (df['open_time'] >= fold['val_start']) &
         (df['open_time'] < fold['val_end']),
         'split'
     ] = 'val'
+
+    if embargo_signals > 0:
+        train_df = df[df['split'] == 'train']
+        if len(train_df) > embargo_signals:
+            last_train_signals = train_df.tail(embargo_signals)
+            df.loc[last_train_signals.index, 'split'] = None
+
     return df[df['split'].notna()].reset_index(drop=True)
 
 
@@ -200,11 +227,12 @@ def run_regime_cv(
         seed: int = 42,
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
+        embargo_signals: int = 5,
 ) -> dict:
     fold_results = []
 
     for fold_idx, fold in enumerate(folds):
-        fold_df = apply_regime_fold_split(dataset_df, fold)
+        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals)
         model, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -250,6 +278,7 @@ def tune_regime_guard(
         seed: int = 42,
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
+        embargo_signals: int = 5,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -291,6 +320,7 @@ def tune_regime_guard(
                 seed=seed,
                 max_blocked_share=max_blocked_share,
                 min_signal_keep_rate=min_signal_keep_rate,
+                embargo_signals=embargo_signals,
             )
 
             trial_record = {

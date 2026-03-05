@@ -43,7 +43,8 @@ class RegimeFeatureBuilder:
                 self.ch_dsn, t_min - timedelta(days=7), t_max, top_n=self.top_n
             )
 
-        breadth_candles = self._load_breadth_candles(t_min - timedelta(hours=96 * 0.25), t_max)
+        breadth_lookback = timedelta(minutes=self.HIGH_8W_BARS * 15 + 96 * 15)
+        breadth_candles = self._load_breadth_candles(t_min - breadth_lookback, t_max)
 
         rows = []
         for _, sig in signals.iterrows():
@@ -76,9 +77,33 @@ class RegimeFeatureBuilder:
         return features_df
 
     def _load_candles_cached(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-        key = symbol
+        key = (symbol, start.isoformat(), end.isoformat())
         if key not in self._candle_cache:
-            self._candle_cache[key] = self.loader.load_candles_range(symbol, start, end)
+            if symbol in self._candle_cache:
+                existing_df = self._candle_cache[symbol]
+                existing_start = existing_df.index.min() if not existing_df.empty else None
+                existing_end = existing_df.index.max() if not existing_df.empty else None
+
+                if existing_start and existing_end:
+                    if start >= existing_start and end <= existing_end:
+                        return existing_df[(existing_df.index >= start) & (existing_df.index <= end)]
+
+                    if start < existing_start:
+                        df_before = self.loader.load_candles_range(symbol, start, existing_start)
+                        existing_df = pd.concat([df_before, existing_df]).sort_index()
+                        existing_df = existing_df[~existing_df.index.duplicated(keep='first')]
+                    if end > existing_end:
+                        df_after = self.loader.load_candles_range(symbol, existing_end, end)
+                        existing_df = pd.concat([existing_df, df_after]).sort_index()
+                        existing_df = existing_df[~existing_df.index.duplicated(keep='first')]
+
+                    self._candle_cache[symbol] = existing_df
+                    return existing_df[(existing_df.index >= start) & (existing_df.index <= end)]
+
+            df = self.loader.load_candles_range(symbol, start, end)
+            self._candle_cache[symbol] = df
+            self._candle_cache[key] = df
+            return df
         return self._candle_cache[key]
 
     def _load_breadth_candles(self, start: datetime, end: datetime) -> dict[str, pd.DataFrame]:
@@ -255,6 +280,7 @@ class RegimeFeatureBuilder:
         high_8w = np.max(high[h8w_start:loc + 1])
         f[f'{prefix}_dist_to_high_8w'] = (c / high_8w - 1) if high_8w > 0 else 0.0
         f[f'{prefix}_within_2pct_high_8w'] = 1 if (high_8w > 0 and c >= high_8w * 0.98) else 0
+        f[f'{prefix}_within_5pct_high_8w'] = 1 if (high_8w > 0 and c >= high_8w * 0.95) else 0
 
         high_slice = high[h8w_start:loc + 1]
         if len(high_slice) > 0:
@@ -271,7 +297,7 @@ class RegimeFeatureBuilder:
             f'{prefix}_vol_ratio_20', f'{prefix}_up_streak',
             f'{prefix}_green_frac_16', f'{prefix}_atr_norm',
             f'{prefix}_dist_to_high_8w', f'{prefix}_within_2pct_high_8w',
-            f'{prefix}_bars_since_high_8w',
+            f'{prefix}_within_5pct_high_8w', f'{prefix}_bars_since_high_8w',
         ]
         return {k: np.nan for k in keys}
 
@@ -288,6 +314,7 @@ class RegimeFeatureBuilder:
         vol_spike_20 = 0
         within_2pct_8w = 0
         within_5pct_8w = 0
+        new_high_8w_24h = 0
         valid_count = 0
 
         for sym, df in breadth_candles.items():
@@ -347,6 +374,12 @@ class RegimeFeatureBuilder:
                 if c >= high_8w * 0.95:
                     within_5pct_8w += 1
 
+                h24_start = max(0, loc - 96)
+                if h24_start < loc:
+                    high_24h_slice = high[h24_start:loc + 1]
+                    if len(high_24h_slice) > 0 and np.max(high_24h_slice) >= high_8w * 0.99:
+                        new_high_8w_24h += 1
+
         if valid_count == 0:
             return self._fill_breadth_nan()
 
@@ -360,6 +393,7 @@ class RegimeFeatureBuilder:
         f['breadth_share_vol_spike_20'] = vol_spike_20 / n
         f['breadth_share_within_2pct_high_8w'] = within_2pct_8w / n
         f['breadth_share_within_5pct_high_8w'] = within_5pct_8w / n
+        f['breadth_share_new_high_8w_last_24h'] = new_high_8w_24h / n
 
         return f
 
@@ -369,6 +403,7 @@ class RegimeFeatureBuilder:
             'breadth_share_gt_3pct_16', 'breadth_share_gt_5pct_16',
             'breadth_share_near_high_96', 'breadth_share_vol_spike_20',
             'breadth_share_within_2pct_high_8w', 'breadth_share_within_5pct_high_8w',
+            'breadth_share_new_high_8w_last_24h',
         ]
         return {k: np.nan for k in keys}
 
