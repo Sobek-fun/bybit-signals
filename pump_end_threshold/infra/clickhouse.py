@@ -167,6 +167,42 @@ class DataLoader:
 
         return df
 
+    def load_raw_1m_candles(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        query = """
+        SELECT
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume
+        FROM bybit.candles
+        WHERE symbol = %(symbol)s
+          AND interval = 1
+          AND open_time >= %(start)s
+          AND open_time < %(end)s
+        ORDER BY open_time
+        """
+
+        result = self.client.query(query, parameters={
+            "symbol": symbol,
+            "start": start_time,
+            "end": end_time
+        })
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["open_time", "open", "high", "low", "close", "volume"]
+        )
+
+        df["open_time"] = pd.to_datetime(df["open_time"])
+        df.set_index("open_time", inplace=True)
+
+        return df
+
     def _get_last_closed_time(self, symbol: str) -> datetime | None:
         now = datetime.now()
         minutes = (now.minute // 15) * 15

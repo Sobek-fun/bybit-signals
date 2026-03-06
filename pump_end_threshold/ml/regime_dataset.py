@@ -15,11 +15,22 @@ BAR_MINUTES = 15
 def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
                    tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
                    entry_shift_bars: int = ENTRY_SHIFT_BARS,
-                   max_horizon_bars: int = 200) -> dict:
+                   max_horizon_bars: int = 200,
+                   candle_cache: dict = None) -> dict:
     entry_time = signal_time + timedelta(minutes=entry_shift_bars * BAR_MINUTES)
     end_time = entry_time + timedelta(minutes=max_horizon_bars * BAR_MINUTES)
 
-    df = loader.load_candles_range(symbol, entry_time, end_time)
+    if candle_cache is not None and symbol in candle_cache:
+        cached_df, cached_start, cached_end = candle_cache[symbol]
+        if entry_time >= cached_start and end_time <= cached_end:
+            df = cached_df[(cached_df.index >= entry_time) & (cached_df.index <= end_time)]
+        else:
+            df = loader.load_raw_1m_candles(symbol, entry_time, end_time)
+            candle_cache[symbol] = (df, entry_time, end_time)
+    else:
+        df = loader.load_raw_1m_candles(symbol, entry_time, end_time)
+        if candle_cache is not None:
+            candle_cache[symbol] = (df, entry_time, end_time)
     if df.empty:
         return {
             'trade_outcome': 'UNKNOWN',
@@ -72,13 +83,13 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
 
         if tp_hit and sl_hit:
             return {
-                'trade_outcome': 'SL',
+                'trade_outcome': 'AMBIGUOUS',
                 'tp_hit': True,
                 'sl_hit': True,
                 'exit_time': df.index[i],
                 'entry_price': entry_price,
-                'exit_price': sl_price,
-                'pnl_pct': -sl_pct,
+                'exit_price': np.nan,
+                'pnl_pct': np.nan,
                 'mfe_pct': mfe,
                 'mae_pct': mae,
                 'trade_duration_bars': i,
@@ -131,12 +142,25 @@ def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
                          max_horizon_bars: int = 200) -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trade_results = []
+    candle_cache = {}
+
+    symbol_groups = signals.groupby('symbol')
+    for symbol, group in symbol_groups:
+        min_time = group['open_time'].min()
+        max_time = group['open_time'].max()
+        entry_start = min_time + timedelta(minutes=ENTRY_SHIFT_BARS * BAR_MINUTES)
+        entry_end = max_time + timedelta(minutes=(ENTRY_SHIFT_BARS + max_horizon_bars) * BAR_MINUTES)
+
+        full_df = loader.load_raw_1m_candles(symbol, entry_start, entry_end)
+        if not full_df.empty:
+            candle_cache[symbol] = (full_df, entry_start, entry_end)
 
     for i, sig in signals.iterrows():
         result = simulate_trade(
             loader, sig['symbol'], sig['open_time'],
             tp_pct, sl_pct,
-            max_horizon_bars=max_horizon_bars
+            max_horizon_bars=max_horizon_bars,
+            candle_cache=candle_cache
         )
         result['signal_idx'] = i
         result['symbol'] = sig['symbol']
@@ -197,23 +221,57 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
 
         resolved = future_slice[future_slice['trade_outcome'].isin(['TP', 'SL'])]
         n_resolved = len(resolved)
-        n_sl = int((resolved['trade_outcome'] == 'SL').sum())
-        sl_rate = n_sl / max(1, n_resolved)
 
-        targets[f'target_bad_next_{w}'] = 1 if (n_resolved >= min_resolved and sl_rate >= sl_rate_threshold) else 0
-        targets[f'target_next_{w}_sl_rate'] = sl_rate
-        targets[f'target_next_{w}_pnl_sum'] = float(resolved['pnl_pct'].sum()) if n_resolved > 0 else 0.0
+        if n_resolved < min_resolved:
+            targets[f'target_bad_next_{w}'] = np.nan
+            targets[f'target_next_{w}_sl_rate'] = np.nan
+            targets[f'target_next_{w}_pnl_sum'] = np.nan
+            targets[f'target_future_block_value_{w}'] = np.nan
+        else:
+            n_sl = int((resolved['trade_outcome'] == 'SL').sum())
+            sl_rate = n_sl / n_resolved
+            targets[f'target_bad_next_{w}'] = 1 if sl_rate >= sl_rate_threshold else 0
+            targets[f'target_next_{w}_sl_rate'] = sl_rate
+            targets[f'target_next_{w}_pnl_sum'] = float(resolved['pnl_pct'].sum())
+
+            tp_pnl = (resolved['trade_outcome'] == 'TP').sum() * TP_PCT
+            sl_pnl = (resolved['trade_outcome'] == 'SL').sum() * (-SL_PCT)
+            targets[f'target_future_block_value_{w}'] = tp_pnl + sl_pnl
+
+        consecutive_sl = 0
+        for _, trade in future_slice.iterrows():
+            if trade['trade_outcome'] == 'SL':
+                consecutive_sl += 1
+            elif trade['trade_outcome'] == 'TP':
+                break
+
+        targets[f'target_sl_streak_start_{w}'] = 1 if consecutive_sl >= 2 else 0
 
     future_12h_end = current_time + timedelta(hours=12)
     future_12h = trades_df[
         (trades_df['open_time'] > current_time) &
         (trades_df['open_time'] <= future_12h_end) &
-        (trades_df['trade_outcome'].isin(['TP', 'SL']))
+        (trades_df['trade_outcome'].isin(['TP', 'SL', 'TIMEOUT']))
     ]
-    n_res_12h = len(future_12h)
-    n_sl_12h = int((future_12h['trade_outcome'] == 'SL').sum()) if n_res_12h > 0 else 0
-    sl_rate_12h = n_sl_12h / max(1, n_res_12h)
-    targets['target_bad_next_12h'] = 1 if (n_res_12h >= min_resolved and sl_rate_12h >= sl_rate_threshold) else 0
+    n_res_12h = len(future_12h[future_12h['trade_outcome'].isin(['TP', 'SL'])])
+
+    if n_res_12h < min_resolved:
+        targets['target_bad_next_12h'] = np.nan
+        targets['target_12h_pnl_sum'] = np.nan
+    else:
+        n_sl_12h = int((future_12h['trade_outcome'] == 'SL').sum())
+        sl_rate_12h = n_sl_12h / n_res_12h
+        targets['target_bad_next_12h'] = 1 if sl_rate_12h >= sl_rate_threshold else 0
+
+        pnl_sum_12h = 0.0
+        for _, t in future_12h.iterrows():
+            if not pd.isna(t['pnl_pct']):
+                pnl_sum_12h += t['pnl_pct']
+            elif t['trade_outcome'] == 'TP':
+                pnl_sum_12h += TP_PCT
+            elif t['trade_outcome'] == 'SL':
+                pnl_sum_12h -= SL_PCT
+        targets['target_12h_pnl_sum'] = pnl_sum_12h
 
     return targets
 
@@ -222,6 +280,8 @@ def build_regime_dataset(
         signals_df: pd.DataFrame,
         features_df: pd.DataFrame,
         trades_df: pd.DataFrame,
+        min_resolved: int = 3,
+        sl_rate_threshold: float = 0.60,
 ) -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trades = trades_df.sort_values('open_time').reset_index(drop=True)
@@ -261,7 +321,7 @@ def build_regime_dataset(
             continue
         feats = feature_row.iloc[0].to_dict()
 
-        targets = compute_targets(trades, i)
+        targets = compute_targets(trades, i, min_resolved=min_resolved, sl_rate_threshold=sl_rate_threshold)
 
         row = {}
         row.update(feats)

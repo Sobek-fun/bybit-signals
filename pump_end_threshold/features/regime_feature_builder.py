@@ -21,6 +21,8 @@ class RegimeFeatureBuilder:
         self.liquid_universe = liquid_universe
         self.top_n = top_n
         self._candle_cache = {}
+        self._breadth_cache = None
+        self._breadth_cache_range = None
 
     def build(
             self,
@@ -47,7 +49,7 @@ class RegimeFeatureBuilder:
         breadth_candles = self._load_breadth_candles(t_min - breadth_lookback, t_max)
 
         rows = []
-        for _, sig in signals.iterrows():
+        for i, sig in signals.iterrows():
             row = {}
             ot = sig['open_time']
 
@@ -55,15 +57,21 @@ class RegimeFeatureBuilder:
 
             token_sym = sig['symbol']
             token_candles = self._load_candles_cached(token_sym, t_min - warmup, t_max)
-            row.update(self._token_context_features(token_candles, ot))
+            token_features = self._token_context_features(token_candles, ot)
+            row.update(token_features)
 
-            row.update(self._asset_context_features(btc_candles, ot, prefix='btc'))
-            row.update(self._asset_context_features(eth_candles, ot, prefix='eth'))
+            btc_features = self._asset_context_features(btc_candles, ot, prefix='btc')
+            eth_features = self._asset_context_features(eth_candles, ot, prefix='eth')
+            row.update(btc_features)
+            row.update(eth_features)
 
-            row.update(self._breadth_features(breadth_candles, ot))
+            breadth_features = self._breadth_features(breadth_candles, ot)
+            row.update(breadth_features)
 
-            if strategy_state is not None:
-                row.update(self._strategy_state_features(strategy_state, ot))
+            row.update(self._market_interaction_features(btc_features, eth_features, breadth_features, token_features))
+
+            signals_before = signals[signals['open_time'] <= ot]
+            row.update(self._signal_flow_features(signals_before, sig))
 
             rows.append(row)
 
@@ -109,8 +117,15 @@ class RegimeFeatureBuilder:
     def _load_breadth_candles(self, start: datetime, end: datetime) -> dict[str, pd.DataFrame]:
         if not self.liquid_universe:
             return {}
-        batch = self.loader.load_candles_batch(self.liquid_universe, start, end)
-        return batch
+
+        if self._breadth_cache is not None and self._breadth_cache_range is not None:
+            cache_start, cache_end = self._breadth_cache_range
+            if start >= cache_start and end <= cache_end:
+                return self._breadth_cache
+
+        self._breadth_cache = self.loader.load_candles_batch(self.liquid_universe, start, end)
+        self._breadth_cache_range = (start, end)
+        return self._breadth_cache
 
     def _detector_confidence_features(self, sig: pd.Series) -> dict:
         f = {}
@@ -306,8 +321,14 @@ class RegimeFeatureBuilder:
         if not breadth_candles:
             return self._fill_breadth_nan()
 
+        pos_1 = []
+        pos_4 = []
         pos_16 = []
+        pos_96 = []
+        rets_1 = []
+        rets_4 = []
         rets_16 = []
+        rets_96 = []
         gt_3pct = 0
         gt_5pct = 0
         near_high_96 = 0
@@ -337,18 +358,17 @@ class RegimeFeatureBuilder:
             c = close[loc]
             valid_count += 1
 
-            si_16 = max(0, loc - 16)
-            if si_16 < loc and close[si_16] > 0:
-                ret_16 = (c / close[si_16]) - 1
-            else:
-                ret_16 = 0.0
+            for w, rets_list, pos_list in [(1, rets_1, pos_1), (4, rets_4, pos_4),
+                                            (16, rets_16, pos_16), (96, rets_96, pos_96)]:
+                si = max(0, loc - w)
+                if si < loc and close[si] > 0:
+                    ret = (c / close[si]) - 1
+                else:
+                    ret = 0.0
+                rets_list.append(ret)
+                pos_list.append(1 if ret > 0 else 0)
 
-            rets_16.append(ret_16)
-            if ret_16 > 0:
-                pos_16.append(1)
-            else:
-                pos_16.append(0)
-
+            ret_16 = rets_16[-1] if rets_16 else 0.0
             if ret_16 >= 0.03:
                 gt_3pct += 1
             if ret_16 >= 0.05:
@@ -384,9 +404,13 @@ class RegimeFeatureBuilder:
             return self._fill_breadth_nan()
 
         n = valid_count
-        f['breadth_pos_16'] = sum(pos_16) / n
-        f['breadth_mean_ret_16'] = float(np.mean(rets_16))
-        f['breadth_median_ret_16'] = float(np.median(rets_16))
+
+        for w, rets_list, pos_list in [(1, rets_1, pos_1), (4, rets_4, pos_4),
+                                        (16, rets_16, pos_16), (96, rets_96, pos_96)]:
+            f[f'breadth_pos_{w}'] = sum(pos_list) / n
+            f[f'breadth_mean_ret_{w}'] = float(np.mean(rets_list))
+            f[f'breadth_median_ret_{w}'] = float(np.median(rets_list))
+
         f['breadth_share_gt_3pct_16'] = gt_3pct / n
         f['breadth_share_gt_5pct_16'] = gt_5pct / n
         f['breadth_share_near_high_96'] = near_high_96 / n
@@ -395,26 +419,86 @@ class RegimeFeatureBuilder:
         f['breadth_share_within_5pct_high_8w'] = within_5pct_8w / n
         f['breadth_share_new_high_8w_last_24h'] = new_high_8w_24h / n
 
+        f['breadth_change_1_to_4'] = f['breadth_pos_1'] - f['breadth_pos_4']
+        f['breadth_change_4_to_16'] = f['breadth_pos_4'] - f['breadth_pos_16']
+        f['breadth_change_16_to_96'] = f['breadth_pos_16'] - f['breadth_pos_96']
+
+        f['breadth_dispersion_16'] = float(np.std(rets_16))
+        f['breadth_acceleration'] = f['breadth_mean_ret_1'] - f['breadth_mean_ret_4']
+
         return f
 
     def _fill_breadth_nan(self) -> dict:
-        keys = [
-            'breadth_pos_16', 'breadth_mean_ret_16', 'breadth_median_ret_16',
+        keys = []
+        for w in [1, 4, 16, 96]:
+            keys.extend([
+                f'breadth_pos_{w}',
+                f'breadth_mean_ret_{w}',
+                f'breadth_median_ret_{w}',
+            ])
+        keys.extend([
             'breadth_share_gt_3pct_16', 'breadth_share_gt_5pct_16',
             'breadth_share_near_high_96', 'breadth_share_vol_spike_20',
             'breadth_share_within_2pct_high_8w', 'breadth_share_within_5pct_high_8w',
             'breadth_share_new_high_8w_last_24h',
-        ]
+            'breadth_change_1_to_4', 'breadth_change_4_to_16', 'breadth_change_16_to_96',
+            'breadth_dispersion_16', 'breadth_acceleration',
+        ])
         return {k: np.nan for k in keys}
 
-    def _strategy_state_features(self, state: dict, t: datetime) -> dict:
-        resolved = state.get('resolved_trades', [])
-        all_signals = state.get('all_signals', [])
-        open_trades = state.get('open_trades', [])
+    def _market_interaction_features(self, btc_features: dict, eth_features: dict,
+                                    breadth_features: dict, token_features: dict) -> dict:
+        f = {}
 
-        resolved_before = [tr for tr in resolved if tr['exit_time'] <= t]
-        signals_before = [s for s in all_signals if s['open_time'] <= t]
-        open_now = [tr for tr in open_trades if tr['entry_time'] <= t and tr.get('exit_time', t + timedelta(hours=1)) > t]
+        def get_safe(d, key, default=np.nan):
+            return d.get(key, default) if d else default
+
+        btc_ret_16 = get_safe(btc_features, 'btc_ret_16', 0.0)
+        eth_ret_16 = get_safe(eth_features, 'eth_ret_16', 0.0)
+        token_near_high_96 = get_safe(token_features, 'token_near_high_96', 0)
+        token_near_8w = get_safe(token_features, 'token_within_2pct_high_8w', 0)
+        token_vol_spike = 1 if get_safe(token_features, 'token_vol_ratio_20', 1) > 5 else 0
+        breadth_near_high = get_safe(breadth_features, 'breadth_share_near_high_96', 0)
+        breadth_vol_spike = get_safe(breadth_features, 'breadth_share_vol_spike_20', 0)
+        btc_near_high = get_safe(btc_features, 'btc_within_2pct_high_8w', 0)
+        eth_near_high = get_safe(eth_features, 'eth_within_2pct_high_8w', 0)
+
+        if not pd.isna(btc_ret_16) and not pd.isna(eth_ret_16):
+            f['btc_eth_divergence'] = btc_ret_16 - eth_ret_16
+            f['btc_strong_eth_weak'] = 1 if (btc_ret_16 > 0.03 and eth_ret_16 < -0.02) else 0
+            f['btc_weak_eth_strong'] = 1 if (btc_ret_16 < -0.02 and eth_ret_16 > 0.03) else 0
+            f['both_strong'] = 1 if (btc_ret_16 > 0.02 and eth_ret_16 > 0.02) else 0
+            f['both_weak'] = 1 if (btc_ret_16 < -0.02 and eth_ret_16 < -0.02) else 0
+
+        if not pd.isna(breadth_near_high):
+            f['breadth_near_high_x_btc_near_high'] = breadth_near_high * btc_near_high
+            f['breadth_vol_spike_x_token_near_high'] = breadth_vol_spike * token_near_high_96
+            f['btc_strong_x_eth_strong_x_token_near_high'] = (
+                f.get('both_strong', 0) * token_near_high_96
+            )
+
+        token_drawdown = get_safe(token_features, 'token_drawdown', 0.0)
+        breadth_mean_16 = get_safe(breadth_features, 'breadth_mean_ret_16', 0.0)
+        if not pd.isna(token_drawdown) and not pd.isna(breadth_mean_16):
+            f['token_relative_heat'] = (
+                1 if (token_near_8w and breadth_mean_16 < 0.02) else 0
+            )
+            f['token_overheated_vs_breadth'] = (
+                1 if (token_near_high_96 and breadth_near_high < 0.2) else 0
+            )
+
+        f['extreme_hot_market'] = (
+            1 if (breadth_near_high > 0.5 and btc_near_high and eth_near_high) else 0
+        )
+        f['extreme_vol_spike'] = (
+            1 if (breadth_vol_spike > 0.3 and token_vol_spike) else 0
+        )
+
+        return f
+
+    def _signal_flow_features(self, signals_before: pd.DataFrame, current_signal: pd.Series) -> dict:
+        t = current_signal['open_time']
+        curr_symbol = current_signal['symbol']
 
         f = {}
 
@@ -423,46 +507,127 @@ class RegimeFeatureBuilder:
         t_12h = t - timedelta(hours=12)
         t_24h = t - timedelta(hours=24)
 
-        f['raw_signals_last_1h'] = sum(1 for s in signals_before if s['open_time'] > t_1h)
-        f['raw_signals_last_4h'] = sum(1 for s in signals_before if s['open_time'] > t_4h)
-        f['raw_signals_last_12h'] = sum(1 for s in signals_before if s['open_time'] > t_12h)
-        f['open_trades_now'] = len(open_now)
+        signals_1h = signals_before[signals_before['open_time'] > t_1h]
+        signals_4h = signals_before[signals_before['open_time'] > t_4h]
+        signals_12h = signals_before[signals_before['open_time'] > t_12h]
+        signals_24h = signals_before[signals_before['open_time'] > t_24h]
 
-        resolved_24h = [tr for tr in resolved_before if tr['exit_time'] > t_24h]
-        f['resolved_trades_last_24h'] = len(resolved_24h)
+        f['raw_signals_last_1h'] = len(signals_1h)
+        f['raw_signals_last_4h'] = len(signals_4h)
+        f['raw_signals_last_12h'] = len(signals_12h)
+        f['raw_signals_last_24h'] = len(signals_24h)
 
-        outcomes_24h = [tr['outcome'] for tr in resolved_24h]
-        sl_24h = sum(1 for o in outcomes_24h if o == 'SL')
-        f['resolved_sl_rate_last_24h'] = sl_24h / max(1, len(outcomes_24h))
-        f['resolved_pnl_sum_last_24h'] = sum(
-            4.5 if tr['outcome'] == 'TP' else -10.0
-            for tr in resolved_24h
-        )
-
-        last_5 = resolved_before[-5:] if len(resolved_before) >= 5 else resolved_before
-        if last_5:
-            sl_5 = sum(1 for tr in last_5 if tr['outcome'] == 'SL')
-            f['resolved_sl_rate_last_5'] = sl_5 / len(last_5)
+        if len(signals_4h) > 0:
+            symbols_4h = signals_4h['symbol'].tolist()
+            symbol_counts = signals_4h['symbol'].value_counts()
+            f['unique_symbols_last_4h'] = len(symbol_counts)
+            f['max_symbol_concentration_4h'] = symbol_counts.max() / len(signals_4h) if len(signals_4h) > 0 else 0.0
         else:
-            f['resolved_sl_rate_last_5'] = np.nan
+            f['unique_symbols_last_4h'] = 0
+            f['max_symbol_concentration_4h'] = 0.0
 
-        tp_streak = 0
-        sl_streak = 0
-        for tr in reversed(resolved_before):
-            if tr['outcome'] == 'TP':
-                if sl_streak == 0:
-                    tp_streak += 1
-                else:
-                    break
-            elif tr['outcome'] == 'SL':
-                if tp_streak == 0:
-                    sl_streak += 1
-                else:
-                    break
+        if len(signals_24h) > 0:
+            symbols_24h = signals_24h['symbol'].tolist()
+            f['unique_symbols_last_24h'] = signals_24h['symbol'].nunique()
+            f['same_symbol_last_24h'] = (signals_24h['symbol'] == curr_symbol).sum()
+        else:
+            f['unique_symbols_last_24h'] = 0
+            f['same_symbol_last_24h'] = 0
+
+        for w_hours, w_label in [(1, '1h'), (4, '4h'), (24, '24h')]:
+            w_time = t - timedelta(hours=w_hours)
+            w_signals = signals_before[signals_before['open_time'] > w_time]
+            if len(w_signals) > 1:
+                times = w_signals['open_time'].sort_values()
+                gaps = [(times.iloc[i] - times.iloc[i-1]).total_seconds() / 60 for i in range(1, len(times))]
+                f[f'signal_density_median_gap_{w_label}'] = float(np.median(gaps))
+                f[f'signal_density_min_gap_{w_label}'] = min(gaps)
             else:
-                break
-
-        f['prev_closed_tp_streak'] = tp_streak
-        f['prev_closed_sl_streak'] = sl_streak
+                f[f'signal_density_median_gap_{w_label}'] = np.nan
+                f[f'signal_density_min_gap_{w_label}'] = np.nan
 
         return f
+
+    def _signal_flow_features_batch(self, all_signals: pd.DataFrame, signal_indices: list) -> pd.DataFrame:
+        all_signals_sorted = all_signals.sort_values('open_time').reset_index(drop=True)
+
+        features = []
+        for idx in signal_indices:
+            sig = all_signals_sorted.iloc[idx]
+            signals_before = all_signals_sorted.iloc[:idx+1]
+            f = self._signal_flow_features(signals_before, sig)
+            f['signal_id'] = sig.get('signal_id', idx)
+            features.append(f)
+
+        return pd.DataFrame(features)
+
+    def build_batch(self, signals: pd.DataFrame, batch_size: int = 100) -> pd.DataFrame:
+        if signals.empty:
+            return pd.DataFrame()
+
+        signals_sorted = signals.sort_values('open_time').reset_index(drop=True)
+
+        t_min = signals_sorted['open_time'].min()
+        t_max = signals_sorted['open_time'].max()
+        warmup = timedelta(hours=8 * 7 * 24)
+
+        btc_candles = self._load_candles_cached('BTCUSDT', t_min - warmup, t_max)
+        eth_candles = self._load_candles_cached('ETHUSDT', t_min - warmup, t_max)
+
+        if self.liquid_universe is None:
+            self.liquid_universe = get_liquid_universe(
+                self.ch_dsn, t_min - timedelta(days=7), t_max, top_n=self.top_n
+            )
+
+        breadth_lookback = timedelta(minutes=self.HIGH_8W_BARS * 15 + 96 * 15)
+        breadth_candles = self._load_breadth_candles(t_min - breadth_lookback, t_max)
+
+        unique_symbols = signals_sorted['symbol'].unique()
+        token_candles_cache = {}
+        for sym in unique_symbols:
+            token_candles_cache[sym] = self._load_candles_cached(sym, t_min - warmup, t_max)
+
+        all_features = []
+
+        for batch_start in range(0, len(signals_sorted), batch_size):
+            batch_end = min(batch_start + batch_size, len(signals_sorted))
+
+            batch_features = []
+            for i in range(batch_start, batch_end):
+                sig = signals_sorted.iloc[i]
+                signals_before = signals_sorted.iloc[:i+1]
+
+                row = {}
+                ot = sig['open_time']
+
+                row.update(self._detector_confidence_features(sig))
+
+                token_sym = sig['symbol']
+                token_candles = token_candles_cache[token_sym]
+                token_features = self._token_context_features(token_candles, ot)
+                row.update(token_features)
+
+                btc_features = self._asset_context_features(btc_candles, ot, prefix='btc')
+                eth_features = self._asset_context_features(eth_candles, ot, prefix='eth')
+                row.update(btc_features)
+                row.update(eth_features)
+
+                breadth_features = self._breadth_features(breadth_candles, ot)
+                row.update(breadth_features)
+
+                row.update(self._market_interaction_features(btc_features, eth_features, breadth_features, token_features))
+
+                row.update(self._signal_flow_features(signals_before, sig))
+
+                batch_features.append(row)
+
+            all_features.extend(batch_features)
+
+        features_df = pd.DataFrame(all_features)
+
+        keep_cols = ['event_id', 'symbol', 'open_time', 'event_type']
+        for c in keep_cols:
+            if c in signals.columns:
+                features_df[c] = signals[c].values
+
+        return features_df

@@ -57,6 +57,7 @@ class RegimePolicy:
 
         all_outcomes = signals_df.sort_values('open_time')
         has_outcome = 'trade_outcome' in all_outcomes.columns
+        has_pnl_pct = 'pnl_pct' in all_outcomes.columns
 
         if not has_outcome:
             return {
@@ -68,13 +69,22 @@ class RegimePolicy:
         before_tp = int((all_outcomes['trade_outcome'] == 'TP').sum())
         before_sl = int((all_outcomes['trade_outcome'] == 'SL').sum())
         before_resolved = before_tp + before_sl
-        pnl_map = {'TP': 4.5, 'SL': -10.0}
-        pnl_before = sum(pnl_map.get(o, 0) for o in all_outcomes['trade_outcome'])
+
+        if has_pnl_pct:
+            pnl_before = all_outcomes['pnl_pct'].fillna(0).sum()
+        else:
+            pnl_map = {'TP': 4.5, 'SL': -10.0, 'TIMEOUT': 0.0}
+            pnl_before = sum(pnl_map.get(o, 0) for o in all_outcomes['trade_outcome'])
 
         accepted = df[~df['blocked_by_policy']]
         after_tp = int((accepted['trade_outcome'] == 'TP').sum()) if has_outcome else 0
         after_sl = int((accepted['trade_outcome'] == 'SL').sum()) if has_outcome else 0
-        pnl_after = sum(pnl_map.get(o, 0) for o in accepted['trade_outcome'])
+
+        if has_pnl_pct:
+            pnl_after = accepted['pnl_pct'].fillna(0).sum()
+        else:
+            pnl_map = {'TP': 4.5, 'SL': -10.0, 'TIMEOUT': 0.0}
+            pnl_after = sum(pnl_map.get(o, 0) for o in accepted['trade_outcome'])
 
         blocked = df[df['blocked_by_policy']]
         tp_blocked = int((blocked['trade_outcome'] == 'TP').sum()) if has_outcome else 0

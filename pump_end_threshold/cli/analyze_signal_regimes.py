@@ -17,6 +17,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
 from pump_end_threshold.features.params import DEFAULT_PUMP_PARAMS
 from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.ml.regime_dataset import simulate_trade
 
 
 # ======================================================================================
@@ -599,105 +600,59 @@ class TradeOutcome:
     mae_pct: float | np.nan
 
 
-def simulate_short_trade(df: pd.DataFrame, signal_time: pd.Timestamp) -> TradeOutcome:
-    if df is None or df.empty or signal_time not in df.index:
+def simulate_short_trade_unified(loader: DataLoader, symbol: str, signal_time: pd.Timestamp) -> TradeOutcome:
+    result = simulate_trade(
+        loader, symbol, signal_time.to_pydatetime(),
+        tp_pct=TP_PCT * 100, sl_pct=SL_PCT * 100,
+        entry_shift_bars=ENTRY_BAR_SHIFT,
+        max_horizon_bars=MAX_HOLD_BARS
+    )
+
+    if result['trade_outcome'] == 'UNKNOWN':
         return TradeOutcome(pd.NaT, np.nan, pd.NaT, np.nan, "no_data", np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
 
-    signal_idx = df.index.get_loc(signal_time)
-    if isinstance(signal_idx, slice):
-        signal_idx = signal_idx.start
+    entry_time = pd.Timestamp(signal_time + pd.Timedelta(minutes=ENTRY_BAR_SHIFT * 15))
+    entry_price = result['entry_price']
 
-    entry_idx = signal_idx + ENTRY_BAR_SHIFT
-    if entry_idx >= len(df):
-        return TradeOutcome(pd.NaT, np.nan, pd.NaT, np.nan, "no_future", np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
-
-    entry_time = pd.Timestamp(df.index[entry_idx])
-    entry_price = float(df.iloc[entry_idx]["open"])
     if not np.isfinite(entry_price) or entry_price <= 0:
         return TradeOutcome(entry_time, np.nan, pd.NaT, np.nan, "bad_entry", np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
 
-    tp_price = entry_price * (1 - TP_PCT)
-    sl_price = entry_price * (1 + SL_PCT)
+    outcome_map = {
+        'TP': 'tp',
+        'SL': 'sl',
+        'TIMEOUT': 'timeout',
+        'AMBIGUOUS': 'ambiguous'
+    }
+    outcome = outcome_map.get(result['trade_outcome'], result['trade_outcome'].lower())
 
-    last_idx = min(len(df) - 1, entry_idx + MAX_HOLD_BARS - 1)
-    future = df.iloc[entry_idx : last_idx + 1]
+    pnl_pct = result['pnl_pct'] / 100 if not pd.isna(result['pnl_pct']) else np.nan
 
-    mfe_pct = safe_div(entry_price - future["low"].min(), entry_price)
-    mae_pct = safe_div(future["high"].max() - entry_price, entry_price)
+    if outcome == 'ambiguous':
+        pnl_pct_best = TP_PCT
+        pnl_pct_worst = -SL_PCT
+    else:
+        pnl_pct_best = pnl_pct
+        pnl_pct_worst = pnl_pct
 
-    for j in range(entry_idx, last_idx + 1):
-        high = float(df.iloc[j]["high"])
-        low = float(df.iloc[j]["low"])
-        current_time = pd.Timestamp(df.index[j])
-
-        hit_tp = low <= tp_price
-        hit_sl = high >= sl_price
-
-        if hit_tp and hit_sl:
-            return TradeOutcome(
-                entry_time=entry_time,
-                entry_price=entry_price,
-                exit_time=current_time,
-                exit_price=np.nan,
-                outcome="ambiguous",
-                pnl_pct=np.nan,
-                pnl_pct_best=TP_PCT,
-                pnl_pct_worst=-SL_PCT,
-                holding_bars=j - entry_idx + 1,
-                mfe_pct=float(mfe_pct),
-                mae_pct=float(mae_pct),
-            )
-        if hit_tp:
-            return TradeOutcome(
-                entry_time=entry_time,
-                entry_price=entry_price,
-                exit_time=current_time,
-                exit_price=tp_price,
-                outcome="tp",
-                pnl_pct=TP_PCT,
-                pnl_pct_best=TP_PCT,
-                pnl_pct_worst=TP_PCT,
-                holding_bars=j - entry_idx + 1,
-                mfe_pct=float(mfe_pct),
-                mae_pct=float(mae_pct),
-            )
-        if hit_sl:
-            return TradeOutcome(
-                entry_time=entry_time,
-                entry_price=entry_price,
-                exit_time=current_time,
-                exit_price=sl_price,
-                outcome="sl",
-                pnl_pct=-SL_PCT,
-                pnl_pct_best=-SL_PCT,
-                pnl_pct_worst=-SL_PCT,
-                holding_bars=j - entry_idx + 1,
-                mfe_pct=float(mfe_pct),
-                mae_pct=float(mae_pct),
-            )
-
-    exit_time = pd.Timestamp(df.index[last_idx])
-    exit_price = float(df.iloc[last_idx]["close"])
-    pnl_pct = float(safe_div(entry_price - exit_price, entry_price))
     return TradeOutcome(
         entry_time=entry_time,
         entry_price=entry_price,
-        exit_time=exit_time,
-        exit_price=exit_price,
-        outcome="timeout",
+        exit_time=pd.Timestamp(result['exit_time']) if result['exit_time'] else pd.NaT,
+        exit_price=result['exit_price'],
+        outcome=outcome,
         pnl_pct=pnl_pct,
-        pnl_pct_best=pnl_pct,
-        pnl_pct_worst=pnl_pct,
-        holding_bars=last_idx - entry_idx + 1,
-        mfe_pct=float(mfe_pct),
-        mae_pct=float(mae_pct),
+        pnl_pct_best=pnl_pct_best,
+        pnl_pct_worst=pnl_pct_worst,
+        holding_bars=result['trade_duration_bars'],
+        mfe_pct=result['mfe_pct'] / 100 if not pd.isna(result['mfe_pct']) else np.nan,
+        mae_pct=result['mae_pct'] / 100 if not pd.isna(result['mae_pct']) else np.nan,
     )
 
 
-def compute_trade_outcomes(signals: pd.DataFrame, symbol_candles: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def compute_trade_outcomes(signals: pd.DataFrame, symbol_candles: dict[str, pd.DataFrame], loader: DataLoader) -> pd.DataFrame:
     rows = []
     for row in signals.itertuples():
-        outcome = simulate_short_trade(symbol_candles.get(row.symbol), row.open_time)
+        outcome = simulate_short_trade_unified(loader, row.symbol, row.open_time)
         rows.append(
             {
                 "signal_id": row.signal_id,
@@ -1392,7 +1347,7 @@ def main() -> None:
 
     # Trade outcomes.
     log("simulating trade outcomes")
-    trade_outcomes = compute_trade_outcomes(signals, symbol_candles)
+    trade_outcomes = compute_trade_outcomes(signals, symbol_candles, loader)
     signals = signals.merge(trade_outcomes, on="signal_id", how="left")
 
     # Context from the current model feature builder.

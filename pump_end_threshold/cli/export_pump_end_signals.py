@@ -61,143 +61,18 @@ def get_symbols(client, start_dt: datetime, end_dt: datetime) -> list:
 
 
 def detect_candidates(df: pd.DataFrame, params: PumpParams) -> list:
-    df = df.copy()
+    from pump_end_threshold.tools.pump_start_detection.detector import PumpDetector
 
-    df['vol_median'] = df['volume'].rolling(window=params.volume_median_window).median()
-    df['vol_ratio'] = df['volume'] / df['vol_median']
+    df = df.copy()
 
     df.ta.rsi(length=14, append=True)
     df.ta.mfi(length=14, append=True)
     df.ta.macd(fast=12, slow=26, signal=9, append=True)
 
-    df = df.rename(columns={
-        'RSI_14': 'rsi_14',
-        'MFI_14': 'mfi_14',
-        'MACDh_12_26_9': 'macdh_12_26_9',
-        'MACD_12_26_9': 'macd_line',
-        'MACDs_12_26_9': 'macd_signal'
-    })
+    detector = PumpDetector(params)
+    result = detector.detect(df)
 
-    rsi = df['rsi_14']
-    mfi = df['mfi_14']
-    macdh = df['macdh_12_26_9']
-    macd_line = df['macd_line']
-
-    df['vol_ratio_max'] = df['vol_ratio'].rolling(window=params.peak_window).max()
-    df['rsi_max'] = rsi.rolling(window=params.peak_window).max()
-    df['macdh_max'] = macdh.rolling(window=params.peak_window).max()
-    df['high_max'] = df['high'].rolling(window=params.peak_window).max()
-
-    min_price = df[['low', 'open']].min(axis=1)
-    local_min = min_price.rolling(window=params.runup_window).min()
-    runup = (df['high'] / local_min) - 1
-    runup_met = ((local_min > 0) & (runup >= params.runup_threshold)).fillna(False)
-
-    vol_spike_cond = df['vol_ratio'] >= params.vol_ratio_spike
-    vol_spike_recent = vol_spike_cond.rolling(window=params.context_window).sum().fillna(0) > 0
-
-    rsi_corridor = rsi.rolling(window=params.corridor_window).quantile(params.corridor_quantile)
-    mfi_corridor = mfi.rolling(window=params.corridor_window).quantile(params.corridor_quantile)
-
-    rsi_hot = rsi.notna() & rsi_corridor.notna() & (rsi >= np.maximum(params.rsi_hot, rsi_corridor))
-    mfi_hot = mfi.notna() & mfi_corridor.notna() & (mfi >= np.maximum(params.mfi_hot, mfi_corridor))
-    osc_hot_recent = (rsi_hot | mfi_hot).rolling(window=params.context_window).sum().fillna(0) > 0
-
-    macd_pos_recent = (macdh.notna() & (macdh > 0)).rolling(window=params.context_window).sum().fillna(0) > 0
-
-    pump_ctx = runup_met & vol_spike_recent & osc_hot_recent & macd_pos_recent
-
-    high_max = df['high_max']
-    near_peak = high_max.notna() & (high_max > 0) & (df['high'] >= high_max * (1 - params.peak_tol))
-
-    n = len(df)
-    open_p = df['open'].values
-    high_p = df['high'].values
-    low_p = df['low'].values
-    close_p = df['close'].values
-
-    candle_range_arr = high_p - low_p
-    range_pos_arr = candle_range_arr > 0
-
-    close_pos = np.zeros(n, dtype=float)
-    np.divide(close_p - low_p, candle_range_arr, out=close_pos, where=range_pos_arr)
-
-    max_oc = np.maximum(open_p, close_p)
-    upper_wick = high_p - max_oc
-
-    wick_ratio = np.zeros(n, dtype=float)
-    np.divide(upper_wick, candle_range_arr, out=wick_ratio, where=range_pos_arr)
-
-    body_size = np.abs(close_p - open_p)
-    body_ratio = np.zeros(n, dtype=float)
-    np.divide(body_size, candle_range_arr, out=body_ratio, where=range_pos_arr)
-
-    bearish = close_p < open_p
-
-    blowoff_exhaustion = (
-            (close_pos <= params.close_pos_low) |
-            (bearish & (close_pos <= 0.45)) |
-            ((wick_ratio >= params.wick_blowoff) & (body_ratio <= params.body_blowoff))
-    )
-
-    osc_extreme = rsi.notna() & mfi.notna() & (rsi >= params.rsi_extreme) & (mfi >= params.mfi_extreme)
-    predump_mask = osc_extreme & (close_pos >= params.close_pos_high)
-
-    vol_ratio_max = df['vol_ratio_max']
-    vol_ratio = df['vol_ratio']
-    vol_fade = vol_ratio_max.notna() & (vol_ratio_max > 0) & (vol_ratio <= vol_ratio_max * params.vol_fade_ratio)
-
-    wick_high_mask = wick_ratio >= params.wick_high
-    wick_low_mask = (wick_ratio >= params.wick_low) & (~wick_high_mask)
-
-    rsi_max = df['rsi_max']
-    macdh_max = df['macdh_max']
-    rsi_fade = rsi_max.notna() & (rsi_max > 0) & (rsi <= rsi_max * params.rsi_fade_ratio)
-    macd_fade = macdh_max.notna() & macdh.notna() & (macdh_max > 0) & (macdh <= macdh_max * params.macd_fade_ratio)
-
-    predump_peak = (
-            predump_mask &
-            (
-                    (wick_high_mask & vol_fade) |
-                    (wick_low_mask & vol_fade & (rsi_fade | macd_fade))
-            )
-    ).fillna(False)
-
-    pump_ctx_arr = pump_ctx.to_numpy(dtype=bool, copy=False)
-    near_peak_arr = near_peak.to_numpy(dtype=bool, copy=False)
-    blowoff_arr = np.array(blowoff_exhaustion, dtype=bool)
-    predump_arr = predump_peak.to_numpy(dtype=bool, copy=False)
-
-    strong_cond = pump_ctx_arr & near_peak_arr & (blowoff_arr | predump_arr)
-
-    macd_turn_down = (
-            macd_line.notna() &
-            macd_line.shift(1).notna() &
-            (macd_line < macd_line.shift(1))
-    ).to_numpy(dtype=bool, copy=False)
-
-    candidates = []
-    pending = False
-    last_signal_idx = None
-
-    skip_initial = max(
-        params.volume_median_window,
-        params.runup_window,
-        params.corridor_window,
-        params.context_window,
-        params.peak_window
-    )
-
-    for i in range(skip_initial, n):
-        if strong_cond[i] and not pending:
-            pending = True
-
-        if pending and macd_turn_down[i]:
-            if last_signal_idx is None or i - last_signal_idx >= params.cooldown_bars:
-                candidates.append(df.index[i])
-                last_signal_idx = i
-            pending = False
-
+    candidates = result[result['pump_signal'] == 'strong_pump'].index.tolist()
     return candidates
 
 
@@ -380,8 +255,7 @@ def run_guard_stage(
 ) -> pd.DataFrame:
     from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
     from pump_end_threshold.ml.regime_policy import RegimePolicy
-    from pump_end_threshold.infra.clickhouse import get_liquid_universe, DataLoader
-    from pump_end_threshold.ml.regime_dataset import build_strategy_state, compute_strategy_state_at
+    from pump_end_threshold.infra.clickhouse import get_liquid_universe
 
     guard_model_path = guard_model_dir / "regime_guard_model.cbm"
     guard_model = CatBoostClassifier()
@@ -408,30 +282,12 @@ def run_guard_stage(
         liquid_universe=liquid_universe,
     )
 
-    log("INFO", "GUARD", "simulating trades for strategy state")
-    loader = DataLoader(ch_dsn)
-    trades_df = build_strategy_state(signals, loader, tp_pct=4.5, sl_pct=10.0)
-    trades_sorted = trades_df.sort_values('open_time').reset_index(drop=True)
-    all_signal_times = signals['open_time'].tolist()
+    log("INFO", "GUARD", "building regime features in batch mode")
+    guard_features = builder.build_batch(signals, batch_size=100)
 
-    log("INFO", "GUARD", "building regime features with strategy state")
-    feature_rows = []
-    for i in range(len(signals)):
-        sig = signals.iloc[i]
-        t = sig['open_time']
-
-        strategy_state = compute_strategy_state_at(trades_sorted, t, all_signal_times)
-
-        sig_for_builder = pd.DataFrame([sig])
-        feats = builder.build(sig_for_builder, strategy_state=strategy_state)
-        if not feats.empty:
-            feature_rows.append(feats)
-
-    if not feature_rows:
+    if guard_features.empty:
         log("WARN", "GUARD", "no features built")
         return raw_signals_df
-
-    guard_features = pd.concat(feature_rows, ignore_index=True)
 
     available = [c for c in guard_feature_columns if c in guard_features.columns]
     if len(available) < len(guard_feature_columns):
