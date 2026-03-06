@@ -3,6 +3,7 @@ import pandas as pd
 
 EXCLUDED_COLUMNS = {
     'event_id',
+    'signal_id',
     'symbol',
     'open_time',
     'event_type',
@@ -32,6 +33,9 @@ EXCLUDED_COLUMNS = {
     'pause_state',
     'blocked_by_policy',
     'accepted_by_policy',
+    'p_bad',
+    'regime_state',
+    'month',
 }
 
 EXCLUDED_PREFIXES = (
