@@ -36,6 +36,12 @@ EXCLUDED_COLUMNS = {
     'p_bad',
     'regime_state',
     'month',
+    'pump_la_type',
+    'timeframe',
+    'window_bars',
+    'warmup_bars',
+    'target',
+    'runup_pct',
 }
 
 EXCLUDED_PREFIXES = (
