@@ -209,7 +209,7 @@ def main():
         log("WARN", "REGIME-DS", "no features built")
         return
 
-    dataset = pd.concat(feature_rows, ignore_index=True)
+    dataset = pd.DataFrame(feature_rows)
     log("INFO", "REGIME-DS", f"dataset shape: {dataset.shape}")
 
     out_path = Path(args.output)
