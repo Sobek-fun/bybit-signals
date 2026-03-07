@@ -552,13 +552,60 @@ def tune_regime_guard(
     if policy_result['best_params'] is None:
         raise ValueError("Failed to find valid policy parameters")
 
+    # Combine results for backward compatibility
+    combined_leaderboard = []
+
+    # Add model results to leaderboard
+    if 'results_df' in model_result and not model_result['results_df'].empty:
+        for _, row in model_result['results_df'].iterrows():
+            combined_leaderboard.append({
+                **row.to_dict(),
+                'policy_pause_on_threshold': np.nan,
+                'policy_resume_threshold': np.nan,
+                'policy_resume_confirm_signals': np.nan,
+                'mean_score': row.get('mean_auc', np.nan),
+                'std_score': row.get('std_auc', np.nan),
+            })
+
+    # Add policy results to leaderboard
+    if 'results_df' in policy_result and not policy_result['results_df'].empty:
+        for _, row in policy_result['results_df'].iterrows():
+            record = {
+                **model_result['best_params'],
+                **row.to_dict(),
+                'mean_score': row.get('score', np.nan),
+                'std_score': np.nan,
+                'n_valid_folds': row.get('n_valid_folds', 0),
+            }
+            combined_leaderboard.append(record)
+
+    leaderboard_df = pd.DataFrame(combined_leaderboard) if combined_leaderboard else pd.DataFrame()
+
+    # Calculate total trials
+    model_trials = len(model_result.get('results_df', [])) if 'results_df' in model_result else 0
+    policy_trials = len(policy_result.get('results_df', [])) if 'results_df' in policy_result else 0
+    total_trials = model_trials + policy_trials
+
+    # Calculate total time
+    total_time = model_result.get('time_elapsed_sec', 0) + policy_result.get('time_elapsed_sec', 0)
+
     return {
         'best_model_params': model_result['best_params'],
         'best_policy_params': policy_result['best_params'],
-        'model_tuning': model_result,
-        'policy_tuning': policy_result,
+        'best_score': policy_result.get('best_score', -np.inf),
+        'best_cv_result': {
+            'mean_score': policy_result.get('best_score', -np.inf),
+            'std_score': 0.0,
+            'n_valid_folds': len(model_result.get('folds', [])),
+            'fold_results': [],
+        },
+        'leaderboard': leaderboard_df,
         'feature_columns': model_result['feature_columns'],
         'folds': model_result['folds'],
+        'trials_completed': total_trials,
+        'time_elapsed_sec': total_time,
+        'model_tuning': model_result,
+        'policy_tuning': policy_result,
     }
 
 
