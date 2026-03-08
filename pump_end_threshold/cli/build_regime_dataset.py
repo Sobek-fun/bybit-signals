@@ -97,6 +97,11 @@ def main():
     )
     log("INFO", "REGIME-DS", f"liquid universe: {len(liquid_universe)} symbols")
 
+    if run_dir:
+        with open(run_dir / "liquid_universe.json", 'w') as f:
+            json.dump(liquid_universe, f, indent=2)
+        log("INFO", "REGIME-DS", "saved liquid_universe.json")
+
     log("INFO", "REGIME-DS", "simulating trades")
     trades_df = build_strategy_state(
         signals_df, loader,
@@ -126,6 +131,17 @@ def main():
         top_n=args.top_n_universe,
     )
 
+    if run_dir:
+        regime_builder_config = {
+            'top_n_universe': args.top_n_universe,
+            'HIGH_8W_BARS': RegimeFeatureBuilder.HIGH_8W_BARS,
+            'breadth_lookback_hours': RegimeFeatureBuilder.HIGH_8W_BARS * 15 / 60 + 24,
+            'feature_version': 'v3',
+        }
+        with open(run_dir / "regime_builder_config.json", 'w') as f:
+            json.dump(regime_builder_config, f, indent=2)
+        log("INFO", "REGIME-DS", "saved regime_builder_config.json")
+
     all_signal_times = signals_df['open_time'].tolist()
     trades_sorted = trades_df.sort_values('open_time').reset_index(drop=True)
 
@@ -143,19 +159,25 @@ def main():
         log("INFO", "REGIME-DS", "including detector snapshot features")
 
     batch_size = 50
-    feature_rows = []
-
+    log("INFO", "REGIME-DS", "building features")
     regime_features = builder.build_batch(signals_df, batch_size=batch_size)
 
-    for idx, sig in signals_df.iterrows():
-        t = sig['open_time']
+    # Use helper function to build dataset with all targets and sample weights
+    from pump_end_threshold.ml.regime_dataset import build_regime_dataset as build_dataset_helper
 
-        if idx < len(regime_features):
-            feats = regime_features.iloc[idx].to_dict()
-        else:
-            feats = {}
+    dataset = build_dataset_helper(
+        signals_df=signals_df,
+        features_df=regime_features,
+        trades_df=trades_df,
+        min_resolved=args.target_min_resolved,
+        sl_rate_threshold=args.target_sl_rate_threshold,
+    )
 
-        if pump_builder:
+    if pump_builder and args.include_detector_snapshot:
+        log("INFO", "REGIME-DS", "adding detector snapshot features")
+        for idx, sig in signals_df.iterrows():
+            if idx >= len(dataset):
+                break
             sig_batch = signals_df.iloc[max(0, idx-batch_size):idx+1].copy()
             sig_batch = sig_batch.rename(columns={'open_time': 'event_open_time'})
             sig_batch['pump_la_type'] = 'A'
@@ -165,51 +187,20 @@ def main():
                 if not pump_feats_batch.empty and idx < len(pump_feats_batch):
                     pump_row = pump_feats_batch.iloc[idx % len(pump_feats_batch)]
                     for col in pump_row.index:
-                        if col not in feats:
-                            feats[col] = pump_row[col]
+                        if col not in dataset.columns and col != 'signal_id':
+                            dataset.loc[idx, col] = pump_row[col]
             except:
                 pass
 
-        targets = compute_targets(
-            trades_sorted, idx,
-            window_sizes=[3, args.target_horizon_signals],
-            min_resolved=args.target_min_resolved,
-            sl_rate_threshold=args.target_sl_rate_threshold
-        )
-        for k, v in targets.items():
-            feats[k] = v
+    for col in ['p_end_at_fire', 'threshold_gap', 'pending_bars',
+                'drop_from_peak_at_fire', 'signal_offset',
+                'p_end_peak_before_fire', 'threshold_used']:
+        if col in signals_df.columns and f'det_{col}' not in dataset.columns:
+            dataset[f'det_{col}'] = signals_df[col].values
 
-        trade_row = trades_sorted[(trades_sorted['open_time'] == t) & (trades_sorted['symbol'] == sig['symbol'])]
-        if not trade_row.empty:
-            tr = trade_row.iloc[0]
-            feats['trade_outcome'] = tr['trade_outcome']
-            feats['tp_hit'] = tr['tp_hit']
-            feats['sl_hit'] = tr['sl_hit']
-            feats['exit_time'] = tr['exit_time']
-            feats['entry_price'] = tr['entry_price']
-            feats['exit_price'] = tr['exit_price']
-            feats['pnl_pct'] = tr['pnl_pct']
-            feats['mfe_pct'] = tr['mfe_pct']
-            feats['mae_pct'] = tr['mae_pct']
-            feats['trade_duration_bars'] = tr['trade_duration_bars']
-
-        for col in ['p_end_at_fire', 'threshold_gap', 'pending_bars',
-                     'drop_from_peak_at_fire', 'signal_offset',
-                     'p_end_peak_before_fire', 'threshold_used']:
-            if col in sig.index:
-                feats[f'det_{col}'] = sig[col]
-
-        feats['signal_id'] = sig['signal_id']
-        feature_rows.append(feats)
-
-        if idx % batch_size == 0:
-            log("INFO", "REGIME-DS", f"processed {idx}/{len(signals_df)} signals")
-
-    if not feature_rows:
+    if dataset.empty:
         log("WARN", "REGIME-DS", "no features built")
         return
-
-    dataset = pd.DataFrame(feature_rows)
     log("INFO", "REGIME-DS", f"dataset shape: {dataset.shape}")
 
     out_path = Path(args.output)

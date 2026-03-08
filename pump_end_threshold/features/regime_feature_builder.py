@@ -68,6 +68,11 @@ class RegimeFeatureBuilder:
             breadth_features = self._breadth_features(breadth_candles, ot)
             row.update(breadth_features)
 
+            token_relative_features = self._token_relative_context_features(
+                token_features, btc_features, eth_features, breadth_features
+            )
+            row.update(token_relative_features)
+
             row.update(self._market_interaction_features(btc_features, eth_features, breadth_features, token_features))
 
             signals_before = signals[signals['open_time'] <= ot]
@@ -129,9 +134,37 @@ class RegimeFeatureBuilder:
 
     def _detector_confidence_features(self, sig: pd.Series) -> dict:
         f = {}
-        for col in ['p_end_at_fire', 'threshold_gap', 'pending_bars',
-                     'drop_from_peak_at_fire', 'signal_offset']:
+
+        core_cols = [
+            'p_end_at_fire', 'threshold_gap', 'pending_bars',
+            'drop_from_peak_at_fire', 'signal_offset'
+        ]
+        for col in core_cols:
             f[f'det_{col}'] = sig.get(col, np.nan)
+
+        snapshot_cols = [
+            'runup_age', 'pump_ctx_age', 'near_peak_streak',
+            'bars_since_new_high', 'close_pos', 'wick_ratio',
+            'blowoff_exhaustion', 'predump_peak', 'vol_fade',
+            'rsi_fade', 'macd_fade', 'liquidity_distance',
+            'sweep_flag', 'reversal_pattern', 'divergence_score',
+            'momentum_fade', 'volume_profile_imbalance',
+            'order_flow_exhaustion', 'support_level_distance',
+            'resistance_break_strength', 'trend_strength_fade',
+            'candle_pattern_score', 'market_structure_shift',
+            'buying_pressure_fade', 'selling_pressure_spike',
+            'breadth_divergence', 'sector_rotation_signal',
+            'time_of_day_bias', 'weekly_momentum', 'monthly_momentum',
+            'liquidity_grab', 'stop_hunt_signal', 'fakeout_probability',
+            'mean_reversion_score', 'breakout_failure_risk',
+            'exhaustion_gap', 'island_reversal', 'double_top_proximity',
+            'head_shoulders_pattern', 'wedge_pattern_completion'
+        ]
+
+        for col in snapshot_cols:
+            if col in sig.index:
+                f[f'snap_{col}'] = sig[col]
+
         return f
 
     def _token_context_features(self, df: pd.DataFrame, t: datetime) -> dict:
@@ -155,7 +188,7 @@ class RegimeFeatureBuilder:
 
         c = close[loc]
 
-        for w in [4, 16, 96]:
+        for w in [1, 4, 16, 96]:
             start_idx = max(0, loc - w)
             if start_idx < loc and close[start_idx] > 0:
                 f[f'token_ret_{w}'] = (c / close[start_idx]) - 1
@@ -221,7 +254,7 @@ class RegimeFeatureBuilder:
 
     def _fill_token_context_nan(self) -> dict:
         keys = [
-            'token_ret_4', 'token_ret_16', 'token_ret_96',
+            'token_ret_1', 'token_ret_4', 'token_ret_16', 'token_ret_96',
             'token_drawdown', 'token_vol_ratio_20', 'token_rsi_14',
             'token_dist_to_high_8w', 'token_within_2pct_high_8w',
             'token_bars_since_high_8w', 'token_up_streak',
@@ -246,15 +279,26 @@ class RegimeFeatureBuilder:
 
         close = df['close'].values
         high = df['high'].values
+        low = df['low'].values
         volume = df['volume'].values
         c = close[loc]
 
-        for w in [16, 96]:
+        for w in [1, 4, 16, 96]:
             si = max(0, loc - w)
             if si < loc and close[si] > 0:
                 f[f'{prefix}_ret_{w}'] = (c / close[si]) - 1
             else:
                 f[f'{prefix}_ret_{w}'] = np.nan
+
+        if loc >= 4:
+            f[f'{prefix}_ret_accel'] = f[f'{prefix}_ret_1'] - f[f'{prefix}_ret_4']
+        else:
+            f[f'{prefix}_ret_accel'] = np.nan
+
+        if loc >= 16:
+            f[f'{prefix}_ret_accel_slow'] = f[f'{prefix}_ret_4'] - f[f'{prefix}_ret_16']
+        else:
+            f[f'{prefix}_ret_accel_slow'] = np.nan
 
         vol_start = max(0, loc - 20)
         vol_slice = volume[vol_start:loc + 1]
@@ -304,15 +348,68 @@ class RegimeFeatureBuilder:
         else:
             f[f'{prefix}_bars_since_high_8w'] = np.nan
 
+        if loc > 0:
+            h = high[loc]
+            l = low[loc]
+            o = df['open'].values[loc] if 'open' in df.columns else c
+            bar_range = h - l
+            f[f'{prefix}_close_pos'] = (c - l) / bar_range if bar_range > 0 else 0.5
+            f[f'{prefix}_upper_wick_ratio'] = (h - max(o, c)) / bar_range if bar_range > 0 else 0.0
+            f[f'{prefix}_lower_wick_ratio'] = (min(o, c) - l) / bar_range if bar_range > 0 else 0.0
+        else:
+            f[f'{prefix}_close_pos'] = 0.5
+            f[f'{prefix}_upper_wick_ratio'] = 0.0
+            f[f'{prefix}_lower_wick_ratio'] = 0.0
+
+        if loc >= 16:
+            breakout_bars = 0
+            start = max(0, loc - 15)
+            for i in range(start, loc + 1):
+                if close[i] >= high_8w * 0.98:
+                    breakout_bars += 1
+            actual_bars = loc - start + 1
+            f[f'{prefix}_breakout_persistence'] = breakout_bars / actual_bars if actual_bars > 0 else 0.0
+        else:
+            f[f'{prefix}_breakout_persistence'] = 0.0
+
+        if loc >= 16:
+            h16 = np.max(high[loc - 16:loc + 1])
+            f[f'{prefix}_dist_to_high_4h'] = (c / h16 - 1) if h16 > 0 else 0.0
+        else:
+            f[f'{prefix}_dist_to_high_4h'] = 0.0
+
+        if loc >= 96:
+            h96 = np.max(high[loc - 96:loc + 1])
+            f[f'{prefix}_dist_to_high_24h'] = (c / h96 - 1) if h96 > 0 else 0.0
+        else:
+            f[f'{prefix}_dist_to_high_24h'] = 0.0
+
+        if loc >= 16:
+            pullback = 0
+            for i in range(max(0, loc - 16), loc):
+                if close[i] < close[max(0, i - 1)] * 0.995:
+                    pullback = 1
+                    break
+            f[f'{prefix}_pullback_last_4h'] = pullback
+        else:
+            f[f'{prefix}_pullback_last_4h'] = 0
+
+        f[f'{prefix}_vol_expansion'] = 1 if f.get(f'{prefix}_vol_ratio_20', 0) > 3.0 else 0
+
         return f
 
     def _fill_asset_nan(self, prefix: str) -> dict:
         keys = [
-            f'{prefix}_ret_16', f'{prefix}_ret_96',
+            f'{prefix}_ret_1', f'{prefix}_ret_4', f'{prefix}_ret_16', f'{prefix}_ret_96',
+            f'{prefix}_ret_accel', f'{prefix}_ret_accel_slow',
             f'{prefix}_vol_ratio_20', f'{prefix}_up_streak',
             f'{prefix}_green_frac_16', f'{prefix}_atr_norm',
             f'{prefix}_dist_to_high_8w', f'{prefix}_within_2pct_high_8w',
             f'{prefix}_within_5pct_high_8w', f'{prefix}_bars_since_high_8w',
+            f'{prefix}_close_pos', f'{prefix}_upper_wick_ratio', f'{prefix}_lower_wick_ratio',
+            f'{prefix}_breakout_persistence', f'{prefix}_dist_to_high_4h',
+            f'{prefix}_dist_to_high_24h', f'{prefix}_pullback_last_4h',
+            f'{prefix}_vol_expansion',
         ]
         return {k: np.nan for k in keys}
 
@@ -426,6 +523,89 @@ class RegimeFeatureBuilder:
         f['breadth_dispersion_16'] = float(np.std(rets_16))
         f['breadth_acceleration'] = f['breadth_mean_ret_1'] - f['breadth_mean_ret_4']
 
+        f['breadth_dispersion_1'] = float(np.std(rets_1)) if rets_1 else np.nan
+        f['breadth_dispersion_4'] = float(np.std(rets_4)) if rets_4 else np.nan
+        f['breadth_acceleration_4_to_16'] = f['breadth_mean_ret_4'] - f['breadth_mean_ret_16']
+
+        new_high_1h = 0
+        new_high_4h = 0
+        new_high_24h = 0
+        strong_green_1 = 0
+        strong_green_4 = 0
+
+        for sym, df in breadth_candles.items():
+            if df.empty:
+                continue
+            if t in df.index:
+                loc = df.index.get_loc(t)
+            else:
+                loc = df.index.searchsorted(t) - 1
+            if isinstance(loc, slice):
+                loc = loc.stop - 1
+            if loc < 0 or loc >= len(df):
+                continue
+
+            close = df['close'].values
+            high = df['high'].values
+            c = close[loc]
+
+            if loc >= 4:
+                h1 = np.max(high[loc - 4:loc + 1])
+                if c >= h1 * 0.99:
+                    new_high_1h += 1
+
+            if loc >= 16:
+                h4 = np.max(high[loc - 16:loc + 1])
+                if c >= h4 * 0.99:
+                    new_high_4h += 1
+
+            if loc >= 96:
+                h24 = np.max(high[loc - 96:loc + 1])
+                if c >= h24 * 0.99:
+                    new_high_24h += 1
+
+            if loc >= 1:
+                ret_1 = (c / close[loc - 1]) - 1
+                if ret_1 > 0.02:
+                    strong_green_1 += 1
+
+            if loc >= 4:
+                ret_4 = (c / close[loc - 4]) - 1
+                if ret_4 > 0.04:
+                    strong_green_4 += 1
+
+        f['breadth_new_high_1h'] = new_high_1h / n
+        f['breadth_new_high_4h'] = new_high_4h / n
+        f['breadth_new_high_24h'] = new_high_24h / n
+        f['breadth_strong_green_1'] = strong_green_1 / n
+        f['breadth_strong_green_4'] = strong_green_4 / n
+
+        if rets_16:
+            rets_16_sorted = sorted(rets_16, reverse=True)
+            top_10_idx = max(1, len(rets_16_sorted) // 10)
+            top_decile_mean = np.mean(rets_16_sorted[:top_10_idx])
+            bottom_decile_mean = np.mean(rets_16_sorted[-top_10_idx:])
+            f['breadth_top_decile_ret_16'] = float(top_decile_mean)
+            f['breadth_bottom_decile_ret_16'] = float(bottom_decile_mean)
+
+            absolute_rets = [abs(r) for r in rets_16_sorted]
+            total_abs = sum(absolute_rets)
+            if total_abs > 0:
+                cum_share = 0
+                for i, abs_ret in enumerate(sorted(absolute_rets, reverse=True)):
+                    cum_share += abs_ret / total_abs
+                    if cum_share >= 0.5:
+                        f['breadth_concentration_50pct'] = (i + 1) / len(absolute_rets)
+                        break
+                else:
+                    f['breadth_concentration_50pct'] = 1.0
+            else:
+                f['breadth_concentration_50pct'] = 1.0
+        else:
+            f['breadth_top_decile_ret_16'] = np.nan
+            f['breadth_bottom_decile_ret_16'] = np.nan
+            f['breadth_concentration_50pct'] = np.nan
+
         return f
 
     def _fill_breadth_nan(self) -> dict:
@@ -443,8 +623,74 @@ class RegimeFeatureBuilder:
             'breadth_share_new_high_8w_last_24h',
             'breadth_change_1_to_4', 'breadth_change_4_to_16', 'breadth_change_16_to_96',
             'breadth_dispersion_16', 'breadth_acceleration',
+            'breadth_dispersion_1', 'breadth_dispersion_4',
+            'breadth_acceleration_4_to_16',
+            'breadth_new_high_1h', 'breadth_new_high_4h', 'breadth_new_high_24h',
+            'breadth_strong_green_1', 'breadth_strong_green_4',
+            'breadth_top_decile_ret_16', 'breadth_bottom_decile_ret_16',
+            'breadth_concentration_50pct',
         ])
         return {k: np.nan for k in keys}
+
+    def _token_relative_context_features(self, token_features: dict, btc_features: dict,
+                                          eth_features: dict, breadth_features: dict) -> dict:
+        f = {}
+
+        def get_safe(d, key, default=np.nan):
+            return d.get(key, default) if d else default
+
+        token_ret_1 = get_safe(token_features, 'token_ret_1', 0.0)
+        token_ret_4 = get_safe(token_features, 'token_ret_4', 0.0)
+        token_ret_16 = get_safe(token_features, 'token_ret_16', 0.0)
+        btc_ret_1 = get_safe(btc_features, 'btc_ret_1', 0.0)
+        btc_ret_4 = get_safe(btc_features, 'btc_ret_4', 0.0)
+        btc_ret_16 = get_safe(btc_features, 'btc_ret_16', 0.0)
+        eth_ret_1 = get_safe(eth_features, 'eth_ret_1', 0.0)
+        eth_ret_4 = get_safe(eth_features, 'eth_ret_4', 0.0)
+        eth_ret_16 = get_safe(eth_features, 'eth_ret_16', 0.0)
+
+        if not pd.isna(btc_ret_16):
+            f['token_vs_btc_ret_1'] = token_ret_1 - btc_ret_1
+            f['token_vs_btc_ret_4'] = token_ret_4 - btc_ret_4
+            f['token_vs_btc_ret_16'] = token_ret_16 - btc_ret_16
+            f['token_vs_btc_acceleration'] = (token_ret_1 - btc_ret_1) - (token_ret_4 - btc_ret_4)
+
+        if not pd.isna(eth_ret_16):
+            f['token_vs_eth_ret_1'] = token_ret_1 - eth_ret_1
+            f['token_vs_eth_ret_4'] = token_ret_4 - eth_ret_4
+            f['token_vs_eth_ret_16'] = token_ret_16 - eth_ret_16
+            f['token_vs_eth_acceleration'] = (token_ret_1 - eth_ret_1) - (token_ret_4 - eth_ret_4)
+
+        breadth_mean_16 = get_safe(breadth_features, 'breadth_mean_ret_16', 0.0)
+        breadth_median_16 = get_safe(breadth_features, 'breadth_median_ret_16', 0.0)
+        breadth_top_decile = get_safe(breadth_features, 'breadth_top_decile_ret_16', 0.0)
+
+        if not pd.isna(breadth_mean_16):
+            f['token_vs_breadth_mean_16'] = token_ret_16 - breadth_mean_16
+            f['token_vs_breadth_median_16'] = token_ret_16 - breadth_median_16
+
+            if not pd.isna(breadth_top_decile):
+                f['token_in_top_decile'] = 1 if token_ret_16 >= breadth_top_decile else 0
+
+        token_vol_ratio = get_safe(token_features, 'token_vol_ratio_20', 1.0)
+        breadth_vol_spike_share = get_safe(breadth_features, 'breadth_share_vol_spike_20', 0.0)
+
+        if not pd.isna(token_vol_ratio) and not pd.isna(breadth_vol_spike_share):
+            f['token_vol_spike_relative'] = 1 if (token_vol_ratio > 5 and breadth_vol_spike_share < 0.2) else 0
+
+        token_near_8w = get_safe(token_features, 'token_within_2pct_high_8w', 0)
+        btc_near_8w = get_safe(btc_features, 'btc_within_2pct_high_8w', 0)
+        eth_near_8w = get_safe(eth_features, 'eth_within_2pct_high_8w', 0)
+        breadth_near_8w = get_safe(breadth_features, 'breadth_share_within_2pct_high_8w', 0)
+
+        if token_near_8w:
+            f['token_breakout_vs_market'] = 1 if (
+                breadth_near_8w < 0.2 and not btc_near_8w and not eth_near_8w
+            ) else 0
+        else:
+            f['token_breakout_vs_market'] = 0
+
+        return f
 
     def _market_interaction_features(self, btc_features: dict, eth_features: dict,
                                     breadth_features: dict, token_features: dict) -> dict:

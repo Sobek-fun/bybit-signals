@@ -257,9 +257,12 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
 
     if n_res_12h < min_resolved:
         targets['target_bad_next_12h'] = np.nan
-        targets['target_12h_pnl_sum'] = np.nan
+        targets['target_future_pnl_sum_12h'] = np.nan
+        targets['target_future_block_value_12h'] = np.nan
+        targets['target_drawdown_cluster_next_12h'] = np.nan
     else:
         n_sl_12h = int((future_12h['trade_outcome'] == 'SL').sum())
+        n_tp_12h = int((future_12h['trade_outcome'] == 'TP').sum())
         sl_rate_12h = n_sl_12h / n_res_12h
         targets['target_bad_next_12h'] = 1 if sl_rate_12h >= sl_rate_threshold else 0
 
@@ -271,7 +274,30 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
                 pnl_sum_12h += TP_PCT
             elif t['trade_outcome'] == 'SL':
                 pnl_sum_12h -= SL_PCT
-        targets['target_12h_pnl_sum'] = pnl_sum_12h
+        targets['target_future_pnl_sum_12h'] = pnl_sum_12h
+
+        block_value_12h = n_tp_12h * TP_PCT + n_sl_12h * (-SL_PCT)
+        targets['target_future_block_value_12h'] = block_value_12h
+
+        cumsum_pnl = 0.0
+        max_drawdown_depth = 0.0
+        consecutive_sl_count = 0
+        max_consecutive_sl = 0
+
+        for _, t in future_12h.iterrows():
+            if t['trade_outcome'] == 'SL':
+                cumsum_pnl -= SL_PCT
+                consecutive_sl_count += 1
+                max_consecutive_sl = max(max_consecutive_sl, consecutive_sl_count)
+            elif t['trade_outcome'] == 'TP':
+                cumsum_pnl += TP_PCT
+                consecutive_sl_count = 0
+
+            if cumsum_pnl < max_drawdown_depth:
+                max_drawdown_depth = cumsum_pnl
+
+        drawdown_cluster = 1 if (max_drawdown_depth <= -15.0 or max_consecutive_sl >= 3) else 0
+        targets['target_drawdown_cluster_next_12h'] = drawdown_cluster
 
     return targets
 
@@ -337,6 +363,27 @@ def build_regime_dataset(
         row['mae_pct'] = trade['mae_pct']
         row['trade_duration_bars'] = trade['trade_duration_bars']
         row.update(targets)
+
+        pnl_12h = targets.get('target_future_pnl_sum_12h', 0)
+        block_value_12h = targets.get('target_future_block_value_12h', 0)
+        is_bad_12h = targets.get('target_bad_next_12h', 0)
+        drawdown_cluster = targets.get('target_drawdown_cluster_next_12h', 0)
+
+        base_weight = 1.0
+        if not pd.isna(pnl_12h):
+            if pnl_12h <= -20:
+                base_weight = 5.0
+            elif pnl_12h <= -10:
+                base_weight = 3.0
+            elif pnl_12h >= 20:
+                base_weight = 3.0
+            elif pnl_12h >= 10:
+                base_weight = 2.0
+
+        if drawdown_cluster == 1:
+            base_weight = max(base_weight, 4.0)
+
+        row['sample_weight'] = base_weight
 
         rows.append(row)
 

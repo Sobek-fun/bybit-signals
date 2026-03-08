@@ -273,13 +273,33 @@ def run_guard_stage(
     t_min = signals['open_time'].min()
     t_max = signals['open_time'].max()
 
-    liquid_universe = get_liquid_universe(
-        ch_dsn, t_min - timedelta(days=7), t_max, top_n=120
-    )
+    # Try to load liquid_universe from saved config
+    liquid_universe_path = guard_model_dir / "liquid_universe.json"
+    if liquid_universe_path.exists():
+        log("INFO", "GUARD", f"loading liquid_universe from {liquid_universe_path}")
+        with open(liquid_universe_path, 'r') as f:
+            liquid_universe = json.load(f)
+    else:
+        log("WARN", "GUARD", "liquid_universe.json not found, computing from scratch")
+        liquid_universe = get_liquid_universe(
+            ch_dsn, t_min - timedelta(days=7), t_max, top_n=120
+        )
+
+    # Try to load regime builder config
+    regime_config_path = guard_model_dir / "regime_builder_config.json"
+    if regime_config_path.exists():
+        log("INFO", "GUARD", f"loading regime builder config from {regime_config_path}")
+        with open(regime_config_path, 'r') as f:
+            regime_config = json.load(f)
+        top_n = regime_config.get('top_n_universe', 120)
+    else:
+        log("WARN", "GUARD", "regime_builder_config.json not found, using defaults")
+        top_n = 120
 
     builder = RegimeFeatureBuilder(
         ch_dsn=ch_dsn,
         liquid_universe=liquid_universe,
+        top_n=top_n,
     )
 
     log("INFO", "GUARD", "building regime features in batch mode")
@@ -292,6 +312,7 @@ def run_guard_stage(
     available = [c for c in guard_feature_columns if c in guard_features.columns]
     if len(available) < len(guard_feature_columns):
         missing = set(guard_feature_columns) - set(available)
+        log("WARN", "GUARD", f"missing {len(missing)} feature columns, filling with NaN: {list(missing)[:10]}")
         for col in missing:
             guard_features[col] = np.nan
 

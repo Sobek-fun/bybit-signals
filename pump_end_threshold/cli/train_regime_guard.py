@@ -34,12 +34,12 @@ def main():
     parser.add_argument("--time-budget-min", type=int, default=60)
     parser.add_argument("--fold-months", type=int, default=1)
     parser.add_argument("--min-train-months", type=int, default=3)
-    parser.add_argument("--fold-days", type=int, default=None,
+    parser.add_argument("--fold-days", type=int, default=14,
                         help="Val fold size in days (overrides --fold-months if set)")
     parser.add_argument("--min-train-days", type=int, default=None,
                         help="Min training period in days (overrides --min-train-months if set)")
-    parser.add_argument("--iterations", type=int, default=1000)
-    parser.add_argument("--early-stopping-rounds", type=int, default=50)
+    parser.add_argument("--iterations", type=int, default=10000)
+    parser.add_argument("--early-stopping-rounds", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--embargo-signals", type=int, default=5,
                         help="Number of signals to embargo at train/val boundary")
@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--min-valid-folds", type=int, default=2,
                         help="Minimum number of valid folds required")
     parser.add_argument("--score-mode", type=str, default="pnl_improvement",
-                        choices=["pnl_after", "pnl_improvement", "block_value"],
+                        choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
                         help="Scoring mode for hyperparameter optimization")
     parser.add_argument("--policy-grid", type=str, default="default",
                         choices=["default", "conservative", "aggressive"],

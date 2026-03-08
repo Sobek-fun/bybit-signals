@@ -14,7 +14,7 @@ def generate_regime_walk_forward_folds(
         dataset_df: pd.DataFrame,
         fold_months: int = 1,
         min_train_months: int = 3,
-        fold_days: int = None,
+        fold_days: int = 14,
         min_train_days: int = None,
 ) -> list:
     times = dataset_df['open_time'].sort_values()
@@ -54,10 +54,13 @@ def generate_regime_walk_forward_folds(
 
 def get_regime_hyperparameter_grid() -> list:
     param_grid = {
-        'depth': [4, 6],
-        'learning_rate': [0.01, 0.03, 0.1],
-        'l2_leaf_reg': [1.0, 3.0, 10.0],
-        'min_data_in_leaf': [5, 10],
+        'depth': [4, 6, 8],
+        'learning_rate': [0.005, 0.01, 0.02, 0.03, 0.05, 0.1],
+        'l2_leaf_reg': [1.0, 3.0, 10.0, 30.0, 100.0],
+        'min_data_in_leaf': [1, 5, 10, 25, 50],
+        'random_strength': [0.0, 1.0, 3.0],
+        'bagging_temperature': [0.0, 0.5, 1.0],
+        'rsm': [0.5, 0.75, 1.0],
     }
     keys = list(param_grid.keys())
     values = list(param_grid.values())
@@ -93,8 +96,8 @@ def train_regime_fold(
         feature_columns: list,
         target_col: str,
         params: dict,
-        iterations: int = 1000,
-        early_stopping_rounds: int = 50,
+        iterations: int = 10000,
+        early_stopping_rounds: int = 300,
         seed: int = 42,
 ) -> tuple:
     train_df = dataset_df[dataset_df['split'] == 'train']
@@ -123,6 +126,9 @@ def train_regime_fold(
         learning_rate=params['learning_rate'],
         l2_leaf_reg=params['l2_leaf_reg'],
         min_data_in_leaf=params['min_data_in_leaf'],
+        random_strength=params.get('random_strength', 1.0),
+        bagging_temperature=params.get('bagging_temperature', 1.0),
+        rsm=params.get('rsm', 1.0),
         early_stopping_rounds=early_stopping_rounds,
         random_seed=seed,
         verbose=0,
@@ -161,6 +167,10 @@ def evaluate_regime_fold(
 
     result = policy.simulate_pnl(val_scored, p_bad_col='p_bad')
 
+    # Apply policy to get actual blocking decisions
+    val_with_policy = policy.apply(val_scored, p_bad_col='p_bad')
+    val_scored['blocked_by_policy'] = val_with_policy['blocked_by_policy']
+
     blocked_share = result.get('blocked_share', 0)
     signals_before = result.get('signals_before', 0)
     signals_after = result.get('signals_after', 0)
@@ -193,6 +203,60 @@ def evaluate_regime_fold(
 
     no_op_penalty = -1000 if blocked_share == 0 else 0
 
+    worst_window_6h_before = 0.0
+    worst_window_6h_after = 0.0
+    worst_window_12h_before = 0.0
+    worst_window_12h_after = 0.0
+    episode_recall = 0.0
+    n_episodes_detected = 0
+
+    if 'open_time' in val_scored.columns:
+        val_sorted = val_scored.sort_values('open_time').reset_index(drop=True)
+
+        for window_hours, key_prefix in [(6, 'worst_window_6h'), (12, 'worst_window_12h')]:
+            window = pd.Timedelta(hours=window_hours)
+
+            for start_idx in range(len(val_sorted)):
+                start_time = val_sorted.iloc[start_idx]['open_time']
+                end_time = start_time + window
+                window_trades = val_sorted[(val_sorted['open_time'] >= start_time) &
+                                         (val_sorted['open_time'] < end_time)]
+
+                if len(window_trades) > 0:
+                    window_pnl_before = window_trades['pnl_pct'].sum()
+                    window_after_pnl = window_trades[~window_trades['blocked_by_policy']]['pnl_pct'].sum()
+
+                    if key_prefix == 'worst_window_6h':
+                        worst_window_6h_before = min(worst_window_6h_before, window_pnl_before)
+                        worst_window_6h_after = min(worst_window_6h_after, window_after_pnl)
+                    else:
+                        worst_window_12h_before = min(worst_window_12h_before, window_pnl_before)
+                        worst_window_12h_after = min(worst_window_12h_after, window_after_pnl)
+
+        sl_streaks = []
+        current_streak = 0
+        for _, trade in val_sorted.iterrows():
+            if trade['trade_outcome'] == 'SL':
+                current_streak += 1
+            else:
+                if current_streak >= 3:
+                    sl_streaks.append({'start': _, 'length': current_streak})
+                current_streak = 0
+
+        if current_streak >= 3:
+            sl_streaks.append({'start': len(val_sorted) - 1, 'length': current_streak})
+
+        for streak in sl_streaks:
+            start_idx = max(0, streak['start'] - streak['length'])
+            if val_sorted.iloc[start_idx:start_idx+2]['blocked_by_policy'].any():
+                n_episodes_detected += 1
+
+        if len(sl_streaks) > 0:
+            episode_recall = n_episodes_detected / len(sl_streaks)
+
+    worst_window_improvement_6h = worst_window_6h_after - worst_window_6h_before
+    worst_window_improvement_12h = worst_window_12h_after - worst_window_12h_before
+
     if score_mode == 'pnl_after':
         score = pnl_after
     elif score_mode == 'block_value':
@@ -202,6 +266,9 @@ def evaluate_regime_fold(
             pnl_improvement * 1.0 +
             streak_reduction * 20.0 +
             blocked_bad_precision * 50.0 +
+            worst_window_improvement_6h * 2.0 +
+            worst_window_improvement_12h * 1.0 +
+            episode_recall * 100.0 +
             no_op_penalty
         )
         if blocked_bad_precision < 0.35:
@@ -211,7 +278,7 @@ def evaluate_regime_fold(
         if blocked_share > 0.25:
             score -= (blocked_share - 0.25) * 100
     else:
-        score = pnl_improvement
+        score = pnl_improvement + worst_window_improvement_12h * 0.5 + streak_reduction * 10.0 + episode_recall * 50.0
         if tp_block_share_total > 0.30:
             score -= (tp_block_share_total - 0.30) * 50
         if blocked_share > 0.25:
@@ -228,6 +295,14 @@ def evaluate_regime_fold(
         'block_value': block_value,
         'blocked_bad_precision': blocked_bad_precision,
         'longest_streak_reduction': streak_reduction,
+        'worst_window_6h_before': worst_window_6h_before,
+        'worst_window_6h_after': worst_window_6h_after,
+        'worst_window_12h_before': worst_window_12h_before,
+        'worst_window_12h_after': worst_window_12h_after,
+        'worst_window_improvement_6h': worst_window_improvement_6h,
+        'worst_window_improvement_12h': worst_window_improvement_12h,
+        'episode_recall': episode_recall,
+        'n_episodes_detected': n_episodes_detected,
         **result,
         'signal_keep_rate': signal_keep_rate,
     }
@@ -294,6 +369,12 @@ def run_regime_cv(
             score_mode=score_mode,
         )
         fold_eval['fold_idx'] = fold_idx
+        fold_eval['train_start'] = fold['train_start']
+        fold_eval['train_end'] = fold['train_end']
+        fold_eval['val_start'] = fold['val_start']
+        fold_eval['val_end'] = fold['val_end']
+        fold_eval['train_size'] = len(fold_df[fold_df['split'] == 'train'])
+        fold_eval['val_size'] = len(fold_df[fold_df['split'] == 'val'])
         fold_results.append(fold_eval)
 
     valid_scores = [r['score'] for r in fold_results if r.get('valid', False)]
@@ -338,6 +419,7 @@ def tune_model_hyperparameters(
         seed: int = 42,
         embargo_signals: int = 5,
         min_valid_folds: int = 2,
+        n_seeds: int = 3,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -364,25 +446,27 @@ def tune_model_hyperparameters(
             break
 
         fold_scores = []
-        for fold_idx, fold in enumerate(folds):
-            fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals)
-            model, val_df = train_regime_fold(
-                fold_df, feature_columns, target_col, params,
-                iterations=iterations, early_stopping_rounds=early_stopping_rounds,
-                seed=seed,
-            )
+        for seed_offset in range(n_seeds):
+            curr_seed = seed + seed_offset * 123
+            for fold_idx, fold in enumerate(folds):
+                fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals)
+                model, val_df = train_regime_fold(
+                    fold_df, feature_columns, target_col, params,
+                    iterations=iterations, early_stopping_rounds=early_stopping_rounds,
+                    seed=curr_seed,
+                )
 
-            if model is None or val_df is None or len(val_df) == 0:
-                continue
+                if model is None or val_df is None or len(val_df) == 0:
+                    continue
 
-            X_val = val_df[feature_columns]
-            p_bad = model.predict_proba(X_val)[:, 1]
+                X_val = val_df[feature_columns]
+                p_bad = model.predict_proba(X_val)[:, 1]
 
-            from sklearn.metrics import roc_auc_score, log_loss
-            y_val = val_df[target_col]
-            auc = roc_auc_score(y_val, p_bad)
-            logloss = log_loss(y_val, p_bad)
-            fold_scores.append({'auc': auc, 'logloss': logloss})
+                from sklearn.metrics import roc_auc_score, log_loss
+                y_val = val_df[target_col]
+                auc = roc_auc_score(y_val, p_bad)
+                logloss = log_loss(y_val, p_bad)
+                fold_scores.append({'auc': auc, 'logloss': logloss, 'seed': curr_seed, 'fold': fold_idx})
 
         if len(fold_scores) >= min_valid_folds:
             mean_auc = np.mean([s['auc'] for s in fold_scores])
@@ -483,6 +567,7 @@ def tune_policy_parameters(
             if final_score > best_score:
                 best_score = final_score
                 best_params = policy_params
+                best_fold_results = fold_results
 
             results.append({
                 **{f'policy_{k}': v for k, v in policy_params.items()},
@@ -496,6 +581,7 @@ def tune_policy_parameters(
         'best_score': best_score,
         'results_df': pd.DataFrame(results),
         'time_elapsed_sec': time.time() - start_time,
+        'fold_results': best_fold_results if 'best_fold_results' in locals() else [],
     }
 
 
@@ -597,7 +683,7 @@ def tune_regime_guard(
             'mean_score': policy_result.get('best_score', -np.inf),
             'std_score': 0.0,
             'n_valid_folds': len(model_result.get('folds', [])),
-            'fold_results': [],
+            'fold_results': policy_result.get('fold_results', []) if 'fold_results' in policy_result else [],
         },
         'leaderboard': leaderboard_df,
         'feature_columns': model_result['feature_columns'],
@@ -615,7 +701,7 @@ def train_final_regime_model(
         target_col: str,
         params: dict,
         train_end: datetime,
-        iterations: int = 1000,
+        iterations: int = 10000,
         seed: int = 42,
         target_horizon_signals: int = 5,
 ) -> CatBoostClassifier:
@@ -639,6 +725,9 @@ def train_final_regime_model(
         learning_rate=params['learning_rate'],
         l2_leaf_reg=params['l2_leaf_reg'],
         min_data_in_leaf=params['min_data_in_leaf'],
+        random_strength=params.get('random_strength', 1.0),
+        bagging_temperature=params.get('bagging_temperature', 1.0),
+        rsm=params.get('rsm', 1.0),
         random_seed=seed,
         verbose=100,
         eval_metric='Logloss',
