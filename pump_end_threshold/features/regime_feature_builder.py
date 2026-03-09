@@ -811,7 +811,10 @@ class RegimeFeatureBuilder:
         if signals.empty:
             return pd.DataFrame()
 
-        signals_sorted = signals.sort_values('open_time').reset_index(drop=True)
+        # Keep track of original order
+        signals_with_idx = signals.reset_index(drop=True).copy()
+        signals_with_idx['_orig_idx'] = range(len(signals_with_idx))
+        signals_sorted = signals_with_idx.sort_values('open_time').reset_index(drop=True)
 
         t_min = signals_sorted['open_time'].min()
         t_max = signals_sorted['open_time'].max()
@@ -846,6 +849,9 @@ class RegimeFeatureBuilder:
                 row = {}
                 ot = sig['open_time']
 
+                # Keep track of original index
+                row['_orig_idx'] = sig['_orig_idx']
+
                 row.update(self._detector_confidence_features(sig))
 
                 token_sym = sig['symbol']
@@ -871,16 +877,20 @@ class RegimeFeatureBuilder:
 
         features_df = pd.DataFrame(all_features)
 
-        # Essential columns for matching with signals
-        if 'symbol' in signals_sorted.columns:
-            features_df['symbol'] = signals_sorted['symbol'].values
-        if 'open_time' in signals_sorted.columns:
-            features_df['open_time'] = signals_sorted['open_time'].values
+        # Sort back to original order
+        features_df = features_df.sort_values('_orig_idx').reset_index(drop=True)
+        features_df = features_df.drop('_orig_idx', axis=1)
+
+        # Essential columns for matching with signals (from original, not sorted)
+        if 'symbol' in signals.columns:
+            features_df['symbol'] = signals['symbol'].values
+        if 'open_time' in signals.columns:
+            features_df['open_time'] = signals['open_time'].values
 
         # Optional columns including signal_offset for proper matching
-        keep_cols = ['event_id', 'event_type', 'signal_offset']
+        keep_cols = ['event_id', 'event_type', 'signal_offset', 'signal_id']
         for c in keep_cols:
-            if c in signals_sorted.columns:
-                features_df[c] = signals_sorted[c].values
+            if c in signals.columns:
+                features_df[c] = signals[c].values
 
         return features_df
