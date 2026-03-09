@@ -235,6 +235,14 @@ def main():
             accepted.to_parquet(run_dir / "test_accepted.parquet", index=False)
             blocked.to_parquet(run_dir / "test_blocked.parquet", index=False)
 
+            if not blocked.empty and 'symbol' in blocked.columns and 'open_time' in blocked.columns:
+                blocked_signals_csv = blocked[['symbol', 'open_time']].copy()
+                blocked_signals_csv = blocked_signals_csv.rename(columns={'open_time': 'timestamp'})
+                blocked_signals_csv = blocked_signals_csv.sort_values(['timestamp', 'symbol'])
+                blocked_signals_csv = blocked_signals_csv.drop_duplicates(subset=['symbol', 'timestamp'])
+                blocked_signals_csv.to_csv(run_dir / "test_blocked_signals.csv", index=False)
+                log("INFO", "REGIME", f"Saved {len(blocked_signals_csv)} blocked signals to test_blocked_signals.csv")
+
             if 'open_time' in test_df.columns:
                 monthly_results = []
                 test_df['month'] = pd.to_datetime(test_df['open_time']).dt.to_period('M')
