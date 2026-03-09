@@ -871,9 +871,16 @@ class RegimeFeatureBuilder:
 
         features_df = pd.DataFrame(all_features)
 
-        keep_cols = ['event_id', 'symbol', 'open_time', 'event_type']
+        # Essential columns for matching with signals
+        if 'symbol' in signals_sorted.columns:
+            features_df['symbol'] = signals_sorted['symbol'].values
+        if 'open_time' in signals_sorted.columns:
+            features_df['open_time'] = signals_sorted['open_time'].values
+
+        # Optional columns
+        keep_cols = ['event_id', 'event_type']
         for c in keep_cols:
-            if c in signals.columns:
-                features_df[c] = signals[c].values
+            if c in signals_sorted.columns:
+                features_df[c] = signals_sorted[c].values
 
         return features_df

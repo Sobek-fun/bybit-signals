@@ -162,6 +162,13 @@ def main():
     log("INFO", "REGIME-DS", "building features")
     regime_features = builder.build_batch(signals_df, batch_size=batch_size)
 
+    if regime_features.empty:
+        log("ERROR", "REGIME-DS", "regime_features is empty!")
+        return
+
+    log("INFO", "REGIME-DS", f"regime_features shape: {regime_features.shape}")
+    log("INFO", "REGIME-DS", f"regime_features columns sample: {list(regime_features.columns)[:10]}")
+
     # Use helper function to build dataset with all targets and sample weights
     from pump_end_threshold.ml.regime_dataset import build_regime_dataset as build_dataset_helper
 
@@ -172,6 +179,13 @@ def main():
         min_resolved=args.target_min_resolved,
         sl_rate_threshold=args.target_sl_rate_threshold,
     )
+
+    if dataset.empty:
+        log("ERROR", "REGIME-DS", "dataset from helper is empty!")
+        return
+
+    log("INFO", "REGIME-DS", f"dataset after helper shape: {dataset.shape}")
+    log("INFO", "REGIME-DS", f"dataset columns sample: {list(dataset.columns)[:20]}")
 
     if pump_builder and args.include_detector_snapshot:
         log("INFO", "REGIME-DS", "adding detector snapshot features")
@@ -196,12 +210,11 @@ def main():
                 'drop_from_peak_at_fire', 'signal_offset',
                 'p_end_peak_before_fire', 'threshold_used']:
         if col in signals_df.columns and f'det_{col}' not in dataset.columns:
-            dataset[f'det_{col}'] = signals_df[col].values
+            if len(dataset) > 0:
+                dataset[f'det_{col}'] = signals_df[col].values[:len(dataset)]
 
-    if dataset.empty:
-        log("WARN", "REGIME-DS", "no features built")
-        return
-    log("INFO", "REGIME-DS", f"dataset shape: {dataset.shape}")
+    log("INFO", "REGIME-DS", f"final dataset shape: {dataset.shape}")
+    log("INFO", "REGIME-DS", f"final columns sample: {list(dataset.columns)[:20]}")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
