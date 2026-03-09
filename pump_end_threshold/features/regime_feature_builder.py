@@ -867,6 +867,11 @@ class RegimeFeatureBuilder:
                 breadth_features = self._breadth_features(breadth_candles, ot)
                 row.update(breadth_features)
 
+                token_relative_features = self._token_relative_context_features(
+                    token_features, btc_features, eth_features, breadth_features
+                )
+                row.update(token_relative_features)
+
                 row.update(self._market_interaction_features(btc_features, eth_features, breadth_features, token_features))
 
                 row.update(self._signal_flow_features(signals_before, sig))

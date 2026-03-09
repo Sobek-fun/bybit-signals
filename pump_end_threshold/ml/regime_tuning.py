@@ -1,3 +1,4 @@
+import random
 import time
 from datetime import datetime
 from itertools import product
@@ -285,6 +286,33 @@ def evaluate_regime_fold(
             score -= (blocked_share - 0.25) * 100
         score += no_op_penalty
 
+    p_bad_percentiles = np.percentile(p_bad, [50, 90, 95, 99])
+    pause_threshold = policy_params['pause_on_threshold']
+    signals_above_pause_threshold = np.sum(p_bad >= pause_threshold)
+    signals_above_pause_threshold_share = signals_above_pause_threshold / len(p_bad) if len(p_bad) > 0 else 0
+
+    first_hit_timing_signals = []
+    if 'signal_id' in val_scored.columns and 'outcome' in val_scored.columns:
+        sl_episodes = []
+        current_episode = []
+        for idx, row in val_scored.iterrows():
+            if row['outcome'] == 'sl':
+                current_episode.append(idx)
+            else:
+                if current_episode and len(current_episode) >= 2:
+                    sl_episodes.append(current_episode)
+                current_episode = []
+        if current_episode and len(current_episode) >= 2:
+            sl_episodes.append(current_episode)
+
+        for episode in sl_episodes:
+            for pos, idx in enumerate(episode):
+                if val_scored.loc[idx, 'p_bad'] >= pause_threshold:
+                    first_hit_timing_signals.append(pos)
+                    break
+
+    avg_first_hit_timing = np.mean(first_hit_timing_signals) if first_hit_timing_signals else -1
+
     return {
         'score': score,
         'valid': True,
@@ -303,6 +331,13 @@ def evaluate_regime_fold(
         'worst_window_improvement_12h': worst_window_improvement_12h,
         'episode_recall': episode_recall,
         'n_episodes_detected': n_episodes_detected,
+        'p_bad_p50': p_bad_percentiles[0],
+        'p_bad_p90': p_bad_percentiles[1],
+        'p_bad_p95': p_bad_percentiles[2],
+        'p_bad_p99': p_bad_percentiles[3],
+        'signals_above_pause_threshold': signals_above_pause_threshold,
+        'signals_above_pause_threshold_share': signals_above_pause_threshold_share,
+        'avg_first_hit_timing': avg_first_hit_timing,
         **result,
         'signal_keep_rate': signal_keep_rate,
     }
@@ -435,10 +470,17 @@ def tune_model_hyperparameters(
         raise ValueError("Not enough data to generate walk-forward folds")
 
     model_grid = get_regime_hyperparameter_grid()
+    random.shuffle(model_grid)
 
     best_score = -np.inf
     best_params = None
     results = []
+
+    default_policy_params = {
+        'pause_on_threshold': 0.65,
+        'resume_threshold': 0.30,
+        'resume_confirm_signals': 2
+    }
 
     for params in model_grid:
         elapsed = time.time() - start_time
@@ -446,6 +488,7 @@ def tune_model_hyperparameters(
             break
 
         fold_scores = []
+        regime_scores = []
         for seed_offset in range(n_seeds):
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
@@ -468,15 +511,25 @@ def tune_model_hyperparameters(
                 logloss = log_loss(y_val, p_bad)
                 fold_scores.append({'auc': auc, 'logloss': logloss, 'seed': curr_seed, 'fold': fold_idx})
 
-        if len(fold_scores) >= min_valid_folds:
+                regime_eval = evaluate_regime_fold(
+                    model, val_df, feature_columns, default_policy_params,
+                    max_blocked_share=0.35, min_signal_keep_rate=0.45,
+                    score_mode='regime_aware',
+                )
+                if regime_eval.get('valid', False):
+                    regime_scores.append(regime_eval['score'])
+
+        if len(regime_scores) >= min_valid_folds:
+            mean_regime_score = np.mean(regime_scores)
             mean_auc = np.mean([s['auc'] for s in fold_scores])
-            if mean_auc > best_score:
-                best_score = mean_auc
+            if mean_regime_score > best_score:
+                best_score = mean_regime_score
                 best_params = params
 
             results.append({
                 **params,
                 'mean_auc': mean_auc,
+                'mean_regime_score': mean_regime_score,
                 'std_auc': np.std([s['auc'] for s in fold_scores]),
                 'n_valid_folds': len(fold_scores),
             })
@@ -561,8 +614,7 @@ def tune_policy_parameters(
             weighted_mean = np.average(scores, weights=weights) if sum(weights) > 0 else np.mean(scores)
 
             n_no_op = sum(1 for r in fold_results if r.get('no_op', False))
-            no_op_penalty = -500 * n_no_op / len(fold_results) if fold_results else 0
-            final_score = weighted_mean + no_op_penalty
+            final_score = weighted_mean
 
             if final_score > best_score:
                 best_score = final_score
@@ -582,6 +634,46 @@ def tune_policy_parameters(
         'results_df': pd.DataFrame(results),
         'time_elapsed_sec': time.time() - start_time,
         'fold_results': best_fold_results if 'best_fold_results' in locals() else [],
+    }
+
+
+def _compute_cv_summary(fold_results: list) -> dict:
+    if not fold_results:
+        return {
+            'mean_score': -np.inf,
+            'std_score': 0.0,
+            'n_valid_folds': 0,
+            'n_no_op_folds': 0,
+            'fold_results': [],
+            'mean_pnl_improvement': 0.0,
+            'mean_blocked_share': 0.0,
+            'median_blocked_share': 0.0,
+            'positive_improvement_ratio': 0.0,
+        }
+
+    scores = [r.get('score', -np.inf) for r in fold_results]
+    weights = [r.get('signals_before', 1) for r in fold_results]
+
+    weighted_mean_score = np.average(scores, weights=weights) if sum(weights) > 0 else np.mean(scores)
+    std_score = np.std(scores) if len(scores) > 1 else 0.0
+
+    n_no_op = sum(1 for r in fold_results if r.get('no_op', False))
+    pnl_improvements = [r.get('pnl_improvement', 0) for r in fold_results]
+    blocked_shares = [r.get('blocked_share', 0) for r in fold_results]
+
+    positive_improvements = sum(1 for p in pnl_improvements if p > 0)
+    positive_improvement_ratio = positive_improvements / len(fold_results) if fold_results else 0
+
+    return {
+        'mean_score': weighted_mean_score,
+        'std_score': std_score,
+        'n_valid_folds': len(fold_results),
+        'n_no_op_folds': n_no_op,
+        'fold_results': fold_results,
+        'mean_pnl_improvement': np.mean(pnl_improvements) if pnl_improvements else 0.0,
+        'mean_blocked_share': np.mean(blocked_shares) if blocked_shares else 0.0,
+        'median_blocked_share': np.median(blocked_shares) if blocked_shares else 0.0,
+        'positive_improvement_ratio': positive_improvement_ratio,
     }
 
 
@@ -679,12 +771,7 @@ def tune_regime_guard(
         'best_model_params': model_result['best_params'],
         'best_policy_params': policy_result['best_params'],
         'best_score': policy_result.get('best_score', -np.inf),
-        'best_cv_result': {
-            'mean_score': policy_result.get('best_score', -np.inf),
-            'std_score': 0.0,
-            'n_valid_folds': len(model_result.get('folds', [])),
-            'fold_results': policy_result.get('fold_results', []) if 'fold_results' in policy_result else [],
-        },
+        'best_cv_result': _compute_cv_summary(policy_result.get('fold_results', [])),
         'leaderboard': leaderboard_df,
         'feature_columns': model_result['feature_columns'],
         'folds': model_result['folds'],

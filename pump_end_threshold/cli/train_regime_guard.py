@@ -21,7 +21,7 @@ def log(level: str, component: str, message: str):
 
 def parse_date_exclusive(date_str: str) -> datetime:
     dt = datetime.strptime(date_str, '%Y-%m-%d')
-    return dt + timedelta(days=1)
+    return dt
 
 
 def main():
