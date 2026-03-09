@@ -315,35 +315,64 @@ def build_regime_dataset(
     all_signal_times = signals['open_time'].tolist()
 
     if 'signal_id' not in signals.columns:
-        signals['signal_id'] = [
-            f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
-            for _, row in signals.iterrows()
-        ]
+        if 'signal_offset' in signals.columns:
+            signals['signal_id'] = [
+                f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}|{row.get('signal_offset', 0)}"
+                for _, row in signals.iterrows()
+            ]
+        else:
+            signals['signal_id'] = [
+                f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
+                for _, row in signals.iterrows()
+            ]
 
     if 'signal_id' not in trades.columns:
-        trades['signal_id'] = [
-            f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
-            for _, row in trades.iterrows()
-        ]
+        if 'signal_offset' in trades.columns:
+            trades['signal_id'] = [
+                f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}|{row.get('signal_offset', 0)}"
+                for _, row in trades.iterrows()
+            ]
+        else:
+            trades['signal_id'] = [
+                f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
+                for _, row in trades.iterrows()
+            ]
 
     if 'signal_id' not in features_df.columns:
-        features_df['signal_id'] = [
-            f"{row['symbol']}|{row['open_time'].strftime('%Y%m%d_%H%M%S')}"
-            for _, row in features_df.iterrows()
-        ]
+        # Create signal_id from symbol and open_time columns if they exist
+        if 'symbol' in features_df.columns and 'open_time' in features_df.columns:
+            if 'signal_offset' in features_df.columns:
+                features_df['signal_id'] = [
+                    f"{row['symbol']}|{pd.to_datetime(row['open_time']).strftime('%Y%m%d_%H%M%S')}|{row.get('signal_offset', 0)}"
+                    for _, row in features_df.iterrows()
+                ]
+            else:
+                features_df['signal_id'] = [
+                    f"{row['symbol']}|{pd.to_datetime(row['open_time']).strftime('%Y%m%d_%H%M%S')}"
+                    for _, row in features_df.iterrows()
+                ]
+        else:
+            # If columns missing, cannot create signal_id
+            print(f"WARNING: Cannot create signal_id for features_df. Columns: {list(features_df.columns)[:10]}")
+            return pd.DataFrame()
 
     rows = []
+    skipped_no_trade = 0
+    skipped_no_features = 0
+
     for i in range(len(signals)):
         sig = signals.iloc[i]
         signal_id = sig['signal_id']
 
         trade_row = trades[trades['signal_id'] == signal_id]
         if trade_row.empty:
+            skipped_no_trade += 1
             continue
         trade = trade_row.iloc[0]
 
         feature_row = features_df[features_df['signal_id'] == signal_id]
         if feature_row.empty:
+            skipped_no_features += 1
             continue
         feats = feature_row.iloc[0].to_dict()
 
@@ -386,5 +415,13 @@ def build_regime_dataset(
         row['sample_weight'] = base_weight
 
         rows.append(row)
+
+    if skipped_no_trade > 0 or skipped_no_features > 0 or len(rows) == 0:
+        print(f"DEBUG: build_regime_dataset - signals: {len(signals)}, trades: {len(trades)}, features: {len(features_df)}")
+        print(f"DEBUG: skipped_no_trade: {skipped_no_trade}, skipped_no_features: {skipped_no_features}, rows built: {len(rows)}")
+        if len(rows) == 0 and len(signals) > 0:
+            print(f"DEBUG: Sample signal_id from signals: {signals.iloc[0]['signal_id']}")
+            print(f"DEBUG: Sample signal_id from trades: {trades.iloc[0]['signal_id'] if len(trades) > 0 else 'NO TRADES'}")
+            print(f"DEBUG: Sample signal_id from features: {features_df.iloc[0]['signal_id'] if len(features_df) > 0 else 'NO FEATURES'}")
 
     return pd.DataFrame(rows)

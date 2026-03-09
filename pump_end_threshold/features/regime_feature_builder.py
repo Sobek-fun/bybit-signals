@@ -877,8 +877,8 @@ class RegimeFeatureBuilder:
         if 'open_time' in signals_sorted.columns:
             features_df['open_time'] = signals_sorted['open_time'].values
 
-        # Optional columns
-        keep_cols = ['event_id', 'event_type']
+        # Optional columns including signal_offset for proper matching
+        keep_cols = ['event_id', 'event_type', 'signal_offset']
         for c in keep_cols:
             if c in signals_sorted.columns:
                 features_df[c] = signals_sorted[c].values
