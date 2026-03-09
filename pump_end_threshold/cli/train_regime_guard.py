@@ -85,7 +85,13 @@ def main():
     log("INFO", "REGIME", f"feature columns: {len(feature_columns)}")
 
     if args.target_col not in dataset.columns:
-        raise ValueError(f"Target column '{args.target_col}' not in dataset")
+        available_targets = [col for col in dataset.columns if col.startswith('target_')]
+        log("ERROR", "REGIME", f"Target column '{args.target_col}' not in dataset")
+        log("ERROR", "REGIME", f"Available target columns: {available_targets}")
+        log("ERROR", "REGIME", f"Total columns in dataset: {len(dataset.columns)}")
+        if len(dataset.columns) < 50:
+            log("ERROR", "REGIME", f"Dataset appears to be incomplete. Columns: {list(dataset.columns)}")
+        raise ValueError(f"Target column '{args.target_col}' not in dataset. Dataset may need to be rebuilt with updated code.")
 
     target_rate = dataset[args.target_col].mean()
     log("INFO", "REGIME", f"target '{args.target_col}' rate: {target_rate:.3f}")
