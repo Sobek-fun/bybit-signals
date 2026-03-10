@@ -72,20 +72,20 @@ def get_regime_hyperparameter_grid() -> list:
 def get_policy_parameter_grid(preset: str = 'default') -> list:
     if preset == 'conservative':
         policy_grid = {
-            'pause_on_threshold': [0.65, 0.70, 0.75],
-            'resume_threshold': [0.20, 0.25, 0.30],
+            'pause_on_quantile': [0.85, 0.90, 0.95],
+            'resume_quantile': [0.40, 0.50, 0.60],
             'resume_confirm_signals': [2, 3, 4],
         }
     elif preset == 'aggressive':
         policy_grid = {
-            'pause_on_threshold': [0.55, 0.60, 0.65],
-            'resume_threshold': [0.35, 0.40, 0.45],
+            'pause_on_quantile': [0.75, 0.80, 0.85],
+            'resume_quantile': [0.50, 0.60, 0.70],
             'resume_confirm_signals': [1, 2],
         }
     else:
         policy_grid = {
-            'pause_on_threshold': [0.60, 0.65, 0.70],
-            'resume_threshold': [0.25, 0.30, 0.35],
+            'pause_on_quantile': [0.80, 0.85, 0.90],
+            'resume_quantile': [0.45, 0.55, 0.65],
             'resume_confirm_signals': [2, 3],
         }
     keys = list(policy_grid.keys())
@@ -136,12 +136,25 @@ def train_regime_fold(
         verbose=0,
         eval_metric='Logloss',
         use_best_model=True,
-        auto_class_weights='Balanced',
     )
 
     model.fit(train_pool, eval_set=val_pool)
 
     return model, val_df
+
+
+def resolve_policy_params(policy_params: dict, p_bad: np.ndarray) -> dict:
+    if 'pause_on_quantile' in policy_params:
+        return {
+            'pause_on_threshold': float(np.quantile(p_bad, policy_params['pause_on_quantile'])),
+            'resume_threshold': float(np.quantile(p_bad, policy_params['resume_quantile'])),
+            'resume_confirm_signals': policy_params['resume_confirm_signals'],
+        }
+    return {
+        'pause_on_threshold': policy_params['pause_on_threshold'],
+        'resume_threshold': policy_params['resume_threshold'],
+        'resume_confirm_signals': policy_params['resume_confirm_signals'],
+    }
 
 
 def evaluate_regime_fold(
@@ -162,10 +175,12 @@ def evaluate_regime_fold(
     val_scored = val_df.copy()
     val_scored['p_bad'] = p_bad
 
+    resolved = resolve_policy_params(policy_params, p_bad)
+
     policy = RegimePolicy(
-        pause_on_threshold=policy_params['pause_on_threshold'],
-        resume_threshold=policy_params['resume_threshold'],
-        resume_confirm_signals=policy_params['resume_confirm_signals'],
+        pause_on_threshold=resolved['pause_on_threshold'],
+        resume_threshold=resolved['resume_threshold'],
+        resume_confirm_signals=resolved['resume_confirm_signals'],
     )
 
     filtered = policy.apply(val_scored, p_bad_col='p_bad')
@@ -179,6 +194,8 @@ def evaluate_regime_fold(
         return {
             'score': -np.inf,
             'valid': False,
+            'resolved_pause_threshold': resolved['pause_on_threshold'],
+            'resolved_resume_threshold': resolved['resume_threshold'],
             **metrics,
         }
 
@@ -192,6 +209,8 @@ def evaluate_regime_fold(
         'score': score,
         'valid': True,
         'no_op': blocked_share == 0,
+        'resolved_pause_threshold': resolved['pause_on_threshold'],
+        'resolved_resume_threshold': resolved['resume_threshold'],
         **metrics,
     }
 
@@ -321,6 +340,8 @@ def tune_model_hyperparameters(
         min_valid_folds: int = 2,
         n_seeds: int = 3,
 ) -> dict:
+    from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
 
@@ -341,19 +362,12 @@ def tune_model_hyperparameters(
     best_params = None
     results = []
 
-    default_policy_params = {
-        'pause_on_threshold': 0.65,
-        'resume_threshold': 0.30,
-        'resume_confirm_signals': 2
-    }
-
     for params in model_grid:
         elapsed = time.time() - start_time
         if elapsed >= time_budget_sec:
             break
 
         fold_scores = []
-        regime_scores = []
         for seed_offset in range(n_seeds):
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
@@ -370,33 +384,30 @@ def tune_model_hyperparameters(
                 X_val = val_df[feature_columns]
                 p_bad = model.predict_proba(X_val)[:, 1]
 
-                from sklearn.metrics import roc_auc_score, log_loss
                 y_val = val_df[target_col]
+                ap = average_precision_score(y_val, p_bad)
                 auc = roc_auc_score(y_val, p_bad)
-                logloss = log_loss(y_val, p_bad)
-                fold_scores.append({'auc': auc, 'logloss': logloss, 'seed': curr_seed, 'fold': fold_idx})
+                brier = brier_score_loss(y_val, p_bad)
+                fold_scores.append({
+                    'ap': ap, 'auc': auc, 'brier': brier,
+                    'seed': curr_seed, 'fold': fold_idx,
+                })
 
-                regime_eval = evaluate_regime_fold(
-                    model, val_df, feature_columns, default_policy_params,
-                    max_blocked_share=0.35, min_signal_keep_rate=0.45,
-                    score_mode='pnl_improvement',
-                    target_col=target_col,
-                )
-                if regime_eval.get('valid', False):
-                    regime_scores.append(regime_eval['score'])
-
-        if len(regime_scores) >= min_valid_folds:
-            mean_regime_score = np.mean(regime_scores)
+        if len(fold_scores) >= min_valid_folds:
+            mean_ap = np.mean([s['ap'] for s in fold_scores])
             mean_auc = np.mean([s['auc'] for s in fold_scores])
-            if mean_regime_score > best_score:
-                best_score = mean_regime_score
+            mean_brier = np.mean([s['brier'] for s in fold_scores])
+
+            if mean_ap > best_score:
+                best_score = mean_ap
                 best_params = params
 
             results.append({
                 **params,
+                'mean_ap': mean_ap,
                 'mean_auc': mean_auc,
-                'mean_regime_score': mean_regime_score,
-                'std_auc': np.std([s['auc'] for s in fold_scores]),
+                'mean_brier': mean_brier,
+                'std_ap': np.std([s['ap'] for s in fold_scores]),
                 'n_valid_folds': len(fold_scores),
             })
 
@@ -497,12 +508,24 @@ def tune_policy_parameters(
                 'n_no_op_folds': n_no_op,
             })
 
+    resolved_thresholds = None
+    if best_params and best_fold_results:
+        resolved_pause = [r['resolved_pause_threshold'] for r in best_fold_results if 'resolved_pause_threshold' in r]
+        resolved_resume = [r['resolved_resume_threshold'] for r in best_fold_results if 'resolved_resume_threshold' in r]
+        if resolved_pause and resolved_resume:
+            resolved_thresholds = {
+                'pause_on_threshold': float(np.median(resolved_pause)),
+                'resume_threshold': float(np.median(resolved_resume)),
+                'resume_confirm_signals': best_params['resume_confirm_signals'],
+            }
+
     return {
         'best_params': best_params,
         'best_score': best_score,
         'results_df': pd.DataFrame(results),
         'time_elapsed_sec': time.time() - start_time,
         'fold_results': best_fold_results,
+        'resolved_thresholds': resolved_thresholds,
     }
 
 
@@ -665,7 +688,6 @@ def train_final_regime_model(
         random_seed=seed,
         verbose=100,
         eval_metric='Logloss',
-        auto_class_weights='Balanced',
     )
 
     model.fit(train_pool)

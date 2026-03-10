@@ -56,6 +56,7 @@ EXCLUDED_PREFIXES = (
     'next_',
     'policy_',
     'blocked_',
+    'det_',
 )
 
 

@@ -18,6 +18,7 @@ from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_colum
 from pump_end_threshold.ml.regime_tuning import (
     tune_regime_guard,
     train_final_regime_model,
+    resolve_policy_params,
 )
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 from pump_end_threshold.ml.train import get_feature_importance
@@ -76,7 +77,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train regime guard model")
     parser.add_argument("--dataset-parquet", type=str, required=True,
                         help="Path to regime dataset parquet")
-    parser.add_argument("--target-col", type=str, default="target_bad_next_5")
+    parser.add_argument("--target-col", type=str, default="target_bad_next_12h")
     parser.add_argument("--train-end", type=str, default=None,
                         help="Train end date (YYYY-MM-DD), exclusive. If set, trains final model")
     parser.add_argument("--time-budget-min", type=int, default=60)
@@ -91,7 +92,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--embargo-signals", type=int, default=5,
                         help="Number of signals to embargo at train/val boundary")
-    parser.add_argument("--embargo-hours", type=float, default=0,
+    parser.add_argument("--embargo-hours", type=float, default=12,
                         help="Hours of time-based embargo at train/val boundary (for time-based targets)")
     parser.add_argument("--max-blocked-share", type=float, default=0.35)
     parser.add_argument("--min-signal-keep-rate", type=float, default=0.45)
@@ -220,15 +221,29 @@ def main():
     with open(run_dir / "policy_report.json", 'w') as f:
         policy_report = {
             'policy_params': tune_result['best_policy_params'],
-            'defaults': {
-                'pause_on_threshold': 0.65,
-                'resume_threshold': 0.30,
-                'resume_confirm_signals': 2,
-            },
+            'resolved_thresholds': tune_result.get('policy_tuning', {}).get('resolved_thresholds'),
         }
         json.dump(policy_report, f, indent=2, default=str)
 
     if train_end:
+        max_open_time_all = dataset['open_time'].max()
+        target_valid = dataset[dataset[args.target_col].notna()]
+        max_open_time_target = target_valid['open_time'].max() if len(target_valid) > 0 else None
+        test_df_check = dataset[dataset['open_time'] >= train_end]
+        n_test_rows = len(test_df_check)
+        n_test_with_target = len(test_df_check[test_df_check[args.target_col].notna()])
+
+        log("INFO", "REGIME", f"max_open_time={max_open_time_all}, max_open_time_with_target={max_open_time_target}")
+        log("INFO", "REGIME", f"n_test_rows={n_test_rows}, n_test_with_target={n_test_with_target}")
+
+        if n_test_with_target == 0:
+            raise ValueError(
+                f"No test rows with valid target after train_end={train_end}. "
+                f"Dataset max_open_time={max_open_time_all}, "
+                f"max_open_time_with_target={max_open_time_target}. "
+                f"Run is invalid without real holdout."
+            )
+
         log("INFO", "REGIME", f"training final model on data before {args.train_end}")
 
         final_model = train_final_regime_model(
@@ -258,9 +273,11 @@ def main():
         test_df = dataset[dataset['open_time'] >= train_end].copy()
         if len(test_df) > 0:
             X_test = test_df[tune_result['feature_columns']]
-            test_df['p_bad'] = final_model.predict_proba(X_test)[:, 1]
+            p_bad_test = final_model.predict_proba(X_test)[:, 1]
+            test_df['p_bad'] = p_bad_test
 
-            policy = RegimePolicy(**tune_result['best_policy_params'])
+            resolved = resolve_policy_params(tune_result['best_policy_params'], p_bad_test)
+            policy = RegimePolicy(**resolved)
             filtered = policy.apply(test_df, p_bad_col='p_bad')
 
             scorecard = compute_regime_scorecard(filtered)

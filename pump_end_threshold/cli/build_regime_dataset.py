@@ -38,7 +38,7 @@ def main():
     parser.add_argument("--target-horizon-signals", type=int, default=5)
     parser.add_argument("--target-min-resolved", type=int, default=3)
     parser.add_argument("--target-sl-rate-threshold", type=float, default=0.60)
-    parser.add_argument("--target-col", type=str, default="target_bad_next_5",
+    parser.add_argument("--target-col", type=str, default="target_bad_next_12h",
                         help="Name of the target column to use for training")
     parser.add_argument("--include-detector-snapshot", action="store_true",
                         help="Include detector snapshot features from PumpFeatureBuilder")
@@ -170,7 +170,6 @@ def main():
     log("INFO", "REGIME-DS", f"regime_features shape: {regime_features.shape}")
     log("INFO", "REGIME-DS", f"regime_features columns sample: {list(regime_features.columns)[:10]}")
 
-    # Use helper function to build dataset with all targets and sample weights
     from pump_end_threshold.ml.regime_dataset import build_regime_dataset as build_dataset_helper
 
     dataset = build_dataset_helper(
@@ -206,13 +205,6 @@ def main():
                             dataset.loc[idx, col] = pump_row[col]
             except:
                 pass
-
-    for col in ['p_end_at_fire', 'threshold_gap', 'pending_bars',
-                'drop_from_peak_at_fire', 'signal_offset',
-                'p_end_peak_before_fire', 'threshold_used']:
-        if col in signals_df.columns and f'det_{col}' not in dataset.columns:
-            if len(dataset) > 0:
-                dataset[f'det_{col}'] = signals_df[col].values[:len(dataset)]
 
     log("INFO", "REGIME-DS", f"final dataset shape: {dataset.shape}")
     log("INFO", "REGIME-DS", f"final columns sample: {list(dataset.columns)[:20]}")

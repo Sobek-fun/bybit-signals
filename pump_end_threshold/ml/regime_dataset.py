@@ -339,7 +339,6 @@ def build_regime_dataset(
             ]
 
     if 'signal_id' not in features_df.columns:
-        # Create signal_id from symbol and open_time columns if they exist
         if 'symbol' in features_df.columns and 'open_time' in features_df.columns:
             if 'signal_offset' in features_df.columns:
                 features_df['signal_id'] = [
@@ -352,7 +351,6 @@ def build_regime_dataset(
                     for _, row in features_df.iterrows()
                 ]
         else:
-            # If columns missing, cannot create signal_id
             print(f"WARNING: Cannot create signal_id for features_df. Columns: {list(features_df.columns)[:10]}")
             return pd.DataFrame()
 
@@ -393,24 +391,18 @@ def build_regime_dataset(
         row['trade_duration_bars'] = trade['trade_duration_bars']
         row.update(targets)
 
-        pnl_12h = targets.get('target_future_pnl_sum_12h', 0)
-        block_value_12h = targets.get('target_future_block_value_12h', 0)
         is_bad_12h = targets.get('target_bad_next_12h', 0)
-        drawdown_cluster = targets.get('target_drawdown_cluster_next_12h', 0)
+        pnl_12h = targets.get('target_future_pnl_sum_12h', 0)
 
         base_weight = 1.0
-        if not pd.isna(pnl_12h):
-            if pnl_12h <= -20:
-                base_weight = 5.0
-            elif pnl_12h <= -10:
+        if not pd.isna(is_bad_12h) and is_bad_12h == 1:
+            severity = abs(pnl_12h) if not pd.isna(pnl_12h) else 0
+            if severity >= 20:
                 base_weight = 3.0
-            elif pnl_12h >= 20:
-                base_weight = 3.0
-            elif pnl_12h >= 10:
+            elif severity >= 10:
                 base_weight = 2.0
-
-        if drawdown_cluster == 1:
-            base_weight = max(base_weight, 4.0)
+            else:
+                base_weight = 1.5
 
         row['sample_weight'] = base_weight
 

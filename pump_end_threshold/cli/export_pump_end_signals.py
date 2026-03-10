@@ -274,7 +274,6 @@ def run_guard_stage(
     t_min = signals['open_time'].min()
     t_max = signals['open_time'].max()
 
-    # Try to load liquid_universe from saved config
     liquid_universe_path = guard_model_dir / "liquid_universe.json"
     if liquid_universe_path.exists():
         log("INFO", "GUARD", f"loading liquid_universe from {liquid_universe_path}")
@@ -286,7 +285,6 @@ def run_guard_stage(
             ch_dsn, t_min - timedelta(days=7), t_max, top_n=120
         )
 
-    # Try to load regime builder config
     regime_config_path = guard_model_dir / "regime_builder_config.json"
     if regime_config_path.exists():
         log("INFO", "GUARD", f"loading regime builder config from {regime_config_path}")
@@ -348,7 +346,18 @@ def run_guard_stage(
         guard_scored_path = run_dir / "guard_scored_signals.parquet"
         signals.to_parquet(guard_scored_path, index=False)
 
-    policy = RegimePolicy(**policy_params)
+    if 'pause_on_quantile' in policy_params:
+        resolved = {
+            'pause_on_threshold': float(np.quantile(p_bad, policy_params['pause_on_quantile'])),
+            'resume_threshold': float(np.quantile(p_bad, policy_params['resume_quantile'])),
+            'resume_confirm_signals': policy_params['resume_confirm_signals'],
+        }
+        log("INFO", "GUARD",
+            f"resolved quantile policy: pause={resolved['pause_on_threshold']:.4f} "
+            f"resume={resolved['resume_threshold']:.4f}")
+        policy = RegimePolicy(**resolved)
+    else:
+        policy = RegimePolicy(**policy_params)
     result = policy.apply(signals, p_bad_col='p_bad')
 
     accepted = result[~result['blocked_by_policy']].copy()

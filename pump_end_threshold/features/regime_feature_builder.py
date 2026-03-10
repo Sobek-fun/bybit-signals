@@ -35,7 +35,7 @@ class RegimeFeatureBuilder:
 
         t_min = signals['open_time'].min()
         t_max = signals['open_time'].max()
-        warmup = timedelta(hours=8 * 7 * 24)
+        warmup = timedelta(hours=48)
 
         btc_candles = self._load_candles_cached('BTCUSDT', t_min - warmup, t_max)
         eth_candles = self._load_candles_cached('ETHUSDT', t_min - warmup, t_max)
@@ -45,7 +45,7 @@ class RegimeFeatureBuilder:
                 self.ch_dsn, t_min - timedelta(days=7), t_max, top_n=self.top_n
             )
 
-        breadth_lookback = timedelta(minutes=self.HIGH_8W_BARS * 15 + 96 * 15)
+        breadth_lookback = timedelta(hours=48)
         breadth_candles = self._load_breadth_candles(t_min - breadth_lookback, t_max)
 
         rows = []
@@ -229,18 +229,6 @@ class RegimeFeatureBuilder:
         else:
             f['token_rsi_14'] = np.nan
 
-        h8w_start = max(0, loc - self.HIGH_8W_BARS)
-        high_8w = np.max(high[h8w_start:loc + 1])
-        f['token_dist_to_high_8w'] = (c / high_8w - 1) if high_8w > 0 else 0.0
-        f['token_within_2pct_high_8w'] = 1 if (high_8w > 0 and c >= high_8w * 0.98) else 0
-
-        high_slice = high[h8w_start:loc + 1]
-        if len(high_slice) > 0:
-            peak_pos = np.argmax(high_slice)
-            f['token_bars_since_high_8w'] = len(high_slice) - 1 - peak_pos
-        else:
-            f['token_bars_since_high_8w'] = np.nan
-
         ret1_slice = np.diff(close[max(0, loc - 16):loc + 1].astype(float))
         if len(ret1_slice) > 0:
             streak = 0
@@ -267,9 +255,7 @@ class RegimeFeatureBuilder:
         keys = [
             'token_ret_1', 'token_ret_4', 'token_ret_16', 'token_ret_96',
             'token_drawdown', 'token_vol_ratio_20', 'token_rsi_14',
-            'token_dist_to_high_8w', 'token_within_2pct_high_8w',
-            'token_bars_since_high_8w', 'token_up_streak',
-            'token_green_frac_16', 'token_near_high_96',
+            'token_up_streak', 'token_green_frac_16', 'token_near_high_96',
         ]
         return {k: np.nan for k in keys}
 
@@ -343,19 +329,6 @@ class RegimeFeatureBuilder:
         else:
             f[f'{prefix}_atr_norm'] = np.nan
 
-        h8w_start = max(0, loc - self.HIGH_8W_BARS)
-        high_8w = np.max(high[h8w_start:loc + 1])
-        f[f'{prefix}_dist_to_high_8w'] = (c / high_8w - 1) if high_8w > 0 else 0.0
-        f[f'{prefix}_within_2pct_high_8w'] = 1 if (high_8w > 0 and c >= high_8w * 0.98) else 0
-        f[f'{prefix}_within_5pct_high_8w'] = 1 if (high_8w > 0 and c >= high_8w * 0.95) else 0
-
-        high_slice = high[h8w_start:loc + 1]
-        if len(high_slice) > 0:
-            peak_pos = np.argmax(high_slice)
-            f[f'{prefix}_bars_since_high_8w'] = len(high_slice) - 1 - peak_pos
-        else:
-            f[f'{prefix}_bars_since_high_8w'] = np.nan
-
         if loc > 0:
             h = high[loc]
             l = low[loc]
@@ -368,17 +341,6 @@ class RegimeFeatureBuilder:
             f[f'{prefix}_close_pos'] = 0.5
             f[f'{prefix}_upper_wick_ratio'] = 0.0
             f[f'{prefix}_lower_wick_ratio'] = 0.0
-
-        if loc >= 16:
-            breakout_bars = 0
-            start = max(0, loc - 15)
-            for i in range(start, loc + 1):
-                if close[i] >= high_8w * 0.98:
-                    breakout_bars += 1
-            actual_bars = loc - start + 1
-            f[f'{prefix}_breakout_persistence'] = breakout_bars / actual_bars if actual_bars > 0 else 0.0
-        else:
-            f[f'{prefix}_breakout_persistence'] = 0.0
 
         if loc >= 16:
             h16 = np.max(high[loc - 16:loc + 1])
@@ -412,10 +374,8 @@ class RegimeFeatureBuilder:
             f'{prefix}_ret_accel', f'{prefix}_ret_accel_slow',
             f'{prefix}_vol_ratio_20', f'{prefix}_up_streak',
             f'{prefix}_green_frac_16', f'{prefix}_atr_norm',
-            f'{prefix}_dist_to_high_8w', f'{prefix}_within_2pct_high_8w',
-            f'{prefix}_within_5pct_high_8w', f'{prefix}_bars_since_high_8w',
             f'{prefix}_close_pos', f'{prefix}_upper_wick_ratio', f'{prefix}_lower_wick_ratio',
-            f'{prefix}_breakout_persistence', f'{prefix}_dist_to_high_4h',
+            f'{prefix}_dist_to_high_4h',
             f'{prefix}_dist_to_high_24h', f'{prefix}_pullback_last_4h',
             f'{prefix}_vol_expansion',
         ]
@@ -438,9 +398,6 @@ class RegimeFeatureBuilder:
         gt_5pct = 0
         near_high_96 = 0
         vol_spike_20 = 0
-        within_2pct_8w = 0
-        within_5pct_8w = 0
-        new_high_8w_24h = 0
         valid_count = 0
 
         for sym, df in breadth_candles.items():
@@ -488,20 +445,6 @@ class RegimeFeatureBuilder:
                 if med_vol > 0 and vol_slice[-1] >= med_vol * 5.0:
                     vol_spike_20 += 1
 
-            h8w_start = max(0, loc - self.HIGH_8W_BARS)
-            high_8w = np.max(high[h8w_start:loc + 1])
-            if high_8w > 0:
-                if c >= high_8w * 0.98:
-                    within_2pct_8w += 1
-                if c >= high_8w * 0.95:
-                    within_5pct_8w += 1
-
-                h24_start = max(0, loc - 96)
-                if h24_start < loc:
-                    high_24h_slice = high[h24_start:loc + 1]
-                    if len(high_24h_slice) > 0 and np.max(high_24h_slice) >= high_8w * 0.99:
-                        new_high_8w_24h += 1
-
         if valid_count == 0:
             return self._fill_breadth_nan()
 
@@ -517,10 +460,6 @@ class RegimeFeatureBuilder:
         f['breadth_share_gt_5pct_16'] = gt_5pct / n
         f['breadth_share_near_high_96'] = near_high_96 / n
         f['breadth_share_vol_spike_20'] = vol_spike_20 / n
-        f['breadth_share_within_2pct_high_8w'] = within_2pct_8w / n
-        f['breadth_share_within_5pct_high_8w'] = within_5pct_8w / n
-        f['breadth_share_new_high_8w_last_24h'] = new_high_8w_24h / n
-
         f['breadth_change_1_to_4'] = f['breadth_pos_1'] - f['breadth_pos_4']
         f['breadth_change_4_to_16'] = f['breadth_pos_4'] - f['breadth_pos_16']
         f['breadth_change_16_to_96'] = f['breadth_pos_16'] - f['breadth_pos_96']
@@ -621,8 +560,6 @@ class RegimeFeatureBuilder:
         keys.extend([
             'breadth_share_gt_3pct_16', 'breadth_share_gt_5pct_16',
             'breadth_share_near_high_96', 'breadth_share_vol_spike_20',
-            'breadth_share_within_2pct_high_8w', 'breadth_share_within_5pct_high_8w',
-            'breadth_share_new_high_8w_last_24h',
             'breadth_change_1_to_4', 'breadth_change_4_to_16', 'breadth_change_16_to_96',
             'breadth_dispersion_16', 'breadth_acceleration',
             'breadth_dispersion_1', 'breadth_dispersion_4',
@@ -680,18 +617,6 @@ class RegimeFeatureBuilder:
         if not pd.isna(token_vol_ratio) and not pd.isna(breadth_vol_spike_share):
             f['token_vol_spike_relative'] = 1 if (token_vol_ratio > 5 and breadth_vol_spike_share < 0.2) else 0
 
-        token_near_8w = get_safe(token_features, 'token_within_2pct_high_8w', 0)
-        btc_near_8w = get_safe(btc_features, 'btc_within_2pct_high_8w', 0)
-        eth_near_8w = get_safe(eth_features, 'eth_within_2pct_high_8w', 0)
-        breadth_near_8w = get_safe(breadth_features, 'breadth_share_within_2pct_high_8w', 0)
-
-        if token_near_8w:
-            f['token_breakout_vs_market'] = 1 if (
-                breadth_near_8w < 0.2 and not btc_near_8w and not eth_near_8w
-            ) else 0
-        else:
-            f['token_breakout_vs_market'] = 0
-
         return f
 
     def _market_interaction_features(self, btc_features: dict, eth_features: dict,
@@ -704,12 +629,9 @@ class RegimeFeatureBuilder:
         btc_ret_16 = get_safe(btc_features, 'btc_ret_16', 0.0)
         eth_ret_16 = get_safe(eth_features, 'eth_ret_16', 0.0)
         token_near_high_96 = get_safe(token_features, 'token_near_high_96', 0)
-        token_near_8w = get_safe(token_features, 'token_within_2pct_high_8w', 0)
         token_vol_spike = 1 if get_safe(token_features, 'token_vol_ratio_20', 1) > 5 else 0
         breadth_near_high = get_safe(breadth_features, 'breadth_share_near_high_96', 0)
         breadth_vol_spike = get_safe(breadth_features, 'breadth_share_vol_spike_20', 0)
-        btc_near_high = get_safe(btc_features, 'btc_within_2pct_high_8w', 0)
-        eth_near_high = get_safe(eth_features, 'eth_within_2pct_high_8w', 0)
 
         if not pd.isna(btc_ret_16) and not pd.isna(eth_ret_16):
             f['btc_eth_divergence'] = btc_ret_16 - eth_ret_16
@@ -719,25 +641,14 @@ class RegimeFeatureBuilder:
             f['both_weak'] = 1 if (btc_ret_16 < -0.02 and eth_ret_16 < -0.02) else 0
 
         if not pd.isna(breadth_near_high):
-            f['breadth_near_high_x_btc_near_high'] = breadth_near_high * btc_near_high
             f['breadth_vol_spike_x_token_near_high'] = breadth_vol_spike * token_near_high_96
             f['btc_strong_x_eth_strong_x_token_near_high'] = (
                 f.get('both_strong', 0) * token_near_high_96
-            )
-
-        token_drawdown = get_safe(token_features, 'token_drawdown', 0.0)
-        breadth_mean_16 = get_safe(breadth_features, 'breadth_mean_ret_16', 0.0)
-        if not pd.isna(token_drawdown) and not pd.isna(breadth_mean_16):
-            f['token_relative_heat'] = (
-                1 if (token_near_8w and breadth_mean_16 < 0.02) else 0
             )
             f['token_overheated_vs_breadth'] = (
                 1 if (token_near_high_96 and breadth_near_high < 0.2) else 0
             )
 
-        f['extreme_hot_market'] = (
-            1 if (breadth_near_high > 0.5 and btc_near_high and eth_near_high) else 0
-        )
         f['extreme_vol_spike'] = (
             1 if (breadth_vol_spike > 0.3 and token_vol_spike) else 0
         )
@@ -851,14 +762,13 @@ class RegimeFeatureBuilder:
         if signals.empty:
             return pd.DataFrame()
 
-        # Keep track of original order
         signals_with_idx = signals.reset_index(drop=True).copy()
         signals_with_idx['_orig_idx'] = range(len(signals_with_idx))
         signals_sorted = signals_with_idx.sort_values('open_time').reset_index(drop=True)
 
         t_min = signals_sorted['open_time'].min()
         t_max = signals_sorted['open_time'].max()
-        warmup = timedelta(hours=8 * 7 * 24)
+        warmup = timedelta(hours=48)
 
         btc_candles = self._load_candles_cached('BTCUSDT', t_min - warmup, t_max)
         eth_candles = self._load_candles_cached('ETHUSDT', t_min - warmup, t_max)
@@ -868,7 +778,7 @@ class RegimeFeatureBuilder:
                 self.ch_dsn, t_min - timedelta(days=7), t_max, top_n=self.top_n
             )
 
-        breadth_lookback = timedelta(minutes=self.HIGH_8W_BARS * 15 + 96 * 15)
+        breadth_lookback = timedelta(hours=48)
         breadth_candles = self._load_breadth_candles(t_min - breadth_lookback, t_max)
 
         unique_symbols = signals_sorted['symbol'].unique()
@@ -888,7 +798,6 @@ class RegimeFeatureBuilder:
                 row = {}
                 ot = sig['open_time']
 
-                # Keep track of original index
                 row['_orig_idx'] = sig['_orig_idx']
 
                 row.update(self._detector_confidence_features(sig))
@@ -934,17 +843,14 @@ class RegimeFeatureBuilder:
 
         features_df = pd.DataFrame(all_features)
 
-        # Sort back to original order
         features_df = features_df.sort_values('_orig_idx').reset_index(drop=True)
         features_df = features_df.drop('_orig_idx', axis=1)
 
-        # Essential columns for matching with signals (from original, not sorted)
         if 'symbol' in signals.columns:
             features_df['symbol'] = signals['symbol'].values
         if 'open_time' in signals.columns:
             features_df['open_time'] = signals['open_time'].values
 
-        # Optional columns including signal_offset for proper matching
         keep_cols = ['event_id', 'event_type', 'signal_offset', 'signal_id']
         for c in keep_cols:
             if c in signals.columns:
