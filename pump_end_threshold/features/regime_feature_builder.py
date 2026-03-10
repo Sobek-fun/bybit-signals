@@ -27,7 +27,7 @@ class RegimeFeatureBuilder:
     def build(
             self,
             signals_df: pd.DataFrame,
-            strategy_state: dict = None,
+            trades_df: pd.DataFrame = None,
     ) -> pd.DataFrame:
         signals = signals_df.sort_values('open_time').reset_index(drop=True)
         if signals.empty:
@@ -75,14 +75,26 @@ class RegimeFeatureBuilder:
 
             row.update(self._market_interaction_features(btc_features, eth_features, breadth_features, token_features))
 
-            signals_before = signals[signals['open_time'] <= ot]
-            row.update(self._signal_flow_features(signals_before, sig))
+            signals_history = signals[signals['open_time'] < ot]
+            signals_bucket = signals[signals['open_time'] == ot]
+            row.update(self._signal_flow_features(signals_history, sig))
+            row['bucket_signals_now'] = len(signals_bucket)
+            row['bucket_unique_symbols_now'] = signals_bucket['symbol'].nunique() if len(signals_bucket) > 0 else 0
+
+            if trades_df is not None:
+                row.update(self._strategy_state_features(trades_df, ot))
+
+            btc_loc = btc_candles.index.searchsorted(ot) - 1
+            if 0 <= btc_loc < len(btc_candles):
+                row['context_time_used'] = btc_candles.index[btc_loc]
+            else:
+                row['context_time_used'] = pd.NaT
 
             rows.append(row)
 
         features_df = pd.DataFrame(rows)
 
-        keep_cols = ['event_id', 'symbol', 'open_time', 'event_type']
+        keep_cols = ['event_id', 'symbol', 'open_time', 'event_type', 'signal_id', 'signal_offset']
         for c in keep_cols:
             if c in signals.columns:
                 features_df[c] = signals[c].values
@@ -169,12 +181,11 @@ class RegimeFeatureBuilder:
 
     def _token_context_features(self, df: pd.DataFrame, t: datetime) -> dict:
         f = {}
-        if df.empty or t not in df.index:
-            loc = df.index.searchsorted(t) - 1
-            if loc < 0:
-                return self._fill_token_context_nan()
-        else:
-            loc = df.index.get_loc(t)
+        if df.empty:
+            return self._fill_token_context_nan()
+        loc = df.index.searchsorted(t) - 1
+        if loc < 0:
+            return self._fill_token_context_nan()
 
         if isinstance(loc, slice):
             loc = loc.stop - 1
@@ -267,10 +278,7 @@ class RegimeFeatureBuilder:
         if df.empty:
             return self._fill_asset_nan(prefix)
 
-        if t in df.index:
-            loc = df.index.get_loc(t)
-        else:
-            loc = df.index.searchsorted(t) - 1
+        loc = df.index.searchsorted(t) - 1
 
         if isinstance(loc, slice):
             loc = loc.stop - 1
@@ -439,10 +447,7 @@ class RegimeFeatureBuilder:
             if df.empty:
                 continue
 
-            if t in df.index:
-                loc = df.index.get_loc(t)
-            else:
-                loc = df.index.searchsorted(t) - 1
+            loc = df.index.searchsorted(t) - 1
 
             if isinstance(loc, slice):
                 loc = loc.stop - 1
@@ -536,10 +541,7 @@ class RegimeFeatureBuilder:
         for sym, df in breadth_candles.items():
             if df.empty:
                 continue
-            if t in df.index:
-                loc = df.index.get_loc(t)
-            else:
-                loc = df.index.searchsorted(t) - 1
+            loc = df.index.searchsorted(t) - 1
             if isinstance(loc, slice):
                 loc = loc.stop - 1
             if loc < 0 or loc >= len(df):
@@ -794,20 +796,58 @@ class RegimeFeatureBuilder:
 
         return f
 
+    def _strategy_state_features(self, trades_df: pd.DataFrame, t: datetime) -> dict:
+        f = {}
+
+        resolved_before = trades_df[
+            (trades_df['exit_time'].notna()) &
+            (trades_df['exit_time'] < t) &
+            (trades_df['trade_outcome'].isin(['TP', 'SL']))
+        ]
+
+        t_24h = t - timedelta(hours=24)
+        resolved_24h = resolved_before[resolved_before['exit_time'] > t_24h]
+
+        if len(resolved_24h) > 0:
+            n_sl = (resolved_24h['trade_outcome'] == 'SL').sum()
+            f['strat_resolved_sl_rate_last_24h'] = n_sl / len(resolved_24h)
+            f['strat_resolved_pnl_sum_last_24h'] = float(resolved_24h['pnl_pct'].fillna(0).sum())
+        else:
+            f['strat_resolved_sl_rate_last_24h'] = np.nan
+            f['strat_resolved_pnl_sum_last_24h'] = np.nan
+
+        sl_streak = 0
+        if len(resolved_before) > 0:
+            for outcome in reversed(resolved_before.sort_values('exit_time')['trade_outcome'].tolist()):
+                if outcome == 'SL':
+                    sl_streak += 1
+                else:
+                    break
+        f['strat_prev_closed_sl_streak'] = sl_streak
+
+        open_trades = trades_df[
+            (trades_df['open_time'] < t) &
+            ((trades_df['exit_time'].isna()) | (trades_df['exit_time'] >= t))
+        ]
+        f['strat_open_trades_now'] = len(open_trades)
+
+        return f
+
     def _signal_flow_features_batch(self, all_signals: pd.DataFrame, signal_indices: list) -> pd.DataFrame:
         all_signals_sorted = all_signals.sort_values('open_time').reset_index(drop=True)
 
         features = []
         for idx in signal_indices:
             sig = all_signals_sorted.iloc[idx]
-            signals_before = all_signals_sorted.iloc[:idx+1]
-            f = self._signal_flow_features(signals_before, sig)
+            ot = sig['open_time']
+            signals_history = all_signals_sorted[all_signals_sorted['open_time'] < ot]
+            f = self._signal_flow_features(signals_history, sig)
             f['signal_id'] = sig.get('signal_id', idx)
             features.append(f)
 
         return pd.DataFrame(features)
 
-    def build_batch(self, signals: pd.DataFrame, batch_size: int = 100) -> pd.DataFrame:
+    def build_batch(self, signals: pd.DataFrame, batch_size: int = 100, trades_df: pd.DataFrame = None) -> pd.DataFrame:
         if signals.empty:
             return pd.DataFrame()
 
@@ -844,7 +884,6 @@ class RegimeFeatureBuilder:
             batch_features = []
             for i in range(batch_start, batch_end):
                 sig = signals_sorted.iloc[i]
-                signals_before = signals_sorted.iloc[:i+1]
 
                 row = {}
                 ot = sig['open_time']
@@ -874,7 +913,20 @@ class RegimeFeatureBuilder:
 
                 row.update(self._market_interaction_features(btc_features, eth_features, breadth_features, token_features))
 
-                row.update(self._signal_flow_features(signals_before, sig))
+                signals_history = signals_sorted[signals_sorted['open_time'] < ot]
+                signals_bucket = signals_sorted[signals_sorted['open_time'] == ot]
+                row.update(self._signal_flow_features(signals_history, sig))
+                row['bucket_signals_now'] = len(signals_bucket)
+                row['bucket_unique_symbols_now'] = signals_bucket['symbol'].nunique() if len(signals_bucket) > 0 else 0
+
+                if trades_df is not None:
+                    row.update(self._strategy_state_features(trades_df, ot))
+
+                btc_loc = btc_candles.index.searchsorted(ot) - 1
+                if 0 <= btc_loc < len(btc_candles):
+                    row['context_time_used'] = btc_candles.index[btc_loc]
+                else:
+                    row['context_time_used'] = pd.NaT
 
                 batch_features.append(row)
 

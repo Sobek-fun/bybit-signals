@@ -18,6 +18,7 @@ from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 from pump_end_threshold.infra.clickhouse import DataLoader
 from pump_end_threshold.ml.feature_schema import prune_feature_columns
 from pump_end_threshold.ml.predict import extract_signals_verbose
+from pump_end_threshold.ml.regime_dataset import build_strategy_state
 
 
 def log(level: str, component: str, message: str):
@@ -302,8 +303,28 @@ def run_guard_stage(
         top_n=top_n,
     )
 
+    loader = DataLoader(ch_dsn)
+    tp_pct = 4.5
+    sl_pct = 10.0
+    max_horizon_bars = 200
+    manifest_path = guard_model_dir / "dataset_manifest.json"
+    if manifest_path.exists():
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+        tp_pct = manifest.get('tp_pct', tp_pct)
+        sl_pct = manifest.get('sl_pct', sl_pct)
+        max_horizon_bars = manifest.get('max_horizon_bars', max_horizon_bars)
+
+    log("INFO", "GUARD", "simulating trades for strategy state features")
+    trades_df = build_strategy_state(
+        signals, loader,
+        tp_pct=tp_pct, sl_pct=sl_pct,
+        max_horizon_bars=max_horizon_bars,
+    )
+    log("INFO", "GUARD", f"trades simulated: {len(trades_df)}")
+
     log("INFO", "GUARD", "building regime features in batch mode")
-    guard_features = builder.build_batch(signals, batch_size=100)
+    guard_features = builder.build_batch(signals, batch_size=100, trades_df=trades_df)
 
     if guard_features.empty:
         log("WARN", "GUARD", "no features built")

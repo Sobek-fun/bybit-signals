@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -160,7 +161,7 @@ def main():
 
     batch_size = 50
     log("INFO", "REGIME-DS", "building features")
-    regime_features = builder.build_batch(signals_df, batch_size=batch_size)
+    regime_features = builder.build_batch(signals_df, batch_size=batch_size, trades_df=trades_df)
 
     if regime_features.empty:
         log("ERROR", "REGIME-DS", "regime_features is empty!")
@@ -260,6 +261,68 @@ def main():
         if args.save_debug_sample and len(dataset) > 10:
             dataset.head(50).to_parquet(run_dir / "debug_sample.parquet", index=False)
             log("INFO", "REGIME-DS", "saved debug sample to debug_sample.parquet")
+
+        signals_hash = ''
+        try:
+            with open(args.signals_path, 'rb') as sf:
+                signals_hash = hashlib.sha256(sf.read()).hexdigest()[:16]
+        except Exception:
+            pass
+
+        universe_hash = ''
+        universe_path = run_dir / "liquid_universe.json"
+        if universe_path.exists():
+            try:
+                with open(universe_path, 'rb') as uf:
+                    universe_hash = hashlib.sha256(uf.read()).hexdigest()[:16]
+            except Exception:
+                pass
+
+        available_target_columns = sorted([
+            c for c in dataset.columns if c.startswith('target_')
+        ])
+        target_types = []
+        time_targets_hours = []
+        for tc in available_target_columns:
+            if 'next_' in tc:
+                target_types.append('signal_count')
+            elif any(h in tc for h in ['_6h', '_12h', '_24h']):
+                target_types.append('time_based')
+                for suffix in ['_6h', '_12h', '_24h']:
+                    if suffix in tc:
+                        hours = int(suffix.replace('_', '').replace('h', ''))
+                        if hours not in time_targets_hours:
+                            time_targets_hours.append(hours)
+            else:
+                target_types.append('other')
+        target_types_present = sorted(set(target_types))
+
+        manifest = {
+            'signals_path': args.signals_path,
+            'signals_hash': signals_hash,
+            'liquid_universe_hash': universe_hash,
+            'tp_pct': args.tp_pct,
+            'sl_pct': args.sl_pct,
+            'max_horizon_bars': args.max_horizon_bars,
+            'entry_shift_bars': ENTRY_SHIFT_BARS,
+            'bar_minutes': BAR_MINUTES,
+            'target_horizon_signals': args.target_horizon_signals,
+            'target_min_resolved': args.target_min_resolved,
+            'target_sl_rate_threshold': args.target_sl_rate_threshold,
+            'target_col': args.target_col,
+            'top_n_universe': args.top_n_universe,
+            'high_lookback_bars': args.high_lookback_bars or RegimeFeatureBuilder.HIGH_8W_BARS,
+            'n_signals': len(signals_df),
+            'n_samples': len(dataset),
+            'columns': sorted(list(dataset.columns)),
+            'available_target_columns': available_target_columns,
+            'target_types_present': target_types_present,
+            'time_targets_hours': sorted(time_targets_hours),
+            'feature_version': 'v3',
+        }
+        with open(run_dir / "dataset_manifest.json", 'w') as f:
+            json.dump(manifest, f, indent=2, default=str)
+        log("INFO", "REGIME-DS", "saved dataset_manifest.json")
 
 
 if __name__ == "__main__":

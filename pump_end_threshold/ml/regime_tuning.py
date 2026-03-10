@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
+from pump_end_threshold.ml.regime_evaluate import evaluate_regime, compute_cv_score
 from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_columns
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 
@@ -151,6 +152,7 @@ def evaluate_regime_fold(
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         score_mode: str = 'pnl_improvement',
+        target_col: str = 'target_bad_next_5',
 ) -> dict:
     if model is None or val_df is None or len(val_df) == 0:
         return {'score': -np.inf, 'valid': False, 'no_op': True}
@@ -166,187 +168,39 @@ def evaluate_regime_fold(
         resume_confirm_signals=policy_params['resume_confirm_signals'],
     )
 
-    result = policy.simulate_pnl(val_scored, p_bad_col='p_bad')
+    filtered = policy.apply(val_scored, p_bad_col='p_bad')
 
-    # Apply policy to get actual blocking decisions
-    val_with_policy = policy.apply(val_scored, p_bad_col='p_bad')
-    val_scored['blocked_by_policy'] = val_with_policy['blocked_by_policy']
+    metrics = evaluate_regime(filtered, target_col=target_col)
 
-    blocked_share = result.get('blocked_share', 0)
-    signals_before = result.get('signals_before', 0)
-    signals_after = result.get('signals_after', 0)
-    signal_keep_rate = signals_after / max(1, signals_before)
+    blocked_share = metrics.get('blocked_share', 0)
+    signal_keep_rate = metrics.get('signal_keep_rate', 1.0)
 
     if blocked_share > max_blocked_share or signal_keep_rate < min_signal_keep_rate:
         return {
             'score': -np.inf,
             'valid': False,
-            **result,
-            'blocked_share': blocked_share,
-            'signal_keep_rate': signal_keep_rate,
+            **metrics,
         }
 
-    pnl_after = result.get('pnl_after', 0)
-    pnl_before = result.get('pnl_before', 0)
-    pnl_improvement = pnl_after - pnl_before
-
-    sl_blocked = result.get('sl_blocked', 0)
-    tp_blocked = result.get('tp_blocked', 0)
-    block_value = 10.0 * sl_blocked - 4.5 * tp_blocked
-
-    tp_block_share_total = tp_blocked / max(1, result.get('tp_kept', 0) + tp_blocked)
-
-    longest_streak_before = result.get('longest_losing_streak_before', 0)
-    longest_streak_after = result.get('longest_losing_streak_after', 0)
-    streak_reduction = longest_streak_before - longest_streak_after
-
-    blocked_bad_precision = sl_blocked / max(1, sl_blocked + tp_blocked)
-
-    no_op_penalty = -1000 if blocked_share == 0 else 0
-
-    worst_window_6h_before = 0.0
-    worst_window_6h_after = 0.0
-    worst_window_12h_before = 0.0
-    worst_window_12h_after = 0.0
-    episode_recall = 0.0
-    n_episodes_detected = 0
-
-    if 'open_time' in val_scored.columns:
-        val_sorted = val_scored.sort_values('open_time').reset_index(drop=True)
-
-        for window_hours, key_prefix in [(6, 'worst_window_6h'), (12, 'worst_window_12h')]:
-            window = pd.Timedelta(hours=window_hours)
-
-            for start_idx in range(len(val_sorted)):
-                start_time = val_sorted.iloc[start_idx]['open_time']
-                end_time = start_time + window
-                window_trades = val_sorted[(val_sorted['open_time'] >= start_time) &
-                                         (val_sorted['open_time'] < end_time)]
-
-                if len(window_trades) > 0:
-                    window_pnl_before = window_trades['pnl_pct'].sum()
-                    window_after_pnl = window_trades[~window_trades['blocked_by_policy']]['pnl_pct'].sum()
-
-                    if key_prefix == 'worst_window_6h':
-                        worst_window_6h_before = min(worst_window_6h_before, window_pnl_before)
-                        worst_window_6h_after = min(worst_window_6h_after, window_after_pnl)
-                    else:
-                        worst_window_12h_before = min(worst_window_12h_before, window_pnl_before)
-                        worst_window_12h_after = min(worst_window_12h_after, window_after_pnl)
-
-        sl_streaks = []
-        current_streak = 0
-        for _, trade in val_sorted.iterrows():
-            if trade['trade_outcome'] == 'SL':
-                current_streak += 1
-            else:
-                if current_streak >= 3:
-                    sl_streaks.append({'start': _, 'length': current_streak})
-                current_streak = 0
-
-        if current_streak >= 3:
-            sl_streaks.append({'start': len(val_sorted) - 1, 'length': current_streak})
-
-        for streak in sl_streaks:
-            start_idx = max(0, streak['start'] - streak['length'])
-            if val_sorted.iloc[start_idx:start_idx+2]['blocked_by_policy'].any():
-                n_episodes_detected += 1
-
-        if len(sl_streaks) > 0:
-            episode_recall = n_episodes_detected / len(sl_streaks)
-
-    worst_window_improvement_6h = worst_window_6h_after - worst_window_6h_before
-    worst_window_improvement_12h = worst_window_12h_after - worst_window_12h_before
-
-    if score_mode == 'pnl_after':
-        score = pnl_after
-    elif score_mode == 'block_value':
-        score = block_value
-    elif score_mode == 'comprehensive':
-        score = (
-            pnl_improvement * 1.0 +
-            streak_reduction * 20.0 +
-            blocked_bad_precision * 50.0 +
-            worst_window_improvement_6h * 2.0 +
-            worst_window_improvement_12h * 1.0 +
-            episode_recall * 100.0 +
-            no_op_penalty
-        )
-        if blocked_bad_precision < 0.35:
-            score -= 100
-        if tp_block_share_total > 0.30:
-            score -= (tp_block_share_total - 0.30) * 100
-        if blocked_share > 0.25:
-            score -= (blocked_share - 0.25) * 100
-    else:
-        score = pnl_improvement + worst_window_improvement_12h * 0.5 + streak_reduction * 10.0 + episode_recall * 50.0
-        if tp_block_share_total > 0.30:
-            score -= (tp_block_share_total - 0.30) * 50
-        if blocked_share > 0.25:
-            score -= (blocked_share - 0.25) * 100
-        score += no_op_penalty
-
-    p_bad_percentiles = np.percentile(p_bad, [50, 90, 95, 99])
-    pause_threshold = policy_params['pause_on_threshold']
-    signals_above_pause_threshold = np.sum(p_bad >= pause_threshold)
-    signals_above_pause_threshold_share = signals_above_pause_threshold / len(p_bad) if len(p_bad) > 0 else 0
-
-    first_hit_timing_signals = []
-    if 'signal_id' in val_scored.columns and 'outcome' in val_scored.columns:
-        sl_episodes = []
-        current_episode = []
-        for idx, row in val_scored.iterrows():
-            if row['outcome'] == 'sl':
-                current_episode.append(idx)
-            else:
-                if current_episode and len(current_episode) >= 2:
-                    sl_episodes.append(current_episode)
-                current_episode = []
-        if current_episode and len(current_episode) >= 2:
-            sl_episodes.append(current_episode)
-
-        for episode in sl_episodes:
-            for pos, idx in enumerate(episode):
-                if val_scored.loc[idx, 'p_bad'] >= pause_threshold:
-                    first_hit_timing_signals.append(pos)
-                    break
-
-    avg_first_hit_timing = np.mean(first_hit_timing_signals) if first_hit_timing_signals else -1
+    score = compute_cv_score(
+        metrics, score_mode=score_mode,
+        max_blocked_share=max_blocked_share,
+        min_signal_keep_rate=min_signal_keep_rate,
+    )
 
     return {
         'score': score,
         'valid': True,
         'no_op': blocked_share == 0,
-        'pnl_before': pnl_before,
-        'pnl_after': pnl_after,
-        'pnl_improvement': pnl_improvement,
-        'block_value': block_value,
-        'blocked_bad_precision': blocked_bad_precision,
-        'longest_streak_reduction': streak_reduction,
-        'worst_window_6h_before': worst_window_6h_before,
-        'worst_window_6h_after': worst_window_6h_after,
-        'worst_window_12h_before': worst_window_12h_before,
-        'worst_window_12h_after': worst_window_12h_after,
-        'worst_window_improvement_6h': worst_window_improvement_6h,
-        'worst_window_improvement_12h': worst_window_improvement_12h,
-        'episode_recall': episode_recall,
-        'n_episodes_detected': n_episodes_detected,
-        'p_bad_p50': p_bad_percentiles[0],
-        'p_bad_p90': p_bad_percentiles[1],
-        'p_bad_p95': p_bad_percentiles[2],
-        'p_bad_p99': p_bad_percentiles[3],
-        'signals_above_pause_threshold': signals_above_pause_threshold,
-        'signals_above_pause_threshold_share': signals_above_pause_threshold_share,
-        'avg_first_hit_timing': avg_first_hit_timing,
-        **result,
-        'signal_keep_rate': signal_keep_rate,
+        **metrics,
     }
 
 
 def apply_regime_fold_split(
         dataset_df: pd.DataFrame,
         fold: dict,
-        embargo_signals: int = 0
+        embargo_signals: int = 0,
+        embargo_hours: float = 0,
 ) -> pd.DataFrame:
     df = dataset_df.copy()
     df['split'] = None
@@ -369,6 +223,14 @@ def apply_regime_fold_split(
             last_train_signals = train_df.tail(embargo_signals)
             df.loc[last_train_signals.index, 'split'] = None
 
+    if embargo_hours > 0:
+        embargo_cutoff = fold['train_end'] - pd.Timedelta(hours=embargo_hours)
+        df.loc[
+            (df['split'] == 'train') &
+            (df['open_time'] >= embargo_cutoff),
+            'split'
+        ] = None
+
     return df[df['split'].notna()].reset_index(drop=True)
 
 
@@ -385,12 +247,13 @@ def run_regime_cv(
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         embargo_signals: int = 5,
+        embargo_hours: float = 0,
         score_mode: str = 'pnl_improvement',
 ) -> dict:
     fold_results = []
 
     for fold_idx, fold in enumerate(folds):
-        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals)
+        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
         model, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -402,6 +265,7 @@ def run_regime_cv(
             max_blocked_share=max_blocked_share,
             min_signal_keep_rate=min_signal_keep_rate,
             score_mode=score_mode,
+            target_col=target_col,
         )
         fold_eval['fold_idx'] = fold_idx
         fold_eval['train_start'] = fold['train_start']
@@ -453,6 +317,7 @@ def tune_model_hyperparameters(
         early_stopping_rounds: int = 50,
         seed: int = 42,
         embargo_signals: int = 5,
+        embargo_hours: float = 0,
         min_valid_folds: int = 2,
         n_seeds: int = 3,
 ) -> dict:
@@ -492,7 +357,7 @@ def tune_model_hyperparameters(
         for seed_offset in range(n_seeds):
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
-                fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals)
+                fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
                 model, val_df = train_regime_fold(
                     fold_df, feature_columns, target_col, params,
                     iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -514,7 +379,8 @@ def tune_model_hyperparameters(
                 regime_eval = evaluate_regime_fold(
                     model, val_df, feature_columns, default_policy_params,
                     max_blocked_share=0.35, min_signal_keep_rate=0.45,
-                    score_mode='regime_aware',
+                    score_mode='pnl_improvement',
+                    target_col=target_col,
                 )
                 if regime_eval.get('valid', False):
                     regime_scores.append(regime_eval['score'])
@@ -559,6 +425,7 @@ def tune_policy_parameters(
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         embargo_signals: int = 5,
+        embargo_hours: float = 0,
         min_valid_folds: int = 2,
         score_mode: str = 'pnl_improvement',
         policy_grid_preset: str = 'default',
@@ -580,7 +447,7 @@ def tune_policy_parameters(
 
     fold_models = []
     for fold in folds:
-        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals)
+        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
         model, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -590,6 +457,7 @@ def tune_policy_parameters(
 
     best_score = -np.inf
     best_params = None
+    best_fold_results = []
     results = []
 
     for policy_params in policy_grid:
@@ -604,6 +472,7 @@ def tune_policy_parameters(
                 max_blocked_share=max_blocked_share,
                 min_signal_keep_rate=min_signal_keep_rate,
                 score_mode=score_mode,
+                target_col=target_col,
             )
             if eval_result.get('valid', False):
                 fold_results.append(eval_result)
@@ -633,7 +502,7 @@ def tune_policy_parameters(
         'best_score': best_score,
         'results_df': pd.DataFrame(results),
         'time_elapsed_sec': time.time() - start_time,
-        'fold_results': best_fold_results if 'best_fold_results' in locals() else [],
+        'fold_results': best_fold_results,
     }
 
 
@@ -691,6 +560,7 @@ def tune_regime_guard(
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         embargo_signals: int = 5,
+        embargo_hours: float = 0,
         min_valid_folds: int = 2,
         score_mode: str = 'pnl_improvement',
         policy_grid_preset: str = 'default',
@@ -704,7 +574,7 @@ def tune_regime_guard(
         fold_months=fold_months, min_train_months=min_train_months,
         fold_days=fold_days, min_train_days=min_train_days,
         iterations=iterations, early_stopping_rounds=early_stopping_rounds,
-        seed=seed, embargo_signals=embargo_signals,
+        seed=seed, embargo_signals=embargo_signals, embargo_hours=embargo_hours,
         min_valid_folds=min_valid_folds,
     )
 
@@ -721,7 +591,7 @@ def tune_regime_guard(
         seed=seed,
         max_blocked_share=max_blocked_share,
         min_signal_keep_rate=min_signal_keep_rate,
-        embargo_signals=embargo_signals,
+        embargo_signals=embargo_signals, embargo_hours=embargo_hours,
         min_valid_folds=min_valid_folds,
         score_mode=score_mode,
         policy_grid_preset=policy_grid_preset,
@@ -730,41 +600,12 @@ def tune_regime_guard(
     if policy_result['best_params'] is None:
         raise ValueError("Failed to find valid policy parameters")
 
-    # Combine results for backward compatibility
-    combined_leaderboard = []
+    model_leaderboard_df = model_result.get('results_df', pd.DataFrame())
+    policy_leaderboard_df = policy_result.get('results_df', pd.DataFrame())
 
-    # Add model results to leaderboard
-    if 'results_df' in model_result and not model_result['results_df'].empty:
-        for _, row in model_result['results_df'].iterrows():
-            combined_leaderboard.append({
-                **row.to_dict(),
-                'policy_pause_on_threshold': np.nan,
-                'policy_resume_threshold': np.nan,
-                'policy_resume_confirm_signals': np.nan,
-                'mean_score': row.get('mean_auc', np.nan),
-                'std_score': row.get('std_auc', np.nan),
-            })
-
-    # Add policy results to leaderboard
-    if 'results_df' in policy_result and not policy_result['results_df'].empty:
-        for _, row in policy_result['results_df'].iterrows():
-            record = {
-                **model_result['best_params'],
-                **row.to_dict(),
-                'mean_score': row.get('score', np.nan),
-                'std_score': np.nan,
-                'n_valid_folds': row.get('n_valid_folds', 0),
-            }
-            combined_leaderboard.append(record)
-
-    leaderboard_df = pd.DataFrame(combined_leaderboard) if combined_leaderboard else pd.DataFrame()
-
-    # Calculate total trials
-    model_trials = len(model_result.get('results_df', [])) if 'results_df' in model_result else 0
-    policy_trials = len(policy_result.get('results_df', [])) if 'results_df' in policy_result else 0
+    model_trials = len(model_leaderboard_df) if not model_leaderboard_df.empty else 0
+    policy_trials = len(policy_leaderboard_df) if not policy_leaderboard_df.empty else 0
     total_trials = model_trials + policy_trials
-
-    # Calculate total time
     total_time = model_result.get('time_elapsed_sec', 0) + policy_result.get('time_elapsed_sec', 0)
 
     return {
@@ -772,7 +613,8 @@ def tune_regime_guard(
         'best_policy_params': policy_result['best_params'],
         'best_score': policy_result.get('best_score', -np.inf),
         'best_cv_result': _compute_cv_summary(policy_result.get('fold_results', [])),
-        'leaderboard': leaderboard_df,
+        'model_leaderboard': model_leaderboard_df,
+        'policy_leaderboard': policy_leaderboard_df,
         'feature_columns': model_result['feature_columns'],
         'folds': model_result['folds'],
         'trials_completed': total_trials,
@@ -791,6 +633,7 @@ def train_final_regime_model(
         iterations: int = 10000,
         seed: int = 42,
         target_horizon_signals: int = 5,
+        embargo_hours: float = 0,
 ) -> CatBoostClassifier:
     train_df = dataset_df[dataset_df['open_time'] < train_end]
 
@@ -799,6 +642,10 @@ def train_final_regime_model(
     train_df = train_df.sort_values('open_time')
     if len(train_df) > target_horizon_signals:
         train_df = train_df.iloc[:-target_horizon_signals]
+
+    if embargo_hours > 0:
+        embargo_cutoff = train_end - pd.Timedelta(hours=embargo_hours)
+        train_df = train_df[train_df['open_time'] < embargo_cutoff]
 
     X_train = train_df[feature_columns]
     y_train = train_df[target_col]

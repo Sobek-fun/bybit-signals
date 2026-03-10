@@ -42,6 +42,12 @@ EXCLUDED_COLUMNS = {
     'warmup_bars',
     'target',
     'runup_pct',
+
+    'context_time_used',
+    'bucket_p_bad',
+    'pause_reason',
+    'resume_reason',
+    'policy_episode_id',
 }
 
 EXCLUDED_PREFIXES = (
