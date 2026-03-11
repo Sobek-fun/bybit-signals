@@ -12,6 +12,26 @@ from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_colum
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 
 
+def _safe_binary_metrics(y_true: pd.Series, y_score: np.ndarray) -> tuple:
+    y = pd.Series(y_true).dropna()
+    if len(y) == 0:
+        return None, None, None
+
+    valid_mask = pd.Series(y_true).notna().values
+    y_score_valid = y_score[valid_mask]
+    y_values = y.values
+
+    brier = float(np.mean((y_score_valid - y_values) ** 2))
+    classes = np.unique(y_values)
+    if len(classes) < 2:
+        return None, None, brier
+
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    ap = float(average_precision_score(y_values, y_score_valid))
+    auc = float(roc_auc_score(y_values, y_score_valid))
+    return ap, auc, brier
+
+
 def generate_regime_walk_forward_folds(
         dataset_df: pd.DataFrame,
         fold_months: int = 1,
@@ -358,8 +378,6 @@ def tune_model_hyperparameters(
         min_valid_folds: int = 2,
         n_seeds: int = 3,
 ) -> dict:
-    from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
-
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
 
@@ -403,9 +421,9 @@ def tune_model_hyperparameters(
                 p_bad = model.predict_proba(X_val)[:, 1]
 
                 y_val = val_df[target_col]
-                ap = average_precision_score(y_val, p_bad)
-                auc = roc_auc_score(y_val, p_bad)
-                brier = brier_score_loss(y_val, p_bad)
+                ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
+                if ap is None:
+                    continue
                 fold_scores.append({
                     'ap': ap, 'auc': auc, 'brier': brier,
                     'seed': curr_seed, 'fold': fold_idx,
@@ -487,6 +505,9 @@ def tune_policy_parameters(
     best_score = -np.inf
     best_params = None
     best_fold_results = []
+    fallback_score = -np.inf
+    fallback_params = None
+    fallback_fold_results = []
     results = []
 
     for policy_params in policy_grid:
@@ -525,6 +546,28 @@ def tune_policy_parameters(
                 'n_valid_folds': len(fold_results),
                 'n_no_op_folds': n_no_op,
             })
+        elif fold_results:
+            scores = [r['score'] for r in fold_results]
+            weights = [r.get('signals_before', 1) for r in fold_results]
+            weighted_mean = np.average(scores, weights=weights) if sum(weights) > 0 else np.mean(scores)
+            if (
+                    fallback_params is None or
+                    len(fold_results) > len(fallback_fold_results) or
+                    (len(fold_results) == len(fallback_fold_results) and weighted_mean > fallback_score)
+            ):
+                fallback_score = weighted_mean
+                fallback_params = policy_params
+                fallback_fold_results = fold_results
+
+    if best_params is None:
+        if fallback_params is not None:
+            best_params = fallback_params
+            best_score = fallback_score
+            best_fold_results = fallback_fold_results
+        elif policy_grid:
+            best_params = policy_grid[0]
+            best_score = -np.inf
+            best_fold_results = []
 
     resolved_thresholds = None
     if best_params and best_fold_results:
