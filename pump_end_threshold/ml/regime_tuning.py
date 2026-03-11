@@ -408,8 +408,9 @@ def tune_model_hyperparameters(
     best_score = -np.inf
     best_params = None
     results = []
+    probe_quantile = 0.88 if max_blocked_share < 0.25 else 0.80
     probe_policy = {
-        'pause_on_quantile': 0.80,
+        'pause_on_quantile': probe_quantile,
         'resume_quantile': 0.55,
         'resume_confirm_signals': 2,
     }
@@ -480,6 +481,11 @@ def tune_model_hyperparameters(
                 'std_ap': np.std([s['ap'] for s in fold_scores]),
                 'n_valid_folds': len(fold_scores),
             })
+
+    if best_params is None and results:
+        fallback = max(results, key=lambda r: r.get('mean_ap', -np.inf))
+        param_keys = ['depth', 'learning_rate', 'l2_leaf_reg', 'min_data_in_leaf', 'random_strength', 'bagging_temperature', 'rsm']
+        best_params = {k: fallback[k] for k in param_keys if k in fallback}
 
     return {
         'best_params': best_params,
