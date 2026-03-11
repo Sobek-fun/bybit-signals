@@ -203,6 +203,87 @@ class DataLoader:
 
         return df
 
+    def load_transactions_range(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        query = """
+        SELECT
+            timestamp,
+            price,
+            size
+        FROM bybit.transactions
+        WHERE symbol = %(symbol)s
+          AND timestamp >= %(start)s
+          AND timestamp < %(end)s
+        ORDER BY timestamp
+        """
+
+        query_start = datetime.now()
+        result = self.client.query(query, parameters={
+            "symbol": symbol,
+            "start": start_time,
+            "end": end_time
+        })
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"transactions query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbol={symbol}")
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["timestamp", "price", "size"]
+        )
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+
+        return df
+
+    def load_1s_bars_from_transactions(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        query = """
+        SELECT
+            toStartOfSecond(timestamp) AS second,
+            argMin(price, timestamp) AS open,
+            max(price) AS high,
+            min(price) AS low,
+            argMax(price, timestamp) AS close,
+            sum(size) AS volume,
+            count() AS trades_count
+        FROM bybit.transactions
+        WHERE symbol = %(symbol)s
+          AND timestamp >= %(start)s
+          AND timestamp < %(end)s
+        GROUP BY second
+        ORDER BY second
+        """
+
+        query_start = datetime.now()
+        result = self.client.query(query, parameters={
+            "symbol": symbol,
+            "start": start_time,
+            "end": end_time
+        })
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"1s bars query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbol={symbol}")
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["second", "open", "high", "low", "close", "volume", "trades_count"]
+        )
+
+        df["second"] = pd.to_datetime(df["second"])
+        df.set_index("second", inplace=True)
+
+        return df
+
     def _get_last_closed_time(self, symbol: str) -> datetime | None:
         now = datetime.now()
         minutes = (now.minute // 15) * 15

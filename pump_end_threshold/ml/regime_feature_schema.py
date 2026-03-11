@@ -48,6 +48,27 @@ EXCLUDED_COLUMNS = {
     'pause_reason',
     'resume_reason',
     'policy_episode_id',
+
+    'bucket_unique_symbols_now',
+    'same_symbol_last_24h',
+    'signal_density_min_gap_1h',
+    'token_near_high_96',
+    'token_in_top_decile',
+    'token_relative_heat',
+    'token_breakout_vs_market',
+    'extreme_hot_market',
+    'extreme_vol_spike',
+    'both_strong',
+    'both_weak',
+    'btc_strong_eth_weak',
+    'btc_weak_eth_strong',
+    'btc_strong_x_eth_strong_x_token_near_high',
+    'breadth_vol_spike_x_token_near_high',
+    'token_overheated_vs_breadth',
+    'btc_up_streak',
+    'eth_up_streak',
+    'btc_vol_expansion',
+    'eth_vol_expansion',
 }
 
 EXCLUDED_PREFIXES = (
@@ -57,6 +78,7 @@ EXCLUDED_PREFIXES = (
     'policy_',
     'blocked_',
     'det_',
+    'snap_',
 )
 
 

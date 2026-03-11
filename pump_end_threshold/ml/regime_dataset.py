@@ -11,12 +11,37 @@ SL_PCT = 10.0
 ENTRY_SHIFT_BARS = 1
 BAR_MINUTES = 15
 
+TARGET_PROFILES = {
+    'pause_value_12h_v2_all': {
+        'window_hours': 12,
+        'min_resolved': 4,
+        'tp_value': 4.5,
+        'sl_value': 10.0,
+        'timeout_penalty': 1.5,
+        'bad_value_threshold': -10.0,
+        'bad_sl_rate_threshold': 0.55,
+        'good_value_threshold': 7.5,
+        'good_sl_rate_threshold': 0.45,
+    },
+    'pause_value_12h_v2_curated': {
+        'window_hours': 12,
+        'min_resolved': 3,
+        'tp_value': 4.5,
+        'sl_value': 10.0,
+        'timeout_penalty': 1.0,
+        'bad_value_threshold': -10.0,
+        'bad_sl_rate_threshold': 0.55,
+        'good_value_threshold': 7.5,
+        'good_sl_rate_threshold': 0.45,
+    },
+}
 
-def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
-                   tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
-                   entry_shift_bars: int = ENTRY_SHIFT_BARS,
-                   max_horizon_bars: int = 200,
-                   candle_cache: dict = None) -> dict:
+
+def simulate_trade_fast_1m(loader: DataLoader, symbol: str, signal_time: datetime,
+                           tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
+                           entry_shift_bars: int = ENTRY_SHIFT_BARS,
+                           max_horizon_bars: int = 200,
+                           candle_cache: dict = None) -> dict:
     entry_time = signal_time + timedelta(minutes=entry_shift_bars * BAR_MINUTES)
     end_time = entry_time + timedelta(minutes=max_horizon_bars * BAR_MINUTES)
 
@@ -31,6 +56,7 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
         df = loader.load_raw_1m_candles(symbol, entry_time, end_time)
         if candle_cache is not None:
             candle_cache[symbol] = (df, entry_time, end_time)
+
     if df.empty:
         return {
             'trade_outcome': 'UNKNOWN',
@@ -43,6 +69,7 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
             'mfe_pct': np.nan,
             'mae_pct': np.nan,
             'trade_duration_bars': np.nan,
+            'ambiguous_bar_time': None,
         }
 
     entry_bar = df.iloc[0]
@@ -60,6 +87,7 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
             'mfe_pct': np.nan,
             'mae_pct': np.nan,
             'trade_duration_bars': np.nan,
+            'ambiguous_bar_time': None,
         }
 
     tp_price = entry_price * (1 - tp_pct / 100)
@@ -93,6 +121,9 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
                 'mfe_pct': mfe,
                 'mae_pct': mae,
                 'trade_duration_bars': i,
+                'ambiguous_bar_time': df.index[i],
+                'tp_price': tp_price,
+                'sl_price': sl_price,
             }
 
         if tp_hit:
@@ -107,6 +138,7 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
                 'mfe_pct': mfe,
                 'mae_pct': mae,
                 'trade_duration_bars': i,
+                'ambiguous_bar_time': None,
             }
 
         if sl_hit:
@@ -121,6 +153,7 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
                 'mfe_pct': mfe,
                 'mae_pct': mae,
                 'trade_duration_bars': i,
+                'ambiguous_bar_time': None,
             }
 
     return {
@@ -134,7 +167,119 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
         'mfe_pct': mfe,
         'mae_pct': mae,
         'trade_duration_bars': len(df),
+        'ambiguous_bar_time': None,
     }
+
+
+def resolve_trade_with_1s_replay(loader: DataLoader, symbol: str,
+                                 entry_price: float, tp_price: float, sl_price: float,
+                                 ambiguous_bar_time: datetime,
+                                 mfe: float, mae: float,
+                                 trade_duration_bars: int,
+                                 tp_pct: float = TP_PCT, sl_pct: float = SL_PCT) -> dict:
+    bar_start = ambiguous_bar_time
+    bar_end = ambiguous_bar_time + timedelta(minutes=1)
+
+    bars_1s = loader.load_1s_bars_from_transactions(symbol, bar_start, bar_end)
+
+    if bars_1s.empty:
+        return {
+            'trade_outcome': 'AMBIGUOUS',
+            'tp_hit': True,
+            'sl_hit': True,
+            'exit_time': ambiguous_bar_time,
+            'entry_price': entry_price,
+            'exit_price': np.nan,
+            'pnl_pct': np.nan,
+            'mfe_pct': mfe,
+            'mae_pct': mae,
+            'trade_duration_bars': trade_duration_bars,
+        }
+
+    for i in range(len(bars_1s)):
+        bar = bars_1s.iloc[i]
+        bar_low = bar['low']
+        bar_high = bar['high']
+
+        excursion_down = (entry_price - bar_low) / entry_price * 100
+        excursion_up = (bar_high - entry_price) / entry_price * 100
+        mfe = max(mfe, excursion_down)
+        mae = max(mae, excursion_up)
+
+        tp_hit = bar_low <= tp_price
+        sl_hit = bar_high >= sl_price
+
+        if tp_hit and not sl_hit:
+            return {
+                'trade_outcome': 'TP',
+                'tp_hit': True,
+                'sl_hit': False,
+                'exit_time': bars_1s.index[i],
+                'entry_price': entry_price,
+                'exit_price': tp_price,
+                'pnl_pct': tp_pct,
+                'mfe_pct': mfe,
+                'mae_pct': mae,
+                'trade_duration_bars': trade_duration_bars,
+            }
+
+        if sl_hit and not tp_hit:
+            return {
+                'trade_outcome': 'SL',
+                'tp_hit': False,
+                'sl_hit': True,
+                'exit_time': bars_1s.index[i],
+                'entry_price': entry_price,
+                'exit_price': sl_price,
+                'pnl_pct': -sl_pct,
+                'mfe_pct': mfe,
+                'mae_pct': mae,
+                'trade_duration_bars': trade_duration_bars,
+            }
+
+    return {
+        'trade_outcome': 'AMBIGUOUS',
+        'tp_hit': True,
+        'sl_hit': True,
+        'exit_time': ambiguous_bar_time,
+        'entry_price': entry_price,
+        'exit_price': np.nan,
+        'pnl_pct': np.nan,
+        'mfe_pct': mfe,
+        'mae_pct': mae,
+        'trade_duration_bars': trade_duration_bars,
+    }
+
+
+def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
+                   tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
+                   entry_shift_bars: int = ENTRY_SHIFT_BARS,
+                   max_horizon_bars: int = 200,
+                   candle_cache: dict = None) -> dict:
+    result = simulate_trade_fast_1m(
+        loader, symbol, signal_time,
+        tp_pct=tp_pct, sl_pct=sl_pct,
+        entry_shift_bars=entry_shift_bars,
+        max_horizon_bars=max_horizon_bars,
+        candle_cache=candle_cache,
+    )
+
+    if result['trade_outcome'] == 'AMBIGUOUS' and result.get('ambiguous_bar_time') is not None:
+        resolved = resolve_trade_with_1s_replay(
+            loader, symbol,
+            entry_price=result['entry_price'],
+            tp_price=result['tp_price'],
+            sl_price=result['sl_price'],
+            ambiguous_bar_time=result['ambiguous_bar_time'],
+            mfe=result['mfe_pct'],
+            mae=result['mae_pct'],
+            trade_duration_bars=result['trade_duration_bars'],
+            tp_pct=tp_pct, sl_pct=sl_pct,
+        )
+        return resolved
+
+    clean = {k: v for k, v in result.items() if k not in ('ambiguous_bar_time', 'tp_price', 'sl_price')}
+    return clean
 
 
 def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
@@ -204,10 +349,67 @@ def compute_strategy_state_at(trades_df: pd.DataFrame, t: datetime,
     }
 
 
+def compute_pause_value_targets(
+        trades_df: pd.DataFrame,
+        current_time: datetime,
+        window_hours: int = 12,
+        min_resolved: int = 4,
+        tp_value: float = 4.5,
+        sl_value: float = 10.0,
+        timeout_penalty: float = 1.5,
+        bad_value_threshold: float = -10.0,
+        bad_sl_rate_threshold: float = 0.55,
+        good_value_threshold: float = 7.5,
+        good_sl_rate_threshold: float = 0.45,
+) -> dict:
+    future_end = current_time + timedelta(hours=window_hours)
+    future = trades_df[
+        (trades_df['open_time'] > current_time) &
+        (trades_df['open_time'] <= future_end)
+    ]
+
+    resolved = future[future['trade_outcome'].isin(['TP', 'SL'])]
+    timeout = future[future['trade_outcome'] == 'TIMEOUT']
+
+    n_resolved = len(resolved)
+    n_tp = int((resolved['trade_outcome'] == 'TP').sum()) if n_resolved > 0 else 0
+    n_sl = int((resolved['trade_outcome'] == 'SL').sum()) if n_resolved > 0 else 0
+    n_timeout = len(timeout)
+
+    targets = {
+        f'future_resolved_count_next_{window_hours}h': n_resolved,
+        f'future_tp_count_next_{window_hours}h': n_tp,
+        f'future_sl_count_next_{window_hours}h': n_sl,
+        f'future_timeout_count_next_{window_hours}h': n_timeout,
+    }
+
+    if n_resolved < min_resolved:
+        targets[f'future_sl_rate_next_{window_hours}h'] = np.nan
+        targets[f'future_block_value_next_{window_hours}h'] = np.nan
+        targets[f'target_pause_value_next_{window_hours}h'] = np.nan
+        return targets
+
+    sl_rate = n_sl / n_resolved
+    block_value = tp_value * n_tp - sl_value * n_sl - timeout_penalty * n_timeout
+
+    targets[f'future_sl_rate_next_{window_hours}h'] = sl_rate
+    targets[f'future_block_value_next_{window_hours}h'] = block_value
+
+    if block_value <= bad_value_threshold and sl_rate >= bad_sl_rate_threshold:
+        targets[f'target_pause_value_next_{window_hours}h'] = 1
+    elif block_value >= good_value_threshold and sl_rate <= good_sl_rate_threshold:
+        targets[f'target_pause_value_next_{window_hours}h'] = 0
+    else:
+        targets[f'target_pause_value_next_{window_hours}h'] = np.nan
+
+    return targets
+
+
 def compute_targets(trades_df: pd.DataFrame, current_idx: int,
                     window_sizes: list[int] = None,
                     min_resolved: int = 3,
-                    sl_rate_threshold: float = 0.60) -> dict:
+                    sl_rate_threshold: float = 0.60,
+                    target_profile: str = None) -> dict:
     if window_sizes is None:
         window_sizes = [3, 5]
 
@@ -247,57 +449,15 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
 
         targets[f'target_sl_streak_start_{w}'] = 1 if consecutive_sl >= 2 else 0
 
-    future_12h_end = current_time + timedelta(hours=12)
-    future_12h = trades_df[
-        (trades_df['open_time'] > current_time) &
-        (trades_df['open_time'] <= future_12h_end) &
-        (trades_df['trade_outcome'].isin(['TP', 'SL', 'TIMEOUT']))
-    ]
-    n_res_12h = len(future_12h[future_12h['trade_outcome'].isin(['TP', 'SL'])])
-
-    if n_res_12h < min_resolved:
-        targets['target_bad_next_12h'] = np.nan
-        targets['target_future_pnl_sum_12h'] = np.nan
-        targets['target_future_block_value_12h'] = np.nan
-        targets['target_drawdown_cluster_next_12h'] = np.nan
+    if target_profile and target_profile in TARGET_PROFILES:
+        profile = TARGET_PROFILES[target_profile]
     else:
-        n_sl_12h = int((future_12h['trade_outcome'] == 'SL').sum())
-        n_tp_12h = int((future_12h['trade_outcome'] == 'TP').sum())
-        sl_rate_12h = n_sl_12h / n_res_12h
-        targets['target_bad_next_12h'] = 1 if sl_rate_12h >= sl_rate_threshold else 0
+        profile = TARGET_PROFILES['pause_value_12h_v2_all']
 
-        pnl_sum_12h = 0.0
-        for _, t in future_12h.iterrows():
-            if not pd.isna(t['pnl_pct']):
-                pnl_sum_12h += t['pnl_pct']
-            elif t['trade_outcome'] == 'TP':
-                pnl_sum_12h += TP_PCT
-            elif t['trade_outcome'] == 'SL':
-                pnl_sum_12h -= SL_PCT
-        targets['target_future_pnl_sum_12h'] = pnl_sum_12h
-
-        block_value_12h = n_tp_12h * TP_PCT + n_sl_12h * (-SL_PCT)
-        targets['target_future_block_value_12h'] = block_value_12h
-
-        cumsum_pnl = 0.0
-        max_drawdown_depth = 0.0
-        consecutive_sl_count = 0
-        max_consecutive_sl = 0
-
-        for _, t in future_12h.iterrows():
-            if t['trade_outcome'] == 'SL':
-                cumsum_pnl -= SL_PCT
-                consecutive_sl_count += 1
-                max_consecutive_sl = max(max_consecutive_sl, consecutive_sl_count)
-            elif t['trade_outcome'] == 'TP':
-                cumsum_pnl += TP_PCT
-                consecutive_sl_count = 0
-
-            if cumsum_pnl < max_drawdown_depth:
-                max_drawdown_depth = cumsum_pnl
-
-        drawdown_cluster = 1 if (max_drawdown_depth <= -15.0 or max_consecutive_sl >= 3) else 0
-        targets['target_drawdown_cluster_next_12h'] = drawdown_cluster
+    pause_targets = compute_pause_value_targets(
+        trades_df, current_time, **profile
+    )
+    targets.update(pause_targets)
 
     return targets
 
@@ -308,6 +468,7 @@ def build_regime_dataset(
         trades_df: pd.DataFrame,
         min_resolved: int = 3,
         sl_rate_threshold: float = 0.60,
+        target_profile: str = None,
 ) -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trades = trades_df.sort_values('open_time').reset_index(drop=True)
@@ -374,7 +535,11 @@ def build_regime_dataset(
             continue
         feats = feature_row.iloc[0].to_dict()
 
-        targets = compute_targets(trades, i, min_resolved=min_resolved, sl_rate_threshold=sl_rate_threshold)
+        targets = compute_targets(
+            trades, i, min_resolved=min_resolved,
+            sl_rate_threshold=sl_rate_threshold,
+            target_profile=target_profile,
+        )
 
         row = {}
         row.update(feats)
@@ -391,20 +556,23 @@ def build_regime_dataset(
         row['trade_duration_bars'] = trade['trade_duration_bars']
         row.update(targets)
 
-        is_bad_12h = targets.get('target_bad_next_12h', 0)
-        pnl_12h = targets.get('target_future_pnl_sum_12h', 0)
+        target_val = targets.get('target_pause_value_next_12h', np.nan)
 
-        base_weight = 1.0
-        if not pd.isna(is_bad_12h) and is_bad_12h == 1:
-            severity = abs(pnl_12h) if not pd.isna(pnl_12h) else 0
+        if pd.isna(target_val):
+            row['sample_weight'] = np.nan
+        elif target_val == 1:
+            block_val = targets.get('future_block_value_next_12h', 0)
+            severity = abs(block_val) if not pd.isna(block_val) else 0
             if severity >= 20:
-                base_weight = 3.0
-            elif severity >= 10:
-                base_weight = 2.0
+                row['sample_weight'] = 2.0
             else:
-                base_weight = 1.5
-
-        row['sample_weight'] = base_weight
+                row['sample_weight'] = 1.5
+        else:
+            block_val = targets.get('future_block_value_next_12h', 0)
+            if not pd.isna(block_val) and block_val >= 15:
+                row['sample_weight'] = 1.5
+            else:
+                row['sample_weight'] = 1.2
 
         rows.append(row)
 

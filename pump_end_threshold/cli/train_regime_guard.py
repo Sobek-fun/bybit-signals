@@ -35,20 +35,13 @@ def parse_date_exclusive(date_str: str) -> datetime:
 
 
 def _feature_family(name: str) -> str:
-    if name.startswith('det_'):
-        return 'det'
-    if name.startswith('snap_'):
-        return 'snap'
     if name.startswith('token_vs_'):
         return 'token_vs'
-    if name.startswith(('token_relative_', 'token_overheated_', 'token_in_top_',
-                        'token_vol_spike_relative', 'token_breakout_vs_')):
+    if name.startswith(('token_vol_spike_relative',)):
         return 'token_vs'
     if name.startswith('token_'):
         return 'token'
     if name.startswith('btc_eth_'):
-        return 'btc_eth'
-    if name.startswith(('btc_strong_', 'btc_weak_', 'both_strong', 'both_weak', 'extreme_')):
         return 'btc_eth'
     if name.startswith('btc_'):
         return 'btc'
@@ -60,8 +53,6 @@ def _feature_family(name: str) -> str:
         return 'raw_signals'
     if name.startswith('unique_symbols_'):
         return 'unique_symbols'
-    if name.startswith('same_symbol_'):
-        return 'same_symbol'
     if name.startswith('signal_density_'):
         return 'signal_density'
     if name.startswith('max_symbol_'):
@@ -77,7 +68,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train regime guard model")
     parser.add_argument("--dataset-parquet", type=str, required=True,
                         help="Path to regime dataset parquet")
-    parser.add_argument("--target-col", type=str, default="target_bad_next_12h")
+    parser.add_argument("--target-col", type=str, default="target_pause_value_next_12h")
     parser.add_argument("--train-end", type=str, default=None,
                         help="Train end date (YYYY-MM-DD), exclusive. If set, trains final model")
     parser.add_argument("--time-budget-min", type=int, default=60)
@@ -102,8 +93,10 @@ def main():
                         choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
                         help="Scoring mode for hyperparameter optimization")
     parser.add_argument("--policy-grid", type=str, default="default",
-                        choices=["default", "conservative", "aggressive"],
+                        choices=["default", "conservative", "aggressive", "low"],
                         help="Policy parameter grid preset")
+    parser.add_argument("--disable-auto-class-weights", action="store_true",
+                        help="Disable auto_class_weights in CatBoost (use manual sample_weight instead)")
     parser.add_argument("--run-dir", type=str, default=None,
                         help="Directory for all artifacts (if not provided, creates timestamped dir)")
     parser.add_argument("--out-dir", type=str, default=None,

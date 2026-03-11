@@ -458,6 +458,18 @@ def main():
         default=4,
         help="Number of parallel workers (default: 4)"
     )
+    parser.add_argument(
+        "--symbols-file",
+        type=str,
+        default=None,
+        help="Path to file with allowed symbols (one per line)"
+    )
+    parser.add_argument(
+        "--symbols-csv",
+        type=str,
+        default=None,
+        help="Comma-separated list of allowed symbols (e.g., 'BTCUSDT,ETHUSDT,...')"
+    )
 
     args = parser.parse_args()
 
@@ -539,6 +551,21 @@ def main():
         return
 
     log("INFO", "EXPORT", f"found {len(symbols)} symbols")
+
+    allowlist = None
+    if args.symbols_file:
+        lines = Path(args.symbols_file).read_text().strip().splitlines()
+        allowlist = set(line.strip() for line in lines if line.strip())
+    elif args.symbols_csv:
+        allowlist = set(s.strip() for s in args.symbols_csv.split(',') if s.strip())
+
+    if allowlist:
+        before = len(symbols)
+        symbols = [s for s in symbols if s in allowlist]
+        log("INFO", "EXPORT", f"filtered by allowlist: {before} -> {len(symbols)} symbols")
+        if not symbols:
+            log("WARN", "EXPORT", "no symbols after allowlist filter")
+            return
 
     num_workers = min(args.workers, len(symbols))
     chunk_size = len(symbols) // num_workers

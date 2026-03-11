@@ -22,6 +22,11 @@ def log(level: str, component: str, message: str):
     print(f"[{level}] {timestamp} [{component}] {message}")
 
 
+def load_symbols_from_file(path: str) -> list[str]:
+    lines = Path(path).read_text().strip().splitlines()
+    return [line.strip() for line in lines if line.strip()]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build regime guard dataset from detector signals")
     parser.add_argument("--signals-path", type=str, required=True,
@@ -38,16 +43,23 @@ def main():
     parser.add_argument("--target-horizon-signals", type=int, default=5)
     parser.add_argument("--target-min-resolved", type=int, default=3)
     parser.add_argument("--target-sl-rate-threshold", type=float, default=0.60)
-    parser.add_argument("--target-col", type=str, default="target_bad_next_12h",
+    parser.add_argument("--target-col", type=str, default="target_pause_value_next_12h",
                         help="Name of the target column to use for training")
     parser.add_argument("--include-detector-snapshot", action="store_true",
                         help="Include detector snapshot features from PumpFeatureBuilder")
-    parser.add_argument("--high-lookback-bars", type=int, default=None,
-                        help="Lookback bars for high calculations (default: 8 weeks)")
-    parser.add_argument("--breadth-lookback-bars", type=int, default=None,
-                        help="Lookback bars for breadth calculations (default: 8 weeks)")
     parser.add_argument("--save-debug-sample", action="store_true",
                         help="Save debug sample of dataset")
+    parser.add_argument("--symbols-file", type=str, default=None,
+                        help="Path to file with allowed symbols (one per line)")
+    parser.add_argument("--fixed-universe-file", type=str, default=None,
+                        help="Path to file with fixed universe symbols (one per line), skips liquid universe computation")
+    parser.add_argument("--trade-replay-source", type=str, default="1s",
+                        choices=["1m", "1s"],
+                        help="Trade replay source: 1m (fast, no 1s resolve) or 1s (exact with 1s replay)")
+    parser.add_argument("--target-profile", type=str, default=None,
+                        help="Target profile name (e.g., pause_value_12h_v2_all, pause_value_12h_v2_curated)")
+    parser.add_argument("--feature-profile", type=str, default=None,
+                        help="Feature profile name for documentation/versioning")
 
     args = parser.parse_args()
 
@@ -72,6 +84,12 @@ def main():
     signals_df['open_time'] = pd.to_datetime(signals_df['open_time'])
     signals_df = signals_df.sort_values('open_time').reset_index(drop=True)
 
+    if args.symbols_file:
+        allowed_symbols = set(load_symbols_from_file(args.symbols_file))
+        before = len(signals_df)
+        signals_df = signals_df[signals_df['symbol'].isin(allowed_symbols)].reset_index(drop=True)
+        log("INFO", "REGIME-DS", f"filtered by symbols-file: {before} -> {len(signals_df)}")
+
     if 'signal_id' not in signals_df.columns:
         if 'event_id' in signals_df.columns:
             signals_df['signal_id'] = signals_df['event_id']
@@ -91,12 +109,16 @@ def main():
     t_min = signals_df['open_time'].min()
     t_max = signals_df['open_time'].max()
 
-    log("INFO", "REGIME-DS", "fetching liquid universe")
-    liquid_universe = get_liquid_universe(
-        args.clickhouse_dsn, t_min - timedelta(days=7), t_max,
-        top_n=args.top_n_universe,
-    )
-    log("INFO", "REGIME-DS", f"liquid universe: {len(liquid_universe)} symbols")
+    if args.fixed_universe_file:
+        liquid_universe = load_symbols_from_file(args.fixed_universe_file)
+        log("INFO", "REGIME-DS", f"using fixed universe: {len(liquid_universe)} symbols")
+    else:
+        log("INFO", "REGIME-DS", "fetching liquid universe")
+        liquid_universe = get_liquid_universe(
+            args.clickhouse_dsn, t_min - timedelta(days=7), t_max,
+            top_n=args.top_n_universe,
+        )
+        log("INFO", "REGIME-DS", f"liquid universe: {len(liquid_universe)} symbols")
 
     if run_dir:
         with open(run_dir / "liquid_universe.json", 'w') as f:
@@ -117,14 +139,10 @@ def main():
         sl_count = (trades_df['trade_outcome'] == 'SL').sum()
         unknown = (trades_df['trade_outcome'] == 'UNKNOWN').sum()
         timeout = (trades_df['trade_outcome'] == 'TIMEOUT').sum()
-        log("INFO", "REGIME-DS", f"outcomes: TP={tp_count} SL={sl_count} UNKNOWN={unknown} TIMEOUT={timeout}")
+        ambiguous = (trades_df['trade_outcome'] == 'AMBIGUOUS').sum()
+        log("INFO", "REGIME-DS", f"outcomes: TP={tp_count} SL={sl_count} UNKNOWN={unknown} TIMEOUT={timeout} AMBIGUOUS={ambiguous}")
 
     log("INFO", "REGIME-DS", "building regime features")
-
-    if args.high_lookback_bars or args.breadth_lookback_bars:
-        from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
-        if args.high_lookback_bars:
-            RegimeFeatureBuilder.HIGH_8W_BARS = args.high_lookback_bars
 
     builder = RegimeFeatureBuilder(
         ch_dsn=args.clickhouse_dsn,
@@ -135,9 +153,10 @@ def main():
     if run_dir:
         regime_builder_config = {
             'top_n_universe': args.top_n_universe,
-            'HIGH_8W_BARS': RegimeFeatureBuilder.HIGH_8W_BARS,
-            'breadth_lookback_hours': RegimeFeatureBuilder.HIGH_8W_BARS * 15 / 60 + 24,
-            'feature_version': 'v3',
+            'feature_version': 'v4',
+            'feature_profile': args.feature_profile or 'regime_compact_v4',
+            'trade_replay_source': args.trade_replay_source,
+            'target_profile': args.target_profile,
         }
         with open(run_dir / "regime_builder_config.json", 'w') as f:
             json.dump(regime_builder_config, f, indent=2)
@@ -178,6 +197,7 @@ def main():
         trades_df=trades_df,
         min_resolved=args.target_min_resolved,
         sl_rate_threshold=args.target_sl_rate_threshold,
+        target_profile=args.target_profile,
     )
 
     if dataset.empty:
@@ -214,9 +234,10 @@ def main():
     dataset.to_parquet(str(out_path), index=False)
     log("INFO", "REGIME-DS", f"saved to {out_path}")
 
-    if 'target_bad_next_5' in dataset.columns:
-        bad_rate = dataset['target_bad_next_5'].mean()
-        log("INFO", "REGIME-DS", f"target_bad_next_5 rate: {bad_rate:.3f}")
+    if 'target_pause_value_next_12h' in dataset.columns:
+        valid = dataset['target_pause_value_next_12h'].dropna()
+        if len(valid) > 0:
+            log("INFO", "REGIME-DS", f"target_pause_value_next_12h: positive_rate={valid.mean():.3f}, n_valid={len(valid)}, n_nan={dataset['target_pause_value_next_12h'].isna().sum()}")
 
     if run_dir:
         config = {
@@ -230,18 +251,30 @@ def main():
             'target_horizon_signals': args.target_horizon_signals,
             'target_min_resolved': args.target_min_resolved,
             'target_sl_rate_threshold': args.target_sl_rate_threshold,
+            'trade_replay_source': args.trade_replay_source,
+            'target_profile': args.target_profile,
+            'feature_profile': args.feature_profile,
+            'symbols_file': args.symbols_file,
+            'fixed_universe_file': args.fixed_universe_file,
         }
         with open(run_dir / "run_config.json", 'w') as f:
             json.dump(config, f, indent=2, default=str)
 
+        target_col = args.target_col
         summary = {
             'n_signals': len(signals_df),
             'n_samples': len(dataset),
             'n_features': len(dataset.columns),
-            'target_bad_next_5_rate': float(dataset['target_bad_next_5'].mean()) if 'target_bad_next_5' in dataset.columns else None,
+            'target_col': target_col,
             'tp_count': int((dataset['trade_outcome'] == 'TP').sum()) if 'trade_outcome' in dataset.columns else None,
             'sl_count': int((dataset['trade_outcome'] == 'SL').sum()) if 'trade_outcome' in dataset.columns else None,
         }
+        if target_col in dataset.columns:
+            valid = dataset[target_col].dropna()
+            summary['target_rate'] = float(valid.mean()) if len(valid) > 0 else None
+            summary['target_valid_count'] = len(valid)
+            summary['target_nan_count'] = int(dataset[target_col].isna().sum())
+
         with open(run_dir / "dataset_summary.json", 'w') as f:
             json.dump(summary, f, indent=2, default=str)
 
@@ -273,21 +306,6 @@ def main():
         available_target_columns = sorted([
             c for c in dataset.columns if c.startswith('target_')
         ])
-        target_types = []
-        time_targets_hours = []
-        for tc in available_target_columns:
-            if 'next_' in tc:
-                target_types.append('signal_count')
-            elif any(h in tc for h in ['_6h', '_12h', '_24h']):
-                target_types.append('time_based')
-                for suffix in ['_6h', '_12h', '_24h']:
-                    if suffix in tc:
-                        hours = int(suffix.replace('_', '').replace('h', ''))
-                        if hours not in time_targets_hours:
-                            time_targets_hours.append(hours)
-            else:
-                target_types.append('other')
-        target_types_present = sorted(set(target_types))
 
         manifest = {
             'signals_path': args.signals_path,
@@ -303,14 +321,16 @@ def main():
             'target_sl_rate_threshold': args.target_sl_rate_threshold,
             'target_col': args.target_col,
             'top_n_universe': args.top_n_universe,
-            'high_lookback_bars': args.high_lookback_bars or RegimeFeatureBuilder.HIGH_8W_BARS,
             'n_signals': len(signals_df),
             'n_samples': len(dataset),
             'columns': sorted(list(dataset.columns)),
             'available_target_columns': available_target_columns,
-            'target_types_present': target_types_present,
-            'time_targets_hours': sorted(time_targets_hours),
-            'feature_version': 'v3',
+            'feature_version': 'v4',
+            'feature_profile': args.feature_profile or 'regime_compact_v4',
+            'trade_replay_source': args.trade_replay_source,
+            'target_profile': args.target_profile,
+            'symbols_file': args.symbols_file,
+            'fixed_universe_file': args.fixed_universe_file,
         }
         with open(run_dir / "dataset_manifest.json", 'w') as f:
             json.dump(manifest, f, indent=2, default=str)

@@ -82,6 +82,12 @@ def get_policy_parameter_grid(preset: str = 'default') -> list:
             'resume_quantile': [0.50, 0.60, 0.70],
             'resume_confirm_signals': [1, 2],
         }
+    elif preset == 'low':
+        policy_grid = {
+            'pause_on_threshold': [0.48, 0.52, 0.56, 0.60],
+            'resume_threshold': [0.28, 0.32, 0.36, 0.40],
+            'resume_confirm_signals': [1, 2],
+        }
     else:
         policy_grid = {
             'pause_on_quantile': [0.80, 0.85, 0.90],
@@ -101,6 +107,7 @@ def train_regime_fold(
         iterations: int = 10000,
         early_stopping_rounds: int = 300,
         seed: int = 42,
+        auto_class_weights: str = None,
 ) -> tuple:
     train_df = dataset_df[dataset_df['split'] == 'train']
     val_df = dataset_df[dataset_df['split'] == 'val']
@@ -119,25 +126,36 @@ def train_regime_fold(
     w_train = train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
     w_val = val_df['sample_weight'].values if 'sample_weight' in val_df.columns else None
 
+    if w_train is not None:
+        valid_mask = ~np.isnan(w_train)
+        if not valid_mask.all():
+            X_train = X_train[valid_mask]
+            y_train = y_train[valid_mask]
+            w_train = w_train[valid_mask]
+
     train_pool = Pool(X_train, y_train, weight=w_train)
-    val_pool = Pool(X_val, y_val, weight=w_val)
+    val_pool = Pool(X_val, y_val, weight=w_val if w_val is None or not np.any(np.isnan(w_val)) else None)
 
-    model = CatBoostClassifier(
-        iterations=iterations,
-        depth=params['depth'],
-        learning_rate=params['learning_rate'],
-        l2_leaf_reg=params['l2_leaf_reg'],
-        min_data_in_leaf=params['min_data_in_leaf'],
-        random_strength=params.get('random_strength', 1.0),
-        bagging_temperature=params.get('bagging_temperature', 1.0),
-        rsm=params.get('rsm', 1.0),
-        early_stopping_rounds=early_stopping_rounds,
-        random_seed=seed,
-        verbose=0,
-        eval_metric='Logloss',
-        use_best_model=True,
-    )
+    catboost_params = {
+        'iterations': iterations,
+        'depth': params['depth'],
+        'learning_rate': params['learning_rate'],
+        'l2_leaf_reg': params['l2_leaf_reg'],
+        'min_data_in_leaf': params['min_data_in_leaf'],
+        'random_strength': params.get('random_strength', 1.0),
+        'bagging_temperature': params.get('bagging_temperature', 1.0),
+        'rsm': params.get('rsm', 1.0),
+        'early_stopping_rounds': early_stopping_rounds,
+        'random_seed': seed,
+        'verbose': 0,
+        'eval_metric': 'Logloss',
+        'use_best_model': True,
+    }
 
+    if auto_class_weights and w_train is None:
+        catboost_params['auto_class_weights'] = auto_class_weights
+
+    model = CatBoostClassifier(**catboost_params)
     model.fit(train_pool, eval_set=val_pool)
 
     return model, val_df
@@ -657,6 +675,7 @@ def train_final_regime_model(
         seed: int = 42,
         target_horizon_signals: int = 5,
         embargo_hours: float = 0,
+        auto_class_weights: str = None,
 ) -> CatBoostClassifier:
     train_df = dataset_df[dataset_df['open_time'] < train_end]
 
@@ -674,21 +693,32 @@ def train_final_regime_model(
     y_train = train_df[target_col]
     w_train = train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
 
+    if w_train is not None:
+        valid_mask = ~np.isnan(w_train)
+        if not valid_mask.all():
+            X_train = X_train[valid_mask]
+            y_train = y_train[valid_mask]
+            w_train = w_train[valid_mask]
+
     train_pool = Pool(X_train, y_train, weight=w_train)
 
-    model = CatBoostClassifier(
-        iterations=iterations,
-        depth=params['depth'],
-        learning_rate=params['learning_rate'],
-        l2_leaf_reg=params['l2_leaf_reg'],
-        min_data_in_leaf=params['min_data_in_leaf'],
-        random_strength=params.get('random_strength', 1.0),
-        bagging_temperature=params.get('bagging_temperature', 1.0),
-        rsm=params.get('rsm', 1.0),
-        random_seed=seed,
-        verbose=100,
-        eval_metric='Logloss',
-    )
+    catboost_params = {
+        'iterations': iterations,
+        'depth': params['depth'],
+        'learning_rate': params['learning_rate'],
+        'l2_leaf_reg': params['l2_leaf_reg'],
+        'min_data_in_leaf': params['min_data_in_leaf'],
+        'random_strength': params.get('random_strength', 1.0),
+        'bagging_temperature': params.get('bagging_temperature', 1.0),
+        'rsm': params.get('rsm', 1.0),
+        'random_seed': seed,
+        'verbose': 100,
+        'eval_metric': 'Logloss',
+    }
 
+    if auto_class_weights and w_train is None:
+        catboost_params['auto_class_weights'] = auto_class_weights
+
+    model = CatBoostClassifier(**catboost_params)
     model.fit(train_pool)
     return model

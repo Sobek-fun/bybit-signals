@@ -17,7 +17,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
 from pump_end_threshold.features.params import DEFAULT_PUMP_PARAMS
 from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.ml.regime_dataset import simulate_trade
+from pump_end_threshold.ml.regime_dataset import simulate_trade, compute_pause_value_targets
 
 
 # ======================================================================================
@@ -813,6 +813,10 @@ def build_future_targets(signals: pd.DataFrame) -> pd.DataFrame:
         ["open_time", "trade_outcome", "trade_pnl_pct"]
     ].reset_index(drop=True)
 
+    trades_for_pause = df[["open_time", "trade_outcome", "trade_pnl_pct"]].copy()
+    trades_for_pause = trades_for_pause.rename(columns={"trade_pnl_pct": "pnl_pct"})
+    trades_for_pause["trade_outcome"] = trades_for_pause["trade_outcome"].str.upper()
+
     rows = []
     for row in df.itertuples():
         t = row.open_time
@@ -835,21 +839,14 @@ def build_future_targets(signals: pd.DataFrame) -> pd.DataFrame:
                 feature_row[f"future_pnl_sum_next_{n}"] = pnl_sum
                 feature_row[f"target_bad_next_{n}_signals"] = int(sl_rate >= 0.60 and pnl_sum < 0)
 
-        for hours in NEXT_TIME_WINDOWS_HOURS:
-            fr = resolved[(resolved["open_time"] >= t) & (resolved["open_time"] < t + pd.Timedelta(hours=hours))].copy()
-            min_needed = MIN_RESOLVED_SIGNALS_FOR_TIME_TARGET[hours]
-            if len(fr) < min_needed:
-                feature_row[f"future_resolved_count_next_{hours}h"] = len(fr)
-                feature_row[f"future_sl_rate_next_{hours}h"] = np.nan
-                feature_row[f"future_pnl_sum_next_{hours}h"] = np.nan
-                feature_row[f"target_bad_next_{hours}h"] = np.nan
-            else:
-                sl_rate = float((fr["trade_outcome"] == "sl").mean())
-                pnl_sum = float(fr["trade_pnl_pct"].sum())
-                feature_row[f"future_resolved_count_next_{hours}h"] = len(fr)
-                feature_row[f"future_sl_rate_next_{hours}h"] = sl_rate
-                feature_row[f"future_pnl_sum_next_{hours}h"] = pnl_sum
-                feature_row[f"target_bad_next_{hours}h"] = int(sl_rate >= 0.67 and pnl_sum < 0)
+        pause_targets = compute_pause_value_targets(
+            trades_for_pause, t.to_pydatetime() if hasattr(t, 'to_pydatetime') else t,
+            window_hours=12, min_resolved=4,
+            tp_value=4.5, sl_value=10.0, timeout_penalty=1.5,
+            bad_value_threshold=-10.0, bad_sl_rate_threshold=0.55,
+            good_value_threshold=7.5, good_sl_rate_threshold=0.45,
+        )
+        feature_row.update(pause_targets)
 
         rows.append(feature_row)
 
