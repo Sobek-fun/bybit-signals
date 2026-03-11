@@ -7,6 +7,8 @@ REPO_DIR="${3:?repo dir required}"
 CH_DB="${4:?clickhouse dsn required}"
 DETECTOR_DIR="${5:?detector dir required}"
 TOKENS_FILE="${6:?tokens file required}"
+TRANSFORM_SCRIPT="${7:-scripts/runpod_jobs/apply_experiment_transform.py}"
+TARGET_COL_OVERRIDE="${8:-}"
 WORKERS="${WORKERS:-8}"
 TRAIN_END="2026-02-20"
 OOS_END="2026-03-03 23:59:59"
@@ -76,90 +78,13 @@ uv run --python 3.13 python -m pump_end_threshold.cli.build_regime_dataset \
   --target-sl-rate-threshold 0.55 \
   --feature-profile "regime_compact_v4"
 
-if [ "$EXP_ID" = "exp1" ]; then
-  uv run --python 3.13 python - <<'PY'
-import pandas as pd
-from pathlib import Path
-import os
-run_root = Path(os.environ["RUN_ROOT"])
-src = run_root / "regime_dataset_base.parquet"
-dst = run_root / "regime_dataset_train.parquet"
-df = pd.read_parquet(src)
-drop_cols = [c for c in df.columns if c.startswith("strat_resolved_") or c.startswith("strat_prev_closed_") or c in {"strat_last_closed_is_sl","strat_last_closed_is_tp"}]
-df = df.drop(columns=drop_cols, errors="ignore")
-df.to_parquet(dst, index=False)
-print(f"saved={dst} rows={len(df)} cols={len(df.columns)} dropped={len(drop_cols)}")
-PY
-  TARGET_COL="target_pause_value_next_12h"
-fi
+uv run --python 3.13 python "$TRANSFORM_SCRIPT" \
+  --exp-id "$EXP_ID" \
+  --run-root "$RUN_ROOT"
 
-if [ "$EXP_ID" = "exp2" ]; then
-  uv run --python 3.13 python - <<'PY'
-import pandas as pd
-from pathlib import Path
-import os
-run_root = Path(os.environ["RUN_ROOT"])
-src = run_root / "regime_dataset_base.parquet"
-dst = run_root / "regime_dataset_train.parquet"
-df = pd.read_parquet(src)
-drop_cols = [c for c in df.columns if c.startswith(("btc_","eth_","breadth_","btc_eth_")) or c.startswith("strat_resolved_") or c.startswith("strat_prev_closed_") or c in {"strat_last_closed_is_sl","strat_last_closed_is_tp"}]
-df = df.drop(columns=drop_cols, errors="ignore")
-df.to_parquet(dst, index=False)
-print(f"saved={dst} rows={len(df)} cols={len(df.columns)} dropped={len(drop_cols)}")
-PY
-  TARGET_COL="target_pause_value_next_12h"
-fi
-
-if [ "$EXP_ID" = "exp3" ]; then
-  uv run --python 3.13 python - <<'PY'
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import os
-run_root = Path(os.environ["RUN_ROOT"])
-src = run_root / "regime_dataset_base.parquet"
-dst = run_root / "regime_dataset_train.parquet"
-df = pd.read_parquet(src)
-drop_cols = [c for c in df.columns if c.startswith("strat_resolved_") or c.startswith("strat_prev_closed_") or c in {"strat_last_closed_is_sl","strat_last_closed_is_tp"}]
-df = df.drop(columns=drop_cols, errors="ignore")
-count_col = "future_resolved_count_next_12h"
-sl_col = "future_sl_rate_next_12h"
-value_col = "future_block_value_next_12h"
-target_col = "target_pause_value_next_12h_v3_good_expanded"
-df[target_col] = np.where(df[count_col] < 4, np.nan, np.where((df[value_col] <= -10.0) & (df[sl_col] >= 0.55), 1.0, np.where((df[value_col] >= 0.0) & (df[sl_col] <= 0.50), 0.0, np.nan)))
-df.to_parquet(dst, index=False)
-valid = int(df[target_col].notna().sum())
-pos = int((df[target_col] == 1).sum())
-neg = int((df[target_col] == 0).sum())
-print(f"saved={dst} rows={len(df)} cols={len(df.columns)} valid={valid} pos={pos} neg={neg}")
-PY
-  TARGET_COL="target_pause_value_next_12h_v3_good_expanded"
-fi
-
-if [ "$EXP_ID" = "exp4" ]; then
-  uv run --python 3.13 python - <<'PY'
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import os
-run_root = Path(os.environ["RUN_ROOT"])
-src = run_root / "regime_dataset_base.parquet"
-dst = run_root / "regime_dataset_train.parquet"
-df = pd.read_parquet(src)
-drop_cols = [c for c in df.columns if c.startswith(("btc_","eth_","breadth_","btc_eth_")) or c.startswith("strat_resolved_") or c.startswith("strat_prev_closed_") or c in {"strat_last_closed_is_sl","strat_last_closed_is_tp"}]
-df = df.drop(columns=drop_cols, errors="ignore")
-count_col = "future_resolved_count_next_12h"
-sl_col = "future_sl_rate_next_12h"
-value_col = "future_block_value_next_12h"
-target_col = "target_pause_value_next_12h_v3_local_min3"
-df[target_col] = np.where(df[count_col] < 3, np.nan, np.where((df[value_col] <= -10.0) & (df[sl_col] >= 0.60), 1.0, np.where((df[value_col] >= 0.0) & (df[sl_col] <= 0.50), 0.0, np.nan)))
-df.to_parquet(dst, index=False)
-valid = int(df[target_col].notna().sum())
-pos = int((df[target_col] == 1).sum())
-neg = int((df[target_col] == 0).sum())
-print(f"saved={dst} rows={len(df)} cols={len(df.columns)} valid={valid} pos={pos} neg={neg}")
-PY
-  TARGET_COL="target_pause_value_next_12h_v3_local_min3"
+TARGET_COL="$TARGET_COL_OVERRIDE"
+if [ -z "$TARGET_COL" ]; then
+  TARGET_COL="$(cat "$RUN_ROOT/target_col.txt")"
 fi
 
 uv run --python 3.13 python -m pump_end_threshold.cli.train_regime_guard \
