@@ -204,24 +204,37 @@ class DataLoader:
         return df
 
     def load_transactions_range(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
-        query = """
+        query_template = """
         SELECT
-            timestamp,
+            {time_col},
             price,
             size
         FROM bybit.transactions
         WHERE symbol = %(symbol)s
-          AND timestamp >= %(start)s
-          AND timestamp < %(end)s
-        ORDER BY timestamp
+          AND {time_col} >= %(start)s
+          AND {time_col} < %(end)s
+        ORDER BY {time_col}
         """
 
         query_start = datetime.now()
-        result = self.client.query(query, parameters={
-            "symbol": symbol,
-            "start": start_time,
-            "end": end_time
-        })
+        result = None
+        for time_col in ("transaction_time", "timestamp"):
+            query = query_template.format(time_col=time_col)
+            try:
+                result = self.client.query(query, parameters={
+                    "symbol": symbol,
+                    "start": start_time,
+                    "end": end_time
+                })
+                break
+            except Exception as e:
+                if "Unknown expression or function identifier" in str(e) and f"`{time_col}`" in str(e):
+                    continue
+                raise
+
+        if result is None:
+            return pd.DataFrame()
+
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
         if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
@@ -242,29 +255,42 @@ class DataLoader:
         return df
 
     def load_1s_bars_from_transactions(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
-        query = """
+        query_template = """
         SELECT
-            toStartOfSecond(timestamp) AS second,
-            argMin(price, timestamp) AS open,
+            toStartOfSecond({time_col}) AS second,
+            argMin(price, {time_col}) AS open,
             max(price) AS high,
             min(price) AS low,
-            argMax(price, timestamp) AS close,
+            argMax(price, {time_col}) AS close,
             sum(size) AS volume,
             count() AS trades_count
         FROM bybit.transactions
         WHERE symbol = %(symbol)s
-          AND timestamp >= %(start)s
-          AND timestamp < %(end)s
+          AND {time_col} >= %(start)s
+          AND {time_col} < %(end)s
         GROUP BY second
         ORDER BY second
         """
 
         query_start = datetime.now()
-        result = self.client.query(query, parameters={
-            "symbol": symbol,
-            "start": start_time,
-            "end": end_time
-        })
+        result = None
+        for time_col in ("transaction_time", "timestamp"):
+            query = query_template.format(time_col=time_col)
+            try:
+                result = self.client.query(query, parameters={
+                    "symbol": symbol,
+                    "start": start_time,
+                    "end": end_time
+                })
+                break
+            except Exception as e:
+                if "Unknown expression or function identifier" in str(e) and f"`{time_col}`" in str(e):
+                    continue
+                raise
+
+        if result is None:
+            return pd.DataFrame()
+
         query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
 
         if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
