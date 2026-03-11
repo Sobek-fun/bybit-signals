@@ -1,0 +1,18 @@
+[
+  {
+    "exp_id": "exp1",
+    "run_root": "/workspace/experiments/exp1_curated55_blockvalue_strict_notpsl"
+  },
+  {
+    "exp_id": "exp2",
+    "run_root": "/workspace/experiments/exp2_curated55_local_features_blockvalue"
+  },
+  {
+    "exp_id": "exp3",
+    "run_root": "/workspace/experiments/exp3_curated55_target_good_expanded_full"
+  },
+  {
+    "exp_id": "exp4",
+    "run_root": "/workspace/experiments/exp4_curated55_combined_local_targetv3_min3"
+  }
+]
