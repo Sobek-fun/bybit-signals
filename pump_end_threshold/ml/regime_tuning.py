@@ -102,6 +102,12 @@ def get_policy_parameter_grid(preset: str = 'default') -> list:
             'resume_quantile': [0.50, 0.60, 0.70],
             'resume_confirm_signals': [1, 2],
         }
+    elif preset == 'selective_local':
+        policy_grid = {
+            'pause_on_quantile': [0.85, 0.88, 0.90, 0.92, 0.95],
+            'resume_quantile': [0.60, 0.65, 0.70, 0.75],
+            'resume_confirm_signals': [1],
+        }
     elif preset == 'low':
         policy_grid = {
             'pause_on_threshold': [0.48, 0.52, 0.56, 0.60],
@@ -377,11 +383,16 @@ def tune_model_hyperparameters(
         embargo_hours: float = 0,
         min_valid_folds: int = 2,
         n_seeds: int = 3,
+        max_blocked_share: float = 0.35,
+        min_signal_keep_rate: float = 0.45,
+        score_mode: str = 'block_value',
+        model_selection_mode: str = 'downstream_cv',
+        feature_profile: str = None,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
 
-    feature_columns = get_regime_feature_columns(dataset_df)
+    feature_columns = get_regime_feature_columns(dataset_df, feature_profile=feature_profile)
 
     folds = generate_regime_walk_forward_folds(
         dataset_df, fold_months=fold_months, min_train_months=min_train_months,
@@ -397,6 +408,11 @@ def tune_model_hyperparameters(
     best_score = -np.inf
     best_params = None
     results = []
+    probe_policy = {
+        'pause_on_quantile': 0.80,
+        'resume_quantile': 0.55,
+        'resume_confirm_signals': 2,
+    }
 
     for params in model_grid:
         elapsed = time.time() - start_time
@@ -404,6 +420,7 @@ def tune_model_hyperparameters(
             break
 
         fold_scores = []
+        downstream_scores = []
         for seed_offset in range(n_seeds):
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
@@ -424,18 +441,33 @@ def tune_model_hyperparameters(
                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
                 if ap is None:
                     continue
+                downstream_eval = evaluate_regime_fold(
+                    model=model,
+                    val_df=val_df,
+                    feature_columns=feature_columns,
+                    policy_params=probe_policy,
+                    max_blocked_share=max_blocked_share,
+                    min_signal_keep_rate=min_signal_keep_rate,
+                    score_mode=score_mode,
+                    target_col=target_col,
+                )
+                downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid', False) else -np.inf
                 fold_scores.append({
                     'ap': ap, 'auc': auc, 'brier': brier,
                     'seed': curr_seed, 'fold': fold_idx,
                 })
+                if np.isfinite(downstream_score):
+                    downstream_scores.append(float(downstream_score))
 
         if len(fold_scores) >= min_valid_folds:
             mean_ap = np.mean([s['ap'] for s in fold_scores])
             mean_auc = np.mean([s['auc'] for s in fold_scores])
             mean_brier = np.mean([s['brier'] for s in fold_scores])
+            mean_downstream_cv = np.mean(downstream_scores) if downstream_scores else -np.inf
+            model_score = mean_downstream_cv if model_selection_mode == 'downstream_cv' else mean_ap
 
-            if mean_ap > best_score:
-                best_score = mean_ap
+            if model_score > best_score:
+                best_score = model_score
                 best_params = params
 
             results.append({
@@ -443,6 +475,8 @@ def tune_model_hyperparameters(
                 'mean_ap': mean_ap,
                 'mean_auc': mean_auc,
                 'mean_brier': mean_brier,
+                'mean_downstream_cv': mean_downstream_cv,
+                'model_score': model_score,
                 'std_ap': np.std([s['ap'] for s in fold_scores]),
                 'n_valid_folds': len(fold_scores),
             })
@@ -450,6 +484,7 @@ def tune_model_hyperparameters(
     return {
         'best_params': best_params,
         'best_score': best_score,
+        'model_selection_mode': model_selection_mode,
         'results_df': pd.DataFrame(results),
         'feature_columns': feature_columns,
         'folds': folds,
@@ -476,11 +511,12 @@ def tune_policy_parameters(
         min_valid_folds: int = 2,
         score_mode: str = 'pnl_improvement',
         policy_grid_preset: str = 'default',
+        feature_profile: str = None,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
 
-    feature_columns = get_regime_feature_columns(dataset_df)
+    feature_columns = get_regime_feature_columns(dataset_df, feature_profile=feature_profile)
 
     folds = generate_regime_walk_forward_folds(
         dataset_df, fold_months=fold_months, min_train_months=min_train_months,
@@ -648,6 +684,8 @@ def tune_regime_guard(
         min_valid_folds: int = 2,
         score_mode: str = 'pnl_improvement',
         policy_grid_preset: str = 'default',
+        model_selection_mode: str = 'downstream_cv',
+        feature_profile: str = None,
 ) -> dict:
     model_budget = int(time_budget_min * 0.5)
     policy_budget = int(time_budget_min * 0.5)
@@ -660,6 +698,11 @@ def tune_regime_guard(
         iterations=iterations, early_stopping_rounds=early_stopping_rounds,
         seed=seed, embargo_signals=embargo_signals, embargo_hours=embargo_hours,
         min_valid_folds=min_valid_folds,
+        max_blocked_share=max_blocked_share,
+        min_signal_keep_rate=min_signal_keep_rate,
+        score_mode=score_mode,
+        model_selection_mode=model_selection_mode,
+        feature_profile=feature_profile,
     )
 
     if model_result['best_params'] is None:
@@ -679,6 +722,7 @@ def tune_regime_guard(
         min_valid_folds=min_valid_folds,
         score_mode=score_mode,
         policy_grid_preset=policy_grid_preset,
+        feature_profile=feature_profile,
     )
 
     if policy_result['best_params'] is None:
@@ -696,6 +740,7 @@ def tune_regime_guard(
         'best_model_params': model_result['best_params'],
         'best_policy_params': policy_result['best_params'],
         'best_score': policy_result.get('best_score', -np.inf),
+        'model_selection_mode': model_result.get('model_selection_mode', model_selection_mode),
         'best_cv_result': _compute_cv_summary(policy_result.get('fold_results', [])),
         'model_leaderboard': model_leaderboard_df,
         'policy_leaderboard': policy_leaderboard_df,

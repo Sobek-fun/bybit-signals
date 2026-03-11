@@ -93,8 +93,13 @@ def main():
                         choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
                         help="Scoring mode for hyperparameter optimization")
     parser.add_argument("--policy-grid", type=str, default="default",
-                        choices=["default", "conservative", "aggressive", "low"],
+                        choices=["default", "conservative", "aggressive", "selective_local", "low"],
                         help="Policy parameter grid preset")
+    parser.add_argument("--model-selection-mode", type=str, default="downstream_cv",
+                        choices=["downstream_cv", "mean_ap"],
+                        help="Model selection objective during model tuning")
+    parser.add_argument("--feature-profile", type=str, default=None,
+                        help="Feature profile: local_only excludes market/breadth/outcome-derived columns")
     parser.add_argument("--disable-auto-class-weights", action="store_true",
                         help="Disable auto_class_weights in CatBoost (use manual sample_weight instead)")
     parser.add_argument("--run-dir", type=str, default=None,
@@ -127,7 +132,7 @@ def main():
     dataset = pd.read_parquet(args.dataset_parquet)
     log("INFO", "REGIME", f"loaded {len(dataset)} rows")
 
-    feature_columns = get_regime_feature_columns(dataset)
+    feature_columns = get_regime_feature_columns(dataset, feature_profile=args.feature_profile)
     log("INFO", "REGIME", f"feature columns: {len(feature_columns)}")
 
     if args.target_col not in dataset.columns:
@@ -176,10 +181,13 @@ def main():
         min_valid_folds=args.min_valid_folds,
         score_mode=args.score_mode,
         policy_grid_preset=args.policy_grid,
+        model_selection_mode=args.model_selection_mode,
+        feature_profile=args.feature_profile,
     )
 
     log("INFO", "REGIME",
         f"tuning done: {tune_result['trials_completed']} trials in {tune_result['time_elapsed_sec']:.1f}s")
+    log("INFO", "REGIME", f"model selection mode: {tune_result.get('model_selection_mode', args.model_selection_mode)}")
     log("INFO", "REGIME", f"best score: {tune_result['best_score']:.4f}")
     log("INFO", "REGIME", f"best model params: {tune_result['best_model_params']}")
     log("INFO", "REGIME", f"best policy params: {tune_result['best_policy_params']}")

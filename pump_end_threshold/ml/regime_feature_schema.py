@@ -81,13 +81,32 @@ EXCLUDED_PREFIXES = (
     'snap_',
 )
 
+LOCAL_ONLY_EXCLUDED_PREFIXES = (
+    'btc_',
+    'eth_',
+    'breadth_',
+    'btc_eth_',
+    'strat_resolved_',
+    'strat_prev_closed_',
+)
 
-def get_regime_feature_columns(df: pd.DataFrame) -> list:
+LOCAL_ONLY_EXCLUDED_COLUMNS = {
+    'strat_last_closed_is_sl',
+    'strat_last_closed_is_tp',
+}
+
+
+def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) -> list:
     features = []
     for col in df.columns:
         if col in EXCLUDED_COLUMNS:
             continue
         if any(col.startswith(p) for p in EXCLUDED_PREFIXES):
             continue
+        if feature_profile == 'local_only':
+            if col in LOCAL_ONLY_EXCLUDED_COLUMNS:
+                continue
+            if any(col.startswith(p) for p in LOCAL_ONLY_EXCLUDED_PREFIXES):
+                continue
         features.append(col)
     return features
