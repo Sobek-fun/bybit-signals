@@ -9,7 +9,7 @@ import pandas as pd
 from catboost import CatBoostClassifier
 
 from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.ml.regime_dataset import build_strategy_state
+from pump_end_threshold.ml.regime_dataset import build_strategy_state, STRATEGY_STATE_MODE
 
 
 def log(level: str, component: str, message: str):
@@ -91,7 +91,9 @@ def run_guard_stage(
     guard_model = CatBoostClassifier()
     guard_model.load_model(str(guard_model_path))
 
-    policy_path = guard_model_dir / "best_policy_params.json"
+    policy_path = guard_model_dir / "resolved_policy_params.json"
+    if not policy_path.exists():
+        policy_path = guard_model_dir / "best_policy_params.json"
     with open(policy_path, 'r') as f:
         policy_params = json.load(f)
 
@@ -101,7 +103,6 @@ def run_guard_stage(
 
     signals = raw_signals_df.sort_values('open_time').reset_index(drop=True)
     t_min = signals['open_time'].min()
-    t_max = signals['open_time'].max()
 
     liquid_universe_path = guard_model_dir / "liquid_universe.json"
     if liquid_universe_path.exists():
@@ -111,7 +112,7 @@ def run_guard_stage(
     else:
         log("WARN", "GUARD", "liquid_universe.json not found, computing from scratch")
         liquid_universe = get_liquid_universe(
-            ch_dsn, t_min - timedelta(days=7), t_max, top_n=120
+            ch_dsn, t_min - timedelta(days=7), t_min, top_n=120
         )
 
     regime_config_path = guard_model_dir / "regime_builder_config.json"
@@ -120,9 +121,16 @@ def run_guard_stage(
         with open(regime_config_path, 'r') as f:
             regime_config = json.load(f)
         top_n = regime_config.get('top_n_universe', 120)
+        strategy_state_mode = regime_config.get('strategy_state_mode', STRATEGY_STATE_MODE)
     else:
         log("WARN", "GUARD", "regime_builder_config.json not found, using defaults")
         top_n = 120
+        strategy_state_mode = STRATEGY_STATE_MODE
+
+    if strategy_state_mode != STRATEGY_STATE_MODE:
+        raise ValueError(
+            f"Unsupported strategy_state_mode={strategy_state_mode}, expected {STRATEGY_STATE_MODE}"
+        )
 
     builder = RegimeFeatureBuilder(
         ch_dsn=ch_dsn,
@@ -176,17 +184,10 @@ def run_guard_stage(
         signals.to_parquet(guard_scored_path, index=False)
 
     if 'pause_on_quantile' in policy_params:
-        resolved = {
-            'pause_on_threshold': float(np.quantile(p_bad, policy_params['pause_on_quantile'])),
-            'resume_threshold': float(np.quantile(p_bad, policy_params['resume_quantile'])),
-            'resume_confirm_signals': policy_params['resume_confirm_signals'],
-        }
-        log("INFO", "GUARD",
-            f"resolved quantile policy: pause={resolved['pause_on_threshold']:.4f} "
-            f"resume={resolved['resume_threshold']:.4f}")
-        policy = RegimePolicy(**resolved)
-    else:
-        policy = RegimePolicy(**policy_params)
+        raise ValueError(
+            "Quantile policy is not allowed in export. Provide numeric thresholds in resolved_policy_params.json"
+        )
+    policy = RegimePolicy(**policy_params)
     result = policy.apply(signals, p_bad_col='p_bad')
 
     accepted = result[~result['blocked_by_policy']].copy()

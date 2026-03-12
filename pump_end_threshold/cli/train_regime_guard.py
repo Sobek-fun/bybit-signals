@@ -192,11 +192,24 @@ def main():
     log("INFO", "REGIME", f"best model params: {tune_result['best_model_params']}")
     log("INFO", "REGIME", f"best policy params: {tune_result['best_policy_params']}")
 
+    best_policy_params_raw = tune_result['best_policy_params']
+    resolved_policy_params = tune_result.get('policy_tuning', {}).get('resolved_thresholds')
+    best_policy_params_to_save = resolved_policy_params if resolved_policy_params else best_policy_params_raw
+    if ('pause_on_quantile' in best_policy_params_to_save) or ('resume_quantile' in best_policy_params_to_save):
+        raise ValueError("Failed to resolve quantile policy to numeric thresholds on train-side calibration")
+
     with open(run_dir / "best_model_params.json", 'w') as f:
         json.dump(tune_result['best_model_params'], f, indent=2)
 
     with open(run_dir / "best_policy_params.json", 'w') as f:
-        json.dump(tune_result['best_policy_params'], f, indent=2)
+        json.dump(best_policy_params_to_save, f, indent=2)
+
+    with open(run_dir / "best_policy_params_raw.json", 'w') as f:
+        json.dump(best_policy_params_raw, f, indent=2)
+
+    if resolved_policy_params:
+        with open(run_dir / "resolved_policy_params.json", 'w') as f:
+            json.dump(resolved_policy_params, f, indent=2)
 
     tune_result['model_leaderboard'].to_csv(run_dir / "model_leaderboard.csv", index=False)
     tune_result['policy_leaderboard'].to_csv(run_dir / "policy_leaderboard.csv", index=False)
@@ -221,8 +234,9 @@ def main():
 
     with open(run_dir / "policy_report.json", 'w') as f:
         policy_report = {
-            'policy_params': tune_result['best_policy_params'],
-            'resolved_thresholds': tune_result.get('policy_tuning', {}).get('resolved_thresholds'),
+            'policy_params': best_policy_params_raw,
+            'resolved_thresholds': resolved_policy_params,
+            'policy_params_used_for_inference': best_policy_params_to_save,
         }
         json.dump(policy_report, f, indent=2, default=str)
 
@@ -277,7 +291,15 @@ def main():
             p_bad_test = final_model.predict_proba(X_test)[:, 1]
             test_df['p_bad'] = p_bad_test
 
-            resolved = resolve_policy_params(tune_result['best_policy_params'], p_bad_test)
+            calibration_df = dataset[
+                (dataset['open_time'] < train_end) &
+                dataset[args.target_col].notna()
+            ].copy()
+            calibration_p_bad = None
+            if len(calibration_df) > 0:
+                calibration_p_bad = final_model.predict_proba(calibration_df[tune_result['feature_columns']])[:, 1]
+
+            resolved = resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
             policy = RegimePolicy(**resolved)
             filtered = policy.apply(test_df, p_bad_col='p_bad')
 

@@ -155,7 +155,7 @@ def train_regime_fold(
     val_df = val_df.dropna(subset=[target_col])
 
     if len(train_df) == 0 or len(val_df) == 0:
-        return None, None
+        return None, None, None
 
     X_train = train_df[feature_columns]
     y_train = train_df[target_col]
@@ -197,14 +197,16 @@ def train_regime_fold(
     model = CatBoostClassifier(**catboost_params)
     model.fit(train_pool, eval_set=val_pool)
 
-    return model, val_df
+    return model, train_df, val_df
 
 
-def resolve_policy_params(policy_params: dict, p_bad: np.ndarray) -> dict:
+def resolve_policy_params(policy_params: dict, calibration_p_bad: np.ndarray = None) -> dict:
     if 'pause_on_quantile' in policy_params:
+        if calibration_p_bad is None or len(calibration_p_bad) == 0:
+            raise ValueError("calibration_p_bad is required for quantile policy resolution")
         return {
-            'pause_on_threshold': float(np.quantile(p_bad, policy_params['pause_on_quantile'])),
-            'resume_threshold': float(np.quantile(p_bad, policy_params['resume_quantile'])),
+            'pause_on_threshold': float(np.quantile(calibration_p_bad, policy_params['pause_on_quantile'])),
+            'resume_threshold': float(np.quantile(calibration_p_bad, policy_params['resume_quantile'])),
             'resume_confirm_signals': policy_params['resume_confirm_signals'],
         }
     return {
@@ -219,6 +221,7 @@ def evaluate_regime_fold(
         val_df: pd.DataFrame,
         feature_columns: list,
         policy_params: dict,
+        calibration_p_bad: np.ndarray = None,
         max_blocked_share: float = 0.35,
         min_signal_keep_rate: float = 0.45,
         score_mode: str = 'pnl_improvement',
@@ -232,7 +235,7 @@ def evaluate_regime_fold(
     val_scored = val_df.copy()
     val_scored['p_bad'] = p_bad
 
-    resolved = resolve_policy_params(policy_params, p_bad)
+    resolved = resolve_policy_params(policy_params, calibration_p_bad=calibration_p_bad)
 
     policy = RegimePolicy(
         pause_on_threshold=resolved['pause_on_threshold'],
@@ -330,14 +333,29 @@ def run_regime_cv(
 
     for fold_idx, fold in enumerate(folds):
         fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
-        model, val_df = train_regime_fold(
+        model, train_df, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
             seed=seed,
         )
 
+        if model is None or val_df is None or train_df is None:
+            fold_eval = {'score': -np.inf, 'valid': False, 'no_op': True}
+            fold_eval['fold_idx'] = fold_idx
+            fold_eval['train_start'] = fold['train_start']
+            fold_eval['train_end'] = fold['train_end']
+            fold_eval['val_start'] = fold['val_start']
+            fold_eval['val_end'] = fold['val_end']
+            fold_eval['train_size'] = len(fold_df[fold_df['split'] == 'train'])
+            fold_eval['val_size'] = len(fold_df[fold_df['split'] == 'val'])
+            fold_results.append(fold_eval)
+            continue
+
+        train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
+
         fold_eval = evaluate_regime_fold(
             model, val_df, feature_columns, policy_params,
+            calibration_p_bad=train_p_bad,
             max_blocked_share=max_blocked_share,
             min_signal_keep_rate=min_signal_keep_rate,
             score_mode=score_mode,
@@ -435,17 +453,18 @@ def tune_model_hyperparameters(
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
                 fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
-                model, val_df = train_regime_fold(
+                model, train_df, val_df = train_regime_fold(
                     fold_df, feature_columns, target_col, params,
                     iterations=iterations, early_stopping_rounds=early_stopping_rounds,
                     seed=curr_seed,
                 )
 
-                if model is None or val_df is None or len(val_df) == 0:
+                if model is None or val_df is None or train_df is None or len(val_df) == 0:
                     continue
 
                 X_val = val_df[feature_columns]
                 p_bad = model.predict_proba(X_val)[:, 1]
+                train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
 
                 y_val = val_df[target_col]
                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
@@ -461,6 +480,7 @@ def tune_model_hyperparameters(
                         val_df=val_df,
                         feature_columns=feature_columns,
                         policy_params=probe_policy,
+                        calibration_p_bad=train_p_bad,
                         max_blocked_share=max_blocked_share,
                         min_signal_keep_rate=min_signal_keep_rate,
                         score_mode=score_mode,
@@ -547,12 +567,15 @@ def tune_policy_parameters(
     fold_models = []
     for fold in folds:
         fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
-        model, val_df = train_regime_fold(
+        model, train_df, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
             seed=seed,
         )
-        fold_models.append((model, val_df))
+        train_p_bad = None
+        if model is not None and train_df is not None and len(train_df) > 0:
+            train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
+        fold_models.append((model, val_df, train_p_bad))
 
     best_score = -np.inf
     best_params = None
@@ -568,9 +591,10 @@ def tune_policy_parameters(
             break
 
         fold_results = []
-        for model, val_df in fold_models:
+        for model, val_df, train_p_bad in fold_models:
             eval_result = evaluate_regime_fold(
                 model, val_df, feature_columns, policy_params,
+                calibration_p_bad=train_p_bad,
                 max_blocked_share=max_blocked_share,
                 min_signal_keep_rate=min_signal_keep_rate,
                 score_mode=score_mode,

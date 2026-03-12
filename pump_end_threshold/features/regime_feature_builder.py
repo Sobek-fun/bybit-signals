@@ -42,7 +42,7 @@ class RegimeFeatureBuilder:
 
         if self.liquid_universe is None:
             self.liquid_universe = get_liquid_universe(
-                self.ch_dsn, t_min - timedelta(days=7), t_max, top_n=self.top_n
+                self.ch_dsn, t_min - timedelta(days=7), t_min, top_n=self.top_n
             )
 
         breadth_lookback = timedelta(hours=48)
@@ -86,7 +86,7 @@ class RegimeFeatureBuilder:
 
             row.update(self._microstructure_features('BTCUSDT', ot, 'btc'))
             row.update(self._microstructure_features('ETHUSDT', ot, 'eth'))
-            self._preload_1m_candles(token_sym, ot - timedelta(minutes=20), ot + timedelta(minutes=1))
+            self._preload_1m_candles(token_sym, ot - timedelta(minutes=20), ot)
             row.update(self._microstructure_features(token_sym, ot, 'token'))
 
             btc_loc = btc_candles.index.searchsorted(ot) - 1
@@ -743,7 +743,7 @@ class RegimeFeatureBuilder:
     def _microstructure_features(self, symbol: str, t: datetime, prefix: str) -> dict:
         f = {}
         start = t - timedelta(minutes=20)
-        end = t + timedelta(minutes=1)
+        end = t - timedelta(microseconds=1)
 
         bars_1m = self._get_1m_candles(symbol, start, end)
         if bars_1m.empty or len(bars_1m) < 2:
@@ -812,12 +812,19 @@ class RegimeFeatureBuilder:
 
         try:
             tx_start = t - timedelta(minutes=5)
-            tx_end = t + timedelta(minutes=1)
+            tx_end = t
             tx_df = self._get_1s_bars(symbol, tx_start, tx_end)
             if not tx_df.empty:
-                tx_1m = tx_df[tx_df.index >= t - timedelta(minutes=1)]
+                tx_1m = tx_df[
+                    (tx_df.index >= t - timedelta(minutes=1)) &
+                    (tx_df.index < t)
+                ]
+                tx_5m = tx_df[
+                    (tx_df.index >= t - timedelta(minutes=5)) &
+                    (tx_df.index < t)
+                ]
                 f[f'{prefix}_trades_count_1m'] = int(tx_1m['trades_count'].sum()) if not tx_1m.empty else 0
-                f[f'{prefix}_trades_count_5m'] = int(tx_df['trades_count'].sum())
+                f[f'{prefix}_trades_count_5m'] = int(tx_5m['trades_count'].sum()) if not tx_5m.empty else 0
             else:
                 f[f'{prefix}_trades_count_1m'] = np.nan
                 f[f'{prefix}_trades_count_5m'] = np.nan
@@ -869,7 +876,7 @@ class RegimeFeatureBuilder:
 
         if self.liquid_universe is None:
             self.liquid_universe = get_liquid_universe(
-                self.ch_dsn, t_min - timedelta(days=7), t_max, top_n=self.top_n
+                self.ch_dsn, t_min - timedelta(days=7), t_min, top_n=self.top_n
             )
 
         breadth_lookback = timedelta(hours=48)

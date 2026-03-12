@@ -14,6 +14,7 @@ from pump_end_threshold.ml.regime_dataset import (
     compute_targets,
     BAR_MINUTES,
     ENTRY_SHIFT_BARS,
+    STRATEGY_STATE_MODE,
 )
 
 
@@ -107,7 +108,6 @@ def main():
     loader = DataLoader(args.clickhouse_dsn)
 
     t_min = signals_df['open_time'].min()
-    t_max = signals_df['open_time'].max()
 
     if args.fixed_universe_file:
         liquid_universe = load_symbols_from_file(args.fixed_universe_file)
@@ -115,7 +115,7 @@ def main():
     else:
         log("INFO", "REGIME-DS", "fetching liquid universe")
         liquid_universe = get_liquid_universe(
-            args.clickhouse_dsn, t_min - timedelta(days=7), t_max,
+            args.clickhouse_dsn, t_min - timedelta(days=7), t_min,
             top_n=args.top_n_universe,
         )
         log("INFO", "REGIME-DS", f"liquid universe: {len(liquid_universe)} symbols")
@@ -157,6 +157,7 @@ def main():
             'feature_profile': args.feature_profile or 'regime_compact_v4',
             'trade_replay_source': args.trade_replay_source,
             'target_profile': args.target_profile,
+            'strategy_state_mode': STRATEGY_STATE_MODE,
         }
         with open(run_dir / "regime_builder_config.json", 'w') as f:
             json.dump(regime_builder_config, f, indent=2)
@@ -256,6 +257,7 @@ def main():
             'feature_profile': args.feature_profile,
             'symbols_file': args.symbols_file,
             'fixed_universe_file': args.fixed_universe_file,
+            'strategy_state_mode': STRATEGY_STATE_MODE,
         }
         with open(run_dir / "run_config.json", 'w') as f:
             json.dump(config, f, indent=2, default=str)
@@ -331,6 +333,7 @@ def main():
             'target_profile': args.target_profile,
             'symbols_file': args.symbols_file,
             'fixed_universe_file': args.fixed_universe_file,
+            'strategy_state_mode': STRATEGY_STATE_MODE,
         }
         with open(run_dir / "dataset_manifest.json", 'w') as f:
             json.dump(manifest, f, indent=2, default=str)

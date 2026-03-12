@@ -62,7 +62,7 @@ def _compute_event_metrics_from_data(
             if pending_count >= min_pending_bars and best_offset is not None:
                 drop_from_peak = best_p - p_end[i]
                 if p_end[i] < threshold_low or (drop_from_peak > 0 and drop_from_peak >= drop_delta):
-                    offset = best_offset
+                    offset = offsets_arr[i]
                     triggered = True
                     break
 

@@ -10,6 +10,7 @@ TP_PCT = 4.5
 SL_PCT = 10.0
 ENTRY_SHIFT_BARS = 1
 BAR_MINUTES = 15
+STRATEGY_STATE_MODE = 'shadow_all_raw_signals'
 
 TARGET_PROFILES = {
     'pause_value_12h_v2_all': {

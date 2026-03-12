@@ -64,7 +64,7 @@ def extract_signals(
             if pending_count >= min_pending_bars and best_offset is not None:
                 drop_from_peak = best_p - p_end[i]
                 if p_end[i] < threshold_low or (drop_from_peak > 0 and drop_from_peak >= drop_delta):
-                    offset = best_offset
+                    offset = offsets_arr[i]
                     triggered = True
                     break
 
@@ -142,7 +142,7 @@ def extract_signals_verbose(
         if not triggered:
             continue
 
-        signal_offset = best_offset
+        signal_offset = fire_offset
         p_end_at_fire = fire_p_end
         drop_from_peak_at_fire = p_end_peak_before_fire - p_end_at_fire
 
@@ -152,6 +152,8 @@ def extract_signals_verbose(
             'open_time': time_map[event_id][signal_offset],
             'event_type': event_type,
             'signal_offset': signal_offset,
+            'peak_offset': best_offset,
+            'peak_open_time': time_map[event_id][best_offset] if best_offset is not None else pd.NaT,
             'p_end_at_fire': p_end_at_fire,
             'p_end_peak_before_fire': p_end_peak_before_fire,
             'threshold_used': threshold,
