@@ -1,23 +1,14 @@
 import argparse
 import csv
 import json
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
 
-import clickhouse_connect
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 from catboost import CatBoostClassifier
 
-from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
-from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.ml.feature_schema import prune_feature_columns
-from pump_end_threshold.ml.predict import extract_signals_verbose
 from pump_end_threshold.ml.regime_dataset import build_strategy_state
 
 
@@ -26,223 +17,61 @@ def log(level: str, component: str, message: str):
     print(f"[{level}] {timestamp} [{component}] {message}")
 
 
-def load_run_config(model_dir: Path) -> dict:
-    config_path = model_dir / "run_config.json"
-    with open(config_path, 'r') as f:
-        return json.load(f)
+def load_symbols_from_file(path: str) -> list[str]:
+    lines = Path(path).read_text().strip().splitlines()
+    return [line.strip() for line in lines if line.strip()]
 
 
-def load_threshold_config(model_dir: Path) -> dict:
-    threshold_path = model_dir / "best_threshold.json"
-    with open(threshold_path, 'r') as f:
-        return json.load(f)
+def normalize_symbol(value: str) -> str:
+    symbol = value.strip().upper()
+    if not symbol:
+        return symbol
+    if not symbol.endswith("USDT"):
+        symbol = f"{symbol}USDT"
+    return symbol
 
 
-def load_model(model_dir: Path) -> CatBoostClassifier:
-    model_path = model_dir / "catboost_model.cbm"
-    model = CatBoostClassifier()
-    model.load_model(str(model_path))
-    return model
+def symbol_to_token(symbol: str) -> str:
+    return normalize_symbol(symbol)[:-4]
 
 
-def get_symbols(client, start_dt: datetime, end_dt: datetime) -> list:
-    query = """
-            SELECT DISTINCT symbol
-            FROM bybit.candles
-            WHERE open_time >= %(start)s
-              AND open_time < %(end)s
-              AND interval = 1
-            ORDER BY symbol \
-            """
-    result = client.query(query, parameters={
-        "start": start_dt,
-        "end": end_dt
-    })
-    return [row[0] for row in result.result_rows]
+def load_raw_signals(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        return pd.DataFrame(columns=['symbol', 'open_time'])
+
+    raw_signals = pd.read_csv(csv_path)
+    if raw_signals.empty:
+        return pd.DataFrame(columns=['symbol', 'open_time'])
+
+    if 'timestamp' in raw_signals.columns and 'open_time' not in raw_signals.columns:
+        raw_signals = raw_signals.rename(columns={'timestamp': 'open_time'})
+
+    if 'open_time' in raw_signals.columns:
+        raw_signals['open_time'] = pd.to_datetime(raw_signals['open_time'])
+
+    return raw_signals
 
 
-def detect_candidates(df: pd.DataFrame, params: PumpParams) -> list:
-    from pump_end_threshold.tools.pump_start_detection.detector import PumpDetector
-
-    df = df.copy()
-
-    df.ta.rsi(length=14, append=True)
-    df.ta.mfi(length=14, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
-
-    detector = PumpDetector(params)
-    result = detector.detect(df)
-
-    candidates = result[result['pump_signal'] == 'strong_pump'].index.tolist()
-    return candidates
+def write_signals_csv(signals_df: pd.DataFrame, output_path: str):
+    with open(output_path, 'w', newline='') as outfile:
+        csv_writer = csv.writer(outfile)
+        csv_writer.writerow(['symbol', 'timestamp'])
+        for _, row in signals_df.iterrows():
+            timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
+            csv_writer.writerow([row['symbol'], timestamp_str])
 
 
-def build_points_around_candidates(
-        candidates: list,
-        symbol: str,
-        neg_before: int,
-        neg_after: int,
-        pos_offsets: list
-) -> pd.DataFrame:
-    if not candidates:
-        return pd.DataFrame()
+def resolve_export_tokens(symbols_file: str = None, symbols_csv: str = None, ch_dsn: str = None) -> list[str]:
+    if symbols_file:
+        symbols = [normalize_symbol(symbol) for symbol in load_symbols_from_file(symbols_file)]
+        return [symbol_to_token(symbol) for symbol in symbols]
 
-    all_offsets = list(range(-neg_before, 0)) + pos_offsets + list(
-        range(max(pos_offsets) + 1, max(pos_offsets) + neg_after + 1)
-    )
-    all_offsets = sorted(set(all_offsets))
+    if symbols_csv:
+        symbols = [normalize_symbol(symbol) for symbol in symbols_csv.split(',') if symbol.strip()]
+        return [symbol_to_token(symbol) for symbol in symbols]
 
-    rows = []
-    for event_time in candidates:
-        event_id = f"{symbol}|{event_time.strftime('%Y%m%d_%H%M%S')}"
-        for offset in all_offsets:
-            open_time = event_time + timedelta(minutes=offset * 15)
-            rows.append({
-                'event_id': event_id,
-                'symbol': symbol,
-                'open_time': open_time,
-                'offset': offset,
-                'y': 1 if offset in pos_offsets else 0,
-                'pump_la_type': 'A',
-                'runup_pct': 0
-            })
-
-    return pd.DataFrame(rows)
-
-
-def process_symbol_chunk(args_tuple):
-    (
-        worker_id,
-        symbols_chunk,
-        ch_dsn,
-        start_dt,
-        end_dt,
-        model_path,
-        feature_columns,
-        window_bars,
-        warmup_bars,
-        feature_set,
-        threshold,
-        min_pending_bars,
-        drop_delta,
-        neg_before,
-        neg_after,
-        pos_offsets,
-        params_dict,
-        abstain_margin,
-        temp_dir
-    ) = args_tuple
-
-    params = PumpParams(**params_dict) if params_dict else DEFAULT_PUMP_PARAMS
-
-    loader = DataLoader(ch_dsn)
-    builder = PumpFeatureBuilder(
-        ch_dsn=ch_dsn,
-        window_bars=window_bars,
-        warmup_bars=warmup_bars,
-        feature_set=feature_set,
-        params=params
-    )
-
-    model = CatBoostClassifier()
-    model.load_model(model_path)
-
-    all_signals = []
-    total_signals = 0
-    symbols_processed = 0
-    candidates_found = 0
-
-    buffer_bars = warmup_bars + window_bars + params.liquidity_window_bars + 21
-
-    for symbol in symbols_chunk:
-        try:
-            query_start = start_dt - timedelta(minutes=buffer_bars * 15)
-            df = loader.load_candles_range(symbol, query_start, end_dt)
-
-            if df.empty or len(df) < buffer_bars:
-                symbols_processed += 1
-                continue
-
-            candidates = detect_candidates(df, params)
-            candidates = [c for c in candidates if start_dt <= c < end_dt]
-
-            if not candidates:
-                symbols_processed += 1
-                continue
-
-            candidates_found += len(candidates)
-
-            points_df = build_points_around_candidates(
-                candidates, symbol, neg_before, neg_after, pos_offsets
-            )
-
-            if points_df.empty:
-                symbols_processed += 1
-                continue
-
-            points_df = points_df.sort_values('y', ascending=False)
-            points_df = points_df.drop_duplicates(subset=['symbol', 'open_time'], keep='first')
-            points_df = points_df.sort_values(['event_id', 'offset']).reset_index(drop=True)
-
-            feature_input = points_df[['symbol', 'open_time']].copy()
-            feature_input = feature_input.rename(columns={'open_time': 'event_open_time'})
-            feature_input['pump_la_type'] = 'A'
-            feature_input['runup_pct'] = 0
-
-            features_df = builder.build(feature_input, max_workers=1)
-
-            if features_df.empty:
-                symbols_processed += 1
-                continue
-
-            features_df = features_df.merge(
-                points_df[['symbol', 'open_time', 'event_id', 'offset', 'y']],
-                on=['symbol', 'open_time'],
-                how='inner'
-            )
-
-            if features_df.empty:
-                symbols_processed += 1
-                continue
-
-            available_features = [f for f in feature_columns if f in features_df.columns]
-            if len(available_features) < len(feature_columns):
-                symbols_processed += 1
-                continue
-
-            X = features_df[feature_columns]
-            p_end = model.predict_proba(X)[:, 1]
-
-            predictions_df = features_df[['event_id', 'symbol', 'open_time', 'offset', 'y']].copy()
-            predictions_df['p_end'] = p_end
-            predictions_df['split'] = 'test'
-
-            signals_df = extract_signals_verbose(
-                predictions_df,
-                threshold,
-                min_pending_bars=min_pending_bars,
-                drop_delta=drop_delta,
-                abstain_margin=abstain_margin
-            )
-
-            if not signals_df.empty:
-                all_signals.append(signals_df)
-                total_signals += len(signals_df)
-
-            symbols_processed += 1
-
-        except Exception:
-            symbols_processed += 1
-            continue
-
-    part_file = str(Path(temp_dir) / f"signals_part_{worker_id}.parquet")
-    if all_signals:
-        combined = pd.concat(all_signals, ignore_index=True)
-        combined.to_parquet(part_file, index=False)
-    else:
-        pd.DataFrame().to_parquet(part_file, index=False)
-
-    return worker_id, symbols_processed, candidates_found, total_signals, part_file
+    from pump_end_prod.infra.clickhouse import list_all_usdt_tokens
+    return list_all_usdt_tokens(ch_dsn)
 
 
 def run_guard_stage(
@@ -391,7 +220,7 @@ def main():
         "--end-date",
         type=str,
         required=True,
-        help="End date (YYYY-MM-DD HH:MM:SS), exclusive"
+        help="End date (YYYY-MM-DD HH:MM:SS), inclusive"
     )
     parser.add_argument(
         "--clickhouse-dsn",
@@ -493,186 +322,35 @@ def main():
         if not args.output:
             args.output = "pump_end_signals.csv"
 
-    log("INFO", "EXPORT", f"loading artifacts from {model_dir}")
-    run_config = load_run_config(model_dir)
-    threshold_config = load_threshold_config(model_dir)
-
-    window_bars = run_config.get('window_bars', 30)
-    warmup_bars = run_config.get('warmup_bars', 150)
-    feature_set = run_config.get('feature_set', 'base')
-    do_prune = run_config.get('prune_features', False)
-    neg_before = run_config.get('neg_before', 20)
-    neg_after = run_config.get('neg_after', 0)
-    pos_offsets_str = run_config.get('pos_offsets', '0')
-    pos_offsets = [int(x.strip()) for x in pos_offsets_str.split(',')]
-
-    threshold = threshold_config['threshold']
-    min_pending_bars = threshold_config.get('min_pending_bars', 1)
-    drop_delta = threshold_config.get('drop_delta', 0.0)
-    abstain_margin = threshold_config.get('abstain_margin', 0.0)
-
-    log("INFO", "EXPORT",
-        f"config: window_bars={window_bars} warmup_bars={warmup_bars} feature_set={feature_set} prune={do_prune}")
-    log("INFO", "EXPORT",
-        f"threshold={threshold} min_pending_bars={min_pending_bars} drop_delta={drop_delta} abstain_margin={abstain_margin}")
-    log("INFO", "EXPORT",
-        f"neg_before={neg_before} neg_after={neg_after} pos_offsets={pos_offsets}")
-
-    model = load_model(model_dir)
-    feature_columns = list(model.feature_names_)
-
-    if do_prune:
-        original_count = len(feature_columns)
-        feature_columns = prune_feature_columns(feature_columns)
-        log("INFO", "EXPORT", f"pruned features: {original_count} -> {len(feature_columns)}")
-
-    parsed = urlparse(args.clickhouse_dsn)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 8123
-    username = parsed.username or "default"
-    password = parsed.password or ""
-    database = parsed.path.lstrip("/") if parsed.path else "default"
-    secure = parsed.scheme == "https"
-
-    client = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        username=username,
-        password=password,
-        database=database,
-        secure=secure
+    tokens = resolve_export_tokens(
+        symbols_file=args.symbols_file,
+        symbols_csv=args.symbols_csv,
+        ch_dsn=args.clickhouse_dsn,
     )
 
-    log("INFO", "EXPORT", f"fetching symbols from {args.start_date} to {args.end_date}")
-    symbols = get_symbols(client, start_dt, end_dt)
-
-    if not symbols:
-        log("WARN", "EXPORT", "no symbols found")
+    if not tokens:
+        log("WARN", "EXPORT", "no tokens resolved for export")
+        write_signals_csv(pd.DataFrame(columns=['symbol', 'open_time']), args.output)
+        if args.raw_signals_output:
+            pd.DataFrame(columns=['symbol', 'open_time']).to_parquet(args.raw_signals_output, index=False)
         return
 
-    log("INFO", "EXPORT", f"found {len(symbols)} symbols")
+    stage_a_csv = temp_dir / "prod_raw_signals.csv"
 
-    allowlist = None
-    if args.symbols_file:
-        lines = Path(args.symbols_file).read_text().strip().splitlines()
-        allowlist = set(line.strip() for line in lines if line.strip())
-    elif args.symbols_csv:
-        allowlist = set(s.strip() for s in args.symbols_csv.split(',') if s.strip())
+    log("INFO", "EXPORT", f"stage A: replaying prod exporter for {len(tokens)} tokens")
+    from pump_end_prod.pump_end.export_signals import export_signals
+    export_signals(
+        tokens=tokens,
+        ch_dsn=args.clickhouse_dsn,
+        model_dir=str(model_dir),
+        dt_from=start_dt,
+        dt_to=end_dt,
+        out_csv=str(stage_a_csv),
+        workers=args.workers,
+    )
 
-    if allowlist:
-        before = len(symbols)
-        symbols = [s for s in symbols if s in allowlist]
-        log("INFO", "EXPORT", f"filtered by allowlist: {before} -> {len(symbols)} symbols")
-        if not symbols:
-            log("WARN", "EXPORT", "no symbols after allowlist filter")
-            return
-
-    num_workers = min(args.workers, len(symbols))
-    chunk_size = len(symbols) // num_workers
-    remainder = len(symbols) % num_workers
-
-    chunks = []
-    start_idx = 0
-    for i in range(num_workers):
-        end_idx = start_idx + chunk_size + (1 if i < remainder else 0)
-        chunks.append(symbols[start_idx:end_idx])
-        start_idx = end_idx
-
-    params_dict = {
-        'runup_window': DEFAULT_PUMP_PARAMS.runup_window,
-        'runup_threshold': DEFAULT_PUMP_PARAMS.runup_threshold,
-        'context_window': DEFAULT_PUMP_PARAMS.context_window,
-        'peak_window': DEFAULT_PUMP_PARAMS.peak_window,
-        'peak_tol': DEFAULT_PUMP_PARAMS.peak_tol,
-        'volume_median_window': DEFAULT_PUMP_PARAMS.volume_median_window,
-        'vol_ratio_spike': DEFAULT_PUMP_PARAMS.vol_ratio_spike,
-        'vol_fade_ratio': DEFAULT_PUMP_PARAMS.vol_fade_ratio,
-        'corridor_window': DEFAULT_PUMP_PARAMS.corridor_window,
-        'corridor_quantile': DEFAULT_PUMP_PARAMS.corridor_quantile,
-        'rsi_hot': DEFAULT_PUMP_PARAMS.rsi_hot,
-        'mfi_hot': DEFAULT_PUMP_PARAMS.mfi_hot,
-        'rsi_extreme': DEFAULT_PUMP_PARAMS.rsi_extreme,
-        'mfi_extreme': DEFAULT_PUMP_PARAMS.mfi_extreme,
-        'rsi_fade_ratio': DEFAULT_PUMP_PARAMS.rsi_fade_ratio,
-        'macd_fade_ratio': DEFAULT_PUMP_PARAMS.macd_fade_ratio,
-        'wick_high': DEFAULT_PUMP_PARAMS.wick_high,
-        'wick_low': DEFAULT_PUMP_PARAMS.wick_low,
-        'close_pos_high': DEFAULT_PUMP_PARAMS.close_pos_high,
-        'close_pos_low': DEFAULT_PUMP_PARAMS.close_pos_low,
-        'wick_blowoff': DEFAULT_PUMP_PARAMS.wick_blowoff,
-        'body_blowoff': DEFAULT_PUMP_PARAMS.body_blowoff,
-        'cooldown_bars': DEFAULT_PUMP_PARAMS.cooldown_bars,
-        'liquidity_window_bars': DEFAULT_PUMP_PARAMS.liquidity_window_bars,
-        'eqh_min_touches': DEFAULT_PUMP_PARAMS.eqh_min_touches,
-        'eqh_base_tol': DEFAULT_PUMP_PARAMS.eqh_base_tol,
-        'eqh_atr_factor': DEFAULT_PUMP_PARAMS.eqh_atr_factor,
-    }
-
-    model_path = str(model_dir / "catboost_model.cbm")
-
-    tasks = []
-    for i, chunk in enumerate(chunks):
-        tasks.append((
-            i + 1,
-            chunk,
-            args.clickhouse_dsn,
-            start_dt,
-            end_dt,
-            model_path,
-            feature_columns,
-            window_bars,
-            warmup_bars,
-            feature_set,
-            threshold,
-            min_pending_bars,
-            drop_delta,
-            neg_before,
-            neg_after,
-            pos_offsets,
-            params_dict,
-            abstain_margin,
-            str(temp_dir)
-        ))
-
-    log("INFO", "EXPORT", f"stage A: starting {num_workers} detector workers")
-
-    part_files = []
-    total_processed = 0
-    total_candidates = 0
-    total_signals = 0
-
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(process_symbol_chunk, task): task[0] for task in tasks}
-
-        for future in as_completed(futures):
-            worker_id, processed, candidates, signals, part_file = future.result()
-            part_files.append(part_file)
-            total_processed += processed
-            total_candidates += candidates
-            total_signals += signals
-            log("INFO", "EXPORT",
-                f"worker={worker_id} done symbols={processed} candidates={candidates} signals={signals}")
-
-    log("INFO", "EXPORT", f"stage A done: {total_signals} raw detector signals from {total_candidates} candidates")
-
-    all_raw = []
-    for pf in part_files:
-        if os.path.exists(pf):
-            part_df = pd.read_parquet(pf)
-            if not part_df.empty:
-                all_raw.append(part_df)
-            os.remove(pf)
-
-    if not all_raw:
-        log("WARN", "EXPORT", "no raw signals produced")
-        with open(args.output, 'w', newline='') as outfile:
-            csv.writer(outfile).writerow(['symbol', 'timestamp'])
-        return
-
-    raw_signals = pd.concat(all_raw, ignore_index=True)
-    raw_signals = raw_signals.sort_values('open_time').reset_index(drop=True)
-
-    log("INFO", "EXPORT", f"combined {len(raw_signals)} raw detector signals")
+    raw_signals = load_raw_signals(stage_a_csv)
+    log("INFO", "EXPORT", f"stage A done: {len(raw_signals)} raw detector signals")
 
     if args.raw_signals_output:
         raw_signals.to_parquet(args.raw_signals_output, index=False)
@@ -702,16 +380,11 @@ def main():
         log("INFO", "EXPORT", "stage B: no guard model, passing all raw signals through")
         final_signals = raw_signals
 
-    with open(args.output, 'w', newline='') as outfile:
-        csv_writer = csv.writer(outfile)
-        csv_writer.writerow(['symbol', 'timestamp'])
-        for _, row in final_signals.iterrows():
-            timestamp_str = pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')
-            csv_writer.writerow([row['symbol'], timestamp_str])
+    write_signals_csv(final_signals, args.output)
 
     log("INFO", "EXPORT",
-        f"done symbols={total_processed} candidates={total_candidates} "
-        f"raw_signals={total_signals} final_signals={len(final_signals)} output={args.output}")
+        f"done tokens={len(tokens)} "
+        f"raw_signals={len(raw_signals)} final_signals={len(final_signals)} output={args.output}")
 
 
 if __name__ == "__main__":
