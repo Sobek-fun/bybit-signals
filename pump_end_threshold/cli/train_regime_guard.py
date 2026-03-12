@@ -71,7 +71,7 @@ def main():
     parser.add_argument("--target-col", type=str, default="target_pause_value_next_12h")
     parser.add_argument("--train-end", type=str, default=None,
                         help="Train end date (YYYY-MM-DD), exclusive. If set, trains final model")
-    parser.add_argument("--time-budget-min", type=int, default=60)
+    parser.add_argument("--time-budget-min", type=int, default=90)
     parser.add_argument("--fold-months", type=int, default=1)
     parser.add_argument("--min-train-months", type=int, default=3)
     parser.add_argument("--fold-days", type=int, default=14,

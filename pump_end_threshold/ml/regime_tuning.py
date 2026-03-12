@@ -89,6 +89,19 @@ def get_regime_hyperparameter_grid() -> list:
     return [dict(zip(keys, combo)) for combo in product(*values)]
 
 
+def get_probe_policy_grid(preset: str, max_blocked_share: float = 0.35) -> list:
+    if preset == 'selective_local':
+        return [
+            {'pause_on_quantile': 0.88, 'resume_quantile': 0.65, 'resume_confirm_signals': 1},
+            {'pause_on_quantile': 0.90, 'resume_quantile': 0.70, 'resume_confirm_signals': 1},
+            {'pause_on_quantile': 0.92, 'resume_quantile': 0.75, 'resume_confirm_signals': 1},
+        ]
+    probe_quantile = 0.88 if max_blocked_share < 0.25 else 0.80
+    return [
+        {'pause_on_quantile': probe_quantile, 'resume_quantile': 0.55, 'resume_confirm_signals': 2},
+    ]
+
+
 def get_policy_parameter_grid(preset: str = 'default') -> list:
     if preset == 'conservative':
         policy_grid = {
@@ -388,6 +401,7 @@ def tune_model_hyperparameters(
         score_mode: str = 'block_value',
         model_selection_mode: str = 'downstream_cv',
         feature_profile: str = None,
+        policy_grid_preset: str = 'default',
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -408,12 +422,7 @@ def tune_model_hyperparameters(
     best_score = -np.inf
     best_params = None
     results = []
-    probe_quantile = 0.88 if max_blocked_share < 0.25 else 0.80
-    probe_policy = {
-        'pause_on_quantile': probe_quantile,
-        'resume_quantile': 0.55,
-        'resume_confirm_signals': 2,
-    }
+    probe_policies = get_probe_policy_grid(policy_grid_preset, max_blocked_share)
 
     for params in model_grid:
         elapsed = time.time() - start_time
@@ -442,23 +451,24 @@ def tune_model_hyperparameters(
                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
                 if ap is None:
                     continue
-                downstream_eval = evaluate_regime_fold(
-                    model=model,
-                    val_df=val_df,
-                    feature_columns=feature_columns,
-                    policy_params=probe_policy,
-                    max_blocked_share=max_blocked_share,
-                    min_signal_keep_rate=min_signal_keep_rate,
-                    score_mode=score_mode,
-                    target_col=target_col,
-                )
-                downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid', False) else -np.inf
                 fold_scores.append({
                     'ap': ap, 'auc': auc, 'brier': brier,
                     'seed': curr_seed, 'fold': fold_idx,
                 })
-                if np.isfinite(downstream_score):
-                    downstream_scores.append(float(downstream_score))
+                for probe_policy in probe_policies:
+                    downstream_eval = evaluate_regime_fold(
+                        model=model,
+                        val_df=val_df,
+                        feature_columns=feature_columns,
+                        policy_params=probe_policy,
+                        max_blocked_share=max_blocked_share,
+                        min_signal_keep_rate=min_signal_keep_rate,
+                        score_mode=score_mode,
+                        target_col=target_col,
+                    )
+                    downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid', False) else -np.inf
+                    if np.isfinite(downstream_score):
+                        downstream_scores.append(float(downstream_score))
 
         if len(fold_scores) >= min_valid_folds:
             mean_ap = np.mean([s['ap'] for s in fold_scores])
@@ -675,7 +685,7 @@ def _compute_cv_summary(fold_results: list) -> dict:
 def tune_regime_guard(
         dataset_df: pd.DataFrame,
         target_col: str = 'target_bad_next_5',
-        time_budget_min: int = 60,
+        time_budget_min: int = 90,
         fold_months: int = 1,
         min_train_months: int = 3,
         fold_days: int = None,
@@ -709,6 +719,7 @@ def tune_regime_guard(
         score_mode=score_mode,
         model_selection_mode=model_selection_mode,
         feature_profile=feature_profile,
+        policy_grid_preset=policy_grid_preset,
     )
 
     if model_result['best_params'] is None:
