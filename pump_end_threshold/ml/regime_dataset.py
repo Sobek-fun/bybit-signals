@@ -35,6 +35,28 @@ TARGET_PROFILES = {
         'good_value_threshold': 7.5,
         'good_sl_rate_threshold': 0.45,
     },
+    'pause_value_12h_v3_clean_extremes': {
+        'window_hours': 12,
+        'min_resolved': 2,
+        'tp_value': 4.5,
+        'sl_value': 10.0,
+        'timeout_penalty': 1.0,
+        'bad_value_threshold': -5.0,
+        'bad_sl_rate_threshold': 0.60,
+        'good_value_threshold': 15.0,
+        'good_sl_rate_threshold': 0.40,
+    },
+    'pause_value_12h_v3_loose_bad': {
+        'window_hours': 12,
+        'min_resolved': 2,
+        'tp_value': 4.5,
+        'sl_value': 10.0,
+        'timeout_penalty': 1.0,
+        'bad_value_threshold': -5.0,
+        'bad_sl_rate_threshold': 0.50,
+        'good_value_threshold': 15.0,
+        'good_sl_rate_threshold': 0.40,
+    },
 }
 
 

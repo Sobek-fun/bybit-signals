@@ -299,8 +299,12 @@ def main():
             if len(calibration_df) > 0:
                 calibration_p_bad = final_model.predict_proba(calibration_df[tune_result['feature_columns']])[:, 1]
 
-            resolved = resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
-            policy = RegimePolicy(**resolved)
+            policy_params_used_for_inference = (
+                resolved_policy_params
+                if resolved_policy_params
+                else resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
+            )
+            policy = RegimePolicy(**policy_params_used_for_inference)
             filtered = policy.apply(test_df, p_bad_col='p_bad')
 
             scorecard = compute_regime_scorecard(filtered)

@@ -108,5 +108,7 @@ def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) ->
                 continue
             if any(col.startswith(p) for p in LOCAL_ONLY_EXCLUDED_PREFIXES):
                 continue
+        if feature_profile == 'token_only' and not col.startswith('token_'):
+            continue
         features.append(col)
     return features
