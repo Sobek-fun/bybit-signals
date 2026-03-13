@@ -57,6 +57,7 @@ if [[ -z "$CLICKHOUSE_DSN" ]]; then
   exit 2
 fi
 
+cd "$RELEASE_DIR"
 mkdir -p "$RUN_DIR" "$TMP_DIR" "$LOCKS_ROOT"
 rm -rf "$VENV_DIR"
 
@@ -74,24 +75,49 @@ ensure_uv() {
 create_cache_if_needed() {
   local cache_dir="$CACHE_ROOT/$BASELINE_HASH"
   local lock_dir="$LOCKS_ROOT/baseline_${BASELINE_HASH}.lock"
+  local lock_owner_file="${lock_dir}.owner"
+  local lock_wait_seconds="${LOCK_WAIT_SECONDS:-1800}"
+  local lock_stale_seconds="${LOCK_STALE_SECONDS:-900}"
+  local lock_wait_started
   local marker="$cache_dir/done.marker"
   local manifest="$cache_dir/cache_manifest.json"
   local raw="$cache_dir/raw_detector_signals_curated55.parquet"
   local base="$cache_dir/regime_dataset_base.parquet"
 
+  lock_wait_started="$(date +%s)"
   mkdir -p "$CACHE_ROOT" "$LOCKS_ROOT"
   if [[ -f "$marker" && -f "$manifest" && -f "$raw" && -f "$base" ]]; then
     return 0
   fi
 
   while ! mkdir "$lock_dir" 2>/dev/null; do
+    local now elapsed owner_ts owner_age
     sleep 3
     if [[ -f "$marker" && -f "$manifest" && -f "$raw" && -f "$base" ]]; then
       return 0
     fi
+    now="$(date +%s)"
+    elapsed=$((now - lock_wait_started))
+    owner_ts=""
+    if [[ -f "$lock_owner_file" ]]; then
+      owner_ts="$(awk 'NR==1 {print $1}' "$lock_owner_file" 2>/dev/null || true)"
+    fi
+    owner_age=0
+    if [[ "$owner_ts" =~ ^[0-9]+$ ]]; then
+      owner_age=$((now - owner_ts))
+    fi
+    if [[ $owner_age -gt $lock_stale_seconds ]]; then
+      rm -rf "$lock_dir" "$lock_owner_file" >/dev/null 2>&1 || true
+      continue
+    fi
+    if [[ $elapsed -gt $lock_wait_seconds ]]; then
+      echo "timed out waiting for baseline lock: $lock_dir"
+      exit 4
+    fi
   done
 
-  trap 'rmdir "$lock_dir" >/dev/null 2>&1 || true' EXIT
+  printf "%s %s %s\n" "$(date +%s)" "$(hostname)" "$$" > "$lock_owner_file"
+  trap 'rm -f "$lock_owner_file"; rmdir "$lock_dir" >/dev/null 2>&1 || true' EXIT
   mkdir -p "$cache_dir"
 
   local work="$TMP_DIR/baseline_cache_build"
@@ -147,6 +173,7 @@ create_cache_if_needed() {
 }
 EOF
   echo "ok" > "$marker"
+  rm -f "$lock_owner_file"
   rmdir "$lock_dir" >/dev/null 2>&1 || true
   trap - EXIT
 }

@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -83,14 +84,22 @@ def main() -> None:
     with log_file.open("a", encoding="utf-8") as log:
         write_state(run_dir=run_dir, exp_id=args.exp_id, state="RUNNING", started_at=started_at, pid=pid, exit_code=None)
         while True:
-            line = proc.stdout.readline() if proc.stdout else ""
+            line = ""
+            if proc.stdout is not None:
+                ready, _, _ = select.select([proc.stdout], [], [], 5.0)
+                if ready:
+                    line = proc.stdout.readline()
             if line:
                 log.write(line)
                 log.flush()
             if proc.poll() is not None:
+                if proc.stdout is not None:
+                    remainder = proc.stdout.read()
+                    if remainder:
+                        log.write(remainder)
+                        log.flush()
                 break
             write_state(run_dir=run_dir, exp_id=args.exp_id, state="RUNNING", started_at=started_at, pid=pid, exit_code=None)
-            time.sleep(5)
 
     rc = int(proc.returncode or 0)
     write_text(run_dir / "exit_code.txt", str(rc))
