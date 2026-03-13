@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--sl-pct", type=float, default=10.0)
     parser.add_argument("--max-horizon-bars", type=int, default=200)
     parser.add_argument("--target-horizon-signals", type=int, default=5)
-    parser.add_argument("--target-min-resolved", type=int, default=3)
+    parser.add_argument("--target-min-resolved", type=int, default=2)
     parser.add_argument("--target-sl-rate-threshold", type=float, default=0.60)
     parser.add_argument("--target-col", type=str, default="target_pause_value_next_12h",
                         help="Name of the target column to use for training")
@@ -57,9 +57,9 @@ def main():
     parser.add_argument("--trade-replay-source", type=str, default="1s",
                         choices=["1m", "1s"],
                         help="Trade replay source: 1m (fast, no 1s resolve) or 1s (exact with 1s replay)")
-    parser.add_argument("--target-profile", type=str, default=None,
+    parser.add_argument("--target-profile", type=str, default="pause_value_12h_v3_clean_extremes",
                         help="Target profile name (e.g., pause_value_12h_v2_all, pause_value_12h_v2_curated)")
-    parser.add_argument("--feature-profile", type=str, default=None,
+    parser.add_argument("--feature-profile", type=str, default="regime_compact_v4",
                         help="Feature profile name for documentation/versioning")
     parser.add_argument("--sample-weight-mode", type=str, default="pause12h",
                         choices=["pause12h", "uniform"],

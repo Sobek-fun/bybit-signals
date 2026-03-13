@@ -475,7 +475,7 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
     if target_profile and target_profile in TARGET_PROFILES:
         profile = TARGET_PROFILES[target_profile]
     else:
-        profile = TARGET_PROFILES['pause_value_12h_v2_all']
+        profile = TARGET_PROFILES['pause_value_12h_v3_clean_extremes']
 
     pause_targets = compute_pause_value_targets(
         trades_df, current_time, **profile
