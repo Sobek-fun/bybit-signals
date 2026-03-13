@@ -96,6 +96,11 @@ def get_probe_policy_grid(preset: str, max_blocked_share: float = 0.35) -> list:
             {'pause_on_quantile': 0.90, 'resume_quantile': 0.70, 'resume_confirm_signals': 1},
             {'pause_on_quantile': 0.92, 'resume_quantile': 0.75, 'resume_confirm_signals': 1},
         ]
+    if preset == 'selective_local_extreme':
+        return [
+            {'pause_on_quantile': 0.97, 'resume_quantile': 0.85, 'resume_confirm_signals': 1},
+            {'pause_on_quantile': 0.98, 'resume_quantile': 0.90, 'resume_confirm_signals': 1},
+        ]
     probe_quantile = 0.88 if max_blocked_share < 0.25 else 0.80
     return [
         {'pause_on_quantile': probe_quantile, 'resume_quantile': 0.55, 'resume_confirm_signals': 2},
@@ -119,6 +124,12 @@ def get_policy_parameter_grid(preset: str = 'default') -> list:
         policy_grid = {
             'pause_on_quantile': [0.85, 0.88, 0.90, 0.92, 0.95],
             'resume_quantile': [0.60, 0.65, 0.70, 0.75],
+            'resume_confirm_signals': [1],
+        }
+    elif preset == 'selective_local_extreme':
+        policy_grid = {
+            'pause_on_quantile': [0.95, 0.96, 0.97, 0.98, 0.99],
+            'resume_quantile': [0.75, 0.80, 0.85, 0.90],
             'resume_confirm_signals': [1],
         }
     elif preset == 'low':
@@ -453,18 +464,20 @@ def tune_model_hyperparameters(
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
                 fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
+                train_full_df = fold_df[fold_df['split'] == 'train']
+                val_full_df = fold_df[fold_df['split'] == 'val']
                 model, train_df, val_df = train_regime_fold(
                     fold_df, feature_columns, target_col, params,
                     iterations=iterations, early_stopping_rounds=early_stopping_rounds,
                     seed=curr_seed,
                 )
 
-                if model is None or val_df is None or train_df is None or len(val_df) == 0:
+                if model is None or val_df is None or train_df is None or len(val_df) == 0 or len(val_full_df) == 0:
                     continue
 
                 X_val = val_df[feature_columns]
                 p_bad = model.predict_proba(X_val)[:, 1]
-                train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
+                train_p_bad = model.predict_proba(train_full_df[feature_columns])[:, 1] if len(train_full_df) > 0 else None
 
                 y_val = val_df[target_col]
                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
@@ -477,7 +490,7 @@ def tune_model_hyperparameters(
                 for probe_policy in probe_policies:
                     downstream_eval = evaluate_regime_fold(
                         model=model,
-                        val_df=val_df,
+                        val_df=val_full_df,
                         feature_columns=feature_columns,
                         policy_params=probe_policy,
                         calibration_p_bad=train_p_bad,
@@ -567,15 +580,17 @@ def tune_policy_parameters(
     fold_models = []
     for fold in folds:
         fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
+        train_full_df = fold_df[fold_df['split'] == 'train']
+        val_full_df = fold_df[fold_df['split'] == 'val']
         model, train_df, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
             seed=seed,
         )
         train_p_bad = None
-        if model is not None and train_df is not None and len(train_df) > 0:
-            train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
-        fold_models.append((model, val_df, train_p_bad))
+        if model is not None and len(train_full_df) > 0:
+            train_p_bad = model.predict_proba(train_full_df[feature_columns])[:, 1]
+        fold_models.append((model, val_full_df, train_p_bad))
 
     best_score = -np.inf
     best_params = None

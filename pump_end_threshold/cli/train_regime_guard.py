@@ -93,7 +93,7 @@ def main():
                         choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
                         help="Scoring mode for hyperparameter optimization")
     parser.add_argument("--policy-grid", type=str, default="default",
-                        choices=["default", "conservative", "aggressive", "selective_local", "low"],
+                        choices=["default", "conservative", "aggressive", "selective_local", "selective_local_extreme", "low"],
                         help="Policy parameter grid preset")
     parser.add_argument("--model-selection-mode", type=str, default="downstream_cv",
                         choices=["downstream_cv", "mean_ap"],
@@ -291,10 +291,10 @@ def main():
             p_bad_test = final_model.predict_proba(X_test)[:, 1]
             test_df['p_bad'] = p_bad_test
 
-            calibration_df = dataset[
-                (dataset['open_time'] < train_end) &
-                dataset[args.target_col].notna()
-            ].copy()
+            calibration_df = dataset[dataset['open_time'] < train_end].copy()
+            if args.embargo_hours > 0:
+                calibration_cutoff = train_end - timedelta(hours=args.embargo_hours)
+                calibration_df = calibration_df[calibration_df['open_time'] < calibration_cutoff].copy()
             calibration_p_bad = None
             if len(calibration_df) > 0:
                 calibration_p_bad = final_model.predict_proba(calibration_df[tune_result['feature_columns']])[:, 1]
