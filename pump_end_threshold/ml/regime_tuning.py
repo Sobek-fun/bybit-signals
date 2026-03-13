@@ -12,6 +12,28 @@ from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_colum
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 
 
+def _build_calibration_frame(
+        fold_df: pd.DataFrame,
+        target_col: str,
+        policy_calibration_mode: str,
+        policy_calibration_lookback_days: int,
+) -> pd.DataFrame:
+    train_full = fold_df[fold_df['split'] == 'train'].copy()
+    if train_full.empty:
+        return train_full
+
+    if policy_calibration_mode == 'fullstream_recent':
+        train_end = train_full['open_time'].max()
+        lookback_start = train_end - pd.Timedelta(days=policy_calibration_lookback_days)
+        recent = train_full[train_full['open_time'] >= lookback_start].copy()
+        min_recent_rows = max(50, int(0.05 * len(train_full)))
+        if len(recent) >= min_recent_rows:
+            return recent
+        return train_full
+
+    return train_full.dropna(subset=[target_col]).copy()
+
+
 def _safe_binary_metrics(y_true: pd.Series, y_score: np.ndarray) -> tuple:
     y = pd.Series(y_true).dropna()
     if len(y) == 0:
@@ -96,11 +118,6 @@ def get_probe_policy_grid(preset: str, max_blocked_share: float = 0.35) -> list:
             {'pause_on_quantile': 0.90, 'resume_quantile': 0.70, 'resume_confirm_signals': 1},
             {'pause_on_quantile': 0.92, 'resume_quantile': 0.75, 'resume_confirm_signals': 1},
         ]
-    if preset == 'selective_local_extreme':
-        return [
-            {'pause_on_quantile': 0.97, 'resume_quantile': 0.85, 'resume_confirm_signals': 1},
-            {'pause_on_quantile': 0.98, 'resume_quantile': 0.90, 'resume_confirm_signals': 1},
-        ]
     probe_quantile = 0.88 if max_blocked_share < 0.25 else 0.80
     return [
         {'pause_on_quantile': probe_quantile, 'resume_quantile': 0.55, 'resume_confirm_signals': 2},
@@ -124,12 +141,6 @@ def get_policy_parameter_grid(preset: str = 'default') -> list:
         policy_grid = {
             'pause_on_quantile': [0.85, 0.88, 0.90, 0.92, 0.95],
             'resume_quantile': [0.60, 0.65, 0.70, 0.75],
-            'resume_confirm_signals': [1],
-        }
-    elif preset == 'selective_local_extreme':
-        policy_grid = {
-            'pause_on_quantile': [0.95, 0.96, 0.97, 0.98, 0.99],
-            'resume_quantile': [0.75, 0.80, 0.85, 0.90],
             'resume_confirm_signals': [1],
         }
     elif preset == 'low':
@@ -431,6 +442,8 @@ def tune_model_hyperparameters(
         model_selection_mode: str = 'downstream_cv',
         feature_profile: str = None,
         policy_grid_preset: str = 'default',
+        cv_policy_calibration_mode: str = 'labeled_train',
+        cv_policy_calibration_lookback_days: int = 30,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -464,20 +477,27 @@ def tune_model_hyperparameters(
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
                 fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
-                train_full_df = fold_df[fold_df['split'] == 'train']
-                val_full_df = fold_df[fold_df['split'] == 'val']
                 model, train_df, val_df = train_regime_fold(
                     fold_df, feature_columns, target_col, params,
                     iterations=iterations, early_stopping_rounds=early_stopping_rounds,
                     seed=curr_seed,
                 )
 
-                if model is None or val_df is None or train_df is None or len(val_df) == 0 or len(val_full_df) == 0:
+                if model is None or val_df is None or train_df is None or len(val_df) == 0:
                     continue
 
                 X_val = val_df[feature_columns]
                 p_bad = model.predict_proba(X_val)[:, 1]
-                train_p_bad = model.predict_proba(train_full_df[feature_columns])[:, 1] if len(train_full_df) > 0 else None
+                calibration_df = _build_calibration_frame(
+                    fold_df=fold_df,
+                    target_col=target_col,
+                    policy_calibration_mode=cv_policy_calibration_mode,
+                    policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
+                )
+                train_p_bad = (
+                    model.predict_proba(calibration_df[feature_columns])[:, 1]
+                    if len(calibration_df) > 0 else None
+                )
 
                 y_val = val_df[target_col]
                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
@@ -490,7 +510,7 @@ def tune_model_hyperparameters(
                 for probe_policy in probe_policies:
                     downstream_eval = evaluate_regime_fold(
                         model=model,
-                        val_df=val_full_df,
+                        val_df=val_df,
                         feature_columns=feature_columns,
                         policy_params=probe_policy,
                         calibration_p_bad=train_p_bad,
@@ -561,6 +581,8 @@ def tune_policy_parameters(
         score_mode: str = 'pnl_improvement',
         policy_grid_preset: str = 'default',
         feature_profile: str = None,
+        cv_policy_calibration_mode: str = 'labeled_train',
+        cv_policy_calibration_lookback_days: int = 30,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -580,17 +602,22 @@ def tune_policy_parameters(
     fold_models = []
     for fold in folds:
         fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
-        train_full_df = fold_df[fold_df['split'] == 'train']
-        val_full_df = fold_df[fold_df['split'] == 'val']
         model, train_df, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
             seed=seed,
         )
-        train_p_bad = None
-        if model is not None and len(train_full_df) > 0:
-            train_p_bad = model.predict_proba(train_full_df[feature_columns])[:, 1]
-        fold_models.append((model, val_full_df, train_p_bad))
+        calibration_p_bad = None
+        if model is not None:
+            calibration_df = _build_calibration_frame(
+                fold_df=fold_df,
+                target_col=target_col,
+                policy_calibration_mode=cv_policy_calibration_mode,
+                policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
+            )
+            if len(calibration_df) > 0:
+                calibration_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
+        fold_models.append((model, val_df, calibration_p_bad))
 
     best_score = -np.inf
     best_params = None
@@ -606,10 +633,10 @@ def tune_policy_parameters(
             break
 
         fold_results = []
-        for model, val_df, train_p_bad in fold_models:
+        for model, val_df, calibration_p_bad in fold_models:
             eval_result = evaluate_regime_fold(
                 model, val_df, feature_columns, policy_params,
-                calibration_p_bad=train_p_bad,
+                calibration_p_bad=calibration_p_bad,
                 max_blocked_share=max_blocked_share,
                 min_signal_keep_rate=min_signal_keep_rate,
                 score_mode=score_mode,
@@ -741,6 +768,8 @@ def tune_regime_guard(
         policy_grid_preset: str = 'default',
         model_selection_mode: str = 'downstream_cv',
         feature_profile: str = None,
+        cv_policy_calibration_mode: str = 'labeled_train',
+        cv_policy_calibration_lookback_days: int = 30,
 ) -> dict:
     model_budget = int(time_budget_min * 0.5)
     policy_budget = int(time_budget_min * 0.5)
@@ -759,6 +788,8 @@ def tune_regime_guard(
         model_selection_mode=model_selection_mode,
         feature_profile=feature_profile,
         policy_grid_preset=policy_grid_preset,
+        cv_policy_calibration_mode=cv_policy_calibration_mode,
+        cv_policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
     )
 
     if model_result['best_params'] is None:
@@ -779,6 +810,8 @@ def tune_regime_guard(
         score_mode=score_mode,
         policy_grid_preset=policy_grid_preset,
         feature_profile=feature_profile,
+        cv_policy_calibration_mode=cv_policy_calibration_mode,
+        cv_policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
     )
 
     if policy_result['best_params'] is None:
