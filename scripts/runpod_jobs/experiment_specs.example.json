@@ -1,18 +1,87 @@
-[
-  {
-    "exp_id": "exp1",
-    "run_root": "/workspace/experiments/exp1_curated55_blockvalue_strict_notpsl"
+{
+  "batch_id": "2026-03-13_guard_v1",
+  "baseline": {
+    "baseline_id": "guard_v1",
+    "self_check_command": "python -m pip --version"
   },
-  {
-    "exp_id": "exp2",
-    "run_root": "/workspace/experiments/exp2_curated55_local_features_blockvalue"
+  "shared_inputs": {
+    "tokens_file": "config/regime_tokens_curated55.txt",
+    "detector_dir": "artifacts/tune_threshold_no_argmax_liq7d_detector",
+    "start_date": "2025-01-01 00:00:00",
+    "train_end": "2026-02-20",
+    "oos_end": "2026-03-03 23:59:59",
+    "clickhouse_dsn": "${CLICKHOUSE_DSN}",
+    "build_dataset_args": {
+      "top_n_universe": 55,
+      "tp_pct": 4.5,
+      "sl_pct": 10.0
+    },
+    "train_args_default": {
+      "iterations": 3500,
+      "score_mode": "block_value"
+    }
   },
-  {
-    "exp_id": "exp3",
-    "run_root": "/workspace/experiments/exp3_curated55_target_good_expanded_full"
+  "pods": [
+    {"alias": "pod1", "pod_id": "replace_me"},
+    {"alias": "pod2", "pod_id": "replace_me"},
+    {"alias": "pod3", "pod_id": "replace_me"},
+    {"alias": "pod4", "pod_id": "replace_me"},
+    {"alias": "pod5", "pod_id": "replace_me"}
+  ],
+  "launch_policy": {
+    "one_active_experiment_per_pod": true,
+    "tail_only": true
   },
-  {
-    "exp_id": "exp4",
-    "run_root": "/workspace/experiments/exp4_curated55_combined_local_targetv3_min3"
-  }
-]
+  "artifact_policy": {
+    "include_paths": [
+      "run_report.md",
+      "run_state.json",
+      "artifacts_manifest.json",
+      "pipeline.log",
+      "summary.json"
+    ]
+  },
+  "experiments": [
+    {
+      "exp_id": "exp1",
+      "pod_alias": "pod1",
+      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp1",
+      "delta": {"transform_script": "scripts/runpod_jobs/apply_experiment_transform.py"}
+    },
+    {
+      "exp_id": "exp2",
+      "pod_alias": "pod2",
+      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp2",
+      "delta": {
+        "transform_script": "scripts/runpod_jobs/apply_experiment_transform.py",
+        "overlay_files": ["scripts/runpod_jobs/transform_template.py"]
+      }
+    },
+    {
+      "exp_id": "exp3",
+      "pod_alias": "pod3",
+      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp3",
+      "delta": {
+        "patch_files": ["scripts/runpod_jobs/examples/exp3.patch"],
+        "transform_script": "scripts/runpod_jobs/apply_experiment_transform.py"
+      }
+    },
+    {
+      "exp_id": "exp4",
+      "pod_alias": "pod4",
+      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp4",
+      "delta": {
+        "command_override": "echo custom command override > /workspace/experiments/2026-03-13_guard_v1/exp4/summary.json"
+      }
+    },
+    {
+      "exp_id": "exp5",
+      "pod_alias": "pod5",
+      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp5",
+      "delta": {
+        "changed_files": ["scripts/runpod_jobs/apply_experiment_transform.py"],
+        "params_override": {"target_col": "target_pause_value_next_12h"}
+      }
+    }
+  ]
+}

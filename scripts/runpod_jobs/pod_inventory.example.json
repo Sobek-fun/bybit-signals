@@ -1,0 +1,19 @@
+{
+  "pods": [
+    {
+      "alias": "pod1",
+      "pod_id": "6h7k...abc",
+      "ssh_user": "root"
+    },
+    {
+      "alias": "pod2",
+      "pod_id": "7l8m...def",
+      "ssh_user": "root"
+    },
+    {
+      "alias": "pod3",
+      "pod_id": "8n9o...ghi",
+      "ssh_user": "root"
+    }
+  ]
+}

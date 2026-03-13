@@ -1,0 +1,45 @@
+{
+  "batch_id": "2026-03-13_guard_v1",
+  "created_at": "2026-03-13T10:00:00+00:00",
+  "baseline": {
+    "baseline_id": "guard_v1",
+    "baseline_hash": "sha256...",
+    "bundle_path": "artifacts/runpod_batches/2026-03-13_guard_v1/baseline/baseline_bundle.tgz",
+    "shared_inputs_hash": "sha256...",
+    "cache_key": "sha256..."
+  },
+  "shared_inputs": {
+    "tokens_file": "config/regime_tokens_curated55.txt",
+    "detector_dir": "artifacts/tune_threshold_no_argmax_liq7d_detector",
+    "clickhouse_dsn": "${CLICKHOUSE_DSN}"
+  },
+  "pods": [
+    {"alias": "pod1", "pod_id": "xxxx"},
+    {"alias": "pod2", "pod_id": "yyyy"}
+  ],
+  "experiments": [
+    {
+      "exp_id": "exp1",
+      "pod_alias": "pod1",
+      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp1",
+      "delta": {
+        "transform_script": "scripts/runpod_jobs/apply_experiment_transform.py",
+        "overlay_files": [],
+        "patch_files": [],
+        "changed_files": [],
+        "command_override": "",
+        "params_override": {}
+      },
+      "expected_checks": []
+    }
+  ],
+  "launch_policy": {
+    "one_active_experiment_per_pod": true,
+    "tail_only": true,
+    "dry_run": false
+  },
+  "artifact_policy": {
+    "include_paths": ["run_report.md", "pipeline.log", "run_state.json"],
+    "required_paths": ["run_report.md", "run_state.json"]
+  }
+}
