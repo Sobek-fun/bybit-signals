@@ -95,16 +95,6 @@ LOCAL_ONLY_EXCLUDED_COLUMNS = {
     'strat_last_closed_is_tp',
 }
 
-LOCAL_PLUS_MARKET_EXCLUDED_PREFIXES = (
-    'strat_resolved_',
-    'strat_prev_closed_',
-)
-
-LOCAL_PLUS_MARKET_EXCLUDED_COLUMNS = {
-    'strat_last_closed_is_sl',
-    'strat_last_closed_is_tp',
-}
-
 
 def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) -> list:
     features = []
@@ -118,10 +108,7 @@ def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) ->
                 continue
             if any(col.startswith(p) for p in LOCAL_ONLY_EXCLUDED_PREFIXES):
                 continue
-        if feature_profile == 'local_plus_market':
-            if col in LOCAL_PLUS_MARKET_EXCLUDED_COLUMNS:
-                continue
-            if any(col.startswith(p) for p in LOCAL_PLUS_MARKET_EXCLUDED_PREFIXES):
-                continue
+        if feature_profile == 'token_only' and not col.startswith('token_'):
+            continue
         features.append(col)
     return features

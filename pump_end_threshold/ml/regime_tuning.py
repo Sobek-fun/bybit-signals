@@ -12,28 +12,6 @@ from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_colum
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 
 
-def _build_calibration_frame(
-        fold_df: pd.DataFrame,
-        target_col: str,
-        policy_calibration_mode: str,
-        policy_calibration_lookback_days: int,
-) -> pd.DataFrame:
-    train_full = fold_df[fold_df['split'] == 'train'].copy()
-    if train_full.empty:
-        return train_full
-
-    if policy_calibration_mode == 'fullstream_recent':
-        train_end = train_full['open_time'].max()
-        lookback_start = train_end - pd.Timedelta(days=policy_calibration_lookback_days)
-        recent = train_full[train_full['open_time'] >= lookback_start].copy()
-        min_recent_rows = max(50, int(0.05 * len(train_full)))
-        if len(recent) >= min_recent_rows:
-            return recent
-        return train_full
-
-    return train_full.dropna(subset=[target_col]).copy()
-
-
 def _safe_binary_metrics(y_true: pd.Series, y_score: np.ndarray) -> tuple:
     y = pd.Series(y_true).dropna()
     if len(y) == 0:
@@ -442,8 +420,6 @@ def tune_model_hyperparameters(
         model_selection_mode: str = 'downstream_cv',
         feature_profile: str = None,
         policy_grid_preset: str = 'default',
-        cv_policy_calibration_mode: str = 'labeled_train',
-        cv_policy_calibration_lookback_days: int = 30,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -488,16 +464,7 @@ def tune_model_hyperparameters(
 
                 X_val = val_df[feature_columns]
                 p_bad = model.predict_proba(X_val)[:, 1]
-                calibration_df = _build_calibration_frame(
-                    fold_df=fold_df,
-                    target_col=target_col,
-                    policy_calibration_mode=cv_policy_calibration_mode,
-                    policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
-                )
-                train_p_bad = (
-                    model.predict_proba(calibration_df[feature_columns])[:, 1]
-                    if len(calibration_df) > 0 else None
-                )
+                train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
 
                 y_val = val_df[target_col]
                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
@@ -581,8 +548,6 @@ def tune_policy_parameters(
         score_mode: str = 'pnl_improvement',
         policy_grid_preset: str = 'default',
         feature_profile: str = None,
-        cv_policy_calibration_mode: str = 'labeled_train',
-        cv_policy_calibration_lookback_days: int = 30,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -607,17 +572,10 @@ def tune_policy_parameters(
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
             seed=seed,
         )
-        calibration_p_bad = None
-        if model is not None:
-            calibration_df = _build_calibration_frame(
-                fold_df=fold_df,
-                target_col=target_col,
-                policy_calibration_mode=cv_policy_calibration_mode,
-                policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
-            )
-            if len(calibration_df) > 0:
-                calibration_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
-        fold_models.append((model, val_df, calibration_p_bad))
+        train_p_bad = None
+        if model is not None and train_df is not None and len(train_df) > 0:
+            train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
+        fold_models.append((model, val_df, train_p_bad))
 
     best_score = -np.inf
     best_params = None
@@ -633,10 +591,10 @@ def tune_policy_parameters(
             break
 
         fold_results = []
-        for model, val_df, calibration_p_bad in fold_models:
+        for model, val_df, train_p_bad in fold_models:
             eval_result = evaluate_regime_fold(
                 model, val_df, feature_columns, policy_params,
-                calibration_p_bad=calibration_p_bad,
+                calibration_p_bad=train_p_bad,
                 max_blocked_share=max_blocked_share,
                 min_signal_keep_rate=min_signal_keep_rate,
                 score_mode=score_mode,
@@ -768,8 +726,6 @@ def tune_regime_guard(
         policy_grid_preset: str = 'default',
         model_selection_mode: str = 'downstream_cv',
         feature_profile: str = None,
-        cv_policy_calibration_mode: str = 'labeled_train',
-        cv_policy_calibration_lookback_days: int = 30,
 ) -> dict:
     model_budget = int(time_budget_min * 0.5)
     policy_budget = int(time_budget_min * 0.5)
@@ -788,8 +744,6 @@ def tune_regime_guard(
         model_selection_mode=model_selection_mode,
         feature_profile=feature_profile,
         policy_grid_preset=policy_grid_preset,
-        cv_policy_calibration_mode=cv_policy_calibration_mode,
-        cv_policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
     )
 
     if model_result['best_params'] is None:
@@ -810,8 +764,6 @@ def tune_regime_guard(
         score_mode=score_mode,
         policy_grid_preset=policy_grid_preset,
         feature_profile=feature_profile,
-        cv_policy_calibration_mode=cv_policy_calibration_mode,
-        cv_policy_calibration_lookback_days=cv_policy_calibration_lookback_days,
     )
 
     if policy_result['best_params'] is None:

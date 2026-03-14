@@ -89,27 +89,17 @@ def main():
     parser.add_argument("--min-signal-keep-rate", type=float, default=0.45)
     parser.add_argument("--min-valid-folds", type=int, default=2,
                         help="Minimum number of valid folds required")
-    parser.add_argument("--score-mode", type=str, default="block_value",
+    parser.add_argument("--score-mode", type=str, default="pnl_improvement",
                         choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
                         help="Scoring mode for hyperparameter optimization")
-    parser.add_argument("--policy-grid", type=str, default="selective_local",
+    parser.add_argument("--policy-grid", type=str, default="default",
                         choices=["default", "conservative", "aggressive", "selective_local", "low"],
                         help="Policy parameter grid preset")
     parser.add_argument("--model-selection-mode", type=str, default="downstream_cv",
                         choices=["downstream_cv", "mean_ap"],
                         help="Model selection objective during model tuning")
-    parser.add_argument("--feature-profile", type=str, default="local_only",
+    parser.add_argument("--feature-profile", type=str, default=None,
                         help="Feature profile: local_only excludes market/breadth/outcome-derived columns")
-    parser.add_argument("--cv-policy-calibration-mode", type=str, default="labeled_train",
-                        choices=["labeled_train", "fullstream_recent"],
-                        help="Calibration source for CV policy threshold resolution")
-    parser.add_argument("--cv-policy-calibration-lookback-days", type=int, default=30,
-                        help="Lookback window in days for CV fullstream_recent calibration mode")
-    parser.add_argument("--final-policy-calibration-mode", type=str, default="labeled_train",
-                        choices=["labeled_train", "fullstream_recent"],
-                        help="Calibration source for final holdout policy threshold resolution")
-    parser.add_argument("--final-policy-calibration-lookback-days", type=int, default=30,
-                        help="Lookback window in days for final fullstream_recent calibration mode")
     parser.add_argument("--disable-auto-class-weights", action="store_true",
                         help="Disable auto_class_weights in CatBoost (use manual sample_weight instead)")
     parser.add_argument("--run-dir", type=str, default=None,
@@ -193,8 +183,6 @@ def main():
         policy_grid_preset=args.policy_grid,
         model_selection_mode=args.model_selection_mode,
         feature_profile=args.feature_profile,
-        cv_policy_calibration_mode=args.cv_policy_calibration_mode,
-        cv_policy_calibration_lookback_days=args.cv_policy_calibration_lookback_days,
     )
 
     log("INFO", "REGIME",
@@ -303,22 +291,10 @@ def main():
             p_bad_test = final_model.predict_proba(X_test)[:, 1]
             test_df['p_bad'] = p_bad_test
 
-            calibration_cutoff = train_end - timedelta(hours=args.embargo_hours)
-            if args.final_policy_calibration_mode == "fullstream_recent":
-                pretrain_full = dataset[dataset['open_time'] < calibration_cutoff].copy()
-                if len(pretrain_full) > 0:
-                    lookback_start = calibration_cutoff - timedelta(days=args.final_policy_calibration_lookback_days)
-                    calibration_df = pretrain_full[pretrain_full['open_time'] >= lookback_start].copy()
-                    min_recent_rows = max(50, int(0.05 * len(pretrain_full)))
-                    if len(calibration_df) < min_recent_rows:
-                        calibration_df = pretrain_full
-                else:
-                    calibration_df = pretrain_full
-            else:
-                calibration_df = dataset[
-                    (dataset['open_time'] < calibration_cutoff) &
-                    (dataset[args.target_col].notna())
-                ].copy()
+            calibration_df = dataset[
+                (dataset['open_time'] < train_end) &
+                dataset[args.target_col].notna()
+            ].copy()
             calibration_p_bad = None
             if len(calibration_df) > 0:
                 calibration_p_bad = final_model.predict_proba(calibration_df[tune_result['feature_columns']])[:, 1]

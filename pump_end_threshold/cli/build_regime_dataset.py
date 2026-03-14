@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--sl-pct", type=float, default=10.0)
     parser.add_argument("--max-horizon-bars", type=int, default=200)
     parser.add_argument("--target-horizon-signals", type=int, default=5)
-    parser.add_argument("--target-min-resolved", type=int, default=2)
+    parser.add_argument("--target-min-resolved", type=int, default=3)
     parser.add_argument("--target-sl-rate-threshold", type=float, default=0.60)
     parser.add_argument("--target-col", type=str, default="target_pause_value_next_12h",
                         help="Name of the target column to use for training")
@@ -57,13 +57,10 @@ def main():
     parser.add_argument("--trade-replay-source", type=str, default="1s",
                         choices=["1m", "1s"],
                         help="Trade replay source: 1m (fast, no 1s resolve) or 1s (exact with 1s replay)")
-    parser.add_argument("--target-profile", type=str, default="pause_value_12h_v3_clean_extremes",
+    parser.add_argument("--target-profile", type=str, default=None,
                         help="Target profile name (e.g., pause_value_12h_v2_all, pause_value_12h_v2_curated)")
-    parser.add_argument("--feature-profile", type=str, default="regime_compact_v4",
+    parser.add_argument("--feature-profile", type=str, default=None,
                         help="Feature profile name for documentation/versioning")
-    parser.add_argument("--sample-weight-mode", type=str, default="pause12h",
-                        choices=["pause12h", "uniform"],
-                        help="Sample weighting mode: pause12h (legacy) or uniform (target-aware)")
 
     args = parser.parse_args()
 
@@ -202,8 +199,6 @@ def main():
         min_resolved=args.target_min_resolved,
         sl_rate_threshold=args.target_sl_rate_threshold,
         target_profile=args.target_profile,
-        target_col=args.target_col,
-        sample_weight_mode=args.sample_weight_mode,
     )
 
     if dataset.empty:
@@ -260,7 +255,6 @@ def main():
             'trade_replay_source': args.trade_replay_source,
             'target_profile': args.target_profile,
             'feature_profile': args.feature_profile,
-            'sample_weight_mode': args.sample_weight_mode,
             'symbols_file': args.symbols_file,
             'fixed_universe_file': args.fixed_universe_file,
             'strategy_state_mode': STRATEGY_STATE_MODE,
@@ -335,7 +329,6 @@ def main():
             'available_target_columns': available_target_columns,
             'feature_version': 'v4',
             'feature_profile': args.feature_profile or 'regime_compact_v4',
-            'sample_weight_mode': args.sample_weight_mode,
             'trade_replay_source': args.trade_replay_source,
             'target_profile': args.target_profile,
             'symbols_file': args.symbols_file,

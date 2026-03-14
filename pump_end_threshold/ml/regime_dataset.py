@@ -475,7 +475,7 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
     if target_profile and target_profile in TARGET_PROFILES:
         profile = TARGET_PROFILES[target_profile]
     else:
-        profile = TARGET_PROFILES['pause_value_12h_v3_clean_extremes']
+        profile = TARGET_PROFILES['pause_value_12h_v2_all']
 
     pause_targets = compute_pause_value_targets(
         trades_df, current_time, **profile
@@ -492,8 +492,6 @@ def build_regime_dataset(
         min_resolved: int = 3,
         sl_rate_threshold: float = 0.60,
         target_profile: str = None,
-        target_col: str = 'target_pause_value_next_12h',
-        sample_weight_mode: str = 'pause12h',
 ) -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trades = trades_df.sort_values('open_time').reset_index(drop=True)
@@ -581,29 +579,23 @@ def build_regime_dataset(
         row['trade_duration_bars'] = trade['trade_duration_bars']
         row.update(targets)
 
-        target_val = targets.get(target_col, np.nan)
-        pause_target_val = targets.get('target_pause_value_next_12h', np.nan)
+        target_val = targets.get('target_pause_value_next_12h', np.nan)
 
-        if sample_weight_mode == 'uniform':
-            row['sample_weight'] = 1.0 if not pd.isna(target_val) else np.nan
-        elif sample_weight_mode == 'pause12h':
-            if pd.isna(pause_target_val):
-                row['sample_weight'] = np.nan
-            elif pause_target_val == 1:
-                block_val = targets.get('future_block_value_next_12h', 0)
-                severity = abs(block_val) if not pd.isna(block_val) else 0
-                if severity >= 20:
-                    row['sample_weight'] = 2.0
-                else:
-                    row['sample_weight'] = 1.5
+        if pd.isna(target_val):
+            row['sample_weight'] = np.nan
+        elif target_val == 1:
+            block_val = targets.get('future_block_value_next_12h', 0)
+            severity = abs(block_val) if not pd.isna(block_val) else 0
+            if severity >= 20:
+                row['sample_weight'] = 2.0
             else:
-                block_val = targets.get('future_block_value_next_12h', 0)
-                if not pd.isna(block_val) and block_val >= 15:
-                    row['sample_weight'] = 1.5
-                else:
-                    row['sample_weight'] = 1.2
+                row['sample_weight'] = 1.5
         else:
-            raise ValueError(f"Unknown sample_weight_mode: {sample_weight_mode}")
+            block_val = targets.get('future_block_value_next_12h', 0)
+            if not pd.isna(block_val) and block_val >= 15:
+                row['sample_weight'] = 1.5
+            else:
+                row['sample_weight'] = 1.2
 
         rows.append(row)
 
