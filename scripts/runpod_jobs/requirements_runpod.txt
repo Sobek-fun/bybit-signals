@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+scikit-learn
+pyarrow
+clickhouse-connect
+catboost
+lightgbm
+joblib
+requests

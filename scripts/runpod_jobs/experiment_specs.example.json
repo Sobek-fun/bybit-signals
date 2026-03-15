@@ -1,87 +1,25 @@
 {
-  "batch_id": "2026-03-13_guard_v1",
-  "baseline": {
-    "baseline_id": "guard_v1",
-    "self_check_command": "python -m pip --version"
-  },
-  "shared_inputs": {
-    "tokens_file": "config/regime_tokens_curated55.txt",
-    "detector_dir": "artifacts/tune_threshold_no_argmax_liq7d_detector",
-    "start_date": "2025-01-01 00:00:00",
-    "train_end": "2026-02-20",
-    "oos_end": "2026-03-03 23:59:59",
-    "clickhouse_dsn": "${CLICKHOUSE_DSN}",
-    "build_dataset_args": {
-      "top_n_universe": 55,
-      "tp_pct": 4.5,
-      "sl_pct": 10.0
-    },
-    "train_args_default": {
-      "iterations": 3500,
-      "score_mode": "block_value"
-    }
-  },
-  "pods": [
-    {"alias": "pod1", "pod_id": "replace_me"},
-    {"alias": "pod2", "pod_id": "replace_me"},
-    {"alias": "pod3", "pod_id": "replace_me"},
-    {"alias": "pod4", "pod_id": "replace_me"},
-    {"alias": "pod5", "pod_id": "replace_me"}
-  ],
-  "launch_policy": {
-    "one_active_experiment_per_pod": true,
-    "tail_only": true
-  },
-  "artifact_policy": {
-    "include_paths": [
-      "run_report.md",
-      "run_state.json",
-      "artifacts_manifest.json",
-      "pipeline.log",
-      "summary.json"
-    ]
+  "batch_id": "2026-03-15_exp18_minimal",
+  "runtime": {
+    "workspace_root": "/workspace/experiments",
+    "requirements_file": "scripts/runpod_jobs/requirements_runpod.txt",
+    "clickhouse_dsn_env": "CH_DB",
+    "detector_dir_remote": "/workspace/bybit-signals/artifacts/tune_threshold_no_argmax_liq7d_detector",
+    "tokens_file_remote": "/workspace/bybit-signals/config/regime_tokens_curated55.txt",
+    "pipeline_command": "RUN_ROOT=\"${RUN_ROOT}\" && DETECTOR_DIR=\"${DETECTOR_DIR}\" && TOKENS_FILE=\"${TOKENS_FILE}\" && SIGNALS_CSV=\"$RUN_ROOT/pump_end_signals_prod.csv\" && WORKERS=\"${WORKERS:-8}\" && TRAIN_END=\"2026-02-20\" && OOS_END=\"2026-03-14 23:59:59\" && mkdir -p \"$RUN_ROOT\" && TOKENS_CSV=$(sed 's/USDT$//i' \"$TOKENS_FILE\" | tr '\\n' ',' | sed 's/,$//') && python -u -m pump_end_prod.pump_end_export_main --token \"$TOKENS_CSV\" --ch-dsn \"${CH_DB}\" --model-dir \"$DETECTOR_DIR\" --from \"2025-01-01 00:00:00\" --to \"$OOS_END\" --out \"$SIGNALS_CSV\" --workers \"$WORKERS\" && python -u -m pump_end_threshold.cli.build_regime_dataset --clickhouse-dsn \"${CH_DB}\" --signals-path \"$SIGNALS_CSV\" --symbols-file \"$TOKENS_FILE\" --fixed-universe-file \"$TOKENS_FILE\" --run-dir \"$RUN_ROOT\" --output \"$RUN_ROOT/regime_dataset.parquet\" --top-n-universe 55 --tp-pct 4.5 --sl-pct 10.0 --max-horizon-bars 200 --trade-replay-source \"1s\" --target-col \"target_pause_value_next_12h\" --target-profile \"pause_value_12h_v3_clean_extremes\" --target-min-resolved 2 --target-sl-rate-threshold 0.60 --feature-profile \"regime_compact_v4\" && python -u -m pump_end_threshold.cli.train_regime_guard --run-dir \"$RUN_ROOT\" --dataset-parquet \"$RUN_ROOT/regime_dataset.parquet\" --target-col \"target_pause_value_next_12h\" --train-end \"$TRAIN_END\" --time-budget-min 60 --fold-days 21 --min-train-days 120 --embargo-hours 12 --iterations 8000 --early-stopping-rounds 250 --seed 42 --score-mode \"block_value\" --model-selection-mode \"downstream_cv\" --feature-profile \"local_only\" --max-blocked-share 0.18 --min-signal-keep-rate 0.80 --min-valid-folds 4 --policy-grid \"selective_local\" --cv-calibration-scope \"train_fullstream\" --inference-calibration-scope \"train_fullstream\" --inference-threshold-mode \"reresolve_on_inference_calibration\""
   },
   "experiments": [
     {
-      "exp_id": "exp1",
-      "pod_alias": "pod1",
-      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp1",
-      "delta": {"transform_script": "scripts/runpod_jobs/apply_experiment_transform.py"}
+      "exp_id": "baseline",
+      "pod_alias": "pod-a",
+      "patch_files": []
     },
     {
-      "exp_id": "exp2",
-      "pod_alias": "pod2",
-      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp2",
-      "delta": {
-        "transform_script": "scripts/runpod_jobs/apply_experiment_transform.py",
-        "overlay_files": ["scripts/runpod_jobs/transform_template.py"]
-      }
-    },
-    {
-      "exp_id": "exp3",
-      "pod_alias": "pod3",
-      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp3",
-      "delta": {
-        "patch_files": ["scripts/runpod_jobs/examples/exp3.patch"],
-        "transform_script": "scripts/runpod_jobs/apply_experiment_transform.py"
-      }
-    },
-    {
-      "exp_id": "exp4",
-      "pod_alias": "pod4",
-      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp4",
-      "delta": {
-        "command_override": "echo custom command override > /workspace/experiments/2026-03-13_guard_v1/exp4/summary.json"
-      }
-    },
-    {
-      "exp_id": "exp5",
-      "pod_alias": "pod5",
-      "run_dir": "/workspace/experiments/2026-03-13_guard_v1/exp5",
-      "delta": {
-        "changed_files": ["scripts/runpod_jobs/apply_experiment_transform.py"],
-        "params_override": {"target_col": "target_pause_value_next_12h"}
-      }
+      "exp_id": "patch_a",
+      "pod_alias": "pod-b",
+      "patch_files": [
+        "scripts/runpod_jobs/examples/patch_a.diff"
+      ]
     }
   ]
 }

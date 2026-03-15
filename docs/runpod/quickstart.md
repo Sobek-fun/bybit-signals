@@ -1,73 +1,55 @@
-# Quickstart
+# RunPod Minimal Flow
 
-## 1) Подготовить baseline и batch manifest
+Только три команды: `doctor`, `launch`, `relaunch`.
+
+## Формат minimal spec
+
+Файл: `scripts/runpod_jobs/experiment_specs.example.json`
+
+- `batch_id`: идентификатор батча.
+- `runtime.workspace_root`: обычно `/workspace/experiments`.
+- `runtime.requirements_file`: путь внутри upload-snapshot.
+- `runtime.pipeline_command`: базовая команда пайплайна (использует `RUN_ROOT`, `DETECTOR_DIR`, `TOKENS_FILE`).
+- `runtime.clickhouse_dsn_env`: имя env-переменной на pod (например `CH_DB`).
+- `runtime.detector_dir_remote`: внешний путь на pod к detector.
+- `runtime.tokens_file_remote`: внешний путь на pod к tokens-файлу.
+- `experiments[]`: `exp_id`, `pod_alias`, `patch_files[]`.
+
+## Формат pod inventory
+
+Файл: `scripts/runpod_jobs/pod_inventory.example.json`
+
+Для каждого alias:
+- либо `host` + `port` (прямой SSH),
+- либо `pod_id` (SSH endpoint будет резолвиться через RunPod API).
+
+## Команда launch
 
 ```bash
-python -m scripts.runpod_jobs.cli prepare_batch \
-  --spec-file scripts/runpod_jobs/experiment_specs.example.json
-```
-
-Результат:
-- `artifacts/runpod_batches/<batch_id>/batch_manifest.json`
-- `artifacts/runpod_batches/<batch_id>/baseline/baseline_manifest.json`
-- `artifacts/runpod_batches/<batch_id>/dry_run_plan.json`
-
-## 2) Запустить 5 экспериментов на 5 существующих pod
-
-```bash
-python -m scripts.runpod_jobs.cli launch_batch \
-  --batch-manifest artifacts/runpod_batches/<batch_id>/batch_manifest.json \
+python -m scripts.runpod_jobs.cli launch \
+  --spec-file scripts/runpod_jobs/experiment_specs.example.json \
   --pod-inventory scripts/runpod_jobs/pod_inventory.example.json \
-  --runpod-api-key $RUNPOD_API_KEY \
-  --ssh-key-path ~/.ssh/id_ed25519 \
-  --tail-only
-```
-
-В `--tail-only` mode stdout печатает только по одной `tail -f` команде на experiment.
-
-Опционально можно разрешить создание недостающих pod:
-
-```bash
-python -m scripts.runpod_jobs.cli launch_batch \
-  --batch-manifest artifacts/runpod_batches/<batch_id>/batch_manifest.json \
-  --pod-inventory scripts/runpod_jobs/pod_inventory.example.json \
-  --runpod-api-key $RUNPOD_API_KEY \
-  --pod-template-file scripts/runpod_jobs/examples/pod_create_template.json \
-  --create-missing-pods
-```
-
-## 3) Проверить статус
-
-```bash
-python -m scripts.runpod_jobs.cli status_batch \
-  --batch-manifest artifacts/runpod_batches/<batch_id>/batch_manifest.json \
-  --runpod-api-key $RUNPOD_API_KEY \
+  --runpod-api-key "$RUNPOD_API_KEY" \
   --ssh-key-path ~/.ssh/id_ed25519
 ```
 
-Сводка пишется в:
-- `artifacts/runpod_batches/<batch_id>/batch_status.json`
+В stdout печатаются только уникальные `tail -f` команды для каждого эксперимента.
 
-## 4) Скачать результаты
-
-```bash
-python -m scripts.runpod_jobs.cli download_batch \
-  --batch-manifest artifacts/runpod_batches/<batch_id>/batch_manifest.json \
-  --runpod-api-key $RUNPOD_API_KEY \
-  --ssh-key-path ~/.ssh/id_ed25519
-```
-
-Артефакты:
-- `artifacts/runpod_batches/<batch_id>/downloaded/<exp_id>/...`
-
-## 5) Перезапустить только один failed experiment
+## Команда relaunch (один experiment)
 
 ```bash
-python -m scripts.runpod_jobs.cli relaunch_experiment \
-  --batch-manifest artifacts/runpod_batches/<batch_id>/batch_manifest.json \
+python -m scripts.runpod_jobs.cli relaunch \
+  --spec-file scripts/runpod_jobs/experiment_specs.example.json \
   --pod-inventory scripts/runpod_jobs/pod_inventory.example.json \
-  --runpod-api-key $RUNPOD_API_KEY \
+  --runpod-api-key "$RUNPOD_API_KEY" \
   --ssh-key-path ~/.ssh/id_ed25519 \
-  --exp-id exp3 \
-  --tail-only
+  --exp-id patch_a
 ```
+
+`relaunch` удаляет только workspace одного эксперимента, пересобирает и перезапускает только его.
+
+## Что делает пользователь вручную
+
+- Следит за логом через выведенную `tail -f` команду.
+- Сам скачивает нужные артефакты.
+- Сам останавливает pod после завершения.

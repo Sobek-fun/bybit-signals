@@ -1,245 +1,85 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXP_ID=""
+SRC_DIR=""
 RUN_DIR=""
-RELEASE_DIR=""
 VENV_DIR=""
-TMP_DIR=""
-BASELINE_HASH=""
-CACHE_ROOT="/workspace/experiments/_baseline_cache"
-LOCKS_ROOT="/workspace/experiments/_locks"
-CLICKHOUSE_DSN=""
-DETECTOR_DIR="artifacts/tune_threshold_no_argmax_liq7d_detector"
-TOKENS_FILE="config/regime_tokens_curated55.txt"
-TRANSFORM_SCRIPT="scripts/runpod_jobs/transform_template.py"
-TARGET_COL=""
-TRAIN_END=""
-OOS_END=""
-START_DATE=""
-BUILD_DATASET_ARGS_JSON="{}"
-TRAIN_ARGS_JSON="{}"
-PARAMS_OVERRIDE_JSON="{}"
-COMMAND_OVERRIDE=""
+LOG_PATH=""
+STARTED_AT_PATH=""
+FINISHED_AT_PATH=""
+EXIT_CODE_PATH=""
+LAUNCH_COMMAND_PATH=""
+PYTHON_BIN="python3"
+REQUIREMENTS_FILE="scripts/runpod_jobs/requirements_runpod.txt"
+CLICKHOUSE_DSN_ENV="CH_DB"
+DETECTOR_DIR_REMOTE=""
+TOKENS_FILE_REMOTE=""
+SETUP_COMMAND=""
+LAUNCH_COMMAND=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --exp-id) EXP_ID="$2"; shift 2;;
+    --src-dir) SRC_DIR="$2"; shift 2;;
     --run-dir) RUN_DIR="$2"; shift 2;;
-    --release-dir) RELEASE_DIR="$2"; shift 2;;
     --venv-dir) VENV_DIR="$2"; shift 2;;
-    --tmp-dir) TMP_DIR="$2"; shift 2;;
-    --baseline-hash) BASELINE_HASH="$2"; shift 2;;
-    --cache-root) CACHE_ROOT="$2"; shift 2;;
-    --locks-root) LOCKS_ROOT="$2"; shift 2;;
-    --clickhouse-dsn) CLICKHOUSE_DSN="$2"; shift 2;;
-    --detector-dir) DETECTOR_DIR="$2"; shift 2;;
-    --tokens-file) TOKENS_FILE="$2"; shift 2;;
-    --transform-script) TRANSFORM_SCRIPT="$2"; shift 2;;
-    --target-col) TARGET_COL="$2"; shift 2;;
-    --train-end) TRAIN_END="$2"; shift 2;;
-    --oos-end) OOS_END="$2"; shift 2;;
-    --start-date) START_DATE="$2"; shift 2;;
-    --build-dataset-args-json) BUILD_DATASET_ARGS_JSON="$2"; shift 2;;
-    --train-args-json) TRAIN_ARGS_JSON="$2"; shift 2;;
-    --params-override-json) PARAMS_OVERRIDE_JSON="$2"; shift 2;;
-    --command-override) COMMAND_OVERRIDE="$2"; shift 2;;
+    --log-path) LOG_PATH="$2"; shift 2;;
+    --started-at-path) STARTED_AT_PATH="$2"; shift 2;;
+    --finished-at-path) FINISHED_AT_PATH="$2"; shift 2;;
+    --exit-code-path) EXIT_CODE_PATH="$2"; shift 2;;
+    --launch-command-path) LAUNCH_COMMAND_PATH="$2"; shift 2;;
+    --python-bin) PYTHON_BIN="$2"; shift 2;;
+    --requirements-file) REQUIREMENTS_FILE="$2"; shift 2;;
+    --clickhouse-dsn-env) CLICKHOUSE_DSN_ENV="$2"; shift 2;;
+    --detector-dir-remote) DETECTOR_DIR_REMOTE="$2"; shift 2;;
+    --tokens-file-remote) TOKENS_FILE_REMOTE="$2"; shift 2;;
+    --setup-command) SETUP_COMMAND="$2"; shift 2;;
+    --launch-command) LAUNCH_COMMAND="$2"; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
 
-if [[ -z "$EXP_ID" || -z "$RUN_DIR" || -z "$RELEASE_DIR" || -z "$VENV_DIR" || -z "$TMP_DIR" || -z "$BASELINE_HASH" ]]; then
+if [[ -z "$SRC_DIR" || -z "$RUN_DIR" || -z "$VENV_DIR" || -z "$LOG_PATH" || -z "$STARTED_AT_PATH" || -z "$FINISHED_AT_PATH" || -z "$EXIT_CODE_PATH" || -z "$LAUNCH_COMMAND_PATH" || -z "$DETECTOR_DIR_REMOTE" || -z "$TOKENS_FILE_REMOTE" || -z "$LAUNCH_COMMAND" ]]; then
   echo "required args are missing"
   exit 2
 fi
-if [[ -z "$CLICKHOUSE_DSN" ]]; then
-  echo "clickhouse dsn is required"
-  exit 2
+
+mkdir -p "$RUN_DIR"
+rm -rf "$VENV_DIR"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STARTED_AT_PATH"
+
+on_exit() {
+  local code=$?
+  date -u +"%Y-%m-%dT%H:%M:%SZ" > "$FINISHED_AT_PATH"
+  echo "$code" > "$EXIT_CODE_PATH"
+}
+trap on_exit EXIT
+
+if [[ ! -f "$SRC_DIR/$REQUIREMENTS_FILE" ]]; then
+  echo "requirements file not found: $SRC_DIR/$REQUIREMENTS_FILE"
+  exit 3
+fi
+if [[ ! -d "$DETECTOR_DIR_REMOTE" ]]; then
+  echo "missing detector dir: $DETECTOR_DIR_REMOTE"
+  exit 4
+fi
+if [[ ! -f "$TOKENS_FILE_REMOTE" ]]; then
+  echo "missing tokens file: $TOKENS_FILE_REMOTE"
+  exit 5
+fi
+if [[ -z "${!CLICKHOUSE_DSN_ENV:-}" ]]; then
+  echo "missing required env var: $CLICKHOUSE_DSN_ENV"
+  exit 6
 fi
 
-cd "$RELEASE_DIR"
-mkdir -p "$RUN_DIR" "$TMP_DIR" "$LOCKS_ROOT"
-rm -rf "$VENV_DIR"
-
-ensure_uv() {
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 is required on pod"
-    exit 3
-  fi
-  if ! command -v uv >/dev/null 2>&1; then
-    python3 -m pip install --upgrade pip >/tmp/runpod_uv_bootstrap.log 2>&1
-    python3 -m pip install uv >>/tmp/runpod_uv_bootstrap.log 2>&1
-  fi
-}
-
-create_cache_if_needed() {
-  local cache_dir="$CACHE_ROOT/$BASELINE_HASH"
-  local lock_dir="$LOCKS_ROOT/baseline_${BASELINE_HASH}.lock"
-  local lock_owner_file="${lock_dir}.owner"
-  local lock_wait_seconds="${LOCK_WAIT_SECONDS:-1800}"
-  local lock_stale_seconds="${LOCK_STALE_SECONDS:-900}"
-  local lock_wait_started
-  local marker="$cache_dir/done.marker"
-  local manifest="$cache_dir/cache_manifest.json"
-  local raw="$cache_dir/raw_detector_signals_curated55.parquet"
-  local base="$cache_dir/regime_dataset_base.parquet"
-
-  lock_wait_started="$(date +%s)"
-  mkdir -p "$CACHE_ROOT" "$LOCKS_ROOT"
-  if [[ -f "$marker" && -f "$manifest" && -f "$raw" && -f "$base" ]]; then
-    return 0
-  fi
-
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    local now elapsed owner_ts owner_age
-    sleep 3
-    if [[ -f "$marker" && -f "$manifest" && -f "$raw" && -f "$base" ]]; then
-      return 0
-    fi
-    now="$(date +%s)"
-    elapsed=$((now - lock_wait_started))
-    owner_ts=""
-    if [[ -f "$lock_owner_file" ]]; then
-      owner_ts="$(awk 'NR==1 {print $1}' "$lock_owner_file" 2>/dev/null || true)"
-    fi
-    owner_age=0
-    if [[ "$owner_ts" =~ ^[0-9]+$ ]]; then
-      owner_age=$((now - owner_ts))
-    fi
-    if [[ $owner_age -gt $lock_stale_seconds ]]; then
-      rm -rf "$lock_dir" "$lock_owner_file" >/dev/null 2>&1 || true
-      continue
-    fi
-    if [[ $elapsed -gt $lock_wait_seconds ]]; then
-      echo "timed out waiting for baseline lock: $lock_dir"
-      exit 4
-    fi
-  done
-
-  printf "%s %s %s\n" "$(date +%s)" "$(hostname)" "$$" > "$lock_owner_file"
-  trap 'rm -f "$lock_owner_file"; rmdir "$lock_dir" >/dev/null 2>&1 || true' EXIT
-  mkdir -p "$cache_dir"
-
-  local work="$TMP_DIR/baseline_cache_build"
-  rm -rf "$work"
-  mkdir -p "$work"
-
-  local det="$RELEASE_DIR/$DETECTOR_DIR"
-  local tok="$RELEASE_DIR/$TOKENS_FILE"
-
-  uv venv --python 3.13 "$VENV_DIR" >/dev/null
-  export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
-  export UV_LINK_MODE=copy
-
-  uv run --python 3.13 python -m pump_end_threshold.cli.export_pump_end_signals \
-    --start-date "${START_DATE:-2025-01-01 00:00:00}" \
-    --end-date "${OOS_END:-2026-03-03 23:59:59}" \
-    --clickhouse-dsn "$CLICKHOUSE_DSN" \
-    --model-dir "$det" \
-    --symbols-file "$tok" \
-    --run-dir "$work" \
-    --output "$work/_detector_signals_curated55.csv" \
-    --raw-signals-output "$work/raw_detector_signals_curated55.parquet" \
-    --skip-guard \
-    --workers 8
-
-  uv run --python 3.13 python -m pump_end_threshold.cli.build_regime_dataset \
-    --clickhouse-dsn "$CLICKHOUSE_DSN" \
-    --signals-path "$work/raw_detector_signals_curated55.parquet" \
-    --symbols-file "$tok" \
-    --fixed-universe-file "$tok" \
-    --run-dir "$work" \
-    --output "$work/regime_dataset_base.parquet" \
-    --top-n-universe 55 \
-    --tp-pct 4.5 \
-    --sl-pct 10.0 \
-    --max-horizon-bars 200 \
-    --trade-replay-source 1s \
-    --target-col target_pause_value_next_12h \
-    --target-profile pause_value_12h_v2_curated \
-    --target-min-resolved 3 \
-    --target-sl-rate-threshold 0.55 \
-    --feature-profile regime_compact_v4
-
-  cp -f "$work/raw_detector_signals_curated55.parquet" "$raw"
-  cp -f "$work/regime_dataset_base.parquet" "$base"
-  cat >"$manifest" <<EOF
-{
-  "baseline_hash": "$BASELINE_HASH",
-  "files": [
-    "raw_detector_signals_curated55.parquet",
-    "regime_dataset_base.parquet"
-  ]
-}
-EOF
-  echo "ok" > "$marker"
-  rm -f "$lock_owner_file"
-  rmdir "$lock_dir" >/dev/null 2>&1 || true
-  trap - EXIT
-}
-
-materialize_run_inputs() {
-  local cache_dir="$CACHE_ROOT/$BASELINE_HASH"
-  cp -f "$cache_dir/raw_detector_signals_curated55.parquet" "$RUN_DIR/raw_detector_signals_curated55.parquet"
-  cp -f "$cache_dir/regime_dataset_base.parquet" "$RUN_DIR/regime_dataset_base.parquet"
-}
-
-run_pipeline() {
-  local tok="$RELEASE_DIR/$TOKENS_FILE"
-  local transform="$RELEASE_DIR/$TRANSFORM_SCRIPT"
-
-  uv run --python 3.13 python "$transform" --exp-id "$EXP_ID" --run-root "$RUN_DIR"
-
-  local target="$TARGET_COL"
-  if [[ -z "$target" && -f "$RUN_DIR/target_col.txt" ]]; then
-    target="$(tr -d '\r' < "$RUN_DIR/target_col.txt")"
-  fi
-  if [[ -z "$target" ]]; then
-    target="target_pause_value_next_12h"
-  fi
-
-  if [[ -n "$COMMAND_OVERRIDE" ]]; then
-    bash -lc "$COMMAND_OVERRIDE"
-    return 0
-  fi
-
-  uv run --python 3.13 python -m pump_end_threshold.cli.train_regime_guard \
-    --run-dir "$RUN_DIR" \
-    --dataset-parquet "$RUN_DIR/regime_dataset_train.parquet" \
-    --target-col "$target" \
-    --train-end "${TRAIN_END:-2026-02-20}" \
-    --time-budget-min 60 \
-    --fold-days 21 \
-    --min-train-days 120 \
-    --embargo-hours 12 \
-    --iterations 3500 \
-    --early-stopping-rounds 250 \
-    --seed 42 \
-    --score-mode block_value \
-    --max-blocked-share 0.18 \
-    --min-signal-keep-rate 0.80 \
-    --min-valid-folds 4 \
-    --policy-grid aggressive \
-    --model-selection-mode downstream_cv \
-    --disable-auto-class-weights
-
-  uv run --python 3.13 python "$RELEASE_DIR/scripts/regime_run_report.py" "$RUN_DIR" --output "$RUN_DIR/run_report.md"
-
-  cat >"$RUN_DIR/artifacts_manifest.json" <<EOF
-{
-  "exp_id": "$EXP_ID",
-  "ready": true,
-  "files": [
-    "run_report.md",
-    "pipeline.log",
-    "run_state.json",
-    "summary.json"
-  ]
-}
-EOF
-}
-
-ensure_uv
-create_cache_if_needed
-materialize_run_inputs
-run_pipeline
+cd "$SRC_DIR"
+"$PYTHON_BIN" -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
+python -m pip install --upgrade pip
+python -m pip install -r "$SRC_DIR/$REQUIREMENTS_FILE"
+if [[ -n "$SETUP_COMMAND" ]]; then
+  bash -lc "$SETUP_COMMAND"
+fi
+export PYTHONPATH="$SRC_DIR"
+export PYTHONUNBUFFERED=1
+echo "$LAUNCH_COMMAND" > "$LAUNCH_COMMAND_PATH"
+bash -lc "$LAUNCH_COMMAND"

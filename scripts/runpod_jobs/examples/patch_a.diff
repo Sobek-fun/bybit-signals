@@ -1,0 +1,9 @@
+diff --git a/scripts/runpod_jobs/requirements_runpod.txt b/scripts/runpod_jobs/requirements_runpod.txt
+index 1111111..2222222 100644
+--- a/scripts/runpod_jobs/requirements_runpod.txt
++++ b/scripts/runpod_jobs/requirements_runpod.txt
+@@ -8,3 +8,4 @@ catboost
+ lightgbm
+ joblib
+ requests
++tenacity

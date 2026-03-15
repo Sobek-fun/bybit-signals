@@ -5,48 +5,46 @@ from pathlib import Path
 
 
 @dataclass(slots=True)
-class LocalBatchPaths:
+class LocalPaths:
     root: Path
-    manifest: Path
     launch_results: Path
-    status: Path
-    downloaded: Path
-    logs: Path
+    assembled_root: Path
 
 
-def local_batch_paths(repo_root: Path, batch_id: str) -> LocalBatchPaths:
-    root = repo_root / "artifacts" / "runpod_batches" / batch_id
-    return LocalBatchPaths(
+def local_paths(repo_root: Path, batch_id: str) -> LocalPaths:
+    root = repo_root / "artifacts" / "runpod_launch" / batch_id
+    return LocalPaths(
         root=root,
-        manifest=root / "batch_manifest.json",
         launch_results=root / "launch_results.json",
-        status=root / "batch_status.json",
-        downloaded=root / "downloaded",
-        logs=root / "logs",
+        assembled_root=root / "assembled",
     )
 
 
 @dataclass(slots=True)
 class RemoteExperimentPaths:
-    run_dir: str
-    release_dir: str
+    exp_root: str
+    src_dir: str
     venv_dir: str
-    tmp_dir: str
+    run_dir: str
     log_path: str
-    state_path: str
-    artifacts_manifest_path: str
+    started_at_path: str
+    finished_at_path: str
+    exit_code_path: str
+    launch_command_path: str
+    start_script_path: str
 
 
-def remote_paths(batch_id: str, exp_id: str, run_dir: str, tmp_root: str = "/tmp/bybit-signals") -> RemoteExperimentPaths:
-    exp_tmp = f"{tmp_root.rstrip('/')}/{batch_id}/{exp_id}"
-    release_dir = f"{exp_tmp}/release"
-    venv_dir = f"{exp_tmp}/venv"
+def remote_paths(workspace_root: str, batch_id: str, exp_id: str) -> RemoteExperimentPaths:
+    exp_root = f"{workspace_root.rstrip('/')}/{batch_id}/{exp_id}"
     return RemoteExperimentPaths(
-        run_dir=run_dir,
-        release_dir=release_dir,
-        venv_dir=venv_dir,
-        tmp_dir=f"{exp_tmp}/tmp",
-        log_path=f"{run_dir.rstrip('/')}/pipeline.log",
-        state_path=f"{run_dir.rstrip('/')}/run_state.json",
-        artifacts_manifest_path=f"{run_dir.rstrip('/')}/artifacts_manifest.json",
+        exp_root=exp_root,
+        src_dir=f"{exp_root}/src",
+        venv_dir=f"{exp_root}/venv",
+        run_dir=f"{exp_root}/run",
+        log_path=f"{exp_root}/pipeline.log",
+        started_at_path=f"{exp_root}/started_at.txt",
+        finished_at_path=f"{exp_root}/finished_at.txt",
+        exit_code_path=f"{exp_root}/exit_code.txt",
+        launch_command_path=f"{exp_root}/launch_command.txt",
+        start_script_path=f"{exp_root}/start.sh",
     )

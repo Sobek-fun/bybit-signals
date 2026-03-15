@@ -1,0 +1,25 @@
+{
+  "batch_id": "2026-03-15_smoke_minimal",
+  "runtime": {
+    "workspace_root": "/workspace/experiments",
+    "requirements_file": "scripts/runpod_jobs/requirements_smoke.txt",
+    "clickhouse_dsn_env": "HOME",
+    "detector_dir_remote": "/workspace",
+    "tokens_file_remote": "/etc/hosts",
+    "pipeline_command": "python -u -c \"import os, time; print('SMOKE_START', os.environ.get('EXP_ID')); time.sleep(2); print('SMOKE_OK', os.environ.get('RUN_ROOT'))\""
+  },
+  "experiments": [
+    {
+      "exp_id": "smoke_base",
+      "pod_alias": "pod-a",
+      "patch_files": []
+    },
+    {
+      "exp_id": "smoke_patch",
+      "pod_alias": "pod-b",
+      "patch_files": [
+        "scripts/runpod_jobs/examples/patch_a.diff"
+      ]
+    }
+  ]
+}

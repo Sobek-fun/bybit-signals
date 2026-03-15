@@ -1,18 +1,14 @@
 {
   "pods": [
     {
-      "alias": "pod1",
-      "pod_id": "6h7k...abc",
+      "alias": "pod-a",
+      "pod_id": "replace_with_runpod_id_if_no_static_host",
       "ssh_user": "root"
     },
     {
-      "alias": "pod2",
-      "pod_id": "7l8m...def",
-      "ssh_user": "root"
-    },
-    {
-      "alias": "pod3",
-      "pod_id": "8n9o...ghi",
+      "alias": "pod-b",
+      "host": "1.2.3.4",
+      "port": 22,
       "ssh_user": "root"
     }
   ]

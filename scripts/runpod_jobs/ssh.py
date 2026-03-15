@@ -97,10 +97,20 @@ def run_ssh(conn: PodConn, command: str, retries: int = 4, timeout: int | None =
     raise SshError(str(last_exc or "ssh failed"))
 
 
-def scp_to_remote(conn: PodConn, local_path: Path, remote_path: str, retries: int = 4) -> None:
+def scp_to_remote(
+    conn: PodConn,
+    local_path: Path,
+    remote_path: str,
+    retries: int = 4,
+    recursive: bool = False,
+) -> None:
     delay = 2
     for attempt in range(1, retries + 1):
-        proc = _run_local(scp_base(conn) + [str(local_path), f"{conn.ssh_user}@{conn.host}:{remote_path}"], check=False)
+        cmd = scp_base(conn)
+        if recursive:
+            cmd.append("-r")
+        cmd.extend([str(local_path), f"{conn.ssh_user}@{conn.host}:{remote_path}"])
+        proc = _run_local(cmd, check=False)
         if proc.returncode == 0:
             return
         output = (proc.stderr or proc.stdout or "").strip()
