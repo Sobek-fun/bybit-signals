@@ -1,0 +1,20 @@
+--- a/pump_end_threshold/ml/regime_dataset.py
++++ b/pump_end_threshold/ml/regime_dataset.py
+@@ -57,6 +57,17 @@
+         'good_value_threshold': 15.0,
+         'good_sl_rate_threshold': 0.40,
+     },
++    'pause_value_12h_v4_good9_sl025': {
++        'window_hours': 12,
++        'min_resolved': 2,
++        'tp_value': 4.5,
++        'sl_value': 10.0,
++        'timeout_penalty': 1.0,
++        'bad_value_threshold': -5.0,
++        'bad_sl_rate_threshold': 0.60,
++        'good_value_threshold': 9.0,
++        'good_sl_rate_threshold': 0.25,
++    },
+ }
+ 
+ 

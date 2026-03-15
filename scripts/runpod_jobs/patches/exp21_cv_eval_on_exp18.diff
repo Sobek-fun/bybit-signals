@@ -1,0 +1,153 @@
+--- a/pump_end_threshold/cli/train_regime_guard.py
++++ b/pump_end_threshold/cli/train_regime_guard.py
+@@ -147,6 +147,13 @@
+         choices=["train_labeled", "train_fullstream"],
+         help="Rows used for fold-level policy threshold calibration during tuning"
+     )
++    parser.add_argument(
++        "--cv-eval-scope",
++        type=str,
++        default="valid_only",
++        choices=["valid_only", "fullstream"],
++        help="Rows used for downstream policy evaluation during CV/model selection"
++    )
+ 
+     args = parser.parse_args()
+ 
+@@ -221,6 +228,7 @@
+         model_selection_mode=args.model_selection_mode,
+         feature_profile=args.feature_profile,
+         cv_calibration_scope=args.cv_calibration_scope,
++        cv_eval_scope=args.cv_eval_scope,
+     )
+ 
+     log("INFO", "REGIME",
+--- a/pump_end_threshold/ml/regime_tuning.py
++++ b/pump_end_threshold/ml/regime_tuning.py
+@@ -288,6 +288,19 @@
+     }
+ 
+ 
++def _select_cv_eval_df(
++        fold_df: pd.DataFrame,
++        val_df_labeled: pd.DataFrame,
++        scope: str,
++) -> pd.DataFrame:
++    if scope == "valid_only":
++        return val_df_labeled.copy()
++    if scope == "fullstream":
++        return fold_df[fold_df['split'] == 'val'].copy()
++
++    raise ValueError(f"Unsupported cv_eval_scope={scope}")
++
++
+ def apply_regime_fold_split(
+         dataset_df: pd.DataFrame,
+         fold: dict,
+@@ -342,6 +355,7 @@
+         embargo_hours: float = 0,
+         score_mode: str = 'pnl_improvement',
+         cv_calibration_scope: str = "train_labeled",
++        cv_eval_scope: str = "valid_only",
+ ) -> dict:
+     fold_results = []
+ 
+@@ -376,8 +390,14 @@
+         if len(calibration_df) > 0:
+             train_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
+ 
++        val_eval_df = _select_cv_eval_df(
++            fold_df=fold_df,
++            val_df_labeled=val_df,
++            scope=cv_eval_scope,
++        )
++
+         fold_eval = evaluate_regime_fold(
+-            model, val_df, feature_columns, policy_params,
++            model, val_eval_df, feature_columns, policy_params,
+             calibration_p_bad=train_p_bad,
+             max_blocked_share=max_blocked_share,
+             min_signal_keep_rate=min_signal_keep_rate,
+@@ -444,6 +464,7 @@
+         feature_profile: str = None,
+         policy_grid_preset: str = 'default',
+         cv_calibration_scope: str = "train_labeled",
++        cv_eval_scope: str = "valid_only",
+ ) -> dict:
+     start_time = time.time()
+     time_budget_sec = time_budget_min * 60
+@@ -507,10 +528,15 @@
+                     'ap': ap, 'auc': auc, 'brier': brier,
+                     'seed': curr_seed, 'fold': fold_idx,
+                 })
++                val_eval_df = _select_cv_eval_df(
++                    fold_df=fold_df,
++                    val_df_labeled=val_df,
++                    scope=cv_eval_scope,
++                )
+                 for probe_policy in probe_policies:
+                     downstream_eval = evaluate_regime_fold(
+                         model=model,
+-                        val_df=val_df,
++                        val_df=val_eval_df,
+                         feature_columns=feature_columns,
+                         policy_params=probe_policy,
+                         calibration_p_bad=train_p_bad,
+@@ -582,6 +608,7 @@
+         policy_grid_preset: str = 'default',
+         feature_profile: str = None,
+         cv_calibration_scope: str = "train_labeled",
++        cv_eval_scope: str = "valid_only",
+ ) -> dict:
+     start_time = time.time()
+     time_budget_sec = time_budget_min * 60
+@@ -616,7 +643,12 @@
+             )
+             if len(calibration_df) > 0:
+                 train_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
+-        fold_models.append((model, val_df, train_p_bad))
++        eval_df = _select_cv_eval_df(
++            fold_df=fold_df,
++            val_df_labeled=val_df,
++            scope=cv_eval_scope,
++        )
++        fold_models.append((model, eval_df, train_p_bad))
+ 
+     best_score = -np.inf
+     best_params = None
+@@ -632,9 +664,9 @@
+             break
+ 
+         fold_results = []
+-        for model, val_df, train_p_bad in fold_models:
++        for model, eval_df, train_p_bad in fold_models:
+             eval_result = evaluate_regime_fold(
+-                model, val_df, feature_columns, policy_params,
++                model, eval_df, feature_columns, policy_params,
+                 calibration_p_bad=train_p_bad,
+                 max_blocked_share=max_blocked_share,
+                 min_signal_keep_rate=min_signal_keep_rate,
+@@ -768,6 +800,7 @@
+         model_selection_mode: str = 'downstream_cv',
+         feature_profile: str = None,
+         cv_calibration_scope: str = "train_labeled",
++        cv_eval_scope: str = "valid_only",
+ ) -> dict:
+     model_budget = int(time_budget_min * 0.5)
+     policy_budget = int(time_budget_min * 0.5)
+@@ -787,6 +820,7 @@
+         feature_profile=feature_profile,
+         policy_grid_preset=policy_grid_preset,
+         cv_calibration_scope=cv_calibration_scope,
++        cv_eval_scope=cv_eval_scope,
+     )
+ 
+     if model_result['best_params'] is None:
+@@ -808,6 +842,7 @@
+         policy_grid_preset=policy_grid_preset,
+         feature_profile=feature_profile,
+         cv_calibration_scope=cv_calibration_scope,
++        cv_eval_scope=cv_eval_scope,
+     )
+ 
+     if policy_result['best_params'] is None:

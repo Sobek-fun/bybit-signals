@@ -1,0 +1,148 @@
+--- a/pump_end_threshold/cli/train_regime_guard.py
++++ b/pump_end_threshold/cli/train_regime_guard.py
+@@ -140,6 +140,13 @@
+         choices=["resolved_fold_median", "reresolve_on_inference_calibration"],
+         help="Use resolved median fold thresholds (baseline) or re-resolve thresholds on chosen inference calibration slice"
+     )
++    parser.add_argument(
++        "--cv-calibration-scope",
++        type=str,
++        default="train_labeled",
++        choices=["train_labeled", "train_fullstream"],
++        help="Rows used for fold-level policy threshold calibration during tuning"
++    )
+ 
+     args = parser.parse_args()
+ 
+@@ -213,6 +220,7 @@
+         policy_grid_preset=args.policy_grid,
+         model_selection_mode=args.model_selection_mode,
+         feature_profile=args.feature_profile,
++        cv_calibration_scope=args.cv_calibration_scope,
+     )
+ 
+     log("INFO", "REGIME",
+--- a/pump_end_threshold/ml/regime_tuning.py
++++ b/pump_end_threshold/ml/regime_tuning.py
+@@ -216,6 +216,19 @@
+     }
+ 
+ 
++def _select_cv_calibration_df(
++        train_split_df: pd.DataFrame,
++        target_col: str,
++        scope: str,
++) -> pd.DataFrame:
++    if scope == "train_labeled":
++        return train_split_df[train_split_df[target_col].notna()].copy()
++    if scope == "train_fullstream":
++        return train_split_df.copy()
++
++    raise ValueError(f"Unsupported cv_calibration_scope={scope}")
++
++
+ def evaluate_regime_fold(
+         model: CatBoostClassifier,
+         val_df: pd.DataFrame,
+@@ -328,6 +341,7 @@
+         embargo_signals: int = 5,
+         embargo_hours: float = 0,
+         score_mode: str = 'pnl_improvement',
++        cv_calibration_scope: str = "train_labeled",
+ ) -> dict:
+     fold_results = []
+ 
+@@ -351,7 +365,16 @@
+             fold_results.append(fold_eval)
+             continue
+ 
+-        train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
++        train_split_full = fold_df[fold_df['split'] == 'train'].copy()
++        calibration_df = _select_cv_calibration_df(
++            train_split_df=train_split_full,
++            target_col=target_col,
++            scope=cv_calibration_scope,
++        )
++
++        train_p_bad = None
++        if len(calibration_df) > 0:
++            train_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
+ 
+         fold_eval = evaluate_regime_fold(
+             model, val_df, feature_columns, policy_params,
+@@ -420,6 +443,7 @@
+         model_selection_mode: str = 'downstream_cv',
+         feature_profile: str = None,
+         policy_grid_preset: str = 'default',
++        cv_calibration_scope: str = "train_labeled",
+ ) -> dict:
+     start_time = time.time()
+     time_budget_sec = time_budget_min * 60
+@@ -464,7 +488,16 @@
+ 
+                 X_val = val_df[feature_columns]
+                 p_bad = model.predict_proba(X_val)[:, 1]
+-                train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
++                train_split_full = fold_df[fold_df['split'] == 'train'].copy()
++                calibration_df = _select_cv_calibration_df(
++                    train_split_df=train_split_full,
++                    target_col=target_col,
++                    scope=cv_calibration_scope,
++                )
++
++                train_p_bad = None
++                if len(calibration_df) > 0:
++                    train_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
+ 
+                 y_val = val_df[target_col]
+                 ap, auc, brier = _safe_binary_metrics(y_val, p_bad)
+@@ -548,6 +581,7 @@
+         score_mode: str = 'pnl_improvement',
+         policy_grid_preset: str = 'default',
+         feature_profile: str = None,
++        cv_calibration_scope: str = "train_labeled",
+ ) -> dict:
+     start_time = time.time()
+     time_budget_sec = time_budget_min * 60
+@@ -573,8 +607,15 @@
+             seed=seed,
+         )
+         train_p_bad = None
+-        if model is not None and train_df is not None and len(train_df) > 0:
+-            train_p_bad = model.predict_proba(train_df[feature_columns])[:, 1]
++        if model is not None:
++            train_split_full = fold_df[fold_df['split'] == 'train'].copy()
++            calibration_df = _select_cv_calibration_df(
++                train_split_df=train_split_full,
++                target_col=target_col,
++                scope=cv_calibration_scope,
++            )
++            if len(calibration_df) > 0:
++                train_p_bad = model.predict_proba(calibration_df[feature_columns])[:, 1]
+         fold_models.append((model, val_df, train_p_bad))
+ 
+     best_score = -np.inf
+@@ -726,6 +767,7 @@
+         policy_grid_preset: str = 'default',
+         model_selection_mode: str = 'downstream_cv',
+         feature_profile: str = None,
++        cv_calibration_scope: str = "train_labeled",
+ ) -> dict:
+     model_budget = int(time_budget_min * 0.5)
+     policy_budget = int(time_budget_min * 0.5)
+@@ -744,6 +786,7 @@
+         model_selection_mode=model_selection_mode,
+         feature_profile=feature_profile,
+         policy_grid_preset=policy_grid_preset,
++        cv_calibration_scope=cv_calibration_scope,
+     )
+ 
+     if model_result['best_params'] is None:
+@@ -764,6 +807,7 @@
+         score_mode=score_mode,
+         policy_grid_preset=policy_grid_preset,
+         feature_profile=feature_profile,
++        cv_calibration_scope=cv_calibration_scope,
+     )
+ 
+     if policy_result['best_params'] is None:

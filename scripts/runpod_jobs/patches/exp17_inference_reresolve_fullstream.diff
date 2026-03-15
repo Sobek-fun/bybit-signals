@@ -1,0 +1,93 @@
+--- a/pump_end_threshold/cli/train_regime_guard.py
++++ b/pump_end_threshold/cli/train_regime_guard.py
+@@ -32,6 +32,22 @@
+ def parse_date_exclusive(date_str: str) -> datetime:
+     dt = datetime.strptime(date_str, '%Y-%m-%d')
+     return dt
++
++
++def _select_inference_calibration_df(
++        dataset: pd.DataFrame,
++        train_end: datetime,
++        target_col: str,
++        scope: str,
++) -> pd.DataFrame:
++    df = dataset[dataset['open_time'] < train_end].copy()
++
++    if scope == 'train_labeled':
++        return df[df[target_col].notna()].copy()
++    if scope == 'train_fullstream':
++        return df
++
++    raise ValueError(f"Unsupported inference_calibration_scope={scope}")
+ 
+ 
+ def _feature_family(name: str) -> str:
+@@ -110,6 +126,20 @@
+                         help="Run name for subdirectory (deprecated, use --run-dir)")
+     parser.add_argument("--clickhouse-dsn", type=str, default=None,
+                         help="ClickHouse DSN for BTC price chart generation (optional)")
++    parser.add_argument(
++        "--inference-calibration-scope",
++        type=str,
++        default="train_labeled",
++        choices=["train_labeled", "train_fullstream"],
++        help="Rows used to re-resolve inference thresholds from raw quantile policy"
++    )
++    parser.add_argument(
++        "--inference-threshold-mode",
++        type=str,
++        default="resolved_fold_median",
++        choices=["resolved_fold_median", "reresolve_on_inference_calibration"],
++        help="Use resolved median fold thresholds (baseline) or re-resolve thresholds on chosen inference calibration slice"
++    )
+ 
+     args = parser.parse_args()
+ 
+@@ -291,19 +321,38 @@
+             p_bad_test = final_model.predict_proba(X_test)[:, 1]
+             test_df['p_bad'] = p_bad_test
+ 
+-            calibration_df = dataset[
+-                (dataset['open_time'] < train_end) &
+-                dataset[args.target_col].notna()
+-            ].copy()
++            calibration_df = _select_inference_calibration_df(
++                dataset=dataset,
++                train_end=train_end,
++                target_col=args.target_col,
++                scope=args.inference_calibration_scope,
++            )
++
+             calibration_p_bad = None
+             if len(calibration_df) > 0:
+                 calibration_p_bad = final_model.predict_proba(calibration_df[tune_result['feature_columns']])[:, 1]
+ 
+-            policy_params_used_for_inference = (
+-                resolved_policy_params
+-                if resolved_policy_params
+-                else resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
++            if args.inference_threshold_mode == "reresolve_on_inference_calibration":
++                policy_params_used_for_inference = resolve_policy_params(
++                    best_policy_params_raw,
++                    calibration_p_bad=calibration_p_bad,
++                )
++            else:
++                policy_params_used_for_inference = (
++                    resolved_policy_params
++                    if resolved_policy_params
++                    else resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
++                )
++
++            log(
++                "INFO",
++                "REGIME",
++                f"inference_threshold_mode={args.inference_threshold_mode} "
++                f"inference_calibration_scope={args.inference_calibration_scope} "
++                f"n_inference_calibration_rows={len(calibration_df)} "
++                f"policy_params_used_for_inference={policy_params_used_for_inference}"
+             )
++
+             policy = RegimePolicy(**policy_params_used_for_inference)
+             filtered = policy.apply(test_df, p_bad_col='p_bad')
+ 
