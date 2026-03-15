@@ -110,6 +110,26 @@ def main():
                         help="Run name for subdirectory (deprecated, use --run-dir)")
     parser.add_argument("--clickhouse-dsn", type=str, default=None,
                         help="ClickHouse DSN for BTC price chart generation (optional)")
+    parser.add_argument(
+        "--inference-threshold-mode",
+        type=str,
+        default="prefer_resolved_policy_params",
+        choices=["prefer_resolved_policy_params", "reresolve_on_inference_calibration"],
+        help="How to choose final inference thresholds",
+    )
+    parser.add_argument(
+        "--inference-calibration-scope",
+        type=str,
+        default="train_labeled",
+        choices=["train_labeled", "train_fullstream", "recent_30d_fullstream"],
+        help="Data scope for inference threshold calibration",
+    )
+    parser.add_argument(
+        "--inference-calibration-recent-days",
+        type=int,
+        default=30,
+        help="Recent pretrain days for recent_30d_fullstream scope",
+    )
 
     args = parser.parse_args()
 
@@ -151,6 +171,10 @@ def main():
     config['n_features'] = len(feature_columns)
     config['n_samples'] = len(dataset)
     config['target_rate'] = float(target_rate)
+    config['n_inference_calibration_rows'] = None
+    config['inference_calibration_start_time'] = None
+    config['inference_calibration_end_time'] = None
+    config['policy_params_used_for_inference'] = None
     with open(run_dir / "run_config.json", 'w') as f:
         json.dump(config, f, indent=2, default=str)
 
@@ -232,12 +256,18 @@ def main():
             fold_metrics = pd.DataFrame(cv_result['fold_results'])
             fold_metrics.to_csv(run_dir / "fold_metrics.csv", index=False)
 
+    policy_report = {
+        'policy_params': best_policy_params_raw,
+        'resolved_thresholds': resolved_policy_params,
+        'inference_threshold_mode': args.inference_threshold_mode,
+        'inference_calibration_scope': args.inference_calibration_scope,
+        'inference_calibration_recent_days': args.inference_calibration_recent_days,
+        'n_inference_calibration_rows': None,
+        'inference_calibration_start_time': None,
+        'inference_calibration_end_time': None,
+        'policy_params_used_for_inference': best_policy_params_to_save,
+    }
     with open(run_dir / "policy_report.json", 'w') as f:
-        policy_report = {
-            'policy_params': best_policy_params_raw,
-            'resolved_thresholds': resolved_policy_params,
-            'policy_params_used_for_inference': best_policy_params_to_save,
-        }
         json.dump(policy_report, f, indent=2, default=str)
 
     if train_end:
@@ -292,18 +322,59 @@ def main():
             test_df['p_bad'] = p_bad_test
 
             calibration_df = dataset[
-                (dataset['open_time'] < train_end) &
-                dataset[args.target_col].notna()
+                dataset['open_time'] < train_end
             ].copy()
+            inference_calibration_scope_used = args.inference_calibration_scope
+            if args.inference_calibration_scope == "train_labeled":
+                calibration_df = calibration_df[calibration_df[args.target_col].notna()].copy()
+            elif args.inference_calibration_scope == "recent_30d_fullstream":
+                recent_start = train_end - timedelta(days=args.inference_calibration_recent_days)
+                calibration_df = calibration_df[calibration_df['open_time'] >= recent_start].copy()
+                if len(calibration_df) < 2:
+                    log(
+                        "WARN",
+                        "REGIME",
+                        f"recent_30d_fullstream calibration is too small ({len(calibration_df)} rows), "
+                        "falling back to train_fullstream",
+                    )
+                    calibration_df = dataset[dataset['open_time'] < train_end].copy()
+                    inference_calibration_scope_used = "train_fullstream"
+
             calibration_p_bad = None
             if len(calibration_df) > 0:
                 calibration_p_bad = final_model.predict_proba(calibration_df[tune_result['feature_columns']])[:, 1]
 
-            policy_params_used_for_inference = (
-                resolved_policy_params
-                if resolved_policy_params
-                else resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
-            )
+            if args.inference_threshold_mode == "reresolve_on_inference_calibration":
+                policy_params_used_for_inference = resolve_policy_params(
+                    best_policy_params_raw,
+                    calibration_p_bad=calibration_p_bad,
+                )
+            else:
+                policy_params_used_for_inference = (
+                    resolved_policy_params
+                    if resolved_policy_params
+                    else resolve_policy_params(best_policy_params_raw, calibration_p_bad=calibration_p_bad)
+                )
+
+            n_inference_calibration_rows = len(calibration_df)
+            inference_calibration_start_time = calibration_df['open_time'].min() if n_inference_calibration_rows > 0 else None
+            inference_calibration_end_time = calibration_df['open_time'].max() if n_inference_calibration_rows > 0 else None
+            config['n_inference_calibration_rows'] = n_inference_calibration_rows
+            config['inference_calibration_scope'] = inference_calibration_scope_used
+            config['inference_calibration_start_time'] = inference_calibration_start_time
+            config['inference_calibration_end_time'] = inference_calibration_end_time
+            config['policy_params_used_for_inference'] = policy_params_used_for_inference
+            with open(run_dir / "run_config.json", 'w') as f:
+                json.dump(config, f, indent=2, default=str)
+
+            policy_report['inference_calibration_scope'] = inference_calibration_scope_used
+            policy_report['n_inference_calibration_rows'] = n_inference_calibration_rows
+            policy_report['inference_calibration_start_time'] = inference_calibration_start_time
+            policy_report['inference_calibration_end_time'] = inference_calibration_end_time
+            policy_report['policy_params_used_for_inference'] = policy_params_used_for_inference
+            with open(run_dir / "policy_report.json", 'w') as f:
+                json.dump(policy_report, f, indent=2, default=str)
+
             policy = RegimePolicy(**policy_params_used_for_inference)
             filtered = policy.apply(test_df, p_bad_col='p_bad')
 
