@@ -16,6 +16,7 @@ DETECTOR_DIR_REMOTE=""
 TOKENS_FILE_REMOTE=""
 SETUP_COMMAND=""
 LAUNCH_COMMAND=""
+LOCK_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,11 +45,14 @@ if [[ -z "$SRC_DIR" || -z "$RUN_DIR" || -z "$VENV_DIR" || -z "$LOG_PATH" || -z "
 fi
 
 mkdir -p "$RUN_DIR"
-rm -rf "$VENV_DIR"
+mkdir -p "$(dirname "$VENV_DIR")"
 date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STARTED_AT_PATH"
 
 on_exit() {
   local code=$?
+  if [[ -n "$LOCK_DIR" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
   date -u +"%Y-%m-%dT%H:%M:%SZ" > "$FINISHED_AT_PATH"
   echo "$code" > "$EXIT_CODE_PATH"
 }
@@ -72,10 +76,22 @@ if [[ -z "${!CLICKHOUSE_DSN_ENV:-}" ]]; then
 fi
 
 cd "$SRC_DIR"
-"$PYTHON_BIN" -m venv "$VENV_DIR"
+LOCK_DIR="${VENV_DIR}.lock"
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  sleep 1
+done
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  rm -rf "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
 source "$VENV_DIR/bin/activate"
+if ! python -m pip --version >/dev/null 2>&1; then
+  python -m ensurepip --upgrade
+fi
 python -m pip install --upgrade pip
 python -m pip install -r "$SRC_DIR/$REQUIREMENTS_FILE"
+rmdir "$LOCK_DIR" 2>/dev/null || true
+LOCK_DIR=""
 if [[ -n "$SETUP_COMMAND" ]]; then
   bash -lc "$SETUP_COMMAND"
 fi

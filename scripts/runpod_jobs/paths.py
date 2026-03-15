@@ -35,11 +35,12 @@ class RemoteExperimentPaths:
 
 
 def remote_paths(workspace_root: str, batch_id: str, exp_id: str) -> RemoteExperimentPaths:
-    exp_root = f"{workspace_root.rstrip('/')}/{batch_id}/{exp_id}"
+    batch_root = f"{workspace_root.rstrip('/')}/{batch_id}"
+    exp_root = f"{batch_root}/{exp_id}"
     return RemoteExperimentPaths(
         exp_root=exp_root,
         src_dir=f"{exp_root}/src",
-        venv_dir=f"{exp_root}/venv",
+        venv_dir=f"{batch_root}/venv_shared",
         run_dir=f"{exp_root}/run",
         log_path=f"{exp_root}/pipeline.log",
         started_at_path=f"{exp_root}/started_at.txt",

@@ -8,3 +8,6 @@ catboost
 lightgbm
 joblib
 requests
+pandas-ta
+websockets
+aiogram
