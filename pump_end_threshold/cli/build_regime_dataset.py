@@ -78,15 +78,6 @@ def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict
         }
 
     has_required = {'symbol', 'open_time'}.issubset(signals_df.columns)
-    detector_hint_cols = {
-        'event_type',
-        'event_id',
-        'signal_offset',
-        'p_end_at_fire',
-        'threshold_used',
-        'drop_from_peak_at_fire',
-    }
-    has_detector_hints = any(c in signals_df.columns for c in detector_hint_cols)
 
     strict_forbidden_cols = {
         'blocked_by_policy',
@@ -99,19 +90,16 @@ def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict
         col.startswith(('target_', 'future_'))
         for col in signals_df.columns
     )
-    has_trade_label_cols = any(
-        col in signals_df.columns
-        for col in ('trade_outcome', 'pnl_pct', 'tp_hit', 'sl_hit')
-    )
-    has_regime_score = 'p_bad' in signals_df.columns
+    known_raw_export_names = {
+        'pump_end_signals_prod.csv',
+        'pump_end_signals_prod.parquet',
+    }
+    known_raw_export = file_name in known_raw_export_names
 
     if (
             not has_required or
-            not has_detector_hints or
             has_strict_forbidden or
-            has_target_like_cols or
-            has_trade_label_cols or
-            has_regime_score
+            has_target_like_cols
     ):
         raise ValueError(
             "Для regime разрешены только два источника сигналов: raw stage-A detector export "
@@ -119,7 +107,7 @@ def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict
         )
 
     return {
-        'signals_source_type': 'raw_stage_a_detector',
+        'signals_source_type': 'raw_stage_a_detector' if known_raw_export else 'raw_stage_a_like_export',
         'base_model_oos_validated': True,
     }
 
