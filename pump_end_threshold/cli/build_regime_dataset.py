@@ -29,7 +29,6 @@ def load_symbols_from_file(path: str) -> list[str]:
 
 def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict:
     path = Path(signals_path)
-    path_lower = str(path).lower()
     file_name = path.name.lower()
     is_cv_oos = file_name == "cv_oos_signals_verbose.parquet"
 
@@ -78,12 +77,42 @@ def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict
             'base_model_oos_validated': True,
         }
 
-    forbidden_cols = {'p_end_at_fire', 'threshold_used', 'source_model_run', 'p_bad', 'accepted_by_policy'}
-    has_forbidden = any(c in signals_df.columns for c in forbidden_cols)
-    raw_path_hint = any(token in path_lower for token in ("detector", "stage_a", "stage-a", "raw"))
     has_required = {'symbol', 'open_time'}.issubset(signals_df.columns)
+    detector_hint_cols = {
+        'event_type',
+        'event_id',
+        'signal_offset',
+        'p_end_at_fire',
+        'threshold_used',
+        'drop_from_peak_at_fire',
+    }
+    has_detector_hints = any(c in signals_df.columns for c in detector_hint_cols)
 
-    if has_forbidden or not raw_path_hint or not has_required:
+    strict_forbidden_cols = {
+        'blocked_by_policy',
+        'accepted_by_policy',
+        'regime_state',
+        'bucket_p_bad',
+    }
+    has_strict_forbidden = any(c in signals_df.columns for c in strict_forbidden_cols)
+    has_target_like_cols = any(
+        col.startswith(('target_', 'future_'))
+        for col in signals_df.columns
+    )
+    has_trade_label_cols = any(
+        col in signals_df.columns
+        for col in ('trade_outcome', 'pnl_pct', 'tp_hit', 'sl_hit')
+    )
+    has_regime_score = 'p_bad' in signals_df.columns
+
+    if (
+            not has_required or
+            not has_detector_hints or
+            has_strict_forbidden or
+            has_target_like_cols or
+            has_trade_label_cols or
+            has_regime_score
+    ):
         raise ValueError(
             "Для regime разрешены только два источника сигналов: raw stage-A detector export "
             "или cv_oos_signals_verbose.parquet"
