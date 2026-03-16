@@ -164,6 +164,149 @@ class DataLoader:
 
         return df
 
+    def load_raw_1m_candles(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        query = """
+        SELECT
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume
+        FROM bybit.candles
+        WHERE symbol = %(symbol)s
+          AND interval = 1
+          AND open_time >= %(start)s
+          AND open_time < %(end)s
+        ORDER BY open_time
+        """
+
+        result = self.client.query(query, parameters={
+            "symbol": symbol,
+            "start": start_time,
+            "end": end_time
+        })
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["open_time", "open", "high", "low", "close", "volume"]
+        )
+
+        df["open_time"] = pd.to_datetime(df["open_time"])
+        df.set_index("open_time", inplace=True)
+
+        return df
+
+    def load_transactions_range(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        query_template = """
+        SELECT
+            {time_col},
+            price,
+            size
+        FROM bybit.transactions
+        WHERE symbol = %(symbol)s
+          AND {time_col} >= %(start)s
+          AND {time_col} < %(end)s
+        ORDER BY {time_col}
+        """
+
+        query_start = datetime.now()
+        result = None
+        for time_col in ("transaction_time", "timestamp"):
+            query = query_template.format(time_col=time_col)
+            try:
+                result = self.client.query(query, parameters={
+                    "symbol": symbol,
+                    "start": start_time,
+                    "end": end_time
+                })
+                break
+            except Exception as e:
+                if "Unknown expression or function identifier" in str(e) and f"`{time_col}`" in str(e):
+                    continue
+                raise
+
+        if result is None:
+            return pd.DataFrame()
+
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"transactions query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbol={symbol}")
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["timestamp", "price", "size"]
+        )
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+
+        return df
+
+    def load_1s_bars_from_transactions(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        query_template = """
+        SELECT
+            toStartOfSecond({time_col}) AS second,
+            argMin(price, {time_col}) AS open,
+            max(price) AS high,
+            min(price) AS low,
+            argMax(price, {time_col}) AS close,
+            sum(size) AS volume,
+            count() AS trades_count
+        FROM bybit.transactions
+        WHERE symbol = %(symbol)s
+          AND {time_col} >= %(start)s
+          AND {time_col} < %(end)s
+        GROUP BY second
+        ORDER BY second
+        """
+
+        query_start = datetime.now()
+        result = None
+        for time_col in ("transaction_time", "timestamp"):
+            query = query_template.format(time_col=time_col)
+            try:
+                result = self.client.query(query, parameters={
+                    "symbol": symbol,
+                    "start": start_time,
+                    "end": end_time
+                })
+                break
+            except Exception as e:
+                if "Unknown expression or function identifier" in str(e) and f"`{time_col}`" in str(e):
+                    continue
+                raise
+
+        if result is None:
+            return pd.DataFrame()
+
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"1s bars query slow: {query_duration_ms:.0f}ms rows={len(result.result_rows)} symbol={symbol}")
+
+        if not result.result_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            result.result_rows,
+            columns=["second", "open", "high", "low", "close", "volume", "trades_count"]
+        )
+
+        df["second"] = pd.to_datetime(df["second"])
+        df.set_index("second", inplace=True)
+
+        return df
+
     def _get_last_closed_time(self, symbol: str) -> datetime | None:
         now = datetime.now()
         minutes = (now.minute // 15) * 15
@@ -192,6 +335,59 @@ class DataLoader:
             return None
 
         return result.result_rows[0][0]
+
+
+def get_liquid_universe(ch_dsn: str, start_dt: datetime, end_dt: datetime, top_n: int = 120,
+                        exclude: list[str] = None) -> list[str]:
+    if exclude is None:
+        exclude = ["BTCUSDT", "ETHUSDT"]
+
+    parsed = urlparse(ch_dsn)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8123
+    username = parsed.username or "default"
+    password = parsed.password or ""
+    database = parsed.path.lstrip("/") if parsed.path else "default"
+    secure = parsed.scheme == "https"
+
+    client = clickhouse_connect.get_client(
+        host=host, port=port, username=username,
+        password=password, database=database, secure=secure
+    )
+
+    exclude_clause = ""
+    if exclude:
+        placeholders = ", ".join([f"'{s}'" for s in exclude])
+        exclude_clause = f"AND symbol NOT IN ({placeholders})"
+
+    query = f"""
+    SELECT symbol, avg(volume * close) AS avg_dollar_volume
+    FROM (
+        SELECT
+            symbol,
+            toStartOfInterval(open_time, INTERVAL 15 minute) AS bucket,
+            sum(volume) AS volume,
+            argMax(close, open_time) AS close
+        FROM bybit.candles
+        WHERE interval = 1
+          AND open_time >= %(start)s
+          AND open_time < %(end)s
+          AND endsWith(symbol, 'USDT')
+          {exclude_clause}
+        GROUP BY symbol, bucket
+    )
+    GROUP BY symbol
+    ORDER BY avg_dollar_volume DESC
+    LIMIT %(top_n)s
+    """
+
+    result = client.query(query, parameters={
+        "start": start_dt,
+        "end": end_dt,
+        "top_n": top_n,
+    })
+
+    return [row[0] for row in result.result_rows]
 
 
 def list_all_usdt_tokens(ch_dsn: str) -> list[str]:

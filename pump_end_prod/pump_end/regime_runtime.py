@@ -4,12 +4,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from pump_end_prod.infra.clickhouse import DataLoader
 from pump_end_prod.infra.logging import log
-from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
-from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.ml.regime_dataset import build_strategy_state_live
-from pump_end_threshold.ml.regime_inference import load_guard_artifacts
-from pump_end_threshold.ml.regime_policy import RegimePolicy
+from pump_end_prod.pump_end.regime_dataset import build_strategy_state_live
+from pump_end_prod.pump_end.regime_feature_builder import RegimeFeatureBuilder
+from pump_end_prod.pump_end.regime_inference import load_guard_artifacts
+from pump_end_prod.pump_end.regime_policy import RegimePolicy
 
 
 class RegimeGuardRuntime:
