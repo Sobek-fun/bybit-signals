@@ -26,6 +26,9 @@ class PumpEndWorkerResult:
     candles_count: int = 0
     p_end: Optional[float] = None
     signal_triggered: bool = False
+    event_time: Optional[datetime] = None
+    close_price: Optional[float] = None
+    raw_signal_payload: Optional[dict] = None
     error_message: Optional[str] = None
 
 
@@ -84,7 +87,8 @@ class PumpEndWorker:
             model: PumpEndModel,
             feature_builder: PumpFeatureBuilder,
             signal_state: PumpEndSignalState,
-            signal_dispatcher: SignalDispatcher
+            signal_dispatcher: SignalDispatcher,
+            dispatch_immediately: bool = True
     ):
         self.token = token
         self.symbol = f"{token}USDT"
@@ -94,6 +98,7 @@ class PumpEndWorker:
         self.feature_builder = feature_builder
         self.signal_state = signal_state
         self.signal_dispatcher = signal_dispatcher
+        self.dispatch_immediately = dispatch_immediately
 
     def process(self) -> PumpEndWorkerResult:
         start_time = time.time()
@@ -185,21 +190,34 @@ class PumpEndWorker:
 
             if triggered:
                 last_close = self.df.loc[self.expected_bucket_start, 'close']
+                payload = {
+                    "symbol": self.symbol,
+                    "event_time": decision_open_time,
+                    "signal_id": f"{self.symbol}|{decision_open_time.strftime('%Y%m%d_%H%M%S')}",
+                    "p_end": p_end,
+                    "threshold": self.model.threshold,
+                    "close_price": last_close,
+                    "min_pending_bars": self.model.min_pending_bars,
+                    "drop_delta": self.model.drop_delta,
+                }
 
-                self.signal_dispatcher.publish_pump_end_signal(
-                    symbol=self.symbol,
-                    event_time=decision_open_time,
-                    p_end=p_end,
-                    threshold=self.model.threshold,
-                    close_price=last_close,
-                    min_pending_bars=self.model.min_pending_bars,
-                    drop_delta=self.model.drop_delta
-                )
+                status = "SIGNAL_READY"
+                if self.dispatch_immediately:
+                    self.signal_dispatcher.publish_pump_end_signal(
+                        symbol=payload["symbol"],
+                        event_time=payload["event_time"],
+                        p_end=payload["p_end"],
+                        threshold=payload["threshold"],
+                        close_price=payload["close_price"],
+                        min_pending_bars=payload["min_pending_bars"],
+                        drop_delta=payload["drop_delta"],
+                    )
+                    status = "SIGNAL_SENT"
 
                 return PumpEndWorkerResult(
                     token=self.token,
                     symbol=self.symbol,
-                    status="SIGNAL_SENT",
+                    status=status,
                     duration_total_ms=(time.time() - start_time) * 1000,
                     duration_features_ms=features_duration,
                     duration_predict_ms=predict_duration,
@@ -210,7 +228,10 @@ class PumpEndWorker:
                     duration_extract_ms=timings.get('extract_ms', 0),
                     candles_count=len(self.df),
                     p_end=p_end,
-                    signal_triggered=True
+                    signal_triggered=True,
+                    event_time=decision_open_time,
+                    close_price=last_close,
+                    raw_signal_payload=payload
                 )
 
             return PumpEndWorkerResult(

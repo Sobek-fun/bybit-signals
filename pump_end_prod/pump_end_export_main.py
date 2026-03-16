@@ -49,8 +49,23 @@ def main():
         default=4,
         help="Number of parallel workers (default: 4)"
     )
+    parser.add_argument(
+        "--regime-on",
+        action="store_true",
+        default=False,
+        help="Enable regime guard stage"
+    )
+    parser.add_argument(
+        "--regime-model-dir",
+        type=str,
+        default=None,
+        help="Path to regime guard artifacts directory"
+    )
 
     args = parser.parse_args()
+
+    if args.regime_on and not args.regime_model_dir:
+        raise ValueError("--regime-model-dir is required when --regime-on is set")
 
     from pump_end_prod.cli import run_pump_end_export
     run_pump_end_export(args)

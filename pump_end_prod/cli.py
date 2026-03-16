@@ -1,5 +1,10 @@
 import argparse
+import csv
+import os
+import tempfile
 from datetime import datetime
+
+import pandas as pd
 
 from pump_end_prod.infra.logging import log
 
@@ -7,6 +12,9 @@ from pump_end_prod.infra.logging import log
 def run_pump_end(args):
     from pump_end_prod.pump_end.pipeline import PumpEndPipeline
     from pump_end_prod.infra.clickhouse import list_all_usdt_tokens
+
+    if args.regime_on and not args.regime_model_dir:
+        raise ValueError("--regime-model-dir is required when --regime-on is set")
 
     tokens = [token.strip().upper() for token in args.token.split(",")]
 
@@ -33,7 +41,9 @@ def run_pump_end(args):
         dry_run=args.dry_run,
         ws_host=args.ws_host,
         ws_port=args.ws_port,
-        restore_lookback_bars=args.restore_lookback_bars
+        restore_lookback_bars=args.restore_lookback_bars,
+        regime_on=args.regime_on,
+        regime_model_dir=args.regime_model_dir
     )
 
     pipeline.run()
@@ -42,6 +52,11 @@ def run_pump_end(args):
 def run_pump_end_export(args):
     from pump_end_prod.pump_end.export_signals import export_signals
     from pump_end_prod.infra.clickhouse import list_all_usdt_tokens
+    from pump_end_threshold.ml.regime_inference import apply_guard_to_raw_signals
+    from pathlib import Path
+
+    if args.regime_on and not args.regime_model_dir:
+        raise ValueError("--regime-model-dir is required when --regime-on is set")
 
     tokens = [token.strip().upper() for token in args.token.split(",")]
 
@@ -58,15 +73,42 @@ def run_pump_end_export(args):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         out_csv = f"pump_end_signals_{timestamp}.csv"
 
-    export_signals(
-        tokens=tokens,
-        ch_dsn=args.ch_dsn,
-        model_dir=args.model_dir,
-        dt_from=dt_from,
-        dt_to=dt_to,
-        out_csv=out_csv,
-        workers=args.workers
-    )
+    if not args.regime_on:
+        export_signals(
+            tokens=tokens,
+            ch_dsn=args.ch_dsn,
+            model_dir=args.model_dir,
+            dt_from=dt_from,
+            dt_to=dt_to,
+            out_csv=out_csv,
+            workers=args.workers
+        )
+        return
+
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as temp_csv:
+        raw_csv = temp_csv.name
+
+    try:
+        export_signals(
+            tokens=tokens,
+            ch_dsn=args.ch_dsn,
+            model_dir=args.model_dir,
+            dt_from=dt_from,
+            dt_to=dt_to,
+            out_csv=raw_csv,
+            workers=args.workers
+        )
+
+        raw_signals_df = _read_raw_export_csv(raw_csv)
+        accepted = apply_guard_to_raw_signals(
+            raw_signals_df=raw_signals_df,
+            guard_model_dir=Path(args.regime_model_dir),
+            ch_dsn=args.ch_dsn
+        )
+        _write_output_csv(accepted, out_csv)
+    finally:
+        if os.path.exists(raw_csv):
+            os.remove(raw_csv)
 
 
 def main():
@@ -139,6 +181,18 @@ def main():
         default=0,
         help="Number of 15m bars to look back for state restoration on startup (default: 0 = disabled)"
     )
+    pump_end_parser.add_argument(
+        "--regime-on",
+        action="store_true",
+        default=False,
+        help="Enable regime guard stage"
+    )
+    pump_end_parser.add_argument(
+        "--regime-model-dir",
+        type=str,
+        default=None,
+        help="Path to regime guard artifacts directory"
+    )
 
     pump_end_export_parser = subparsers.add_parser('pump_end_export', help='Export historical pump end signals to CSV')
     pump_end_export_parser.add_argument(
@@ -185,6 +239,18 @@ def main():
         default=4,
         help="Number of parallel workers (default: 4)"
     )
+    pump_end_export_parser.add_argument(
+        "--regime-on",
+        action="store_true",
+        default=False,
+        help="Enable regime guard stage"
+    )
+    pump_end_export_parser.add_argument(
+        "--regime-model-dir",
+        type=str,
+        default=None,
+        help="Path to regime guard artifacts directory"
+    )
 
     args = parser.parse_args()
 
@@ -194,6 +260,28 @@ def main():
         run_pump_end_export(args)
     else:
         parser.print_help()
+
+
+def _read_raw_export_csv(csv_path: str):
+    raw_signals = []
+    with open(csv_path, 'r', newline='') as infile:
+        reader = csv.DictReader(infile)
+        for row in reader:
+            open_time = datetime.strptime(row['timestamp'], '%Y-%m-%d %H:%M:%S')
+            raw_signals.append({'symbol': row['symbol'], 'open_time': open_time})
+    if not raw_signals:
+        return pd.DataFrame(columns=['symbol', 'open_time'])
+    return pd.DataFrame(raw_signals)
+
+
+def _write_output_csv(signals_df, out_csv: str):
+    with open(out_csv, 'w', newline='') as outfile:
+        writer = csv.writer(outfile)
+        writer.writerow(['symbol', 'timestamp'])
+        if signals_df.empty:
+            return
+        for _, row in signals_df.iterrows():
+            writer.writerow([row['symbol'], pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')])
 
 
 if __name__ == "__main__":

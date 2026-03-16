@@ -70,8 +70,23 @@ def main():
         default=0,
         help="Number of 15m bars to look back for state restoration on startup (default: 0 = disabled)"
     )
+    parser.add_argument(
+        "--regime-on",
+        action="store_true",
+        default=False,
+        help="Enable regime guard stage"
+    )
+    parser.add_argument(
+        "--regime-model-dir",
+        type=str,
+        default=None,
+        help="Path to regime guard artifacts directory"
+    )
 
     args = parser.parse_args()
+
+    if args.regime_on and not args.regime_model_dir:
+        raise ValueError("--regime-model-dir is required when --regime-on is set")
 
     from pump_end_prod.cli import run_pump_end
     run_pump_end(args)

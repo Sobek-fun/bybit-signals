@@ -16,6 +16,7 @@ from pump_end_prod.pump_end.feature_builder import PumpFeatureBuilder
 from pump_end_prod.infra.clickhouse import DataLoader
 from pump_end_prod.infra.logging import log
 from pump_end_prod.pump_end.model import PumpEndModel
+from pump_end_prod.pump_end.regime_runtime import RegimeGuardRuntime
 from pump_end_prod.pump_end.worker import PumpEndWorker, PumpEndWorkerResult, PumpEndSignalState
 from pump_end_prod.delivery.telegram_sender import TelegramSender
 from pump_end_prod.delivery.ws_broadcaster import WsBroadcaster
@@ -37,7 +38,9 @@ class PumpEndPipeline:
             dry_run: bool = False,
             ws_host: str = None,
             ws_port: int = None,
-            restore_lookback_bars: int = 0
+            restore_lookback_bars: int = 0,
+            regime_on: bool = False,
+            regime_model_dir: str = None
     ):
         self.tokens = tokens
         self.ch_dsn = ch_dsn
@@ -45,6 +48,8 @@ class PumpEndPipeline:
         self.offset_seconds = offset_seconds
         self.dry_run = dry_run
         self.restore_lookback_bars = restore_lookback_bars
+        self.regime_on = regime_on
+        self.regime_model_dir = regime_model_dir
 
         self.loader = DataLoader(ch_dsn, offset_seconds)
         self.model = PumpEndModel(model_dir)
@@ -68,6 +73,14 @@ class PumpEndPipeline:
             telegram_sender=self.telegram_sender,
             dry_run=dry_run
         )
+        self.regime_runtime = None
+        if self.regime_on:
+            if not self.regime_model_dir:
+                raise ValueError("regime_model_dir is required when regime_on=True")
+            self.regime_runtime = RegimeGuardRuntime(ch_dsn=ch_dsn, guard_model_dir=self.regime_model_dir)
+            regime_restore_bars = int(self.regime_runtime.history_restore_window().total_seconds() // (15 * 60))
+            if self.restore_lookback_bars < regime_restore_bars:
+                self.restore_lookback_bars = regime_restore_bars
 
         self.candles_cache: dict[str, pd.DataFrame] = {}
         self.last_processed_minute: int = -1
@@ -75,6 +88,8 @@ class PumpEndPipeline:
         log("INFO", "PUMP_END", f"model loaded: threshold={self.model.threshold:.4f} "
                                 f"min_pending_bars={self.model.min_pending_bars} "
                                 f"drop_delta={self.model.drop_delta}")
+        if self.regime_on:
+            log("INFO", "PUMP_END", f"regime enabled model_dir={self.regime_model_dir}")
 
     def run(self):
         if self.restore_lookback_bars > 0:
@@ -150,6 +165,7 @@ class PumpEndPipeline:
 
         restore_start = datetime.now()
         total_decisions_processed = 0
+        all_restore_payloads = []
         symbols_processed = 0
         symbols_skipped = 0
 
@@ -159,10 +175,11 @@ class PumpEndPipeline:
                 symbols_skipped += 1
                 continue
 
-            decisions_count = self._restore_symbol_state(
+            decisions_count, restore_payloads = self._restore_symbol_state(
                 symbol, df, restore_start_decision_time, restore_end_decision_time
             )
             total_decisions_processed += decisions_count
+            all_restore_payloads.extend(restore_payloads)
 
             if restore_end_bucket in df.index:
                 idx = df.index.get_loc(restore_end_bucket)
@@ -173,6 +190,10 @@ class PumpEndPipeline:
             symbols_processed += 1
 
         restore_duration = (datetime.now() - restore_start).total_seconds()
+
+        if self.regime_on and all_restore_payloads:
+            self.regime_runtime.bootstrap_history(all_restore_payloads)
+            log("INFO", "PUMP_END", f"regime restore raw_signals={len(all_restore_payloads)}")
 
         log("INFO", "PUMP_END",
             f"restore complete: symbols_processed={symbols_processed} symbols_skipped={symbols_skipped} "
@@ -185,7 +206,7 @@ class PumpEndPipeline:
             df: pd.DataFrame,
             restore_start_decision_time: datetime,
             restore_end_decision_time: datetime
-    ) -> int:
+    ) -> tuple[int, list[dict]]:
         all_decision_times = pd.date_range(
             start=restore_start_decision_time,
             end=restore_end_decision_time,
@@ -215,17 +236,17 @@ class PumpEndPipeline:
                     valid_decision_times.append(dt)
 
         if not valid_decision_times:
-            return 0
+            return 0, []
 
         feature_rows = self.feature_builder.build_many_for_inference(df, symbol, valid_decision_times)
 
         if not feature_rows:
-            return 0
+            return 0, []
 
         if len(feature_rows) != len(valid_decision_times):
             log("WARN", "PUMP_END",
                 f"restore {symbol}: feature_rows={len(feature_rows)} != valid_decisions={len(valid_decision_times)}, skipping")
-            return 0
+            return 0, []
 
         feature_values_list = []
         for row in feature_rows:
@@ -237,9 +258,10 @@ class PumpEndPipeline:
 
         probas = self.model.model.predict_proba(feature_values_list, thread_count=1)[:, 1]
 
+        restore_payloads = []
         for i, dt in enumerate(valid_decision_times):
             p_end = probas[i]
-            self.signal_state.update_and_check(
+            triggered = self.signal_state.update_and_check(
                 symbol,
                 p_end,
                 self.model.threshold,
@@ -247,8 +269,21 @@ class PumpEndPipeline:
                 self.model.drop_delta,
                 dt
             )
+            if triggered:
+                expected_bucket_start = dt - timedelta(minutes=15)
+                if expected_bucket_start in df.index:
+                    close_price = float(df.loc[expected_bucket_start, 'close'])
+                    restore_payloads.append({
+                        "symbol": symbol,
+                        "event_time": dt,
+                        "p_end": float(p_end),
+                        "threshold": self.model.threshold,
+                        "close_price": close_price,
+                        "min_pending_bars": self.model.min_pending_bars,
+                        "drop_delta": self.model.drop_delta,
+                    })
 
-        return len(valid_decision_times)
+        return len(valid_decision_times), restore_payloads
 
     def _process_cycle(self, current_time: datetime):
         minutes = (current_time.minute // 15) * 15
@@ -301,8 +336,34 @@ class PumpEndPipeline:
                     log("ERROR", "PUMP_END", f"token={token}USDT unexpected error: {e}")
 
         cycle_duration = (datetime.now() - cycle_start).total_seconds()
+        accepted_count = 0
+        blocked_count = 0
+        if self.regime_on:
+            ready_payloads = [r.raw_signal_payload for r in results if r.status == "SIGNAL_READY" and r.raw_signal_payload]
+            accepted, blocked = self.regime_runtime.process_bucket(ready_payloads, decision_open_time)
+            for payload in accepted:
+                self.signal_dispatcher.publish_pump_end_signal(
+                    symbol=payload["symbol"],
+                    event_time=payload["event_time"],
+                    p_end=payload["p_end"],
+                    threshold=payload["threshold"],
+                    close_price=payload["close_price"],
+                    min_pending_bars=payload["min_pending_bars"],
+                    drop_delta=payload["drop_delta"],
+                )
+            accepted_count = len(accepted)
+            blocked_count = len(blocked)
+            accepted_ids = {p.get("signal_id") for p in accepted}
+            blocked_ids = {p.get("signal_id") for p in blocked}
+            for r in results:
+                if r.status == "SIGNAL_READY" and r.raw_signal_payload:
+                    signal_id = r.raw_signal_payload.get("signal_id")
+                    if signal_id in accepted_ids:
+                        r.status = "SIGNAL_SENT"
+                    elif signal_id in blocked_ids:
+                        r.status = "SIGNAL_BLOCKED"
 
-        self._log_cycle_summary(results, cycle_duration, load_duration)
+        self._log_cycle_summary(results, cycle_duration, load_duration, accepted_count, blocked_count)
 
     def _update_cache(self, latest_candles: dict[str, pd.DataFrame]):
         for symbol, new_df in latest_candles.items():
@@ -331,17 +392,27 @@ class PumpEndPipeline:
             model=self.model,
             feature_builder=self.feature_builder,
             signal_state=self.signal_state,
-            signal_dispatcher=self.signal_dispatcher
+            signal_dispatcher=self.signal_dispatcher,
+            dispatch_immediately=not self.regime_on
         )
         return worker.process()
 
-    def _log_cycle_summary(self, results: list[PumpEndWorkerResult], cycle_duration: float, load_duration: float):
+    def _log_cycle_summary(
+            self,
+            results: list[PumpEndWorkerResult],
+            cycle_duration: float,
+            load_duration: float,
+            regime_accepted: int = 0,
+            regime_blocked: int = 0
+    ):
         status_counts = {}
         for result in results:
             status_counts[result.status] = status_counts.get(result.status, 0) + 1
 
         ok = status_counts.get("OK_NO_SIGNAL", 0)
         signals_sent = status_counts.get("SIGNAL_SENT", 0)
+        signals_ready = status_counts.get("SIGNAL_READY", 0)
+        signals_blocked = status_counts.get("SIGNAL_BLOCKED", 0)
         skipped_empty = status_counts.get("SKIP_EMPTY", 0)
         skipped_short = status_counts.get("SKIP_SHORT", 0)
         skipped_missing_last = status_counts.get("SKIP_MISSING_LAST", 0)
@@ -351,16 +422,19 @@ class PumpEndPipeline:
 
         log("INFO", "PUMP_END",
             f"cycle done ok={ok} signals_sent={signals_sent} "
+            f"signals_ready={signals_ready} signals_blocked={signals_blocked} "
             f"skip_empty={skipped_empty} skip_short={skipped_short} "
             f"skip_missing={skipped_missing_last} skip_gapped={skipped_gapped} "
             f"skip_features={skipped_features} errors={errors}")
+        if self.regime_on:
+            log("INFO", "PUMP_END", f"regime accepted={regime_accepted} blocked={regime_blocked}")
 
         if errors > 0:
             error_results = [r for r in results if r.status == "ERROR"]
             first_error = error_results[0]
             log("ERROR", "PUMP_END", f"token={first_error.symbol} error={first_error.error_message}")
 
-        processed_results = [r for r in results if r.status in ("OK_NO_SIGNAL", "SIGNAL_SENT")]
+        processed_results = [r for r in results if r.status in ("OK_NO_SIGNAL", "SIGNAL_SENT", "SIGNAL_BLOCKED")]
 
         if processed_results:
             durations = [r.duration_total_ms for r in processed_results]
