@@ -72,6 +72,7 @@ def run_pump_end_export(args):
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         out_csv = f"pump_end_signals_{timestamp}.csv"
+    blocked_out_csv = args.blocked_out or _derive_blocked_out_path(out_csv)
 
     if not args.regime_on:
         export_signals(
@@ -109,6 +110,8 @@ def run_pump_end_export(args):
             artifacts=guard_artifacts,
         )
         _write_output_csv(accepted, out_csv)
+        blocked = _build_blocked_signals(raw_signals_df, accepted)
+        _write_output_csv(blocked, blocked_out_csv)
     finally:
         if os.path.exists(raw_csv):
             os.remove(raw_csv)
@@ -243,6 +246,12 @@ def main():
         help="Number of parallel workers (default: 4)"
     )
     pump_end_export_parser.add_argument(
+        "--blocked-out",
+        type=str,
+        default=None,
+        help="Blocked signals CSV path (default: <out>_blocked.csv)"
+    )
+    pump_end_export_parser.add_argument(
         "--regime-on",
         action="store_true",
         default=False,
@@ -285,6 +294,28 @@ def _write_output_csv(signals_df, out_csv: str):
             return
         for _, row in signals_df.iterrows():
             writer.writerow([row['symbol'], pd.to_datetime(row['open_time']).strftime('%Y-%m-%d %H:%M:%S')])
+
+
+def _build_blocked_signals(raw_signals_df, accepted_df):
+    if raw_signals_df.empty:
+        return pd.DataFrame(columns=['symbol', 'open_time'])
+    if accepted_df.empty:
+        return raw_signals_df.copy()
+
+    accepted_keys = accepted_df[['symbol', 'open_time']].drop_duplicates().copy()
+    accepted_keys['__accepted__'] = 1
+
+    raw_keys = raw_signals_df[['symbol', 'open_time']].drop_duplicates().copy()
+    merged = raw_keys.merge(accepted_keys, on=['symbol', 'open_time'], how='left')
+    blocked = merged[merged['__accepted__'].isna()][['symbol', 'open_time']].copy()
+    return blocked.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+
+
+def _derive_blocked_out_path(out_csv: str) -> str:
+    base, ext = os.path.splitext(out_csv)
+    if ext:
+        return f"{base}_blocked{ext}"
+    return f"{out_csv}_blocked.csv"
 
 
 if __name__ == "__main__":

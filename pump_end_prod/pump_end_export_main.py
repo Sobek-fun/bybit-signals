@@ -50,6 +50,12 @@ def main():
         help="Number of parallel workers (default: 4)"
     )
     parser.add_argument(
+        "--blocked-out",
+        type=str,
+        default=None,
+        help="Blocked signals CSV path (default: <out>_blocked.csv)"
+    )
+    parser.add_argument(
         "--regime-on",
         action="store_true",
         default=False,
