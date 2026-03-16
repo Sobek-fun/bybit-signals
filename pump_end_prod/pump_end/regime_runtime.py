@@ -13,6 +13,8 @@ from pump_end_threshold.ml.regime_policy import RegimePolicy
 
 
 class RegimeGuardRuntime:
+    POLICY_STATE_LOOKBACK = timedelta(days=7)
+
     def __init__(self, ch_dsn: str, guard_model_dir: str):
         self.ch_dsn = ch_dsn
         self.guard_model_dir = Path(guard_model_dir)
@@ -28,7 +30,10 @@ class RegimeGuardRuntime:
 
     def history_restore_window(self) -> timedelta:
         horizon = timedelta(minutes=(self.artifacts.max_horizon_bars + 1) * 15)
-        return max(timedelta(hours=24), horizon) + timedelta(hours=1)
+        return horizon + timedelta(hours=24) + timedelta(hours=2)
+
+    def history_keep_window(self) -> timedelta:
+        return max(self.history_restore_window(), self.POLICY_STATE_LOOKBACK)
 
     def bootstrap_history(self, raw_payloads: list[dict]):
         if not raw_payloads:
@@ -58,6 +63,7 @@ class RegimeGuardRuntime:
             return [], raw_payloads
 
         asof_time = pd.to_datetime(bucket_time)
+        self._prune_history(asof_time)
         trades_df = build_strategy_state_live(
             self.raw_signals,
             self.loader,
@@ -65,10 +71,12 @@ class RegimeGuardRuntime:
             tp_pct=self.artifacts.tp_pct,
             sl_pct=self.artifacts.sl_pct,
             max_horizon_bars=self.artifacts.max_horizon_bars,
+            trade_replay_source=self.artifacts.trade_replay_source or "1s",
         )
 
         guard_features = self.builder.build_batch(self.raw_signals, batch_size=100, trades_df=trades_df)
         if guard_features.empty:
+            log("WARN", "REGIME", f"bucket={asof_time.strftime('%Y-%m-%d %H:%M:%S')} features_empty fail_open={len(raw_payloads)}")
             return raw_payloads, []
 
         available = [c for c in self.artifacts.feature_columns if c in guard_features.columns]
@@ -101,3 +109,8 @@ class RegimeGuardRuntime:
 
         log("INFO", "REGIME", f"bucket={asof_time.strftime('%Y-%m-%d %H:%M:%S')} raw={len(raw_payloads)} accepted={len(accepted)} blocked={len(blocked)}")
         return accepted, blocked
+
+    def _prune_history(self, asof_time: pd.Timestamp):
+        keep_from = asof_time - self.history_keep_window()
+        self.raw_signals = self.raw_signals[self.raw_signals['open_time'] >= keep_from].copy()
+        self.raw_signals = self.raw_signals.sort_values('open_time').reset_index(drop=True)

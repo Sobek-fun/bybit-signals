@@ -106,11 +106,10 @@ def apply_guard_to_raw_signals(
         accepted_signals_output: str = None,
         artifacts: GuardArtifacts = None,
 ) -> pd.DataFrame:
-    if raw_signals_df.empty:
-        return raw_signals_df
-
     if artifacts is None:
         artifacts = load_guard_artifacts(guard_model_dir, ch_dsn)
+    if raw_signals_df.empty:
+        return raw_signals_df
 
     signals = raw_signals_df.sort_values('open_time').reset_index(drop=True).copy()
     t_min = signals['open_time'].min()
@@ -135,6 +134,7 @@ def apply_guard_to_raw_signals(
         tp_pct=artifacts.tp_pct,
         sl_pct=artifacts.sl_pct,
         max_horizon_bars=artifacts.max_horizon_bars,
+        trade_replay_source=artifacts.trade_replay_source or "1s",
     )
     log("INFO", "GUARD", f"trades simulated: {len(trades_df)}")
 

@@ -109,8 +109,11 @@ class PumpEndPipeline:
                 current_time = datetime.now()
 
                 if self._should_process(current_time):
-                    self.last_processed_minute = current_time.minute
-                    self._process_cycle(current_time)
+                    try:
+                        self._process_cycle(current_time)
+                        self.last_processed_minute = current_time.minute
+                    except Exception as e:
+                        log("ERROR", "PUMP_END", f"cycle failed: {type(e).__name__}: {str(e)}")
 
                 sleep(0.1)
         except KeyboardInterrupt:
@@ -340,28 +343,48 @@ class PumpEndPipeline:
         blocked_count = 0
         if self.regime_on:
             ready_payloads = [r.raw_signal_payload for r in results if r.status == "SIGNAL_READY" and r.raw_signal_payload]
-            accepted, blocked = self.regime_runtime.process_bucket(ready_payloads, decision_open_time)
-            for payload in accepted:
-                self.signal_dispatcher.publish_pump_end_signal(
-                    symbol=payload["symbol"],
-                    event_time=payload["event_time"],
-                    p_end=payload["p_end"],
-                    threshold=payload["threshold"],
-                    close_price=payload["close_price"],
-                    min_pending_bars=payload["min_pending_bars"],
-                    drop_delta=payload["drop_delta"],
-                )
-            accepted_count = len(accepted)
-            blocked_count = len(blocked)
-            accepted_ids = {p.get("signal_id") for p in accepted}
-            blocked_ids = {p.get("signal_id") for p in blocked}
-            for r in results:
-                if r.status == "SIGNAL_READY" and r.raw_signal_payload:
-                    signal_id = r.raw_signal_payload.get("signal_id")
-                    if signal_id in accepted_ids:
+            try:
+                accepted, blocked = self.regime_runtime.process_bucket(ready_payloads, decision_open_time)
+                for payload in accepted:
+                    self.signal_dispatcher.publish_pump_end_signal(
+                        symbol=payload["symbol"],
+                        event_time=payload["event_time"],
+                        p_end=payload["p_end"],
+                        threshold=payload["threshold"],
+                        close_price=payload["close_price"],
+                        min_pending_bars=payload["min_pending_bars"],
+                        drop_delta=payload["drop_delta"],
+                    )
+                accepted_count = len(accepted)
+                blocked_count = len(blocked)
+                accepted_ids = {p.get("signal_id") for p in accepted}
+                blocked_ids = {p.get("signal_id") for p in blocked}
+                for r in results:
+                    if r.status == "SIGNAL_READY" and r.raw_signal_payload:
+                        signal_id = r.raw_signal_payload.get("signal_id")
+                        if signal_id in accepted_ids:
+                            r.status = "SIGNAL_SENT"
+                        elif signal_id in blocked_ids:
+                            r.status = "SIGNAL_BLOCKED"
+                        else:
+                            r.status = "SIGNAL_BLOCKED"
+            except Exception as e:
+                log("ERROR", "PUMP_END", f"regime stage failed: {type(e).__name__}: {str(e)}; fail_open")
+                for r in results:
+                    if r.status == "SIGNAL_READY" and r.raw_signal_payload:
+                        p = r.raw_signal_payload
+                        self.signal_dispatcher.publish_pump_end_signal(
+                            symbol=p["symbol"],
+                            event_time=p["event_time"],
+                            p_end=p["p_end"],
+                            threshold=p["threshold"],
+                            close_price=p["close_price"],
+                            min_pending_bars=p["min_pending_bars"],
+                            drop_delta=p["drop_delta"],
+                        )
                         r.status = "SIGNAL_SENT"
-                    elif signal_id in blocked_ids:
-                        r.status = "SIGNAL_BLOCKED"
+                accepted_count = len(ready_payloads)
+                blocked_count = 0
 
         self._log_cycle_summary(results, cycle_duration, load_duration, accepted_count, blocked_count)
 

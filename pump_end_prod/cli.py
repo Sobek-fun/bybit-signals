@@ -52,7 +52,7 @@ def run_pump_end(args):
 def run_pump_end_export(args):
     from pump_end_prod.pump_end.export_signals import export_signals
     from pump_end_prod.infra.clickhouse import list_all_usdt_tokens
-    from pump_end_threshold.ml.regime_inference import apply_guard_to_raw_signals
+    from pump_end_threshold.ml.regime_inference import apply_guard_to_raw_signals, load_guard_artifacts
     from pathlib import Path
 
     if args.regime_on and not args.regime_model_dir:
@@ -88,6 +88,8 @@ def run_pump_end_export(args):
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as temp_csv:
         raw_csv = temp_csv.name
 
+    guard_artifacts = load_guard_artifacts(Path(args.regime_model_dir), args.ch_dsn)
+
     try:
         export_signals(
             tokens=tokens,
@@ -103,7 +105,8 @@ def run_pump_end_export(args):
         accepted = apply_guard_to_raw_signals(
             raw_signals_df=raw_signals_df,
             guard_model_dir=Path(args.regime_model_dir),
-            ch_dsn=args.ch_dsn
+            ch_dsn=args.ch_dsn,
+            artifacts=guard_artifacts,
         )
         _write_output_csv(accepted, out_csv)
     finally:

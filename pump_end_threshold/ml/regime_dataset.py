@@ -307,7 +307,8 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
 
 def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
                          tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
-                         max_horizon_bars: int = 200) -> pd.DataFrame:
+                         max_horizon_bars: int = 200,
+                         trade_replay_source: str = "1s") -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trade_results = []
     candle_cache = {}
@@ -324,12 +325,24 @@ def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
             candle_cache[symbol] = (full_df, entry_start, entry_end)
 
     for i, sig in signals.iterrows():
-        result = simulate_trade(
-            loader, sig['symbol'], sig['open_time'],
-            tp_pct, sl_pct,
-            max_horizon_bars=max_horizon_bars,
-            candle_cache=candle_cache
-        )
+        if trade_replay_source == "1m":
+            result = simulate_trade_fast_1m(
+                loader,
+                sig['symbol'],
+                sig['open_time'],
+                tp_pct=tp_pct,
+                sl_pct=sl_pct,
+                max_horizon_bars=max_horizon_bars,
+                candle_cache=candle_cache
+            )
+            result = {k: v for k, v in result.items() if k not in ('ambiguous_bar_time', 'tp_price', 'sl_price')}
+        else:
+            result = simulate_trade(
+                loader, sig['symbol'], sig['open_time'],
+                tp_pct, sl_pct,
+                max_horizon_bars=max_horizon_bars,
+                candle_cache=candle_cache
+            )
         result['signal_idx'] = i
         result['symbol'] = sig['symbol']
         result['open_time'] = sig['open_time']
@@ -347,6 +360,7 @@ def simulate_trade_live_asof(loader: DataLoader, symbol: str, signal_time: datet
                              tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
                              entry_shift_bars: int = ENTRY_SHIFT_BARS,
                              max_horizon_bars: int = 200,
+                             trade_replay_source: str = "1s",
                              candle_cache: dict = None) -> dict:
     entry_time = signal_time + timedelta(minutes=entry_shift_bars * BAR_MINUTES)
     horizon_end_time = entry_time + timedelta(minutes=max_horizon_bars * BAR_MINUTES)
@@ -427,6 +441,19 @@ def simulate_trade_live_asof(loader: DataLoader, symbol: str, signal_time: datet
         sl_hit = bar_high >= sl_price
 
         if tp_hit and sl_hit:
+            if trade_replay_source == "1m":
+                return {
+                    'trade_outcome': 'AMBIGUOUS',
+                    'tp_hit': True,
+                    'sl_hit': True,
+                    'exit_time': df.index[i],
+                    'entry_price': entry_price,
+                    'exit_price': np.nan,
+                    'pnl_pct': np.nan,
+                    'mfe_pct': mfe,
+                    'mae_pct': mae,
+                    'trade_duration_bars': i,
+                }
             resolved = resolve_trade_with_1s_replay(
                 loader,
                 symbol,
@@ -500,7 +527,8 @@ def simulate_trade_live_asof(loader: DataLoader, symbol: str, signal_time: datet
 
 def build_strategy_state_live(signals_df: pd.DataFrame, loader: DataLoader, asof_time: datetime,
                               tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
-                              max_horizon_bars: int = 200) -> pd.DataFrame:
+                              max_horizon_bars: int = 200,
+                              trade_replay_source: str = "1s") -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True).copy()
     if signals.empty:
         return pd.DataFrame()
@@ -529,6 +557,7 @@ def build_strategy_state_live(signals_df: pd.DataFrame, loader: DataLoader, asof
             tp_pct=tp_pct,
             sl_pct=sl_pct,
             max_horizon_bars=max_horizon_bars,
+            trade_replay_source=trade_replay_source,
             candle_cache=candle_cache,
         )
         result['signal_idx'] = i
