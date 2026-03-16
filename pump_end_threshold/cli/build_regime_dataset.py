@@ -10,7 +10,6 @@ from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuil
 from pump_end_threshold.infra.clickhouse import DataLoader, get_liquid_universe
 from pump_end_threshold.ml.regime_dataset import (
     build_strategy_state,
-    build_strategy_state_live,
     BAR_MINUTES,
     ENTRY_SHIFT_BARS,
     STRATEGY_STATE_MODE,
@@ -110,30 +109,6 @@ def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict
         'signals_source_type': 'raw_stage_a_detector' if known_raw_export else 'raw_stage_a_like_export',
         'base_model_oos_validated': True,
     }
-
-
-def build_strategy_state_live_by_time(
-        signals_df: pd.DataFrame,
-        loader: DataLoader,
-        tp_pct: float,
-        sl_pct: float,
-        max_horizon_bars: int,
-        trade_replay_source: str,
-) -> dict:
-    state_by_time = {}
-    unique_times = pd.Series(signals_df['open_time'].dropna().unique()).sort_values()
-    for t in unique_times:
-        asof_time = pd.Timestamp(t).to_pydatetime()
-        state_by_time[pd.Timestamp(t)] = build_strategy_state_live(
-            signals_df,
-            loader,
-            asof_time=asof_time,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            max_horizon_bars=max_horizon_bars,
-            trade_replay_source=trade_replay_source,
-        )
-    return state_by_time
 
 
 def main():
@@ -287,17 +262,8 @@ def main():
         log("INFO", "REGIME-DS", "including detector snapshot features")
 
     batch_size = 50
-    log("INFO", "REGIME-DS", "building causal strategy-state snapshots")
-    strategy_state_by_time = build_strategy_state_live_by_time(
-        signals_df=signals_df,
-        loader=loader,
-        tp_pct=args.tp_pct,
-        sl_pct=args.sl_pct,
-        max_horizon_bars=args.max_horizon_bars,
-        trade_replay_source=args.trade_replay_source,
-    )
     log("INFO", "REGIME-DS", "building features")
-    regime_features = builder.build_batch(signals_df, batch_size=batch_size, trades_df=strategy_state_by_time)
+    regime_features = builder.build_batch(signals_df, batch_size=batch_size, trades_df=trades_df)
 
     if regime_features.empty:
         log("ERROR", "REGIME-DS", "regime_features is empty!")
