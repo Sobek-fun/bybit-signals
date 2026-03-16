@@ -4,14 +4,13 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
 from pump_end_threshold.infra.clickhouse import DataLoader, get_liquid_universe
 from pump_end_threshold.ml.regime_dataset import (
     build_strategy_state,
-    compute_targets,
+    build_strategy_state_live,
     BAR_MINUTES,
     ENTRY_SHIFT_BARS,
     STRATEGY_STATE_MODE,
@@ -26,6 +25,98 @@ def log(level: str, component: str, message: str):
 def load_symbols_from_file(path: str) -> list[str]:
     lines = Path(path).read_text().strip().splitlines()
     return [line.strip() for line in lines if line.strip()]
+
+
+def validate_signals_source(signals_path: str, signals_df: pd.DataFrame) -> dict:
+    path = Path(signals_path)
+    path_lower = str(path).lower()
+    file_name = path.name.lower()
+    is_cv_oos = file_name == "cv_oos_signals_verbose.parquet"
+
+    if is_cv_oos:
+        source_col_oos = False
+        if 'source_model_run' in signals_df.columns:
+            source_model_run = signals_df['source_model_run'].astype(str).str.lower()
+            source_col_oos = bool(source_model_run.str.contains('oos').all())
+
+        flag_col_oos = False
+        if 'base_model_oos' in signals_df.columns:
+            base_model_oos = pd.to_numeric(signals_df['base_model_oos'], errors='coerce').fillna(0)
+            flag_col_oos = bool((base_model_oos > 0).all())
+
+        manifest_oos = False
+        for candidate in [
+            path.with_suffix(path.suffix + ".manifest.json"),
+            path.parent / "dataset_manifest.json",
+            path.parent / "signals_manifest.json",
+            path.parent / "manifest.json",
+        ]:
+            if not candidate.exists():
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                manifest_oos = bool(
+                    payload.get("base_model_oos")
+                    or payload.get("is_oos")
+                    or payload.get("oos")
+                    or payload.get("base_model_is_oos")
+                )
+                if manifest_oos:
+                    break
+            except Exception:
+                continue
+
+        validated = bool(source_col_oos or flag_col_oos or manifest_oos)
+        if not validated:
+            raise ValueError(
+                "cv_oos_signals_verbose.parquet должен содержать подтверждение OOS provenance "
+                "(source_model_run~oos, base_model_oos=true или manifest с OOS=true)"
+            )
+        return {
+            'signals_source_type': 'cv_oos_base_model',
+            'base_model_oos_validated': True,
+        }
+
+    forbidden_cols = {'p_end_at_fire', 'threshold_used', 'source_model_run', 'p_bad', 'accepted_by_policy'}
+    has_forbidden = any(c in signals_df.columns for c in forbidden_cols)
+    raw_path_hint = any(token in path_lower for token in ("detector", "stage_a", "stage-a", "raw"))
+    has_required = {'symbol', 'open_time'}.issubset(signals_df.columns)
+
+    if has_forbidden or not raw_path_hint or not has_required:
+        raise ValueError(
+            "Для regime разрешены только два источника сигналов: raw stage-A detector export "
+            "или cv_oos_signals_verbose.parquet"
+        )
+
+    return {
+        'signals_source_type': 'raw_stage_a_detector',
+        'base_model_oos_validated': True,
+    }
+
+
+def build_strategy_state_live_by_time(
+        signals_df: pd.DataFrame,
+        loader: DataLoader,
+        tp_pct: float,
+        sl_pct: float,
+        max_horizon_bars: int,
+        trade_replay_source: str,
+) -> dict:
+    state_by_time = {}
+    unique_times = pd.Series(signals_df['open_time'].dropna().unique()).sort_values()
+    for t in unique_times:
+        asof_time = pd.Timestamp(t).to_pydatetime()
+        state_by_time[pd.Timestamp(t)] = build_strategy_state_live(
+            signals_df,
+            loader,
+            asof_time=asof_time,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            max_horizon_bars=max_horizon_bars,
+            trade_replay_source=trade_replay_source,
+        )
+    return state_by_time
 
 
 def main():
@@ -84,6 +175,7 @@ def main():
         signals_df = signals_df.rename(columns={'timestamp': 'open_time'})
     signals_df['open_time'] = pd.to_datetime(signals_df['open_time'])
     signals_df = signals_df.sort_values('open_time').reset_index(drop=True)
+    source_meta = validate_signals_source(args.signals_path, signals_df)
 
     if args.symbols_file:
         allowed_symbols = set(load_symbols_from_file(args.symbols_file))
@@ -130,7 +222,8 @@ def main():
         signals_df, loader,
         tp_pct=args.tp_pct,
         sl_pct=args.sl_pct,
-        max_horizon_bars=args.max_horizon_bars
+        max_horizon_bars=args.max_horizon_bars,
+        trade_replay_source=args.trade_replay_source,
     )
     log("INFO", "REGIME-DS", f"trades simulated: {len(trades_df)}")
 
@@ -163,9 +256,6 @@ def main():
             json.dump(regime_builder_config, f, indent=2)
         log("INFO", "REGIME-DS", "saved regime_builder_config.json")
 
-    all_signal_times = signals_df['open_time'].tolist()
-    trades_sorted = trades_df.sort_values('open_time').reset_index(drop=True)
-
     log("INFO", "REGIME-DS", "building regime features in batch mode")
 
     pump_builder = None
@@ -180,8 +270,17 @@ def main():
         log("INFO", "REGIME-DS", "including detector snapshot features")
 
     batch_size = 50
+    log("INFO", "REGIME-DS", "building causal strategy-state snapshots")
+    strategy_state_by_time = build_strategy_state_live_by_time(
+        signals_df=signals_df,
+        loader=loader,
+        tp_pct=args.tp_pct,
+        sl_pct=args.sl_pct,
+        max_horizon_bars=args.max_horizon_bars,
+        trade_replay_source=args.trade_replay_source,
+    )
     log("INFO", "REGIME-DS", "building features")
-    regime_features = builder.build_batch(signals_df, batch_size=batch_size, trades_df=trades_df)
+    regime_features = builder.build_batch(signals_df, batch_size=batch_size, trades_df=strategy_state_by_time)
 
     if regime_features.empty:
         log("ERROR", "REGIME-DS", "regime_features is empty!")
@@ -199,6 +298,7 @@ def main():
         min_resolved=args.target_min_resolved,
         sl_rate_threshold=args.target_sl_rate_threshold,
         target_profile=args.target_profile,
+        max_horizon_bars=args.max_horizon_bars,
     )
 
     if dataset.empty:
@@ -258,6 +358,8 @@ def main():
             'symbols_file': args.symbols_file,
             'fixed_universe_file': args.fixed_universe_file,
             'strategy_state_mode': STRATEGY_STATE_MODE,
+            'signals_source_type': source_meta['signals_source_type'],
+            'base_model_oos_validated': source_meta['base_model_oos_validated'],
         }
         with open(run_dir / "run_config.json", 'w') as f:
             json.dump(config, f, indent=2, default=str)
@@ -334,6 +436,8 @@ def main():
             'symbols_file': args.symbols_file,
             'fixed_universe_file': args.fixed_universe_file,
             'strategy_state_mode': STRATEGY_STATE_MODE,
+            'signals_source_type': source_meta['signals_source_type'],
+            'base_model_oos_validated': source_meta['base_model_oos_validated'],
         }
         with open(run_dir / "dataset_manifest.json", 'w') as f:
             json.dump(manifest, f, indent=2, default=str)

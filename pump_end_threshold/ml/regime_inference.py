@@ -11,7 +11,7 @@ from catboost import CatBoostClassifier
 from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
 from pump_end_threshold.infra.clickhouse import DataLoader, get_liquid_universe
 from pump_end_threshold.infra.logging import log
-from pump_end_threshold.ml.regime_dataset import STRATEGY_STATE_MODE, build_strategy_state
+from pump_end_threshold.ml.regime_dataset import STRATEGY_STATE_MODE, build_strategy_state_live
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 
 
@@ -127,19 +127,24 @@ def apply_guard_to_raw_signals(
     )
 
     loader = DataLoader(ch_dsn)
-    log("INFO", "GUARD", "simulating trades for strategy state features")
-    trades_df = build_strategy_state(
-        signals,
-        loader,
-        tp_pct=artifacts.tp_pct,
-        sl_pct=artifacts.sl_pct,
-        max_horizon_bars=artifacts.max_horizon_bars,
-        trade_replay_source=artifacts.trade_replay_source or "1s",
-    )
-    log("INFO", "GUARD", f"trades simulated: {len(trades_df)}")
+    log("INFO", "GUARD", "building causal strategy-state snapshots")
+    strategy_state_by_time = {}
+    unique_times = pd.Series(signals['open_time'].dropna().unique()).sort_values()
+    replay_source = artifacts.trade_replay_source or "1s"
+    for t in unique_times:
+        asof_time = pd.Timestamp(t).to_pydatetime()
+        strategy_state_by_time[pd.Timestamp(t)] = build_strategy_state_live(
+            signals,
+            loader,
+            asof_time=asof_time,
+            tp_pct=artifacts.tp_pct,
+            sl_pct=artifacts.sl_pct,
+            max_horizon_bars=artifacts.max_horizon_bars,
+            trade_replay_source=replay_source,
+        )
 
     log("INFO", "GUARD", "building regime features in batch mode")
-    guard_features = builder.build_batch(signals, batch_size=100, trades_df=trades_df)
+    guard_features = builder.build_batch(signals, batch_size=100, trades_df=strategy_state_by_time)
 
     if guard_features.empty:
         log("WARN", "GUARD", "no features built")

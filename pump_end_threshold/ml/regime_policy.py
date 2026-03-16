@@ -23,49 +23,51 @@ class RegimePolicy:
         df['policy_episode_id'] = -1
         df['pause_reason'] = ''
         df['resume_reason'] = ''
-        df['bucket_p_bad'] = np.nan
+        df['bucket_p_bad'] = pd.to_numeric(df[p_bad_col], errors='coerce')
 
         state = self.STATE_ACTIVE
         resume_streak = 0
         episode_id = 0
+        pending_pause_time = None
 
-        buckets = df.groupby('open_time', sort=True)
+        for idx in df.index:
+            current_time = df.at[idx, 'open_time']
+            p_bad_val = pd.to_numeric(df.at[idx, p_bad_col], errors='coerce')
 
-        for bucket_time, bucket_idx in buckets.groups.items():
-            bucket_p_bads = df.loc[bucket_idx, p_bad_col]
-            bucket_p_bad_val = float(bucket_p_bads.max())
-            df.loc[bucket_idx, 'bucket_p_bad'] = bucket_p_bad_val
+            if (
+                    state == self.STATE_ACTIVE and
+                    pending_pause_time is not None and
+                    current_time > pending_pause_time
+            ):
+                state = self.STATE_PAUSED
+                episode_id += 1
+                resume_streak = 0
+                pending_pause_time = None
 
             if state == self.STATE_ACTIVE:
-                if bucket_p_bad_val >= self.pause_on_threshold:
-                    state = self.STATE_PAUSED
-                    episode_id += 1
-                    resume_streak = 0
-                    df.loc[bucket_idx, 'regime_state'] = self.STATE_PAUSED
-                    df.loc[bucket_idx, 'blocked_by_policy'] = True
-                    df.loc[bucket_idx, 'policy_episode_id'] = episode_id
-                    df.loc[bucket_idx, 'pause_reason'] = f'bucket_p_bad={bucket_p_bad_val:.3f}'
-                else:
-                    df.loc[bucket_idx, 'regime_state'] = self.STATE_ACTIVE
-                    df.loc[bucket_idx, 'blocked_by_policy'] = False
+                df.at[idx, 'regime_state'] = self.STATE_ACTIVE
+                df.at[idx, 'blocked_by_policy'] = False
+                df.at[idx, 'policy_episode_id'] = -1
+                if pd.notna(p_bad_val) and p_bad_val >= self.pause_on_threshold:
+                    pending_pause_time = current_time
+                    df.at[idx, 'pause_reason'] = f'p_bad={p_bad_val:.3f}'
+                continue
 
-            elif state == self.STATE_PAUSED:
-                df.loc[bucket_idx, 'regime_state'] = self.STATE_PAUSED
-                df.loc[bucket_idx, 'blocked_by_policy'] = True
-                df.loc[bucket_idx, 'policy_episode_id'] = episode_id
+            df.at[idx, 'regime_state'] = self.STATE_PAUSED
+            df.at[idx, 'blocked_by_policy'] = True
+            df.at[idx, 'policy_episode_id'] = episode_id
 
-                if bucket_p_bad_val <= self.resume_threshold:
-                    resume_streak += 1
-                    if resume_streak >= self.resume_confirm_signals:
-                        state = self.STATE_ACTIVE
-                        reason = f'{resume_streak}_consecutive_low_risk_buckets'
-                        df.loc[bucket_idx, 'regime_state'] = self.STATE_ACTIVE
-                        df.loc[bucket_idx, 'blocked_by_policy'] = False
-                        df.loc[bucket_idx, 'policy_episode_id'] = -1
-                        df.loc[bucket_idx, 'resume_reason'] = reason
-                        resume_streak = 0
-                else:
+            if pd.notna(p_bad_val) and p_bad_val <= self.resume_threshold:
+                resume_streak += 1
+                if resume_streak >= self.resume_confirm_signals:
+                    state = self.STATE_ACTIVE
+                    df.at[idx, 'regime_state'] = self.STATE_ACTIVE
+                    df.at[idx, 'blocked_by_policy'] = False
+                    df.at[idx, 'policy_episode_id'] = -1
+                    df.at[idx, 'resume_reason'] = f'{resume_streak}_consecutive_low_risk_signals'
                     resume_streak = 0
+            else:
+                resume_streak = 0
 
         return df
 

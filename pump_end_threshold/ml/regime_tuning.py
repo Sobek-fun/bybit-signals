@@ -284,9 +284,17 @@ def apply_regime_fold_split(
     df = dataset_df.copy()
     df['split'] = None
 
+    if 'label_end_time' not in df.columns:
+        raise ValueError("Dataset must contain 'label_end_time' for leakage-safe split")
+
+    train_boundary = fold['train_end']
+    if embargo_hours > 0:
+        train_boundary = train_boundary - pd.Timedelta(hours=embargo_hours)
+
     df.loc[
         (df['open_time'] >= fold['train_start']) &
-        (df['open_time'] < fold['train_end']),
+        (df['open_time'] < fold['train_end']) &
+        (pd.to_datetime(df['label_end_time']) < train_boundary),
         'split'
     ] = 'train'
 
@@ -301,14 +309,6 @@ def apply_regime_fold_split(
         if len(train_df) > embargo_signals:
             last_train_signals = train_df.tail(embargo_signals)
             df.loc[last_train_signals.index, 'split'] = None
-
-    if embargo_hours > 0:
-        embargo_cutoff = fold['train_end'] - pd.Timedelta(hours=embargo_hours)
-        df.loc[
-            (df['split'] == 'train') &
-            (df['open_time'] >= embargo_cutoff),
-            'split'
-        ] = None
 
     return df[df['split'].notna()].reset_index(drop=True)
 
@@ -806,17 +806,19 @@ def train_final_regime_model(
         embargo_hours: float = 0,
         auto_class_weights: str = None,
 ) -> CatBoostClassifier:
-    train_df = dataset_df[dataset_df['open_time'] < train_end]
+    if 'label_end_time' not in dataset_df.columns:
+        raise ValueError("Dataset must contain 'label_end_time' for leakage-safe final training")
+
+    train_boundary = train_end
+    if embargo_hours > 0:
+        train_boundary = train_end - pd.Timedelta(hours=embargo_hours)
+
+    train_df = dataset_df[
+        (dataset_df['open_time'] < train_end) &
+        (pd.to_datetime(dataset_df['label_end_time']) < train_boundary)
+    ]
 
     train_df = train_df.dropna(subset=[target_col])
-
-    train_df = train_df.sort_values('open_time')
-    if len(train_df) > target_horizon_signals:
-        train_df = train_df.iloc[:-target_horizon_signals]
-
-    if embargo_hours > 0:
-        embargo_cutoff = train_end - pd.Timedelta(hours=embargo_hours)
-        train_df = train_df[train_df['open_time'] < embargo_cutoff]
 
     X_train = train_df[feature_columns]
     y_train = train_df[target_col]

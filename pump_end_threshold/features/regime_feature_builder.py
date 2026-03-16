@@ -77,12 +77,11 @@ class RegimeFeatureBuilder:
             row.update(self._market_interaction_features(btc_features, eth_features))
 
             signals_history = signals[signals['open_time'] < ot]
-            signals_bucket = signals[signals['open_time'] == ot]
             row.update(self._signal_flow_features(signals_history, sig))
-            row['bucket_signals_now'] = len(signals_bucket)
 
             if trades_df is not None:
-                row.update(self._strategy_state_features(trades_df, ot, signals_history, sig['symbol']))
+                trades_state = trades_df.get(ot) if isinstance(trades_df, dict) else trades_df
+                row.update(self._strategy_state_features(trades_state, ot, signals_history, sig['symbol']))
 
             row.update(self._microstructure_features('BTCUSDT', ot, 'btc'))
             row.update(self._microstructure_features('ETHUSDT', ot, 'eth'))
@@ -663,6 +662,32 @@ class RegimeFeatureBuilder:
                                   signals_before: pd.DataFrame = None,
                                   current_symbol: str = None) -> dict:
         f = {}
+        if trades_df is None or len(trades_df) == 0:
+            f['strat_resolved_sl_rate_last_24h'] = np.nan
+            f['strat_resolved_pnl_sum_last_24h'] = np.nan
+            f['strat_closed_last_24h'] = 0
+            f['strat_prev_closed_sl_streak'] = 0
+            f['strat_prev_closed_tp_streak'] = 0
+            f['strat_last_closed_is_sl'] = np.nan
+            f['strat_resolved_sl_rate_last_5'] = np.nan
+            f['strat_resolved_tp_rate_last_5'] = np.nan
+            f['strat_resolved_pnl_sum_last_5'] = np.nan
+            f['strat_open_trades_now'] = 0
+            if signals_before is not None:
+                t_1h = t - timedelta(hours=1)
+                t_4h = t - timedelta(hours=4)
+                t_12h = t - timedelta(hours=12)
+                f['strat_signals_last_1h'] = len(signals_before[signals_before['open_time'] > t_1h])
+                f['strat_signals_last_4h'] = len(signals_before[signals_before['open_time'] > t_4h])
+                f['strat_signals_last_12h'] = len(signals_before[signals_before['open_time'] > t_12h])
+                signals_4h = signals_before[signals_before['open_time'] > t_4h]
+                f['strat_unique_symbols_last_4h'] = signals_4h['symbol'].nunique() if len(signals_4h) > 0 else 0
+            else:
+                f['strat_signals_last_1h'] = np.nan
+                f['strat_signals_last_4h'] = np.nan
+                f['strat_signals_last_12h'] = np.nan
+                f['strat_unique_symbols_last_4h'] = np.nan
+            return f
 
         resolved_before = trades_df[
             (trades_df['exit_time'].notna()) &
@@ -926,12 +951,11 @@ class RegimeFeatureBuilder:
                 row.update(self._market_interaction_features(btc_features, eth_features))
 
                 signals_history = signals_sorted[signals_sorted['open_time'] < ot]
-                signals_bucket = signals_sorted[signals_sorted['open_time'] == ot]
                 row.update(self._signal_flow_features(signals_history, sig))
-                row['bucket_signals_now'] = len(signals_bucket)
 
                 if trades_df is not None:
-                    row.update(self._strategy_state_features(trades_df, ot, signals_history, sig['symbol']))
+                    trades_state = trades_df.get(ot) if isinstance(trades_df, dict) else trades_df
+                    row.update(self._strategy_state_features(trades_state, ot, signals_history, sig['symbol']))
 
                 row.update(self._microstructure_features('BTCUSDT', ot, 'btc'))
                 row.update(self._microstructure_features('ETHUSDT', ot, 'eth'))
