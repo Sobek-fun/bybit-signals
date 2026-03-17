@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -343,15 +344,24 @@ def calibrate_threshold_on_val(
 
 
 def run_build_dataset(args, artifacts: RunArtifacts):
+    t0 = time.perf_counter()
+    stage_t = t0
+
     start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
     end_date = parse_date_exclusive(args.end_date) if args.end_date else None
 
     log("INFO", "BUILD", f"loading labels from {args.labels}")
     labels_df = load_labels(args.labels, start_date, end_date)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=load_labels took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
     log("INFO", "BUILD",
         f"loaded {len(labels_df)} labels (A={len(labels_df[labels_df['pump_la_type'] == 'A'])}, B={len(labels_df[labels_df['pump_la_type'] == 'B'])})")
 
     artifacts.save_labels_filtered(labels_df)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=save_labels_filtered took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
 
     pos_offsets = parse_pos_offsets(args.pos_offsets)
     log("INFO", "BUILD",
@@ -364,10 +374,16 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         include_b=args.include_b
     )
     points_df = deduplicate_points(points_df)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=build_and_dedup_points took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
     log("INFO", "BUILD",
         f"training points: {len(points_df)} (y=1: {len(points_df[points_df['y'] == 1])}, y=0: {len(points_df[points_df['y'] == 0])})")
 
     artifacts.save_training_points(points_df)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=save_training_points took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
 
     log("INFO", "BUILD", f"building features from ClickHouse")
     builder = PumpFeatureBuilder(
@@ -383,6 +399,9 @@ def run_build_dataset(args, artifacts: RunArtifacts):
     feature_input['runup_pct'] = 0
 
     features_df = builder.build(feature_input, max_workers=args.build_workers)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=feature_builder_build took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
 
     features_df = features_df.merge(
         points_df[['symbol', 'open_time', 'event_id', 'offset', 'y', 'pump_la_type', 'runup_pct']],
@@ -394,9 +413,15 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         features_df = features_df.drop(columns=['pump_la_type_feat'])
     if 'runup_pct_feat' in features_df.columns:
         features_df = features_df.drop(columns=['runup_pct_feat'])
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=merge_points_features took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
 
     features_df = check_event_integrity(features_df)
     features_df = features_df.sort_values(['event_id', 'offset']).reset_index(drop=True)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=integrity_and_sort took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
 
     features_df['sample_weight'] = 1.0
 
@@ -415,9 +440,15 @@ def run_build_dataset(args, artifacts: RunArtifacts):
 
     pos_offset0_mask = (features_df['y'] == 1) & (features_df['offset'] == 0)
     features_df.loc[pos_offset0_mask, 'sample_weight'] *= 2.0
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=sample_weighting took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    stage_t = now
 
     log("INFO", "BUILD", f"features shape: {features_df.shape}")
     artifacts.save_features(features_df)
+    now = time.perf_counter()
+    log("INFO", "BUILD", f"stage=save_features took={now - stage_t:.2f}s total={now - t0:.2f}s")
+    log("INFO", "BUILD", f"stage=build_dataset_total took={now - t0:.2f}s")
 
     log("INFO", "BUILD", f"dataset saved to {artifacts.get_path()}")
 
@@ -879,7 +910,7 @@ def main():
     parser.add_argument("--window-bars", type=int, default=30)
     parser.add_argument("--warmup-bars", type=int, default=150)
     parser.add_argument("--feature-set", type=str, choices=["base", "extended"], default="base")
-    parser.add_argument("--build-workers", type=int, default=4)
+    parser.add_argument("--build-workers", type=int, default=8)
 
     parser.add_argument("--split-strategy", type=str, choices=["time", "ratio"], default="time")
     parser.add_argument("--train-end", type=str, default=None)

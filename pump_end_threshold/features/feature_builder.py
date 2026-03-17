@@ -1,29 +1,47 @@
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-from concurrent.futures import ProcessPoolExecutor
+import shutil
+import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import timedelta
+from pathlib import Path
 
 from pump_end_threshold.infra.clickhouse import DataLoader
 from pump_end_threshold.features.params import PumpParams, DEFAULT_PUMP_PARAMS
 
+_WORKER_BUILDER = None
+_WORKER_PARTS_DIR = ""
 
-def _process_symbol_worker(args):
-    ch_dsn, symbol, events_data, window_bars, warmup_bars, feature_set, params_dict, market_symbol = args
 
-    builder = PumpFeatureBuilder(
+def _init_worker(worker_config):
+    global _WORKER_BUILDER, _WORKER_PARTS_DIR
+    ch_dsn, window_bars, warmup_bars, feature_set, params_dict, market_symbol, parts_dir = worker_config
+    _WORKER_BUILDER = PumpFeatureBuilder(
         ch_dsn=ch_dsn,
         window_bars=window_bars,
         warmup_bars=warmup_bars,
         feature_set=feature_set,
         params=PumpParams(**params_dict) if params_dict else None,
-        market_symbol=market_symbol
+        market_symbol=market_symbol,
     )
+    _WORKER_PARTS_DIR = parts_dir
 
-    events = pd.DataFrame(events_data)
-    events['open_time'] = pd.to_datetime(events['open_time'])
 
-    return builder._process_symbol(symbol, events)
+def _process_symbol_worker(task):
+    task_idx, symbol, _, event_times_ns, pump_types, runups = task
+    events = pd.DataFrame({
+        'open_time': pd.to_datetime(np.array(event_times_ns, dtype=np.int64)),
+        'pump_la_type': pump_types,
+        'runup_pct': runups,
+    })
+    rows = _WORKER_BUILDER._process_symbol(symbol, events)
+    if not rows:
+        return symbol, "", 0
+    part_path = Path(_WORKER_PARTS_DIR) / f"part_{task_idx:05d}_{symbol}.parquet"
+    pd.DataFrame(rows).to_parquet(part_path, index=False)
+    return symbol, str(part_path), len(rows)
 
 
 class PumpFeatureBuilder:
@@ -50,6 +68,7 @@ class PumpFeatureBuilder:
         self._btc_cache = {}
 
     def build(self, labels_df: pd.DataFrame, max_workers: int = 4) -> pd.DataFrame:
+        t0 = time.perf_counter()
         labels_df = labels_df[labels_df['pump_la_type'].isin(['A', 'B'])].copy()
 
         if 'event_open_time' in labels_df.columns:
@@ -61,12 +80,15 @@ class PumpFeatureBuilder:
 
         grouped = labels_df.groupby('symbol', sort=False)
         symbols = list(grouped.groups.keys())
+        print(f"[BUILD_FEATS] symbols={len(symbols)} max_workers={max_workers}")
 
         if len(symbols) <= 2 or max_workers <= 1:
+            t_seq = time.perf_counter()
             all_rows = []
             for symbol, group in grouped:
                 rows = self._process_symbol(symbol, group)
                 all_rows.extend(rows)
+            print(f"[BUILD_FEATS] mode=sequential took={time.perf_counter() - t_seq:.2f}s")
         else:
             params_dict = {
                 'runup_window': self.params.runup_window,
@@ -99,28 +121,59 @@ class PumpFeatureBuilder:
             }
 
             tasks = []
-            for symbol, group in grouped:
-                events_data = group[['open_time', 'pump_la_type', 'runup_pct']].to_dict('records')
-                tasks.append((
-                    self.ch_dsn,
-                    symbol,
-                    events_data,
-                    self.window_bars,
-                    self.warmup_bars,
-                    self.feature_set,
-                    params_dict,
-                    self.market_symbol
-                ))
+            for task_idx, (symbol, group) in enumerate(grouped):
+                event_times_ns = pd.to_datetime(group['open_time']).astype('int64').tolist()
+                pump_types = group['pump_la_type'].astype(str).tolist()
+                runups = group['runup_pct'].astype(float).tolist()
+                tasks.append((task_idx, symbol, len(group), event_times_ns, pump_types, runups))
+            # Start heavy symbols first to reduce tail latency.
+            tasks.sort(key=lambda x: (-x[2], x[1]))
 
-            all_rows = []
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                for rows in executor.map(_process_symbol_worker, tasks):
-                    all_rows.extend(rows)
+            worker_config = (
+                self.ch_dsn,
+                self.window_bars,
+                self.warmup_bars,
+                self.feature_set,
+                params_dict,
+                self.market_symbol,
+                tempfile.mkdtemp(prefix="pump_feat_parts_"),
+            )
+            parts_dir = worker_config[-1]
+
+            t_mp = time.perf_counter()
+            finished_parts = []
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    initializer=_init_worker,
+                    initargs=(worker_config,),
+                ) as executor:
+                    futures = {executor.submit(_process_symbol_worker, task): task for task in tasks}
+                    for future in as_completed(futures):
+                        task = futures[future]
+                        _, symbol, _, _, _, _ = task
+                        _, part_path, row_count = future.result()
+                        finished_parts.append((symbol, part_path, row_count))
+
+                finished_parts.sort(key=lambda x: x[0])
+                frames = [pd.read_parquet(part_path) for _, part_path, row_count in finished_parts if row_count > 0 and part_path]
+                if not frames:
+                    print(f"[BUILD_FEATS] done rows=0 total={time.perf_counter() - t0:.2f}s")
+                    return pd.DataFrame()
+                result_df = pd.concat(frames, ignore_index=True)
+                result_df = result_df.sort_values(['symbol', 'open_time']).reset_index(drop=True)
+                print(f"[BUILD_FEATS] mode=process_pool workers={max_workers} took={time.perf_counter() - t_mp:.2f}s")
+                print(f"[BUILD_FEATS] done rows={len(result_df)} total={time.perf_counter() - t0:.2f}s")
+                return result_df
+            finally:
+                shutil.rmtree(parts_dir, ignore_errors=True)
 
         if not all_rows:
+            print(f"[BUILD_FEATS] done rows=0 total={time.perf_counter() - t0:.2f}s")
             return pd.DataFrame()
 
         result_df = pd.DataFrame(all_rows)
+        print(f"[BUILD_FEATS] done rows={len(result_df)} total={time.perf_counter() - t0:.2f}s")
         return result_df
 
     def build_one_for_inference(
@@ -246,6 +299,7 @@ class PumpFeatureBuilder:
         return rows
 
     def _process_symbol(self, symbol: str, events: pd.DataFrame) -> list:
+        t0 = time.perf_counter()
         t_min = events['open_time'].min()
         t_max = events['open_time'].max()
 
@@ -254,8 +308,10 @@ class PumpFeatureBuilder:
         end_bucket = t_max
 
         df = self.loader.load_candles_range(symbol, start_bucket, end_bucket)
+        t_load = time.perf_counter()
 
         if df.empty:
+            print(f"[BUILD_FEATS_SYMBOL] symbol={symbol} events={len(events)} candles=0 load={t_load - t0:.2f}s total={time.perf_counter() - t0:.2f}s")
             return []
 
         df = self._calculate_base_indicators(df)
@@ -275,14 +331,81 @@ class PumpFeatureBuilder:
         df = self._apply_decision_shift(df)
 
         self._validate_columns(df)
+        t_calc = time.perf_counter()
 
-        return self._extract_features_vectorized(df, symbol, events)
+        rows = self._extract_features_vectorized(df, symbol, events)
+        t_ext = time.perf_counter()
+        print(
+            f"[BUILD_FEATS_SYMBOL] symbol={symbol} events={len(events)} candles={len(df)} "
+            f"rows={len(rows)} load={t_load - t0:.2f}s calc={t_calc - t_load:.2f}s "
+            f"extract={t_ext - t_calc:.2f}s total={t_ext - t0:.2f}s"
+        )
+        return rows
 
     def _validate_columns(self, df: pd.DataFrame):
         required = ['rsi_14', 'mfi_14', 'macdh_12_26_9']
         missing = [col for col in required if col not in df.columns]
         if missing:
             raise ValueError(f"Missing required indicator columns: {missing}")
+
+    @staticmethod
+    def _fallback_rsi(close: pd.Series, length: int = 14) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = (-delta.clip(upper=0))
+        avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.where(avg_loss != 0, 100.0)
+        rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
+        return rsi
+
+    @staticmethod
+    def _fallback_mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, length: int = 14) -> pd.Series:
+        typical_price = (high + low + close) / 3.0
+        raw_money_flow = typical_price * volume
+        direction = typical_price.diff()
+        positive_flow = raw_money_flow.where(direction > 0, 0.0)
+        negative_flow = raw_money_flow.where(direction < 0, 0.0).abs()
+        pos_sum = positive_flow.rolling(window=length).sum()
+        neg_sum = negative_flow.rolling(window=length).sum()
+        mfr = pos_sum / neg_sum.replace(0, np.nan)
+        mfi = 100 - (100 / (1 + mfr))
+        mfi = mfi.where(neg_sum != 0, 100.0)
+        mfi = mfi.where(~((pos_sum == 0) & (neg_sum == 0)), 50.0)
+        return mfi
+
+    @staticmethod
+    def _fallback_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series, pd.Series]:
+        ema_fast = close.ewm(span=fast, adjust=False).mean()
+        ema_slow = close.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+        macd_hist = macd_line - macd_signal
+        return macd_line, macd_signal, macd_hist
+
+    def _ensure_base_indicator_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        if 'rsi_14' not in df.columns:
+            df['rsi_14'] = self._fallback_rsi(df['close'], length=14)
+        if 'mfi_14' not in df.columns:
+            df['mfi_14'] = self._fallback_mfi(df['high'], df['low'], df['close'], df['volume'], length=14)
+        if 'macdh_12_26_9' not in df.columns or 'macd_line' not in df.columns or 'macd_signal' not in df.columns:
+            macd_line, macd_signal, macd_hist = self._fallback_macd(df['close'], fast=12, slow=26, signal=9)
+            if 'macd_line' not in df.columns:
+                df['macd_line'] = macd_line
+            if 'macd_signal' not in df.columns:
+                df['macd_signal'] = macd_signal
+            if 'macdh_12_26_9' not in df.columns:
+                df['macdh_12_26_9'] = macd_hist
+        if 'atr_14' not in df.columns:
+            tr = pd.concat([
+                df['high'] - df['low'],
+                (df['high'] - df['close'].shift(1)).abs(),
+                (df['low'] - df['close'].shift(1)).abs()
+            ], axis=1).max(axis=1)
+            df['atr_14'] = tr.rolling(window=14).mean()
+        return df
 
     def _calculate_base_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df['ret_1'] = df['close'] / df['close'].shift(1) - 1
@@ -318,6 +441,8 @@ class PumpFeatureBuilder:
         atr_col = [c for c in df.columns if 'ATR' in c and '14' in c]
         if atr_col:
             df = df.rename(columns={atr_col[0]: 'atr_14'})
+
+        df = self._ensure_base_indicator_columns(df)
 
         rolling_max_close = df['close'].rolling(window=self.window_bars).max()
         df['drawdown'] = (df['close'] - rolling_max_close) / rolling_max_close
@@ -494,9 +619,9 @@ class PumpFeatureBuilder:
         eqh_atr_factor = p.eqh_atr_factor
         min_touches = p.eqh_min_touches
 
-        df['eqh_level'] = np.nan
-        df['eqh_strength'] = 0
-        df['eqh_age_bars'] = np.nan
+        eqh_level = np.full(n, np.nan)
+        eqh_strength = np.zeros(n, dtype=int)
+        eqh_age_bars = np.full(n, np.nan)
 
         high_arr = df['high'].values
         atr_arr = df['atr_14'].values if 'atr_14' in df.columns else np.full(n, np.nan)
@@ -549,9 +674,13 @@ class PumpFeatureBuilder:
             if clusters:
                 clusters.sort(key=lambda x: (-x[1], -x[0]))
                 best = clusters[0]
-                df.iloc[i, df.columns.get_loc('eqh_level')] = best[0]
-                df.iloc[i, df.columns.get_loc('eqh_strength')] = best[1]
-                df.iloc[i, df.columns.get_loc('eqh_age_bars')] = best[2]
+                eqh_level[i] = best[0]
+                eqh_strength[i] = best[1]
+                eqh_age_bars[i] = best[2]
+
+        df['eqh_level'] = eqh_level
+        df['eqh_strength'] = eqh_strength
+        df['eqh_age_bars'] = eqh_age_bars
 
         df['dist_to_eqh'] = np.where(df['eqh_level'].notna() & (df['eqh_level'] > 0), (df['eqh_level'] - df['close']) / df['close'], np.nan)
         df['sweep_eqh'] = ((df['high'] > df['eqh_level'] * 1.001) & (df['close'] < df['eqh_level'] * 0.999) & df['eqh_level'].notna()).astype(int)
