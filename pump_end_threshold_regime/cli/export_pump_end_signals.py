@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from pump_end_threshold.infra.clickhouse import list_all_usdt_tokens
+from pump_end_threshold.ml.export_signals import export_signals
 from pump_end_threshold.ml.regime_inference import apply_guard_to_raw_signals
 
 
@@ -66,7 +68,6 @@ def resolve_export_tokens(symbols_file: str = None, symbols_csv: str = None, ch_
         symbols = [normalize_symbol(symbol) for symbol in symbols_csv.split(',') if symbol.strip()]
         return [symbol_to_token(symbol) for symbol in symbols]
 
-    from pump_end_prod.infra.clickhouse import list_all_usdt_tokens
     return list_all_usdt_tokens(ch_dsn)
 
 
@@ -197,10 +198,9 @@ def main():
             pd.DataFrame(columns=['symbol', 'open_time']).to_parquet(args.raw_signals_output, index=False)
         return
 
-    stage_a_csv = temp_dir / "prod_raw_signals.csv"
+    stage_a_csv = temp_dir / "raw_detector_signals.csv"
 
-    log("INFO", "EXPORT", f"stage A: replaying prod exporter for {len(tokens)} tokens")
-    from pump_end_prod.pump_end.export_signals import export_signals
+    log("INFO", "EXPORT", f"stage A: exporting detector signals for {len(tokens)} tokens")
     export_signals(
         tokens=tokens,
         ch_dsn=args.clickhouse_dsn,
