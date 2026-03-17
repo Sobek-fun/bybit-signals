@@ -22,7 +22,7 @@ class BatchRuntime:
             workspace_root=str(payload.get("workspace_root", "/workspace/experiments")).strip(),
             requirements_file=str(payload.get("requirements_file", "scripts/runpod_jobs/requirements_runpod.txt")).strip(),
             pipeline_command=str(payload.get("pipeline_command", "")).strip(),
-            clickhouse_dsn_env=str(payload.get("clickhouse_dsn_env", "CH_DB")).strip(),
+            clickhouse_dsn_env=str(payload.get("clickhouse_dsn_env", "")).strip(),
             detector_dir_remote=str(payload.get("detector_dir_remote", "")).strip(),
             tokens_file_remote=str(payload.get("tokens_file_remote", "")).strip(),
             python_bin=str(payload.get("python_bin", "python3")).strip(),

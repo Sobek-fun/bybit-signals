@@ -4,16 +4,32 @@
 
 ## Формат minimal spec
 
-Файл: `scripts/runpod_jobs/experiment_specs.example.json`
+Файлы примеров:
+
+- regime: `scripts/runpod_jobs/experiment_specs.example.json`
+- threshold: `scripts/runpod_jobs/experiment_specs.threshold.example.json`
 
 - `batch_id`: идентификатор батча.
 - `runtime.workspace_root`: обычно `/workspace/experiments`.
 - `runtime.requirements_file`: путь внутри upload-snapshot.
-- `runtime.pipeline_command`: базовая команда пайплайна (использует `RUN_ROOT`, `DETECTOR_DIR`, `TOKENS_FILE`).
-- `runtime.clickhouse_dsn_env`: имя env-переменной на pod (например `CH_DB`).
-- `runtime.detector_dir_remote`: внешний путь на pod к detector.
-- `runtime.tokens_file_remote`: внешний путь на pod к tokens-файлу.
+- `runtime.pipeline_command`: команда пайплайна (всегда использует `RUN_ROOT`, опционально `DETECTOR_DIR`, `TOKENS_FILE`).
+- `runtime.clickhouse_dsn_env`: optional имя env-переменной с DSN (например `CH_DB`).
+- `runtime.detector_dir_remote`: optional путь к detector на pod.
+- `runtime.tokens_file_remote`: optional путь к tokens-файлу на pod.
+- `runtime.extra_env`: optional словарь env-переменных, экспортируется перед запуском пайплайна.
 - `experiments[]`: `exp_id`, `pod_alias`, `patch_files[]`.
+
+### Regime job
+
+- Обычно нужны `detector_dir_remote`, `tokens_file_remote`, `clickhouse_dsn_env`.
+- В `pipeline_command` используется экспорт сигналов и `pump_end_threshold.cli.train_regime_guard`.
+
+### Threshold job
+
+- Достаточно готового parquet, detector/tokens не обязательны.
+- Рекомендуется передавать путь через `runtime.extra_env.DATASET_PARQUET`.
+- Для запуска threshold используй `python -m pump_end_threshold.cli.train_pump_end_model`, а не `src.scripts...`.
+- `clickhouse_dsn_env` заполняй только если нужны trade-replay метрики.
 
 ## Формат pod inventory
 
@@ -27,7 +43,7 @@
 
 ```bash
 python -m scripts.runpod_jobs.cli launch \
-  --spec-file scripts/runpod_jobs/experiment_specs.example.json \
+  --spec-file scripts/runpod_jobs/experiment_specs.threshold.example.json \
   --pod-inventory scripts/runpod_jobs/pod_inventory.example.json \
   --runpod-api-key "$RUNPOD_API_KEY" \
   --ssh-key-path ~/.ssh/id_ed25519

@@ -51,12 +51,6 @@ def _validate_spec(spec: BatchSpec) -> None:
         raise SystemExit("spec.experiments must be non-empty")
     if not spec.runtime.pipeline_command:
         raise SystemExit("spec.runtime.pipeline_command is required")
-    if not spec.runtime.detector_dir_remote:
-        raise SystemExit("spec.runtime.detector_dir_remote is required")
-    if not spec.runtime.tokens_file_remote:
-        raise SystemExit("spec.runtime.tokens_file_remote is required")
-    if not spec.runtime.clickhouse_dsn_env:
-        raise SystemExit("spec.runtime.clickhouse_dsn_env is required")
     if not spec.runtime.requirements_file:
         raise SystemExit("spec.runtime.requirements_file is required")
     _assert_allowed_relative_path(spec.runtime.requirements_file, "spec.runtime.requirements_file")
@@ -454,25 +448,28 @@ def doctor(args: argparse.Namespace) -> int:
             det = run_ssh(
                 conn,
                 f"if [ -d {shlex.quote(spec.runtime.detector_dir_remote)} ]; then echo ok; else echo missing; fi",
-            )
-            det_ok = "ok" in (det.stdout or "")
-            checks.append({"check": f"detector_dir:{exp.pod_alias}", "ok": det_ok})
-            ok = ok and det_ok
+            ) if spec.runtime.detector_dir_remote else None
+            if spec.runtime.detector_dir_remote:
+                det_ok = "ok" in (det.stdout or "")
+                checks.append({"check": f"detector_dir:{exp.pod_alias}", "ok": det_ok})
+                ok = ok and det_ok
             tok = run_ssh(
                 conn,
                 f"if [ -f {shlex.quote(spec.runtime.tokens_file_remote)} ]; then echo ok; else echo missing; fi",
-            )
-            tok_ok = "ok" in (tok.stdout or "")
-            checks.append({"check": f"tokens_file:{exp.pod_alias}", "ok": tok_ok})
-            ok = ok and tok_ok
+            ) if spec.runtime.tokens_file_remote else None
+            if spec.runtime.tokens_file_remote:
+                tok_ok = "ok" in (tok.stdout or "")
+                checks.append({"check": f"tokens_file:{exp.pod_alias}", "ok": tok_ok})
+                ok = ok and tok_ok
             dsn_env = spec.runtime.clickhouse_dsn_env
-            if spec.runtime.extra_env.get(dsn_env, "").strip():
-                dsn_ok = True
-            else:
-                env_check = run_ssh(conn, f"if [ -n \"${{{dsn_env}:-}}\" ]; then echo ok; else echo missing; fi")
-                dsn_ok = "ok" in (env_check.stdout or "")
-            checks.append({"check": f"dsn_env:{exp.pod_alias}", "ok": dsn_ok, "env": dsn_env})
-            ok = ok and dsn_ok
+            if dsn_env:
+                if spec.runtime.extra_env.get(dsn_env, "").strip():
+                    dsn_ok = True
+                else:
+                    env_check = run_ssh(conn, f"if [ -n \"${{{dsn_env}:-}}\" ]; then echo ok; else echo missing; fi")
+                    dsn_ok = "ok" in (env_check.stdout or "")
+                checks.append({"check": f"dsn_env:{exp.pod_alias}", "ok": dsn_ok, "env": dsn_env})
+                ok = ok and dsn_ok
         except BaseException as exc:
             checks.append({"check": f"pod_health:{exp.pod_alias}", "ok": False, "error": str(exc)})
             ok = False

@@ -1,0 +1,21 @@
+{
+  "batch_id": "2026-03-17_threshold_example",
+  "runtime": {
+    "workspace_root": "/workspace/experiments",
+    "requirements_file": "scripts/runpod_jobs/requirements_runpod.txt",
+    "pipeline_command": "RUN_ROOT=\"${RUN_ROOT}\" && TRAIN_END=\"2026-02-20\" && VAL_END=\"2026-03-01\" && TEST_END=\"2026-03-14\" && mkdir -p \"$RUN_ROOT\" && python -u -m pump_end_threshold.cli.train_pump_end_model --mode tune --dataset-parquet \"${DATASET_PARQUET}\" --train-end \"$TRAIN_END\" --val-end \"$VAL_END\" --test-end \"$TEST_END\" --time-budget-min 45 --fold-months 1 --min-train-months 3 --signal-rule pending_turn_down --out-dir \"$RUN_ROOT\" --run-name \"$EXP_ID\" && python -u scripts/threshold_run_report.py \"$RUN_ROOT/$EXP_ID\"",
+    "clickhouse_dsn_env": "",
+    "detector_dir_remote": "",
+    "tokens_file_remote": "",
+    "extra_env": {
+      "DATASET_PARQUET": "/workspace/bybit-signals/artifacts/threshold/features.parquet"
+    }
+  },
+  "experiments": [
+    {
+      "exp_id": "threshold_baseline",
+      "pod_alias": "pod-a",
+      "patch_files": []
+    }
+  ]
+}

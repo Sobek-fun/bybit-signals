@@ -11,7 +11,7 @@ EXIT_CODE_PATH=""
 LAUNCH_COMMAND_PATH=""
 PYTHON_BIN="python3"
 REQUIREMENTS_FILE="scripts/runpod_jobs/requirements_runpod.txt"
-CLICKHOUSE_DSN_ENV="CH_DB"
+CLICKHOUSE_DSN_ENV=""
 DETECTOR_DIR_REMOTE=""
 TOKENS_FILE_REMOTE=""
 SETUP_COMMAND=""
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SRC_DIR" || -z "$RUN_DIR" || -z "$VENV_DIR" || -z "$LOG_PATH" || -z "$STARTED_AT_PATH" || -z "$FINISHED_AT_PATH" || -z "$EXIT_CODE_PATH" || -z "$LAUNCH_COMMAND_PATH" || -z "$DETECTOR_DIR_REMOTE" || -z "$TOKENS_FILE_REMOTE" || -z "$LAUNCH_COMMAND" ]]; then
+if [[ -z "$SRC_DIR" || -z "$RUN_DIR" || -z "$VENV_DIR" || -z "$LOG_PATH" || -z "$STARTED_AT_PATH" || -z "$FINISHED_AT_PATH" || -z "$EXIT_CODE_PATH" || -z "$LAUNCH_COMMAND_PATH" || -z "$LAUNCH_COMMAND" ]]; then
   echo "required args are missing"
   exit 2
 fi
@@ -62,15 +62,15 @@ if [[ ! -f "$SRC_DIR/$REQUIREMENTS_FILE" ]]; then
   echo "requirements file not found: $SRC_DIR/$REQUIREMENTS_FILE"
   exit 3
 fi
-if [[ ! -d "$DETECTOR_DIR_REMOTE" ]]; then
+if [[ -n "$DETECTOR_DIR_REMOTE" && ! -d "$DETECTOR_DIR_REMOTE" ]]; then
   echo "missing detector dir: $DETECTOR_DIR_REMOTE"
   exit 4
 fi
-if [[ ! -f "$TOKENS_FILE_REMOTE" ]]; then
+if [[ -n "$TOKENS_FILE_REMOTE" && ! -f "$TOKENS_FILE_REMOTE" ]]; then
   echo "missing tokens file: $TOKENS_FILE_REMOTE"
   exit 5
 fi
-if [[ -z "${!CLICKHOUSE_DSN_ENV:-}" ]]; then
+if [[ -n "$CLICKHOUSE_DSN_ENV" && -z "${!CLICKHOUSE_DSN_ENV:-}" ]]; then
   echo "missing required env var: $CLICKHOUSE_DSN_ENV"
   exit 6
 fi
