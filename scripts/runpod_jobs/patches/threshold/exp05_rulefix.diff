@@ -1,0 +1,171 @@
+diff --git a/pump_end_threshold/ml/tuning.py b/pump_end_threshold/ml/tuning.py
+--- a/pump_end_threshold/ml/tuning.py
++++ b/pump_end_threshold/ml/tuning.py
+@@ -119,8 +119,8 @@
+ 
+ def get_rule_parameter_grid() -> list:
+     rule_grid = {
+-        'min_pending_bars': [1, 2, 3],
+-        'drop_delta': [0.0, 0.01, 0.02]
++        'min_pending_bars': [1, 2, 3, 4],
++        'drop_delta': [0.00, 0.01, 0.02, 0.03, 0.05]
+     }
+ 
+     keys = list(rule_grid.keys())
+@@ -187,7 +187,10 @@
+         gamma_miss: float,
+         early_penalty_threshold: int = -5,
+         delta_fp_b: float = 3.0,
+-        abstain_margin: float = 0.0
++        abstain_margin: float = 0.0,
++        threshold_grid_from: float = 0.01,
++        threshold_grid_to: float = 0.30,
++        threshold_grid_step: float = 0.01
+ ) -> dict:
+     val_df = features_df[features_df['split'] == 'val']
+ 
+@@ -212,6 +215,9 @@
+         threshold, sweep_df = threshold_sweep(
+             predictions,
+             alpha_hit1=alpha_hit1,
++            grid_from=threshold_grid_from,
++            grid_to=threshold_grid_to,
++            grid_step=threshold_grid_step,
+             beta_early=beta_early,
+             gamma_miss=gamma_miss,
+             delta_fp_b=delta_fp_b,
+@@ -242,14 +248,7 @@
+         else:
+             early_penalty = 0
+ 
+-        score = (
+-                metrics['hit0_rate'] +
+-                alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate'] + metrics['hit1_rate']) -
+-                beta_early * metrics['early_rate'] -
+-                gamma_miss * metrics['miss_rate'] -
+-                delta_fp_b * metrics['fp_b_rate'] -
+-                early_penalty
+-        )
++        score = float(best_row['score']) - early_penalty
+ 
+         if score > best_score:
+             best_score = score
+@@ -290,7 +289,10 @@
+         iterations: int = 1000,
+         early_stopping_rounds: int = 50,
+         seed: int = 42,
+-        tune_strategy: str = 'threshold'
++        tune_strategy: str = 'threshold',
++        threshold_grid_from: float = 0.01,
++        threshold_grid_to: float = 0.30,
++        threshold_grid_step: float = 0.01
+ ) -> dict:
+     fold_results = []
+ 
+@@ -322,7 +324,10 @@
+             beta_early,
+             gamma_miss,
+             delta_fp_b=delta_fp_b,
+-            abstain_margin=abstain_margin
++            abstain_margin=abstain_margin,
++            threshold_grid_from=threshold_grid_from,
++            threshold_grid_to=threshold_grid_to,
++            threshold_grid_step=threshold_grid_step
+         )
+ 
+         fold_metrics['fold_idx'] = fold_idx
+@@ -363,7 +368,10 @@
+         iterations: int = 1000,
+         early_stopping_rounds: int = 50,
+         seed: int = 42,
+-        tune_strategy: str = 'threshold'
++        tune_strategy: str = 'threshold',
++        threshold_grid_from: float = 0.01,
++        threshold_grid_to: float = 0.30,
++        threshold_grid_step: float = 0.01
+ ) -> dict:
+     start_time = time.time()
+     time_budget_sec = time_budget_min * 60
+@@ -392,6 +400,9 @@
+             params,
+             signal_rule=signal_rule,
+             alpha_hit1=alpha_hit1,
++            grid_from=threshold_grid_from,
++            grid_to=threshold_grid_to,
++            grid_step=threshold_grid_step,
+             beta_early=beta_early,
+             gamma_miss=gamma_miss,
+             delta_fp_b=delta_fp_b,
+@@ -400,7 +411,10 @@
+             iterations=iterations,
+             early_stopping_rounds=early_stopping_rounds,
+             seed=seed,
+-            tune_strategy=tune_strategy
++            tune_strategy=tune_strategy,
++            threshold_grid_from=threshold_grid_from,
++            threshold_grid_to=threshold_grid_to,
++            threshold_grid_step=threshold_grid_step
+         )
+ 
+         fold_results = cv_result.get('fold_results', [])
+diff --git a/pump_end_threshold/cli/train_pump_end_model.py b/pump_end_threshold/cli/train_pump_end_model.py
+--- a/pump_end_threshold/cli/train_pump_end_model.py
++++ b/pump_end_threshold/cli/train_pump_end_model.py
+@@ -268,7 +268,10 @@
+         beta_early: float,
+         gamma_miss: float,
+         delta_fp_b: float = 3.0,
+-        abstain_margin: float = 0.0
++        abstain_margin: float = 0.0,
++        grid_from: float = 0.01,
++        grid_to: float = 0.30,
++        grid_step: float = 0.01
+ ) -> dict:
+     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
+     val_events = event_times[
+@@ -310,6 +313,9 @@
+         threshold, sweep_df = threshold_sweep(
+             predictions,
+             alpha_hit1=alpha_hit1,
++            grid_from=grid_from,
++            grid_to=grid_to,
++            grid_step=grid_step,
+             beta_early=beta_early,
+             gamma_miss=gamma_miss,
+             delta_fp_b=delta_fp_b,
+@@ -627,7 +633,10 @@
+         iterations=args.iterations,
+         early_stopping_rounds=args.early_stopping_rounds,
+         seed=args.seed,
+-        tune_strategy=args.tune_strategy
++        tune_strategy=args.tune_strategy,
++        threshold_grid_from=args.threshold_grid_from,
++        threshold_grid_to=args.threshold_grid_to,
++        threshold_grid_step=args.threshold_grid_step
+     )
+ 
+     best_result = tune_result
+@@ -683,7 +692,10 @@
+                 args.beta_early,
+                 args.gamma_miss,
+                 delta_fp_b=args.delta_fp_b,
+-                abstain_margin=args.abstain_margin
++                abstain_margin=args.abstain_margin,
++                grid_from=args.threshold_grid_from,
++                grid_to=args.threshold_grid_to,
++                grid_step=args.threshold_grid_step
+             )
+ 
+             best_threshold = calibration_result['threshold']
+@@ -828,7 +840,10 @@
+                 args.beta_early,
+                 args.gamma_miss,
+                 delta_fp_b=args.delta_fp_b,
+-                abstain_margin=args.abstain_margin
++                abstain_margin=args.abstain_margin,
++                threshold_grid_from=args.threshold_grid_from,
++                threshold_grid_to=args.threshold_grid_to,
++                threshold_grid_step=args.threshold_grid_step
+             )
+             fold_threshold = fold_eval.get('threshold')
+             fold_mpb = fold_eval.get('min_pending_bars')

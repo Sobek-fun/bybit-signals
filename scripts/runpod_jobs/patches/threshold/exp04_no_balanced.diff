@@ -1,0 +1,34 @@
+diff --git a/pump_end_threshold/ml/train.py b/pump_end_threshold/ml/train.py
+--- a/pump_end_threshold/ml/train.py
++++ b/pump_end_threshold/ml/train.py
+@@ -47,8 +47,7 @@
+         random_seed=seed,
+         verbose=100,
+         eval_metric='Logloss',
+-        use_best_model=True,
+-        auto_class_weights='Balanced'
++        use_best_model=True
+     )
+ 
+     model.fit(train_pool, eval_set=val_pool)
+diff --git a/pump_end_threshold/ml/tuning.py b/pump_end_threshold/ml/tuning.py
+--- a/pump_end_threshold/ml/tuning.py
++++ b/pump_end_threshold/ml/tuning.py
+@@ -168,8 +168,7 @@
+         random_seed=seed,
+         verbose=0,
+         eval_metric='Logloss',
+-        use_best_model=True,
+-        auto_class_weights='Balanced'
++        use_best_model=True
+     )
+ 
+     model.fit(train_pool, eval_set=val_pool)
+@@ -482,7 +481,6 @@
+         random_seed=seed,
+         verbose=100,
+         eval_metric='Logloss',
+-        auto_class_weights='Balanced'
+     )
+ 
+     model.fit(train_pool)
