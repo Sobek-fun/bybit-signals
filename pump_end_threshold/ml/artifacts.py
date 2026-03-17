@@ -38,6 +38,16 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(splits_info, f, indent=2, default=str)
 
+    def save_dataset_manifest(self, manifest: dict):
+        path = self.run_dir / "dataset_manifest.json"
+        with open(path, 'w') as f:
+            json.dump(manifest, f, indent=2, default=str)
+
+    def save_feature_columns(self, feature_columns: list):
+        path = self.run_dir / "feature_columns.json"
+        with open(path, 'w') as f:
+            json.dump(feature_columns, f, indent=2, default=str)
+
     def save_model(self, model):
         path = self.run_dir / "catboost_model.cbm"
         model.save_model(str(path))
@@ -98,6 +108,22 @@ class RunArtifacts:
         }
         with open(path, 'w') as f:
             json.dump(serializable, f, indent=2, default=str)
+
+    def save_fold_metrics(self, df: pd.DataFrame):
+        path = self.run_dir / "fold_metrics.csv"
+        df.to_csv(path, index=False)
+
+    def save_calibration_sweep_val(self, df: pd.DataFrame):
+        path = self.run_dir / "calibration_sweep_val.csv"
+        df.to_csv(path, index=False)
+
+    def save_holdout_window_summary_6h(self, df: pd.DataFrame):
+        path = self.run_dir / "holdout_window_summary_6h.csv"
+        df.to_csv(path, index=False)
+
+    def save_holdout_symbol_summary(self, df: pd.DataFrame):
+        path = self.run_dir / "holdout_symbol_summary.csv"
+        df.to_csv(path, index=False)
 
     def save_folds(self, folds: list):
         path = self.run_dir / "folds.json"

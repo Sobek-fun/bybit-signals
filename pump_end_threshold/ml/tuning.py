@@ -228,8 +228,10 @@ def evaluate_fold(
             'hit0_rate': best_row['hit0_rate'],
             'hit1_rate': best_row['hit1_rate'],
             'early_rate': best_row['early_rate'],
+            'late_rate': best_row['late_rate'],
             'miss_rate': best_row['miss_rate'],
             'fp_b_rate': best_row.get('fp_b_rate', 0),
+            'signal_count': best_row.get('signal_count', 0),
             'median_pred_offset': best_row['median_offset'],
             'n_events': best_row['n_events']
         }
@@ -262,8 +264,12 @@ def evaluate_fold(
         'min_pending_bars': best_min_pending_bars,
         'drop_delta': best_drop_delta,
         'hit0_rate': best_metrics['hit0_rate'] if best_metrics else 0,
+        'hit1_rate': best_metrics['hit1_rate'] if best_metrics else 0,
         'early_rate': best_metrics['early_rate'] if best_metrics else 0,
+        'late_rate': best_metrics['late_rate'] if best_metrics else 0,
         'miss_rate': best_metrics['miss_rate'] if best_metrics else 0,
+        'fp_b_rate': best_metrics['fp_b_rate'] if best_metrics else 0,
+        'signal_count': best_metrics['signal_count'] if best_metrics else 0,
         'median_pred_offset': best_metrics.get('median_pred_offset') if best_metrics else None,
         'n_events': best_metrics['n_events'] if best_metrics else 0
     }
@@ -397,11 +403,30 @@ def tune_model(
             tune_strategy=tune_strategy
         )
 
+        fold_results = cv_result.get('fold_results', [])
+        mean_hit0_rate = np.mean([r.get('hit0_rate', 0) for r in fold_results]) if fold_results else np.nan
+        mean_hit1_rate = np.mean([r.get('hit1_rate', 0) for r in fold_results]) if fold_results else np.nan
+        mean_early_rate = np.mean([r.get('early_rate', 0) for r in fold_results]) if fold_results else np.nan
+        mean_late_rate = np.mean([r.get('late_rate', 0) for r in fold_results]) if fold_results else np.nan
+        mean_miss_rate = np.mean([r.get('miss_rate', 0) for r in fold_results]) if fold_results else np.nan
+        mean_fp_b_rate = np.mean([r.get('fp_b_rate', 0) for r in fold_results]) if fold_results else np.nan
+        mean_signal_count = np.mean([r.get('signal_count', 0) for r in fold_results]) if fold_results else np.nan
+        median_offsets = [r.get('median_pred_offset') for r in fold_results if r.get('median_pred_offset') is not None]
+        mean_median_pred_offset = np.mean(median_offsets) if median_offsets else np.nan
+
         trial_record = {
             'trial_idx': trial_idx,
             **params,
             'mean_score': cv_result['mean_score'],
             'std_score': cv_result['std_score'],
+            'mean_hit0_rate': mean_hit0_rate,
+            'mean_hit1_rate': mean_hit1_rate,
+            'mean_early_rate': mean_early_rate,
+            'mean_late_rate': mean_late_rate,
+            'mean_miss_rate': mean_miss_rate,
+            'mean_fp_b_rate': mean_fp_b_rate,
+            'mean_signal_count': mean_signal_count,
+            'mean_median_pred_offset': mean_median_pred_offset,
             'elapsed_sec': time.time() - start_time
         }
         leaderboard.append(trial_record)

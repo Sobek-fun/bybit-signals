@@ -1,14 +1,13 @@
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    precision_recall_curve,
     average_precision_score,
     roc_auc_score,
     precision_score,
     recall_score
 )
 
-from pump_end_threshold.ml.threshold import _prepare_event_data
+from pump_end_threshold.ml.predict import build_pending_turn_down_decision_table, extract_signals
 
 
 def compute_event_level_metrics(
@@ -20,76 +19,51 @@ def compute_event_level_metrics(
         event_data: dict = None,
         abstain_margin: float = 0.0
 ) -> dict:
-    if event_data is None:
-        event_data = _prepare_event_data(predictions_df)
+    decision_df = build_pending_turn_down_decision_table(
+        predictions_df=predictions_df,
+        threshold=threshold,
+        signal_rule=signal_rule,
+        min_pending_bars=min_pending_bars,
+        drop_delta=drop_delta,
+        abstain_margin=abstain_margin,
+        event_data=event_data,
+    )
 
-    hit0 = 0
-    hit1 = 0
-    early = 0
-    late = 0
-    miss = 0
-    offsets = []
+    if decision_df.empty:
+        return {
+            'n_events': 0,
+            'hit0': 0,
+            'hit0_rate': 0,
+            'hit0_or_hit1': 0,
+            'hit0_or_hit1_rate': 0,
+            'early': 0,
+            'early_rate': 0,
+            'late': 0,
+            'late_rate': 0,
+            'miss': 0,
+            'miss_rate': 0,
+            'avg_pred_offset': None,
+            'median_pred_offset': None,
+            'n_b': 0,
+            'false_positive_b': 0,
+            'true_negative_b': 0,
+            'fp_b_rate': 0,
+        }
 
-    false_positive_b = 0
-    true_negative_b = 0
-    n_b = 0
+    b_df = decision_df[decision_df['event_type'] == 'B']
+    a_df = decision_df[decision_df['event_type'] != 'B']
+    a_triggered = a_df[a_df['triggered']]
+    offsets = a_triggered['signal_offset'].dropna().to_numpy()
 
-    threshold_high = threshold
-    threshold_low = max(0.0, threshold - abstain_margin)
-
-    for event_id, data in event_data.items():
-        offsets_arr = data['offsets']
-        p_end = data['p_end']
-        event_type = data.get('event_type', 'A')
-
-        triggered = False
-        pending_count = 0
-        best_p = -1.0
-        best_offset = None
-
-        for i in range(len(offsets_arr)):
-            if p_end[i] >= threshold_high:
-                pending_count += 1
-                if p_end[i] > best_p:
-                    best_p = p_end[i]
-                    best_offset = offsets_arr[i]
-
-            if pending_count >= min_pending_bars and best_offset is not None:
-                drop_from_peak = best_p - p_end[i]
-                if p_end[i] < threshold_low or (drop_from_peak > 0 and drop_from_peak >= drop_delta):
-                    offset = best_offset
-                    triggered = True
-                    break
-
-            if p_end[i] < threshold_low:
-                pending_count = 0
-                best_p = -1.0
-                best_offset = None
-
-        if event_type == 'B':
-            n_b += 1
-            if triggered:
-                false_positive_b += 1
-            else:
-                true_negative_b += 1
-            continue
-
-        if not triggered:
-            miss += 1
-            continue
-
-        offsets.append(offset)
-
-        if offset == 0:
-            hit0 += 1
-        elif offset == 1:
-            hit1 += 1
-        elif offset < 0:
-            early += 1
-        else:
-            late += 1
-
-    n_a = len(event_data) - n_b
+    hit0 = int((offsets == 0).sum())
+    hit1 = int((offsets == 1).sum())
+    early = int((offsets < 0).sum())
+    late = int((offsets > 1).sum())
+    miss = int((~a_df['triggered']).sum())
+    false_positive_b = int((b_df['triggered']).sum())
+    true_negative_b = int((~b_df['triggered']).sum())
+    n_b = int(len(b_df))
+    n_a = int(len(a_df))
     n_events = n_a
 
     return {
@@ -104,8 +78,8 @@ def compute_event_level_metrics(
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss': miss,
         'miss_rate': miss / n_events if n_events > 0 else 0,
-        'avg_pred_offset': np.mean(offsets) if offsets else None,
-        'median_pred_offset': np.median(offsets) if offsets else None,
+        'avg_pred_offset': float(np.mean(offsets)) if len(offsets) > 0 else None,
+        'median_pred_offset': float(np.median(offsets)) if len(offsets) > 0 else None,
         'n_b': n_b,
         'false_positive_b': false_positive_b,
         'true_negative_b': true_negative_b,
@@ -272,10 +246,11 @@ def evaluate(
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None
+        event_data: dict = None,
+        abstain_margin: float = 0.0
 ) -> dict:
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                event_data)
+                                                event_data, abstain_margin=abstain_margin)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {
@@ -295,8 +270,6 @@ def evaluate_with_trade_quality(
         event_data: dict = None,
         abstain_margin: float = 0.0
 ) -> dict:
-    from pump_end_threshold.ml.predict import extract_signals
-
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
                                                 event_data, abstain_margin=abstain_margin)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)

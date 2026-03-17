@@ -1,6 +1,7 @@
 import argparse
-import os
+import hashlib
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -11,7 +12,7 @@ from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info,
 from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
 from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
 from pump_end_threshold.ml.evaluate import evaluate, evaluate_with_trade_quality
-from pump_end_threshold.ml.predict import predict_proba, extract_signals, extract_signals_verbose
+from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
 from pump_end_threshold.ml.tuning import (
     tune_model, train_final_model, get_rule_parameter_grid,
     generate_walk_forward_folds, apply_fold_split, apply_fold_embargo,
@@ -19,6 +20,7 @@ from pump_end_threshold.ml.tuning import (
 )
 from pump_end_threshold.ml.feature_schema import prune_feature_columns
 from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.ml.regime_dataset import simulate_trade
 
 
 def log(level: str, component: str, message: str):
@@ -87,6 +89,174 @@ def filter_features_by_event_time(features_df: pd.DataFrame, cutoff: datetime) -
     return features_df[features_df['event_id'].isin(valid_events)].copy()
 
 
+def hash_file_sha256(path: str) -> str:
+    file_path = Path(path)
+    if not file_path.exists():
+        return ""
+    h = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_dataset_manifest(
+        args,
+        features_df: pd.DataFrame,
+        feature_columns: list,
+        train_end: datetime = None,
+        val_end: datetime = None,
+        test_end: datetime = None
+) -> dict:
+    dataset_path = Path(args.dataset_parquet)
+    rows = len(features_df)
+    unique_events = features_df['event_id'].nunique() if 'event_id' in features_df.columns else None
+    event_zero = features_df[features_df['offset'] == 0] if 'offset' in features_df.columns else pd.DataFrame()
+    n_event_a = int((event_zero['pump_la_type'] == 'A').sum()) if 'pump_la_type' in event_zero.columns else None
+    n_event_b = int((event_zero['pump_la_type'] == 'B').sum()) if 'pump_la_type' in event_zero.columns else None
+    min_time = features_df['open_time'].min() if 'open_time' in features_df.columns and rows > 0 else None
+    max_time = features_df['open_time'].max() if 'open_time' in features_df.columns and rows > 0 else None
+    stat_size = dataset_path.stat().st_size if dataset_path.exists() else None
+    stat_mtime = datetime.fromtimestamp(dataset_path.stat().st_mtime) if dataset_path.exists() else None
+
+    return {
+        'dataset_parquet_path': str(dataset_path),
+        'dataset_parquet_size_bytes': stat_size,
+        'dataset_parquet_mtime': stat_mtime,
+        'dataset_parquet_sha256': hash_file_sha256(str(dataset_path)),
+        'n_rows': rows,
+        'n_events': int(unique_events) if unique_events is not None else None,
+        'n_event_type_a': n_event_a,
+        'n_event_type_b': n_event_b,
+        'feature_count': len(feature_columns),
+        'date_from': min_time,
+        'date_to': max_time,
+        'label_params': {
+            'neg_before': args.neg_before,
+            'neg_after': args.neg_after,
+            'pos_offsets': parse_pos_offsets(args.pos_offsets),
+            'include_b': args.include_b,
+        },
+        'feature_build_params': {
+            'window_bars': args.window_bars,
+            'warmup_bars': args.warmup_bars,
+            'feature_set': args.feature_set,
+        },
+        'split_params': {
+            'split_strategy': args.split_strategy,
+            'embargo_bars': args.embargo_bars,
+        },
+        'raw_cutoffs': {
+            'train_end': args.train_end,
+            'val_end': args.val_end,
+            'test_end': args.test_end,
+        },
+        'resolved_cutoffs': {
+            'train_end_exclusive': train_end,
+            'val_end_exclusive': val_end,
+            'test_end_exclusive': test_end,
+        }
+    }
+
+
+def format_predicted_signals(signals_df: pd.DataFrame) -> pd.DataFrame:
+    if signals_df.empty:
+        columns = [
+            'symbol', 'open_time', 'event_id', 'event_type', 'signal_offset', 'peak_offset', 'peak_open_time',
+            'p_end_at_fire', 'p_end_peak_before_fire', 'drop_from_peak_at_fire', 'threshold_used',
+            'min_pending_bars_used', 'drop_delta_used', 'abstain_margin_used'
+        ]
+        return pd.DataFrame(columns=columns)
+    columns = [
+        'symbol', 'open_time', 'event_id', 'event_type', 'signal_offset', 'peak_offset', 'peak_open_time',
+        'p_end_at_fire', 'p_end_peak_before_fire', 'drop_from_peak_at_fire', 'threshold_used',
+        'min_pending_bars_used', 'drop_delta_used', 'abstain_margin_used'
+    ]
+    existing = [c for c in columns if c in signals_df.columns]
+    rest = [c for c in signals_df.columns if c not in existing]
+    formatted = signals_df[existing + rest].copy()
+    formatted = formatted.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    return formatted
+
+
+def enrich_with_trade_replay(signals_df: pd.DataFrame, loader: DataLoader) -> pd.DataFrame:
+    if signals_df.empty:
+        for col in ['entry_time', 'entry_price', 'exit_time', 'exit_price', 'trade_outcome',
+                    'trade_pnl_pct', 'mfe_pct', 'mae_pct', 'holding_bars']:
+            signals_df[col] = []
+        return signals_df
+
+    rows = []
+    for row in signals_df.itertuples():
+        result = simulate_trade(loader, row.symbol, row.open_time)
+        rows.append({
+            'event_id': row.event_id,
+            'entry_time': result.get('entry_time'),
+            'entry_price': result.get('entry_price'),
+            'exit_time': result.get('exit_time'),
+            'exit_price': result.get('exit_price'),
+            'trade_outcome': str(result.get('trade_outcome', '')).lower(),
+            'trade_pnl_pct': result.get('pnl_pct'),
+            'mfe_pct': result.get('mfe_pct'),
+            'mae_pct': result.get('mae_pct'),
+            'holding_bars': result.get('trade_duration_bars'),
+        })
+    trade_df = pd.DataFrame(rows)
+    return signals_df.merge(trade_df, on='event_id', how='left')
+
+
+def build_holdout_window_summary_6h(signals_df: pd.DataFrame) -> pd.DataFrame:
+    if signals_df.empty or 'trade_outcome' not in signals_df.columns:
+        return pd.DataFrame(columns=[
+            'window_start', 'signals', 'tp', 'sl', 'timeout', 'ambiguous', 'resolved',
+            'tp_rate_resolved', 'sl_rate_resolved', 'pnl_sum', 'expectancy_all', 'expectancy_resolved'
+        ])
+    df = signals_df.copy()
+    df['window_start'] = pd.to_datetime(df['open_time']).dt.floor('6h')
+    grouped = df.groupby('window_start', as_index=False).agg(
+        signals=('event_id', 'count'),
+        pnl_sum=('trade_pnl_pct', 'sum')
+    )
+    grouped['tp'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
+    grouped['sl'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'sl').sum())).values
+    grouped['timeout'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'timeout').sum())).values
+    grouped['ambiguous'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'ambiguous').sum())).values
+    grouped['resolved'] = grouped['tp'] + grouped['sl']
+    grouped['tp_rate_resolved'] = grouped['tp'] / grouped['resolved'].replace(0, pd.NA)
+    grouped['sl_rate_resolved'] = grouped['sl'] / grouped['resolved'].replace(0, pd.NA)
+    grouped['expectancy_all'] = grouped['pnl_sum'] / grouped['signals'].replace(0, pd.NA)
+    resolved_pnl = df[df['trade_outcome'].isin(['tp', 'sl'])].groupby('window_start')['trade_pnl_pct'].sum()
+    grouped['expectancy_resolved'] = grouped['window_start'].map(resolved_pnl) / grouped['resolved'].replace(0, pd.NA)
+    return grouped.sort_values('window_start').reset_index(drop=True)
+
+
+def build_holdout_symbol_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
+    if signals_df.empty or 'trade_outcome' not in signals_df.columns:
+        return pd.DataFrame(columns=[
+            'symbol', 'signals', 'tp', 'sl', 'timeout', 'ambiguous', 'resolved',
+            'tp_rate_resolved', 'sl_rate_resolved', 'pnl_sum', 'expectancy_all', 'expectancy_resolved'
+        ])
+    df = signals_df.copy()
+    grouped = df.groupby('symbol', as_index=False).agg(
+        signals=('event_id', 'count'),
+        pnl_sum=('trade_pnl_pct', 'sum')
+    )
+    grouped['tp'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
+    grouped['sl'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'sl').sum())).values
+    grouped['timeout'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'timeout').sum())).values
+    grouped['ambiguous'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'ambiguous').sum())).values
+    grouped['resolved'] = grouped['tp'] + grouped['sl']
+    grouped['tp_rate_resolved'] = grouped['tp'] / grouped['resolved'].replace(0, pd.NA)
+    grouped['sl_rate_resolved'] = grouped['sl'] / grouped['resolved'].replace(0, pd.NA)
+    grouped['expectancy_all'] = grouped['pnl_sum'] / grouped['signals'].replace(0, pd.NA)
+    resolved_pnl = df[df['trade_outcome'].isin(['tp', 'sl'])].groupby('symbol')['trade_pnl_pct'].sum()
+    grouped['expectancy_resolved'] = grouped['symbol'].map(resolved_pnl) / grouped['resolved'].replace(0, pd.NA)
+    return grouped.sort_values(['signals', 'symbol'], ascending=[False, True]).reset_index(drop=True)
+
+
 def calibrate_threshold_on_val(
         model,
         features_df: pd.DataFrame,
@@ -113,7 +283,13 @@ def calibrate_threshold_on_val(
         ].copy()
 
     if len(val_df) == 0:
-        return {'threshold': 0.1, 'min_pending_bars': 1, 'drop_delta': 0.0}
+        return {
+            'threshold': 0.1,
+            'min_pending_bars': 1,
+            'drop_delta': 0.0,
+            'calibration_sweep': pd.DataFrame(),
+            'val_predictions': pd.DataFrame(),
+        }
 
     val_df['split'] = 'val'
     predictions = predict_proba(model, val_df, feature_columns)
@@ -125,6 +301,7 @@ def calibrate_threshold_on_val(
     best_threshold = 0.1
     best_min_pending_bars = 1
     best_drop_delta = 0.0
+    all_sweeps = []
 
     for rule_params in rule_combinations:
         min_pending_bars = rule_params['min_pending_bars']
@@ -145,6 +322,10 @@ def calibrate_threshold_on_val(
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
         score = best_row['score']
+        sweep_with_rule = sweep_df.copy()
+        sweep_with_rule['min_pending_bars'] = min_pending_bars
+        sweep_with_rule['drop_delta'] = drop_delta
+        all_sweeps.append(sweep_with_rule)
 
         if score > best_score:
             best_score = score
@@ -155,7 +336,9 @@ def calibrate_threshold_on_val(
     return {
         'threshold': best_threshold,
         'min_pending_bars': best_min_pending_bars,
-        'drop_delta': best_drop_delta
+        'drop_delta': best_drop_delta,
+        'calibration_sweep': pd.concat(all_sweeps, ignore_index=True) if all_sweeps else pd.DataFrame(),
+        'val_predictions': predictions
     }
 
 
@@ -252,10 +435,23 @@ def run_train_only(args, artifacts: RunArtifacts):
         log("INFO", "TRAIN",
             f"pruned features: {original_count} -> {len(feature_columns)} (removed {original_count - len(feature_columns)})")
 
+    artifacts.save_feature_columns(feature_columns)
+
+    train_end = parse_date_exclusive(args.train_end) if args.split_strategy == "time" and args.train_end else None
+    val_end = parse_date_exclusive(args.val_end) if args.split_strategy == "time" and args.val_end else None
+    test_end = parse_date_exclusive(args.test_end) if args.split_strategy == "time" and args.test_end else None
+
+    dataset_manifest = build_dataset_manifest(
+        args=args,
+        features_df=features_df,
+        feature_columns=feature_columns,
+        train_end=train_end,
+        val_end=val_end,
+        test_end=test_end,
+    )
+    artifacts.save_dataset_manifest(dataset_manifest)
+
     if args.split_strategy == "time":
-        train_end = parse_date_exclusive(args.train_end)
-        val_end = parse_date_exclusive(args.val_end)
-        test_end = parse_date_exclusive(args.test_end) if args.test_end else None
         features_df = time_split(features_df, train_end, val_end)
 
         if args.embargo_bars > 0:
@@ -335,7 +531,8 @@ def run_train_only(args, artifacts: RunArtifacts):
 
     log("INFO", "TRAIN", "evaluating on val set")
     val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule,
-                           min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
+                           min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
+                           abstain_margin=args.abstain_margin)
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} early={val_metrics['event_level']['early_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
@@ -350,15 +547,27 @@ def run_train_only(args, artifacts: RunArtifacts):
 
     log("INFO", "TRAIN", "evaluating on test set")
     test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta)
+                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
+                            abstain_margin=args.abstain_margin)
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
     log("INFO", "TRAIN", "extracting holdout signals")
-    signals_df = extract_signals(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                                 min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                                 abstain_margin=args.abstain_margin)
+    signals_df = extract_signals_verbose(
+        test_predictions,
+        best_threshold,
+        signal_rule=args.signal_rule,
+        min_pending_bars=args.min_pending_bars,
+        drop_delta=args.drop_delta,
+        abstain_margin=args.abstain_margin
+    )
+    signals_df = format_predicted_signals(signals_df)
+    if args.clickhouse_dsn and not signals_df.empty:
+        loader = DataLoader(args.clickhouse_dsn)
+        signals_df = enrich_with_trade_replay(signals_df, loader)
+    artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(signals_df))
+    artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(signals_df))
     artifacts.save_predicted_signals(signals_df)
     log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
 
@@ -378,9 +587,21 @@ def run_tune(args, artifacts: RunArtifacts):
         log("INFO", "TUNE",
             f"pruned features: {original_count} -> {len(feature_columns)} (removed {original_count - len(feature_columns)})")
 
+    artifacts.save_feature_columns(feature_columns)
+
     train_end = parse_date_exclusive(args.train_end) if args.train_end else None
     val_end = parse_date_exclusive(args.val_end) if args.val_end else None
     test_end = parse_date_exclusive(args.test_end) if args.test_end else None
+
+    dataset_manifest = build_dataset_manifest(
+        args=args,
+        features_df=features_df,
+        feature_columns=feature_columns,
+        train_end=train_end,
+        val_end=val_end,
+        test_end=test_end,
+    )
+    artifacts.save_dataset_manifest(dataset_manifest)
 
     if train_end:
         cv_features_df = filter_features_by_event_time(features_df, train_end)
@@ -421,6 +642,8 @@ def run_tune(args, artifacts: RunArtifacts):
     artifacts.save_leaderboard(tune_result['leaderboard'])
     artifacts.save_cv_report(tune_result['best_cv_result'])
     artifacts.save_folds(tune_result['folds'])
+    if tune_result.get('best_cv_result') and tune_result['best_cv_result'].get('fold_results'):
+        artifacts.save_fold_metrics(pd.DataFrame(tune_result['best_cv_result']['fold_results']))
 
     actual_signal_rule = args.signal_rule
 
@@ -466,6 +689,7 @@ def run_tune(args, artifacts: RunArtifacts):
             best_threshold = calibration_result['threshold']
             best_min_pending_bars = calibration_result['min_pending_bars']
             best_drop_delta = calibration_result['drop_delta']
+            artifacts.save_calibration_sweep_val(calibration_result['calibration_sweep'])
 
             log("INFO", "TUNE",
                 f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
@@ -490,6 +714,15 @@ def run_tune(args, artifacts: RunArtifacts):
                 feature_columns
             )
             artifacts.save_predictions(val_predictions, 'val')
+            val_metrics = evaluate(
+                val_predictions,
+                best_threshold,
+                signal_rule=actual_signal_rule,
+                min_pending_bars=best_min_pending_bars,
+                drop_delta=best_drop_delta,
+                abstain_margin=args.abstain_margin
+            )
+            artifacts.save_metrics(val_metrics, 'val')
 
             test_predictions = predict_proba(
                 final_model,
@@ -508,7 +741,8 @@ def run_tune(args, artifacts: RunArtifacts):
                     signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
                     drop_delta=best_drop_delta,
-                    horizons=[16, 32]
+                    horizons=[16, 32],
+                    abstain_margin=args.abstain_margin
                 )
                 log("INFO", "TUNE",
                     f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
@@ -522,14 +756,15 @@ def run_tune(args, artifacts: RunArtifacts):
                     best_threshold,
                     signal_rule=actual_signal_rule,
                     min_pending_bars=best_min_pending_bars,
-                    drop_delta=best_drop_delta
+                    drop_delta=best_drop_delta,
+                    abstain_margin=args.abstain_margin
                 )
 
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
                 f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
-            val_signals_df = extract_signals(
+            val_signals_df = extract_signals_verbose(
                 val_predictions,
                 best_threshold,
                 signal_rule=actual_signal_rule,
@@ -537,10 +772,11 @@ def run_tune(args, artifacts: RunArtifacts):
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin
             )
+            val_signals_df = format_predicted_signals(val_signals_df)
             artifacts.save_predicted_signals_val(val_signals_df)
             log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
 
-            test_signals_df = extract_signals(
+            test_signals_df = extract_signals_verbose(
                 test_predictions,
                 best_threshold,
                 signal_rule=actual_signal_rule,
@@ -548,6 +784,12 @@ def run_tune(args, artifacts: RunArtifacts):
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin
             )
+            test_signals_df = format_predicted_signals(test_signals_df)
+            if args.clickhouse_dsn and not test_signals_df.empty:
+                loader = DataLoader(args.clickhouse_dsn)
+                test_signals_df = enrich_with_trade_replay(test_signals_df, loader)
+            artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(test_signals_df))
+            artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(test_signals_df))
             artifacts.save_predicted_signals(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
 
@@ -556,20 +798,6 @@ def run_tune(args, artifacts: RunArtifacts):
         oos_feature_columns = feature_columns
         oos_folds = tune_result['folds']
         best_params = tune_result['best_params']
-
-        best_threshold_val = None
-        best_mpb_val = 1
-        best_dd_val = 0.0
-
-        if train_end and val_end:
-            best_threshold_val = best_threshold
-            best_mpb_val = best_min_pending_bars
-            best_dd_val = best_drop_delta
-        elif tune_result.get('best_cv_result') and tune_result['best_cv_result'].get('mean_threshold'):
-            best_threshold_val = tune_result['best_cv_result']['mean_threshold']
-
-        if best_threshold_val is None:
-            best_threshold_val = 0.1
 
         all_oos_signals = []
         for fold_idx, fold in enumerate(oos_folds):
@@ -591,11 +819,28 @@ def run_tune(args, artifacts: RunArtifacts):
                 continue
 
             val_preds = predict_proba(fold_model, val_data, oos_feature_columns)
+            fold_eval = evaluate_fold(
+                fold_model,
+                fold_df,
+                oos_feature_columns,
+                actual_signal_rule,
+                args.alpha_hit1,
+                args.beta_early,
+                args.gamma_miss,
+                delta_fp_b=args.delta_fp_b,
+                abstain_margin=args.abstain_margin
+            )
+            fold_threshold = fold_eval.get('threshold')
+            fold_mpb = fold_eval.get('min_pending_bars')
+            fold_dd = fold_eval.get('drop_delta')
+            if fold_threshold is None or fold_mpb is None or fold_dd is None:
+                continue
             verbose_sigs = extract_signals_verbose(
                 val_preds,
-                best_threshold_val,
-                min_pending_bars=best_mpb_val,
-                drop_delta=best_dd_val,
+                fold_threshold,
+                signal_rule=actual_signal_rule,
+                min_pending_bars=fold_mpb,
+                drop_delta=fold_dd,
                 abstain_margin=args.abstain_margin,
             )
 
