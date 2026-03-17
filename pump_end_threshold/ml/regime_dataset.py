@@ -5,7 +5,6 @@ import pandas as pd
 
 from pump_end_threshold.infra.clickhouse import DataLoader
 
-
 TP_PCT = 4.5
 SL_PCT = 10.0
 ENTRY_SHIFT_BARS = 1
@@ -305,19 +304,6 @@ def simulate_trade(loader: DataLoader, symbol: str, signal_time: datetime,
     return clean
 
 
-def _compute_trade_label_end_time(
-        signal_time: datetime,
-        exit_time,
-        trade_outcome: str,
-        max_horizon_bars: int,
-) -> datetime:
-    horizon_end = signal_time + timedelta(minutes=(ENTRY_SHIFT_BARS + max_horizon_bars) * BAR_MINUTES)
-    exit_ts = pd.to_datetime(exit_time, errors='coerce')
-    if pd.notna(exit_ts) and trade_outcome in ('TP', 'SL', 'TIMEOUT', 'AMBIGUOUS'):
-        return min(exit_ts.to_pydatetime(), horizon_end)
-    return horizon_end
-
-
 def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
                          tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
                          max_horizon_bars: int = 200,
@@ -359,12 +345,6 @@ def build_strategy_state(signals_df: pd.DataFrame, loader: DataLoader,
         result['signal_idx'] = i
         result['symbol'] = sig['symbol']
         result['open_time'] = sig['open_time']
-        result['label_end_time'] = _compute_trade_label_end_time(
-            signal_time=sig['open_time'],
-            exit_time=result.get('exit_time'),
-            trade_outcome=result.get('trade_outcome'),
-            max_horizon_bars=max_horizon_bars,
-        )
         if 'signal_id' in sig.index:
             result['signal_id'] = sig['signal_id']
         else:
@@ -632,13 +612,12 @@ def compute_pause_value_targets(
         bad_sl_rate_threshold: float = 0.55,
         good_value_threshold: float = 7.5,
         good_sl_rate_threshold: float = 0.45,
-        max_horizon_bars: int = 200,
 ) -> dict:
     future_end = current_time + timedelta(hours=window_hours)
     future = trades_df[
         (trades_df['open_time'] > current_time) &
         (trades_df['open_time'] <= future_end)
-    ]
+        ]
 
     resolved = future[future['trade_outcome'].isin(['TP', 'SL'])]
     timeout = future[future['trade_outcome'] == 'TIMEOUT']
@@ -653,20 +632,7 @@ def compute_pause_value_targets(
         f'future_tp_count_next_{window_hours}h': n_tp,
         f'future_sl_count_next_{window_hours}h': n_sl,
         f'future_timeout_count_next_{window_hours}h': n_timeout,
-        'label_end_time': future_end,
     }
-
-    if len(future) > 0:
-        if 'label_end_time' in future.columns:
-            future_label_end = pd.to_datetime(future['label_end_time'], errors='coerce')
-            max_label_end = future_label_end.max()
-            if pd.notna(max_label_end):
-                targets['label_end_time'] = max(targets['label_end_time'], max_label_end.to_pydatetime())
-        else:
-            default_future_end = future['open_time'].max() + timedelta(
-                minutes=(ENTRY_SHIFT_BARS + max_horizon_bars) * BAR_MINUTES
-            )
-            targets['label_end_time'] = max(targets['label_end_time'], default_future_end.to_pydatetime())
 
     if n_resolved < min_resolved:
         targets[f'future_sl_rate_next_{window_hours}h'] = np.nan
@@ -694,8 +660,7 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
                     window_sizes: list[int] = None,
                     min_resolved: int = 3,
                     sl_rate_threshold: float = 0.60,
-                    target_profile: str = None,
-                    max_horizon_bars: int = 200) -> dict:
+                    target_profile: str = None) -> dict:
     if window_sizes is None:
         window_sizes = [3, 5]
 
@@ -741,7 +706,7 @@ def compute_targets(trades_df: pd.DataFrame, current_idx: int,
         profile = TARGET_PROFILES['pause_value_12h_v2_all']
 
     pause_targets = compute_pause_value_targets(
-        trades_df, current_time, max_horizon_bars=max_horizon_bars, **profile
+        trades_df, current_time, **profile
     )
     targets.update(pause_targets)
 
@@ -755,7 +720,6 @@ def build_regime_dataset(
         min_resolved: int = 3,
         sl_rate_threshold: float = 0.60,
         target_profile: str = None,
-        max_horizon_bars: int = 200,
 ) -> pd.DataFrame:
     signals = signals_df.sort_values('open_time').reset_index(drop=True)
     trades = trades_df.sort_values('open_time').reset_index(drop=True)
@@ -826,7 +790,6 @@ def build_regime_dataset(
             trades, i, min_resolved=min_resolved,
             sl_rate_threshold=sl_rate_threshold,
             target_profile=target_profile,
-            max_horizon_bars=max_horizon_bars,
         )
 
         row = {}
@@ -865,11 +828,15 @@ def build_regime_dataset(
         rows.append(row)
 
     if skipped_no_trade > 0 or skipped_no_features > 0 or len(rows) == 0:
-        print(f"DEBUG: build_regime_dataset - signals: {len(signals)}, trades: {len(trades)}, features: {len(features_df)}")
-        print(f"DEBUG: skipped_no_trade: {skipped_no_trade}, skipped_no_features: {skipped_no_features}, rows built: {len(rows)}")
+        print(
+            f"DEBUG: build_regime_dataset - signals: {len(signals)}, trades: {len(trades)}, features: {len(features_df)}")
+        print(
+            f"DEBUG: skipped_no_trade: {skipped_no_trade}, skipped_no_features: {skipped_no_features}, rows built: {len(rows)}")
         if len(rows) == 0 and len(signals) > 0:
             print(f"DEBUG: Sample signal_id from signals: {signals.iloc[0]['signal_id']}")
-            print(f"DEBUG: Sample signal_id from trades: {trades.iloc[0]['signal_id'] if len(trades) > 0 else 'NO TRADES'}")
-            print(f"DEBUG: Sample signal_id from features: {features_df.iloc[0]['signal_id'] if len(features_df) > 0 else 'NO FEATURES'}")
+            print(
+                f"DEBUG: Sample signal_id from trades: {trades.iloc[0]['signal_id'] if len(trades) > 0 else 'NO TRADES'}")
+            print(
+                f"DEBUG: Sample signal_id from features: {features_df.iloc[0]['signal_id'] if len(features_df) > 0 else 'NO FEATURES'}")
 
     return pd.DataFrame(rows)

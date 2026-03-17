@@ -1,6 +1,5 @@
 import pandas as pd
 
-
 EXCLUDED_COLUMNS = {
     'event_id',
     'signal_id',
@@ -29,7 +28,6 @@ EXCLUDED_COLUMNS = {
     'mfe_pct',
     'mae_pct',
     'trade_duration_bars',
-    'label_end_time',
 
     'pause_state',
     'blocked_by_policy',
@@ -46,7 +44,6 @@ EXCLUDED_COLUMNS = {
 
     'context_time_used',
     'bucket_p_bad',
-    'bucket_signals_now',
     'pause_reason',
     'resume_reason',
     'policy_episode_id',

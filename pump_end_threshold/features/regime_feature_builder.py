@@ -77,11 +77,12 @@ class RegimeFeatureBuilder:
             row.update(self._market_interaction_features(btc_features, eth_features))
 
             signals_history = signals[signals['open_time'] < ot]
+            signals_bucket = signals[signals['open_time'] == ot]
             row.update(self._signal_flow_features(signals_history, sig))
+            row['bucket_signals_now'] = len(signals_bucket)
 
             if trades_df is not None:
-                trades_state = trades_df.get(ot) if isinstance(trades_df, dict) else trades_df
-                row.update(self._strategy_state_features(trades_state, ot, signals_history, sig['symbol']))
+                row.update(self._strategy_state_features(trades_df, ot, signals_history, sig['symbol']))
 
             row.update(self._microstructure_features('BTCUSDT', ot, 'btc'))
             row.update(self._microstructure_features('ETHUSDT', ot, 'eth'))
@@ -402,7 +403,7 @@ class RegimeFeatureBuilder:
             valid_count += 1
 
             for w, rets_list, pos_list in [(1, rets_1, pos_1), (4, rets_4, pos_4),
-                                            (16, rets_16, pos_16), (96, rets_96, pos_96)]:
+                                           (16, rets_16, pos_16), (96, rets_96, pos_96)]:
                 si = max(0, loc - w)
                 if si < loc and close[si] > 0:
                     ret = (c / close[si]) - 1
@@ -435,7 +436,7 @@ class RegimeFeatureBuilder:
         n = valid_count
 
         for w, rets_list, pos_list in [(1, rets_1, pos_1), (4, rets_4, pos_4),
-                                        (16, rets_16, pos_16), (96, rets_96, pos_96)]:
+                                       (16, rets_16, pos_16), (96, rets_96, pos_96)]:
             f[f'breadth_pos_{w}'] = sum(pos_list) / n
             f[f'breadth_mean_ret_{w}'] = float(np.mean(rets_list))
             f[f'breadth_median_ret_{w}'] = float(np.median(rets_list))
@@ -556,7 +557,7 @@ class RegimeFeatureBuilder:
         return {k: np.nan for k in keys}
 
     def _token_relative_context_features(self, token_features: dict, btc_features: dict,
-                                          eth_features: dict, breadth_features: dict) -> dict:
+                                         eth_features: dict, breadth_features: dict) -> dict:
         f = {}
 
         def get_safe(d, key, default=np.nan):
@@ -651,7 +652,7 @@ class RegimeFeatureBuilder:
             w_signals = signals_before[signals_before['open_time'] > w_time]
             if len(w_signals) > 1:
                 times = w_signals['open_time'].sort_values()
-                gaps = [(times.iloc[i] - times.iloc[i-1]).total_seconds() / 60 for i in range(1, len(times))]
+                gaps = [(times.iloc[i] - times.iloc[i - 1]).total_seconds() / 60 for i in range(1, len(times))]
                 f[f'signal_density_median_gap_{w_label}'] = float(np.median(gaps))
             else:
                 f[f'signal_density_median_gap_{w_label}'] = np.nan
@@ -659,41 +660,15 @@ class RegimeFeatureBuilder:
         return f
 
     def _strategy_state_features(self, trades_df: pd.DataFrame, t: datetime,
-                                  signals_before: pd.DataFrame = None,
-                                  current_symbol: str = None) -> dict:
+                                 signals_before: pd.DataFrame = None,
+                                 current_symbol: str = None) -> dict:
         f = {}
-        if trades_df is None or len(trades_df) == 0:
-            f['strat_resolved_sl_rate_last_24h'] = np.nan
-            f['strat_resolved_pnl_sum_last_24h'] = np.nan
-            f['strat_closed_last_24h'] = 0
-            f['strat_prev_closed_sl_streak'] = 0
-            f['strat_prev_closed_tp_streak'] = 0
-            f['strat_last_closed_is_sl'] = np.nan
-            f['strat_resolved_sl_rate_last_5'] = np.nan
-            f['strat_resolved_tp_rate_last_5'] = np.nan
-            f['strat_resolved_pnl_sum_last_5'] = np.nan
-            f['strat_open_trades_now'] = 0
-            if signals_before is not None:
-                t_1h = t - timedelta(hours=1)
-                t_4h = t - timedelta(hours=4)
-                t_12h = t - timedelta(hours=12)
-                f['strat_signals_last_1h'] = len(signals_before[signals_before['open_time'] > t_1h])
-                f['strat_signals_last_4h'] = len(signals_before[signals_before['open_time'] > t_4h])
-                f['strat_signals_last_12h'] = len(signals_before[signals_before['open_time'] > t_12h])
-                signals_4h = signals_before[signals_before['open_time'] > t_4h]
-                f['strat_unique_symbols_last_4h'] = signals_4h['symbol'].nunique() if len(signals_4h) > 0 else 0
-            else:
-                f['strat_signals_last_1h'] = np.nan
-                f['strat_signals_last_4h'] = np.nan
-                f['strat_signals_last_12h'] = np.nan
-                f['strat_unique_symbols_last_4h'] = np.nan
-            return f
 
         resolved_before = trades_df[
             (trades_df['exit_time'].notna()) &
             (trades_df['exit_time'] < t) &
             (trades_df['trade_outcome'].isin(['TP', 'SL']))
-        ].sort_values('exit_time')
+            ].sort_values('exit_time')
 
         t_24h = t - timedelta(hours=24)
         resolved_24h = resolved_before[resolved_before['exit_time'] > t_24h]
@@ -744,7 +719,7 @@ class RegimeFeatureBuilder:
         open_trades = trades_df[
             (trades_df['open_time'] < t) &
             ((trades_df['exit_time'].isna()) | (trades_df['exit_time'] >= t))
-        ]
+            ]
         f['strat_open_trades_now'] = len(open_trades)
 
         if signals_before is not None:
@@ -843,11 +818,11 @@ class RegimeFeatureBuilder:
                 tx_1m = tx_df[
                     (tx_df.index >= t - timedelta(minutes=1)) &
                     (tx_df.index < t)
-                ]
+                    ]
                 tx_5m = tx_df[
                     (tx_df.index >= t - timedelta(minutes=5)) &
                     (tx_df.index < t)
-                ]
+                    ]
                 f[f'{prefix}_trades_count_1m'] = int(tx_1m['trades_count'].sum()) if not tx_1m.empty else 0
                 f[f'{prefix}_trades_count_5m'] = int(tx_5m['trades_count'].sum()) if not tx_5m.empty else 0
             else:
@@ -951,11 +926,12 @@ class RegimeFeatureBuilder:
                 row.update(self._market_interaction_features(btc_features, eth_features))
 
                 signals_history = signals_sorted[signals_sorted['open_time'] < ot]
+                signals_bucket = signals_sorted[signals_sorted['open_time'] == ot]
                 row.update(self._signal_flow_features(signals_history, sig))
+                row['bucket_signals_now'] = len(signals_bucket)
 
                 if trades_df is not None:
-                    trades_state = trades_df.get(ot) if isinstance(trades_df, dict) else trades_df
-                    row.update(self._strategy_state_features(trades_state, ot, signals_history, sig['symbol']))
+                    row.update(self._strategy_state_features(trades_df, ot, signals_history, sig['symbol']))
 
                 row.update(self._microstructure_features('BTCUSDT', ot, 'btc'))
                 row.update(self._microstructure_features('ETHUSDT', ot, 'eth'))

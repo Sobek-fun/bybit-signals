@@ -284,17 +284,9 @@ def apply_regime_fold_split(
     df = dataset_df.copy()
     df['split'] = None
 
-    if 'label_end_time' not in df.columns:
-        raise ValueError("Dataset must contain 'label_end_time' for leakage-safe split")
-
-    train_boundary = fold['train_end']
-    if embargo_hours > 0:
-        train_boundary = train_boundary - pd.Timedelta(hours=embargo_hours)
-
     df.loc[
         (df['open_time'] >= fold['train_start']) &
-        (df['open_time'] < fold['train_end']) &
-        (pd.to_datetime(df['label_end_time']) < train_boundary),
+        (df['open_time'] < fold['train_end']),
         'split'
     ] = 'train'
 
@@ -309,6 +301,14 @@ def apply_regime_fold_split(
         if len(train_df) > embargo_signals:
             last_train_signals = train_df.tail(embargo_signals)
             df.loc[last_train_signals.index, 'split'] = None
+
+    if embargo_hours > 0:
+        embargo_cutoff = fold['train_end'] - pd.Timedelta(hours=embargo_hours)
+        df.loc[
+            (df['split'] == 'train') &
+            (df['open_time'] >= embargo_cutoff),
+            'split'
+        ] = None
 
     return df[df['split'].notna()].reset_index(drop=True)
 
@@ -332,7 +332,8 @@ def run_regime_cv(
     fold_results = []
 
     for fold_idx, fold in enumerate(folds):
-        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
+        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals,
+                                          embargo_hours=embargo_hours)
         model, train_df, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -452,7 +453,8 @@ def tune_model_hyperparameters(
         for seed_offset in range(n_seeds):
             curr_seed = seed + seed_offset * 123
             for fold_idx, fold in enumerate(folds):
-                fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
+                fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals,
+                                                  embargo_hours=embargo_hours)
                 model, train_df, val_df = train_regime_fold(
                     fold_df, feature_columns, target_col, params,
                     iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -486,7 +488,8 @@ def tune_model_hyperparameters(
                         score_mode=score_mode,
                         target_col=target_col,
                     )
-                    downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid', False) else -np.inf
+                    downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid',
+                                                                                                    False) else -np.inf
                     if np.isfinite(downstream_score):
                         downstream_scores.append(float(downstream_score))
 
@@ -514,7 +517,8 @@ def tune_model_hyperparameters(
 
     if best_params is None and results:
         fallback = max(results, key=lambda r: r.get('mean_ap', -np.inf))
-        param_keys = ['depth', 'learning_rate', 'l2_leaf_reg', 'min_data_in_leaf', 'random_strength', 'bagging_temperature', 'rsm']
+        param_keys = ['depth', 'learning_rate', 'l2_leaf_reg', 'min_data_in_leaf', 'random_strength',
+                      'bagging_temperature', 'rsm']
         best_params = {k: fallback[k] for k in param_keys if k in fallback}
 
     return {
@@ -566,7 +570,8 @@ def tune_policy_parameters(
 
     fold_models = []
     for fold in folds:
-        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals, embargo_hours=embargo_hours)
+        fold_df = apply_regime_fold_split(dataset_df, fold, embargo_signals=embargo_signals,
+                                          embargo_hours=embargo_hours)
         model, train_df, val_df = train_regime_fold(
             fold_df, feature_columns, target_col, model_params,
             iterations=iterations, early_stopping_rounds=early_stopping_rounds,
@@ -648,7 +653,8 @@ def tune_policy_parameters(
     resolved_thresholds = None
     if best_params and best_fold_results:
         resolved_pause = [r['resolved_pause_threshold'] for r in best_fold_results if 'resolved_pause_threshold' in r]
-        resolved_resume = [r['resolved_resume_threshold'] for r in best_fold_results if 'resolved_resume_threshold' in r]
+        resolved_resume = [r['resolved_resume_threshold'] for r in best_fold_results if
+                           'resolved_resume_threshold' in r]
         if resolved_pause and resolved_resume:
             resolved_thresholds = {
                 'pause_on_threshold': float(np.median(resolved_pause)),
@@ -806,19 +812,17 @@ def train_final_regime_model(
         embargo_hours: float = 0,
         auto_class_weights: str = None,
 ) -> CatBoostClassifier:
-    if 'label_end_time' not in dataset_df.columns:
-        raise ValueError("Dataset must contain 'label_end_time' for leakage-safe final training")
-
-    train_boundary = train_end
-    if embargo_hours > 0:
-        train_boundary = train_end - pd.Timedelta(hours=embargo_hours)
-
-    train_df = dataset_df[
-        (dataset_df['open_time'] < train_end) &
-        (pd.to_datetime(dataset_df['label_end_time']) < train_boundary)
-    ]
+    train_df = dataset_df[dataset_df['open_time'] < train_end]
 
     train_df = train_df.dropna(subset=[target_col])
+
+    train_df = train_df.sort_values('open_time')
+    if len(train_df) > target_horizon_signals:
+        train_df = train_df.iloc[:-target_horizon_signals]
+
+    if embargo_hours > 0:
+        embargo_cutoff = train_end - pd.Timedelta(hours=embargo_hours)
+        train_df = train_df[train_df['open_time'] < embargo_cutoff]
 
     X_train = train_df[feature_columns]
     y_train = train_df[target_col]
