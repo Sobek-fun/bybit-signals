@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { echo "[run_experiment][$(ts)] $*"; }
+
 SRC_DIR=""
 RUN_DIR=""
 VENV_DIR=""
@@ -40,13 +43,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SRC_DIR" || -z "$RUN_DIR" || -z "$VENV_DIR" || -z "$LOG_PATH" || -z "$STARTED_AT_PATH" || -z "$FINISHED_AT_PATH" || -z "$EXIT_CODE_PATH" || -z "$LAUNCH_COMMAND_PATH" || -z "$LAUNCH_COMMAND" ]]; then
-  echo "required args are missing"
+  log "required args are missing"
   exit 2
 fi
 
+log "init src_dir=$SRC_DIR run_dir=$RUN_DIR venv_dir=$VENV_DIR"
 mkdir -p "$RUN_DIR"
 mkdir -p "$(dirname "$VENV_DIR")"
 date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STARTED_AT_PATH"
+log "started_at written to $STARTED_AT_PATH"
 
 on_exit() {
   local code=$?
@@ -59,43 +64,54 @@ on_exit() {
 trap on_exit EXIT
 
 if [[ ! -f "$SRC_DIR/$REQUIREMENTS_FILE" ]]; then
-  echo "requirements file not found: $SRC_DIR/$REQUIREMENTS_FILE"
+  log "requirements file not found: $SRC_DIR/$REQUIREMENTS_FILE"
   exit 3
 fi
 if [[ -n "$DETECTOR_DIR_REMOTE" && ! -d "$DETECTOR_DIR_REMOTE" ]]; then
-  echo "missing detector dir: $DETECTOR_DIR_REMOTE"
+  log "missing detector dir: $DETECTOR_DIR_REMOTE"
   exit 4
 fi
 if [[ -n "$TOKENS_FILE_REMOTE" && ! -f "$TOKENS_FILE_REMOTE" ]]; then
-  echo "missing tokens file: $TOKENS_FILE_REMOTE"
+  log "missing tokens file: $TOKENS_FILE_REMOTE"
   exit 5
 fi
 if [[ -n "$CLICKHOUSE_DSN_ENV" && -z "${!CLICKHOUSE_DSN_ENV:-}" ]]; then
-  echo "missing required env var: $CLICKHOUSE_DSN_ENV"
+  log "missing required env var: $CLICKHOUSE_DSN_ENV"
   exit 6
 fi
 
 cd "$SRC_DIR"
+log "switched to src dir"
 LOCK_DIR="${VENV_DIR}.lock"
-while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-  sleep 1
-done
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-  rm -rf "$VENV_DIR"
-  "$PYTHON_BIN" -m venv "$VENV_DIR"
+log "acquiring venv lock: $LOCK_DIR"
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do sleep 1; done
+if [[ -x "$VENV_DIR/bin/python" && -f "$VENV_DIR/.ready" ]]; then
+  log "shared venv already ready, skip install"
+else
+  log "shared venv missing/incomplete, provisioning"
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    rm -rf "$VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+  fi
+  source "$VENV_DIR/bin/activate"
+  if ! python -m pip --version >/dev/null 2>&1; then
+    python -m ensurepip --upgrade
+  fi
+  python -m pip install -r "$SRC_DIR/$REQUIREMENTS_FILE"
+  touch "$VENV_DIR/.ready"
+  log "shared venv provisioning done"
 fi
 source "$VENV_DIR/bin/activate"
-if ! python -m pip --version >/dev/null 2>&1; then
-  python -m ensurepip --upgrade
-fi
-python -m pip install --upgrade pip
-python -m pip install -r "$SRC_DIR/$REQUIREMENTS_FILE"
 rmdir "$LOCK_DIR" 2>/dev/null || true
 LOCK_DIR=""
+log "venv activated"
 if [[ -n "$SETUP_COMMAND" ]]; then
+  log "running setup command"
   bash -lc "$SETUP_COMMAND"
 fi
 export PYTHONPATH="$SRC_DIR"
 export PYTHONUNBUFFERED=1
 echo "$LAUNCH_COMMAND" > "$LAUNCH_COMMAND_PATH"
+log "launch command saved to $LAUNCH_COMMAND_PATH"
+log "starting pipeline"
 bash -lc "$LAUNCH_COMMAND"

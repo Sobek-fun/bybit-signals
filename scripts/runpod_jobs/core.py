@@ -7,13 +7,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from scripts.runpod_jobs.models import BatchSpec, ExperimentSpec, LaunchResult, PodSpec
-from scripts.runpod_jobs.paths import local_paths, remote_paths
+from scripts.runpod_jobs.paths import SHARED_VENV_DIR, local_paths, remote_paths
 from scripts.runpod_jobs.runpod_api import RunpodClient
 from scripts.runpod_jobs.ssh import PodConn, check_ssh_ready, run_ssh, scp_to_remote
 from scripts.runpod_jobs.utils import ensure_dir, read_json, write_json
@@ -21,6 +22,11 @@ from scripts.runpod_jobs.utils import ensure_dir, read_json, write_json
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALLOWED_DIRS = ("pump_end_threshold", "pump_end_prod", "scripts")
+
+
+def _log(stage: str, message: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[runpod_jobs][{ts}][{stage}] {message}")
 
 
 def _load_spec(path: Path) -> BatchSpec:
@@ -62,6 +68,10 @@ def _validate_spec(spec: BatchSpec) -> None:
             raise SystemExit("experiment.exp_id is required")
         if not exp.pod_alias:
             raise SystemExit(f"{exp.exp_id}: pod_alias is required")
+        if len(exp.patch_files) > 1:
+            raise SystemExit(
+                f"{exp.exp_id}: only one patch file is allowed per experiment; got {len(exp.patch_files)}"
+            )
 
 
 def _assert_allowed_relative_path(rel: str, field_name: str) -> None:
@@ -115,7 +125,9 @@ def _copy_baseline_subset(dst_src: Path) -> None:
         src = REPO_ROOT / name
         if not src.exists():
             raise SystemExit(f"required baseline directory is missing: {src}")
-        shutil.copytree(src, dst_src / name, dirs_exist_ok=False)
+        dst = dst_src / name
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst, dirs_exist_ok=False)
 
 
 def _assert_snapshot_contains_only_allowed(src_root: Path) -> None:
@@ -130,8 +142,10 @@ def _assemble_experiment(exp: ExperimentSpec, lp: Any) -> Path:
     src_root = exp_root / "src"
     shutil.rmtree(exp_root, ignore_errors=True)
     ensure_dir(exp_root)
+    _log("assemble", f"{exp.exp_id}: copy baseline subset")
     _copy_baseline_subset(src_root)
     for rel_patch in exp.patch_files:
+        _log("assemble", f"{exp.exp_id}: apply patch {rel_patch}")
         _assert_repo_relative_path(rel_patch, f"{exp.exp_id}.patch_files[]")
         patch_path = (REPO_ROOT / rel_patch).resolve()
         if not patch_path.exists():
@@ -147,6 +161,52 @@ def _assemble_experiment(exp: ExperimentSpec, lp: Any) -> Path:
             raise SystemExit(f"patch apply failed for {exp.exp_id}: {patch_path}\n{details}")
     _assert_snapshot_contains_only_allowed(src_root)
     return src_root
+
+
+def _ensure_shared_venv(
+    spec: BatchSpec,
+    experiments: list[ExperimentSpec],
+    inventory: dict[str, PodSpec],
+    ssh_key: Path,
+    api: RunpodClient | None,
+    dry_run: bool,
+) -> None:
+    if dry_run or not experiments:
+        return
+    requirements_path = (REPO_ROOT / spec.runtime.requirements_file).resolve()
+    if not requirements_path.exists():
+        raise SystemExit(f"requirements file not found: {requirements_path}")
+    bootstrap_exp = experiments[0]
+    bootstrap_pod = inventory[bootstrap_exp.pod_alias]
+    _log("venv", f"bootstrap shared venv on pod alias={bootstrap_exp.pod_alias}")
+    conn = _resolve_conn(bootstrap_pod, ssh_key, api)
+    remote_requirements = f"/tmp/runpod_requirements_{spec.batch_id}.txt".replace(" ", "_")
+    scp_to_remote(conn, requirements_path, remote_requirements)
+    cmd = (
+        "set -euo pipefail; "
+        f"VENV={shlex.quote(SHARED_VENV_DIR)}; "
+        f"REQ={shlex.quote(remote_requirements)}; "
+        "MARKER=\"$VENV/.ready\"; "
+        "LOCK=\"$VENV.lock\"; "
+        "if [[ -x \"$VENV/bin/python\" && -f \"$MARKER\" ]]; then "
+        "  echo 'shared_venv_ready'; "
+        "  exit 0; "
+        "fi; "
+        "mkdir -p \"$(dirname \"$VENV\")\"; "
+        "while ! mkdir \"$LOCK\" 2>/dev/null; do sleep 1; done; "
+        "trap 'rmdir \"$LOCK\" 2>/dev/null || true' EXIT; "
+        "if [[ ! -x \"$VENV/bin/python\" ]]; then "
+        "  rm -rf \"$VENV\"; "
+        f"  {shlex.quote(spec.runtime.python_bin)} -m venv \"$VENV\"; "
+        "fi; "
+        "source \"$VENV/bin/activate\"; "
+        "if ! python -m pip --version >/dev/null 2>&1; then python -m ensurepip --upgrade; fi; "
+        "python -m pip install -r \"$REQ\"; "
+        "touch \"$MARKER\"; "
+        "echo 'shared_venv_bootstrap_done'; "
+    )
+    run_ssh(conn, f"bash -lc {shlex.quote(cmd)}", timeout=3600)
+    _log("venv", f"shared venv ready at {SHARED_VENV_DIR}")
 
 
 def _resolve_conn(pod: PodSpec, ssh_key: Path, api: RunpodClient | None) -> PodConn:
@@ -252,6 +312,7 @@ def _deploy_and_start(
             launch_command=launch_command,
         )
 
+    _log("deploy", f"{exp.exp_id}: prepare remote dir {rp.exp_root}")
     if relaunch_mode:
         run_ssh(conn, f"rm -rf {shlex.quote(rp.exp_root)}")
     else:
@@ -263,8 +324,10 @@ def _deploy_and_start(
             )
 
     run_ssh(conn, f"mkdir -p {shlex.quote(rp.exp_root)}")
+    _log("deploy", f"{exp.exp_id}: upload snapshot")
     scp_to_remote(conn, src_root, rp.exp_root, recursive=True)
 
+    _log("deploy", f"{exp.exp_id}: render and upload starter script")
     script_text = _start_script(spec, rp, launch_command)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, encoding="utf-8", newline="\n") as tmp:
         tmp.write(script_text.replace("\r\n", "\n"))
@@ -275,6 +338,7 @@ def _deploy_and_start(
         tmp_path.unlink(missing_ok=True)
 
     run_ssh(conn, f"chmod +x {shlex.quote(rp.start_script_path)}")
+    _log("deploy", f"{exp.exp_id}: start pipeline in background")
     run_ssh(
         conn,
         f"nohup bash {shlex.quote(rp.start_script_path)} > {shlex.quote(rp.log_path)} 2>&1 < /dev/null & echo $!",
@@ -292,6 +356,7 @@ def _deploy_and_start(
 
 
 def _launch_impl(args: argparse.Namespace, relaunch_mode: bool) -> int:
+    _log("start", f"command={'relaunch' if relaunch_mode else 'launch'}")
     spec = _load_spec(Path(args.spec_file).expanduser().resolve())
     lp = local_paths(REPO_ROOT, spec.batch_id)
     ensure_dir(lp.root)
@@ -314,6 +379,7 @@ def _launch_impl(args: argparse.Namespace, relaunch_mode: bool) -> int:
             raise SystemExit(f"exp_id not found in spec: {target_exp_id}")
     spec.experiments = experiments
 
+    _log("assemble", f"build local snapshots count={len(spec.experiments)}")
     assembled: dict[str, Path] = {}
     for exp in spec.experiments:
         assembled[exp.exp_id] = _assemble_experiment(exp, lp)
@@ -322,6 +388,8 @@ def _launch_impl(args: argparse.Namespace, relaunch_mode: bool) -> int:
     needs_api = any(not inventory[exp.pod_alias].host for exp in spec.experiments)
     if needs_api and not args.dry_run:
         api = RunpodClient(api_key=args.runpod_api_key)
+
+    _ensure_shared_venv(spec, spec.experiments, inventory, ssh_key, api, args.dry_run)
 
     launch_commands = {exp.exp_id: _build_launch_command(spec, exp, remote_paths(spec.runtime.workspace_root, spec.batch_id, exp.exp_id)) for exp in spec.experiments}
     if len(set(launch_commands.values())) != len(launch_commands):
@@ -345,14 +413,17 @@ def _launch_impl(args: argparse.Namespace, relaunch_mode: bool) -> int:
         return _deploy_and_start(spec, exp, assembled[exp.exp_id], conn, relaunch_mode, dry_run=False)
 
     max_parallel = max(1, int(getattr(args, "max_parallel", 4)))
+    _log("launch", f"starting deployment max_parallel={max_parallel}")
     with ThreadPoolExecutor(max_workers=max_parallel) as ex:
         future_map = {ex.submit(_one, exp): exp for exp in spec.experiments}
         for future in as_completed(future_map):
             exp = future_map[future]
             try:
                 results.append(future.result())
+                _log("launch", f"{exp.exp_id}: started")
             except BaseException as exc:
                 failures.append(f"{exp.exp_id}: {exc}")
+                _log("launch", f"{exp.exp_id}: failed {exc}")
 
     payload = {
         "batch_id": spec.batch_id,

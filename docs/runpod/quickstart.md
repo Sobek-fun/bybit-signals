@@ -17,7 +17,12 @@
 - `runtime.detector_dir_remote`: optional путь к detector на pod.
 - `runtime.tokens_file_remote`: optional путь к tokens-файлу на pod.
 - `runtime.extra_env`: optional словарь env-переменных, экспортируется перед запуском пайплайна.
-- `experiments[]`: `exp_id`, `pod_alias`, `patch_files[]`.
+- `experiments[]`: `exp_id`, `pod_alias`, `patch_files[]` (максимум один patch на `exp_id`).
+
+Важно:
+- multi-patch для одного эксперимента запрещен — только один patch-файл или пустой список.
+- launcher всегда использует единый shared venv: `/workspace/.venvs/bybit-signals-runpod`.
+- перед deploy выполняется bootstrap shared venv на одном из pod, после чего все эксперименты используют это же окружение без повторной установки зависимостей.
 
 ### Regime job
 
@@ -50,6 +55,7 @@ python -m scripts.runpod_jobs.cli launch \
 ```
 
 В stdout печатаются только уникальные `tail -f` команды для каждого эксперимента.
+Дополнительно launcher печатает этапные логи (`assemble`, `venv`, `deploy`, `launch`) для быстрой диагностики.
 
 ## Команда relaunch (один experiment)
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+SHARED_VENV_DIR = "/workspace/.venvs/bybit-signals-runpod"
+
 
 @dataclass(slots=True)
 class LocalPaths:
@@ -40,7 +42,7 @@ def remote_paths(workspace_root: str, batch_id: str, exp_id: str) -> RemoteExper
     return RemoteExperimentPaths(
         exp_root=exp_root,
         src_dir=f"{exp_root}/src",
-        venv_dir=f"{batch_root}/venv_shared",
+        venv_dir=SHARED_VENV_DIR,
         run_dir=f"{exp_root}/run",
         log_path=f"{exp_root}/pipeline.log",
         started_at_path=f"{exp_root}/started_at.txt",
