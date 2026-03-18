@@ -134,6 +134,7 @@ def flatten_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
     event_level = metrics.get("event_level", {}) if isinstance(metrics.get("event_level"), dict) else {}
     point_level = metrics.get("point_level", {}) if isinstance(metrics.get("point_level"), dict) else {}
     trade_quality = metrics.get("trade_quality", {}) if isinstance(metrics.get("trade_quality"), dict) else {}
+    signal_quality = metrics.get("signal_quality", {}) if isinstance(metrics.get("signal_quality"), dict) else {}
 
     flat = {}
     for src in (metrics, event_level, point_level):
@@ -156,6 +157,10 @@ def flatten_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
         if mae:
             flat[f"{mae_key}_median"] = mae.get("median")
             flat[f"{mae_key}_count"] = mae.get("count")
+
+    for k, v in signal_quality.items():
+        if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+            flat[k] = v
 
     return flat
 
@@ -804,9 +809,9 @@ def build_report(run_dir: Path) -> str:
             lines.append(md_table(top_cols, rows))
             lines.append("")
 
+    lines.append("## Validation metrics")
+    lines.append("")
     if val_summary:
-        lines.append("### Val snapshot")
-        lines.append("")
         val_rows = [
             ["signals", fmt(val_summary.get("signals"))],
             ["hit0_rate", fmt_pct(val_summary.get("hit0_rate"))],
@@ -817,24 +822,63 @@ def build_report(run_dir: Path) -> str:
             ["fp_b_rate", fmt_pct(val_summary.get("fp_b_rate"))],
             ["pr_auc", fmt(val_summary.get("pr_auc"))],
             ["roc_auc", fmt(val_summary.get("roc_auc"))],
+            ["squeeze_median_h32", fmt(val_summary.get("squeeze_median_h32"))],
+            ["squeeze_p75_h32", fmt(val_summary.get("squeeze_p75_h32"))],
+            ["pullback_median_h32", fmt(val_summary.get("pullback_median_h32"))],
+            ["pullback_p75_h32", fmt(val_summary.get("pullback_p75_h32"))],
+            ["net_edge_median_h32", fmt(val_summary.get("net_edge_median_h32"))],
+            ["clean_2_3_count_h32", fmt(val_summary.get("clean_2_3_count_h32"))],
+            ["clean_2_3_share_h32", fmt_pct(val_summary.get("clean_2_3_share_h32"))],
+            ["dirty_retrace_2_3_count_h32", fmt(val_summary.get("dirty_retrace_2_3_count_h32"))],
+            ["dirty_retrace_2_3_share_h32", fmt_pct(val_summary.get("dirty_retrace_2_3_share_h32"))],
+            ["clean_no_pullback_2_3_count_h32", fmt(val_summary.get("clean_no_pullback_2_3_count_h32"))],
+            ["clean_no_pullback_2_3_share_h32", fmt_pct(val_summary.get("clean_no_pullback_2_3_share_h32"))],
+            ["dirty_no_pullback_2_3_count_h32", fmt(val_summary.get("dirty_no_pullback_2_3_count_h32"))],
+            ["dirty_no_pullback_2_3_share_h32", fmt_pct(val_summary.get("dirty_no_pullback_2_3_share_h32"))],
+            ["clean_to_dirty_failure_ratio_2_3_h32", fmt(val_summary.get("clean_to_dirty_failure_ratio_2_3_h32"))],
+            ["clean_retrace_precision_2_3_h32", fmt(val_summary.get("clean_retrace_precision_2_3_h32"))],
+            ["low_squeeze_conversion_2_3_h32", fmt(val_summary.get("low_squeeze_conversion_2_3_h32"))],
+            ["pullback_before_squeeze_share_2_3_h32", fmt_pct(val_summary.get("pullback_before_squeeze_share_2_3_h32"))],
             ["trade_quality_score", fmt(val_summary.get("trade_quality_score"))],
         ]
         lines.append(md_table(["Metric", "Value"], val_rows))
         lines.append("")
+    else:
+        lines.append("Validation artifacts not found.")
+        lines.append("")
 
-    lines.append("## Holdout / test")
+    lines.append("## Holdout metrics")
     lines.append("")
     if holdout_summary:
         hold_rows = [
             ["signals", fmt(holdout_summary.get("signals"))],
-            ["signals_per_30d", fmt(holdout_summary.get("signals_per_30d"))],
-            ["symbols", fmt(holdout_summary.get("symbols"))],
             ["hit0_rate", fmt_pct(holdout_summary.get("hit0_rate"))],
             ["hit0_or_hit1_rate", fmt_pct(holdout_summary.get("hit0_or_hit1_rate"))],
             ["early_rate", fmt_pct(holdout_summary.get("early_rate"))],
             ["late_rate", fmt_pct(holdout_summary.get("late_rate"))],
             ["miss_rate", fmt_pct(holdout_summary.get("miss_rate"))],
             ["fp_b_rate", fmt_pct(holdout_summary.get("fp_b_rate"))],
+            ["pr_auc", fmt(holdout_summary.get("pr_auc"))],
+            ["roc_auc", fmt(holdout_summary.get("roc_auc"))],
+            ["squeeze_median_h32", fmt(holdout_summary.get("squeeze_median_h32"))],
+            ["squeeze_p75_h32", fmt(holdout_summary.get("squeeze_p75_h32"))],
+            ["pullback_median_h32", fmt(holdout_summary.get("pullback_median_h32"))],
+            ["pullback_p75_h32", fmt(holdout_summary.get("pullback_p75_h32"))],
+            ["net_edge_median_h32", fmt(holdout_summary.get("net_edge_median_h32"))],
+            ["clean_2_3_count_h32", fmt(holdout_summary.get("clean_2_3_count_h32"))],
+            ["clean_2_3_share_h32", fmt_pct(holdout_summary.get("clean_2_3_share_h32"))],
+            ["dirty_retrace_2_3_count_h32", fmt(holdout_summary.get("dirty_retrace_2_3_count_h32"))],
+            ["dirty_retrace_2_3_share_h32", fmt_pct(holdout_summary.get("dirty_retrace_2_3_share_h32"))],
+            ["clean_no_pullback_2_3_count_h32", fmt(holdout_summary.get("clean_no_pullback_2_3_count_h32"))],
+            ["clean_no_pullback_2_3_share_h32", fmt_pct(holdout_summary.get("clean_no_pullback_2_3_share_h32"))],
+            ["dirty_no_pullback_2_3_count_h32", fmt(holdout_summary.get("dirty_no_pullback_2_3_count_h32"))],
+            ["dirty_no_pullback_2_3_share_h32", fmt_pct(holdout_summary.get("dirty_no_pullback_2_3_share_h32"))],
+            ["clean_to_dirty_failure_ratio_2_3_h32", fmt(holdout_summary.get("clean_to_dirty_failure_ratio_2_3_h32"))],
+            ["clean_retrace_precision_2_3_h32", fmt(holdout_summary.get("clean_retrace_precision_2_3_h32"))],
+            ["low_squeeze_conversion_2_3_h32", fmt(holdout_summary.get("low_squeeze_conversion_2_3_h32"))],
+            ["pullback_before_squeeze_share_2_3_h32", fmt_pct(holdout_summary.get("pullback_before_squeeze_share_2_3_h32"))],
+            ["signals_per_30d", fmt(holdout_summary.get("signals_per_30d"))],
+            ["symbols", fmt(holdout_summary.get("symbols"))],
             ["signal_offset_p50", fmt(holdout_summary.get("signal_offset_p50") or holdout_summary.get("median_pred_offset"))],
             ["signal_offset_p90", fmt(holdout_summary.get("signal_offset_p90"))],
             ["tp", fmt(holdout_summary.get("tp"))],
@@ -850,8 +894,6 @@ def build_report(run_dir: Path) -> str:
             ["max_losing_streak", fmt(holdout_summary.get("max_losing_streak"))],
             ["worst_6h_pnl", fmt(holdout_summary.get("worst_6h_pnl"))],
             ["worst_24h_pnl", fmt(holdout_summary.get("worst_24h_pnl"))],
-            ["pr_auc", fmt(holdout_summary.get("pr_auc"))],
-            ["roc_auc", fmt(holdout_summary.get("roc_auc"))],
             ["trade_quality_score", fmt(holdout_summary.get("trade_quality_score"))],
             ["mfe_short_32_median", fmt(holdout_summary.get("mfe_short_32_median"))],
             ["mfe_short_32_pct_above_2pct", fmt_pct(holdout_summary.get("mfe_short_32_pct_above_2pct"))],
@@ -860,7 +902,7 @@ def build_report(run_dir: Path) -> str:
         lines.append(md_table(["Metric", "Value"], hold_rows))
         lines.append("")
     else:
-        lines.append("Holdout/test artifacts not found.")
+        lines.append("Holdout artifacts not found.")
         lines.append("")
 
     if not monthly_df.empty:

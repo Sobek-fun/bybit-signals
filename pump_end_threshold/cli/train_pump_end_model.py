@@ -12,7 +12,7 @@ from pump_end_threshold.ml.dataset import load_labels, build_training_points, de
 from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
 from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
 from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
-from pump_end_threshold.ml.evaluate import evaluate, evaluate_with_trade_quality
+from pump_end_threshold.ml.evaluate import evaluate_with_trade_quality, attach_signal_quality_columns
 from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
 from pump_end_threshold.ml.tuning import (
     tune_model, train_final_model, get_rule_parameter_grid,
@@ -560,10 +560,19 @@ def run_train_only(args, artifacts: RunArtifacts):
     })
     log("INFO", "TRAIN", f"best threshold: {best_threshold:.3f}")
 
+    loader = DataLoader(args.clickhouse_dsn) if args.clickhouse_dsn else None
+
     log("INFO", "TRAIN", "evaluating on val set")
-    val_metrics = evaluate(val_predictions, best_threshold, signal_rule=args.signal_rule,
-                           min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                           abstain_margin=args.abstain_margin)
+    val_metrics = evaluate_with_trade_quality(
+        val_predictions,
+        best_threshold,
+        loader,
+        signal_rule=args.signal_rule,
+        min_pending_bars=args.min_pending_bars,
+        drop_delta=args.drop_delta,
+        horizons=[16, 32],
+        abstain_margin=args.abstain_margin
+    )
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
         f"val metrics: hit0={val_metrics['event_level']['hit0_rate']:.3f} early={val_metrics['event_level']['early_rate']:.3f} miss={val_metrics['event_level']['miss_rate']:.3f}")
@@ -577,9 +586,16 @@ def run_train_only(args, artifacts: RunArtifacts):
     artifacts.save_predictions(test_predictions, 'test')
 
     log("INFO", "TRAIN", "evaluating on test set")
-    test_metrics = evaluate(test_predictions, best_threshold, signal_rule=args.signal_rule,
-                            min_pending_bars=args.min_pending_bars, drop_delta=args.drop_delta,
-                            abstain_margin=args.abstain_margin)
+    test_metrics = evaluate_with_trade_quality(
+        test_predictions,
+        best_threshold,
+        loader,
+        signal_rule=args.signal_rule,
+        min_pending_bars=args.min_pending_bars,
+        drop_delta=args.drop_delta,
+        horizons=[16, 32],
+        abstain_margin=args.abstain_margin
+    )
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
@@ -593,9 +609,10 @@ def run_train_only(args, artifacts: RunArtifacts):
         drop_delta=args.drop_delta,
         abstain_margin=args.abstain_margin
     )
+    if loader is not None and not signals_df.empty:
+        signals_df = attach_signal_quality_columns(signals_df, loader, horizons=[16, 32])
     signals_df = format_predicted_signals(signals_df)
-    if args.clickhouse_dsn and not signals_df.empty:
-        loader = DataLoader(args.clickhouse_dsn)
+    if loader is not None and not signals_df.empty:
         signals_df = enrich_with_trade_replay(signals_df, loader)
     artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(signals_df))
     artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(signals_df))
@@ -745,12 +762,15 @@ def run_tune(args, artifacts: RunArtifacts):
                 feature_columns
             )
             artifacts.save_predictions(val_predictions, 'val')
-            val_metrics = evaluate(
+            loader = DataLoader(args.clickhouse_dsn) if args.clickhouse_dsn else None
+            val_metrics = evaluate_with_trade_quality(
                 val_predictions,
                 best_threshold,
+                loader,
                 signal_rule=actual_signal_rule,
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta,
+                horizons=[16, 32],
                 abstain_margin=args.abstain_margin
             )
             artifacts.save_metrics(val_metrics, 'val')
@@ -762,34 +782,22 @@ def run_tune(args, artifacts: RunArtifacts):
             )
             artifacts.save_predictions(test_predictions, 'test')
 
-            if args.clickhouse_dsn:
-                log("INFO", "TUNE", "evaluating with trade quality metrics")
-                loader = DataLoader(args.clickhouse_dsn)
-                test_metrics = evaluate_with_trade_quality(
-                    test_predictions,
-                    best_threshold,
-                    loader,
-                    signal_rule=actual_signal_rule,
-                    min_pending_bars=best_min_pending_bars,
-                    drop_delta=best_drop_delta,
-                    horizons=[16, 32],
-                    abstain_margin=args.abstain_margin
-                )
-                log("INFO", "TUNE",
-                    f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
+            test_metrics = evaluate_with_trade_quality(
+                test_predictions,
+                best_threshold,
+                loader,
+                signal_rule=actual_signal_rule,
+                min_pending_bars=best_min_pending_bars,
+                drop_delta=best_drop_delta,
+                horizons=[16, 32],
+                abstain_margin=args.abstain_margin
+            )
+            if loader is not None:
+                log("INFO", "TUNE", f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
                 if 'mfe_short_32' in test_metrics['trade_quality'] and test_metrics['trade_quality']['mfe_short_32']:
                     mfe_stats = test_metrics['trade_quality']['mfe_short_32']
                     log("INFO", "TUNE",
                         f"MFE_32: median={mfe_stats.get('median', 0):.4f} pct_above_2pct={mfe_stats.get('pct_above_2pct', 0):.2f}")
-            else:
-                test_metrics = evaluate(
-                    test_predictions,
-                    best_threshold,
-                    signal_rule=actual_signal_rule,
-                    min_pending_bars=best_min_pending_bars,
-                    drop_delta=best_drop_delta,
-                    abstain_margin=args.abstain_margin
-                )
 
             artifacts.save_metrics(test_metrics, 'test')
             log("INFO", "TUNE",
@@ -803,6 +811,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin
             )
+            if loader is not None and not val_signals_df.empty:
+                val_signals_df = attach_signal_quality_columns(val_signals_df, loader, horizons=[16, 32])
             val_signals_df = format_predicted_signals(val_signals_df)
             artifacts.save_predicted_signals_val(val_signals_df)
             log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
@@ -815,9 +825,10 @@ def run_tune(args, artifacts: RunArtifacts):
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin
             )
+            if loader is not None and not test_signals_df.empty:
+                test_signals_df = attach_signal_quality_columns(test_signals_df, loader, horizons=[16, 32])
             test_signals_df = format_predicted_signals(test_signals_df)
-            if args.clickhouse_dsn and not test_signals_df.empty:
-                loader = DataLoader(args.clickhouse_dsn)
+            if loader is not None and not test_signals_df.empty:
                 test_signals_df = enrich_with_trade_replay(test_signals_df, loader)
             artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(test_signals_df))
             artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(test_signals_df))
