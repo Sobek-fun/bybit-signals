@@ -1,0 +1,119 @@
+diff --git a/pump_end_threshold/cli/train_pump_end_model.py b/pump_end_threshold/cli/train_pump_end_model.py
+--- a/pump_end_threshold/cli/train_pump_end_model.py
++++ b/pump_end_threshold/cli/train_pump_end_model.py
+@@ -12,7 +12,11 @@ from pump_end_threshold.ml.dataset import load_labels, build_training_points, de
+ from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
+ from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
+ from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
+-from pump_end_threshold.ml.evaluate import evaluate_with_trade_quality, attach_signal_quality_columns
++from pump_end_threshold.ml.evaluate import (
++    evaluate_with_trade_quality,
++    attach_signal_quality_columns,
++    compute_signal_quality_metrics,
++)
+ from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
+ from pump_end_threshold.ml.tuning import (
+     tune_model, train_final_model, get_rule_parameter_grid,
+@@ -264,6 +268,7 @@ def calibrate_threshold_on_val(
+         feature_columns: list,
+         train_end: datetime,
+         val_end: datetime,
++        clickhouse_dsn: str,
+         signal_rule: str,
+         alpha_hit1: float,
+         beta_early: float,
+@@ -306,6 +311,13 @@ def calibrate_threshold_on_val(
+     best_min_pending_bars = 1
+     best_drop_delta = 0.0
+     all_sweeps = []
++    loader = DataLoader(clickhouse_dsn) if clickhouse_dsn else None
++
++    def metric_value(metrics: dict, name: str, default: float = 0.0) -> float:
++        value = metrics.get(name, default)
++        if value is None or pd.isna(value):
++            return float(default)
++        return float(value)
+ 
+     for rule_params in rule_combinations:
+         min_pending_bars = rule_params['min_pending_bars']
+@@ -328,17 +340,66 @@ def calibrate_threshold_on_val(
+         )
+ 
+         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
+-        score = best_row['score']
+         sweep_with_rule = sweep_df.copy()
+         sweep_with_rule['min_pending_bars'] = min_pending_bars
+         sweep_with_rule['drop_delta'] = drop_delta
+         all_sweeps.append(sweep_with_rule)
+ 
+-        if score > best_score:
+-            best_score = score
+-            best_threshold = threshold
+-            best_min_pending_bars = min_pending_bars
+-            best_drop_delta = drop_delta
++        candidate_rows: list[dict] = []
++        if 'signal_count' in sweep_df.columns:
++            positive_signals = sweep_df[sweep_df['signal_count'] > 0].copy()
++            if not positive_signals.empty:
++                positive_signals['prefilter_score'] = positive_signals['score'] + 0.002 * positive_signals['signal_count']
++                candidate_rows = positive_signals.sort_values('prefilter_score', ascending=False).head(6).to_dict('records')
++        if not candidate_rows:
++            candidate_rows = [best_row.to_dict()]
++
++        for candidate in candidate_rows:
++            cand_threshold = float(candidate['threshold'])
++            quality_score = float(candidate.get('score', -float('inf')))
++
++            if loader is not None:
++                candidate_signals = extract_signals_verbose(
++                    predictions,
++                    cand_threshold,
++                    signal_rule=signal_rule,
++                    min_pending_bars=min_pending_bars,
++                    drop_delta=drop_delta,
++                    abstain_margin=abstain_margin,
++                )
++                n_signals = len(candidate_signals)
++                if n_signals == 0:
++                    continue
++                signal_path = attach_signal_quality_columns(
++                    candidate_signals[['symbol', 'open_time', 'event_type']].copy(),
++                    loader,
++                    horizons=[32],
++                )
++                quality_metrics = compute_signal_quality_metrics(
++                    signal_path_df=signal_path,
++                    horizon=32,
++                    squeeze_threshold=0.02,
++                    pullback_threshold=0.03,
++                )
++                quality_score = (
++                        6.0 * metric_value(quality_metrics, 'clean_2_3_share_h32')
++                        + 0.03 * metric_value(quality_metrics, 'clean_2_3_count_h32')
++                        + 3.0 * metric_value(quality_metrics, 'clean_retrace_precision_2_3_h32')
++                        + 2.0 * metric_value(quality_metrics, 'low_squeeze_conversion_2_3_h32')
++                        + 2.0 * metric_value(quality_metrics, 'pullback_before_squeeze_share_2_3_h32')
++                        + 30.0 * metric_value(quality_metrics, 'net_edge_median_h32')
++                        - 20.0 * metric_value(quality_metrics, 'squeeze_p75_h32')
++                        - 6.0 * metric_value(quality_metrics, 'dirty_no_pullback_2_3_share_h32')
++                        - 0.02 * metric_value(quality_metrics, 'dirty_no_pullback_2_3_count_h32')
++                )
++                if n_signals < 12:
++                    quality_score -= 0.15 * (12 - n_signals)
++
++            if quality_score > best_score:
++                best_score = quality_score
++                best_threshold = cand_threshold
++                best_min_pending_bars = min_pending_bars
++                best_drop_delta = drop_delta
+ 
+     return {
+         'threshold': best_threshold,
+@@ -735,6 +796,7 @@ def run_tune(args, artifacts: RunArtifacts):
+                 feature_columns,
+                 train_end,
+                 val_end,
++                args.clickhouse_dsn,
+                 actual_signal_rule,
+                 args.alpha_hit1,
+                 args.beta_early,

@@ -1,0 +1,53 @@
+diff --git a/pump_end_threshold/ml/feature_schema.py b/pump_end_threshold/ml/feature_schema.py
+--- a/pump_end_threshold/ml/feature_schema.py
++++ b/pump_end_threshold/ml/feature_schema.py
+@@ -1,19 +1,12 @@
+ def prune_feature_columns(feature_columns: list) -> list:
+-    prune_prefixes = [
+-        'liq_sweep_flag_lag_',
+-        'liq_sweep_overshoot_lag_',
+-        'liq_reject_strength_lag_',
+-    ]
++    prune_prefixes = []
+ 
+     prune_names = {
+-        'touched_pdh', 'touched_pwh',
+-        'sweep_pdh', 'sweep_pwh', 'sweep_eqh',
+-        'overshoot_pdh', 'overshoot_pwh', 'overshoot_eqh',
+-        'liq_level_type_pwh',
+         'vol_spike_cond', 'vol_spike_recent',
+         'rsi_hot', 'mfi_hot', 'osc_hot_recent', 'osc_extreme', 'macd_pos_recent',
+-        'pump_ctx', 'strong_cond', 'pump_score',
++        'pump_ctx', 'near_peak', 'strong_cond', 'pump_score',
+         'predump_mask', 'predump_peak',
++        'runup_age_bars', 'pump_ctx_age_bars', 'bars_since_new_high', 'near_peak_streak',
+     }
+ 
+     pruned = []
+--- a/pump_end_threshold/ml/feature_schema.py
++++ b/pump_end_threshold/ml/feature_schema.py
+@@ -1,19 +1,14 @@
+ def prune_feature_columns(feature_columns: list) -> list:
+-    prune_prefixes = [
+-        'liq_sweep_flag_lag_',
+-        'liq_sweep_overshoot_lag_',
+-        'liq_reject_strength_lag_',
+-    ]
++    prune_prefixes = []
+ 
+     prune_names = {
+-        'touched_pdh', 'touched_pwh',
+-        'sweep_pdh', 'sweep_pwh', 'sweep_eqh',
+-        'overshoot_pdh', 'overshoot_pwh', 'overshoot_eqh',
+-        'liq_level_type_pwh',
+         'vol_spike_cond', 'vol_spike_recent',
+         'rsi_hot', 'mfi_hot', 'osc_hot_recent', 'osc_extreme', 'macd_pos_recent',
+-        'pump_ctx', 'strong_cond', 'pump_score',
++        'pump_ctx', 'pump_score',
++        'near_peak', 'strong_cond',
+         'predump_mask', 'predump_peak',
++        'runup_age_bars', 'pump_ctx_age_bars',
++        'bars_since_new_high', 'near_peak_streak',
+     }
+ 
+     pruned = []

@@ -1,0 +1,29 @@
+diff --git a/pump_end_threshold/cli/train_pump_end_model.py b/pump_end_threshold/cli/train_pump_end_model.py
+--- a/pump_end_threshold/cli/train_pump_end_model.py
++++ b/pump_end_threshold/cli/train_pump_end_model.py
+@@ -432,20 +432,20 @@ def run_build_dataset(args, artifacts: RunArtifacts):
+     features_df['sample_weight'] = 1.0
+ 
+     b_offset0_mask = (features_df['pump_la_type'] == 'B') & (features_df['offset'] == 0)
+-    features_df.loc[b_offset0_mask, 'sample_weight'] *= 10.0
++    features_df.loc[b_offset0_mask, 'sample_weight'] *= 6.0
+ 
+     if 'pump_ctx' in features_df.columns:
+         neg_pump_ctx_mask = (features_df['y'] == 0) & (features_df['pump_ctx'] == 1)
+-        features_df.loc[neg_pump_ctx_mask, 'sample_weight'] *= 2.0
++        features_df.loc[neg_pump_ctx_mask, 'sample_weight'] *= 1.5
+ 
+         neg_no_pump_ctx_mask = (features_df['y'] == 0) & (features_df['pump_ctx'] == 0)
+-        features_df.loc[neg_no_pump_ctx_mask, 'sample_weight'] *= 0.2
++        features_df.loc[neg_no_pump_ctx_mask, 'sample_weight'] *= 0.5
+ 
+     near_peak_mask = features_df['offset'].abs() <= 3
+-    features_df.loc[near_peak_mask, 'sample_weight'] *= 1.5
++    features_df.loc[near_peak_mask, 'sample_weight'] *= 1.25
+ 
+     pos_offset0_mask = (features_df['y'] == 1) & (features_df['offset'] == 0)
+-    features_df.loc[pos_offset0_mask, 'sample_weight'] *= 2.0
++    features_df.loc[pos_offset0_mask, 'sample_weight'] *= 2.5
+     now = time.perf_counter()
+     log("INFO", "BUILD", f"stage=sample_weighting took={now - stage_t:.2f}s total={now - t0:.2f}s")
+     stage_t = now
