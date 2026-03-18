@@ -15,6 +15,19 @@ _WORKER_BUILDER = None
 _WORKER_PARTS_DIR = ""
 
 
+def _infer_epoch_unit(values: np.ndarray) -> str:
+    if values.size == 0:
+        return "ns"
+    vmax = int(np.max(np.abs(values)))
+    if vmax >= 10**17:
+        return "ns"
+    if vmax >= 10**14:
+        return "us"
+    if vmax >= 10**11:
+        return "ms"
+    return "s"
+
+
 def _init_worker(worker_config):
     global _WORKER_BUILDER, _WORKER_PARTS_DIR
     ch_dsn, window_bars, warmup_bars, feature_set, params_dict, market_symbol, parts_dir = worker_config
@@ -31,8 +44,10 @@ def _init_worker(worker_config):
 
 def _process_symbol_worker(task):
     task_idx, symbol, _, event_times_ns, pump_types, runups = task
+    raw_values = np.array(event_times_ns, dtype=np.int64)
+    epoch_unit = _infer_epoch_unit(raw_values)
     events = pd.DataFrame({
-        'open_time': pd.to_datetime(np.array(event_times_ns, dtype=np.int64)),
+        'open_time': pd.to_datetime(raw_values, unit=epoch_unit, utc=True).tz_localize(None),
         'pump_la_type': pump_types,
         'runup_pct': runups,
     })
@@ -77,7 +92,6 @@ class PumpFeatureBuilder:
             labels_df['open_time'] = pd.to_datetime(labels_df['timestamp'], utc=True).dt.tz_localize(None)
 
         labels_df = labels_df.sort_values(['symbol', 'open_time'])
-
         grouped = labels_df.groupby('symbol', sort=False)
         symbols = list(grouped.groups.keys())
         print(f"[BUILD_FEATS] symbols={len(symbols)} max_workers={max_workers}")
@@ -122,7 +136,9 @@ class PumpFeatureBuilder:
 
             tasks = []
             for task_idx, (symbol, group) in enumerate(grouped):
-                event_times_ns = pd.to_datetime(group['open_time']).astype('int64').tolist()
+                event_times = pd.to_datetime(group['open_time'], utc=True)
+                event_times_np = event_times.to_numpy(dtype='datetime64[ns]')
+                event_times_ns = event_times_np.astype(np.int64).tolist()
                 pump_types = group['pump_la_type'].astype(str).tolist()
                 runups = group['runup_pct'].astype(float).tolist()
                 tasks.append((task_idx, symbol, len(group), event_times_ns, pump_types, runups))

@@ -408,6 +408,14 @@ def run_build_dataset(args, artifacts: RunArtifacts):
     now = time.perf_counter()
     log("INFO", "BUILD", f"stage=feature_builder_build took={now - stage_t:.2f}s total={now - t0:.2f}s")
     stage_t = now
+    if features_df.empty or 'symbol' not in features_df.columns or 'open_time' not in features_df.columns:
+        msg = (
+            f"feature build returned empty/invalid frame: rows={len(features_df)} "
+            f"columns={list(features_df.columns)} build_workers={args.build_workers}"
+        )
+        if args.build_workers > 1:
+            msg += " ; retry with lower --build-workers (e.g. 4 or 1)"
+        raise RuntimeError(msg)
 
     features_df = features_df.merge(
         points_df[['symbol', 'open_time', 'event_id', 'offset', 'y', 'pump_la_type', 'runup_pct']],
