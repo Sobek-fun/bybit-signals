@@ -119,8 +119,8 @@ def get_hyperparameter_grid() -> list:
 
 def get_rule_parameter_grid() -> list:
     rule_grid = {
-        'min_pending_bars': [1, 2, 3],
-        'drop_delta': [0.0, 0.01, 0.02]
+        'min_pending_bars': [2, 3, 4],
+        'drop_delta': [0.0, 0.01, 0.02, 0.03]
     }
 
     keys = list(rule_grid.keys())
@@ -185,6 +185,9 @@ def evaluate_fold(
         alpha_hit1: float,
         beta_early: float,
         gamma_miss: float,
+        threshold_grid_from: float = 0.01,
+        threshold_grid_to: float = 0.30,
+        threshold_grid_step: float = 0.01,
         early_penalty_threshold: int = -5,
         delta_fp_b: float = 3.0,
         abstain_margin: float = 0.0
@@ -211,6 +214,9 @@ def evaluate_fold(
 
         threshold, sweep_df = threshold_sweep(
             predictions,
+            grid_from=threshold_grid_from,
+            grid_to=threshold_grid_to,
+            grid_step=threshold_grid_step,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
@@ -242,14 +248,7 @@ def evaluate_fold(
         else:
             early_penalty = 0
 
-        score = (
-                metrics['hit0_rate'] +
-                alpha_hit1 * metrics.get('hit0_or_hit1_rate', metrics['hit0_rate'] + metrics['hit1_rate']) -
-                beta_early * metrics['early_rate'] -
-                gamma_miss * metrics['miss_rate'] -
-                delta_fp_b * metrics['fp_b_rate'] -
-                early_penalty
-        )
+        score = float(best_row['score']) - early_penalty
 
         if score > best_score:
             best_score = score
@@ -284,6 +283,9 @@ def run_cv(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        threshold_grid_from: float = 0.01,
+        threshold_grid_to: float = 0.30,
+        threshold_grid_step: float = 0.01,
         delta_fp_b: float = 3.0,
         abstain_margin: float = 0.0,
         embargo_bars: int = 0,
@@ -321,6 +323,9 @@ def run_cv(
             alpha_hit1,
             beta_early,
             gamma_miss,
+            threshold_grid_from=threshold_grid_from,
+            threshold_grid_to=threshold_grid_to,
+            threshold_grid_step=threshold_grid_step,
             delta_fp_b=delta_fp_b,
             abstain_margin=abstain_margin
         )
@@ -357,6 +362,9 @@ def tune_model(
         alpha_hit1: float = 0.5,
         beta_early: float = 2.0,
         gamma_miss: float = 1.0,
+        threshold_grid_from: float = 0.01,
+        threshold_grid_to: float = 0.30,
+        threshold_grid_step: float = 0.01,
         delta_fp_b: float = 3.0,
         abstain_margin: float = 0.0,
         embargo_bars: int = 0,
@@ -394,6 +402,9 @@ def tune_model(
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
+            threshold_grid_from=threshold_grid_from,
+            threshold_grid_to=threshold_grid_to,
+            threshold_grid_step=threshold_grid_step,
             delta_fp_b=delta_fp_b,
             abstain_margin=abstain_margin,
             embargo_bars=embargo_bars,

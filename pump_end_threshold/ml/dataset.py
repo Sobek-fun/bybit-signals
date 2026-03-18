@@ -83,7 +83,13 @@ def build_training_points(
 
 
 def deduplicate_points(points_df: pd.DataFrame) -> pd.DataFrame:
-    points_df = points_df.sort_values('y', ascending=False)
+    points_df = points_df.copy()
+    points_df['priority'] = 0
+    points_df.loc[points_df['offset'] == 0, 'priority'] = 1
+    points_df.loc[(points_df['pump_la_type'] == 'B') & (points_df['offset'] == 0), 'priority'] = 2
+    points_df.loc[points_df['y'] == 1, 'priority'] = 3
+    points_df = points_df.sort_values(['priority', 'y'], ascending=[False, False])
     points_df = points_df.drop_duplicates(subset=['symbol', 'open_time'], keep='first')
+    points_df = points_df.drop(columns=['priority'])
     points_df = points_df.sort_values(['symbol', 'open_time']).reset_index(drop=True)
     return points_df

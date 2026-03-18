@@ -268,6 +268,9 @@ def calibrate_threshold_on_val(
         alpha_hit1: float,
         beta_early: float,
         gamma_miss: float,
+        threshold_grid_from: float = 0.01,
+        threshold_grid_to: float = 0.30,
+        threshold_grid_step: float = 0.01,
         delta_fp_b: float = 3.0,
         abstain_margin: float = 0.0
 ) -> dict:
@@ -310,6 +313,9 @@ def calibrate_threshold_on_val(
 
         threshold, sweep_df = threshold_sweep(
             predictions,
+            grid_from=threshold_grid_from,
+            grid_to=threshold_grid_to,
+            grid_step=threshold_grid_step,
             alpha_hit1=alpha_hit1,
             beta_early=beta_early,
             gamma_miss=gamma_miss,
@@ -669,6 +675,9 @@ def run_tune(args, artifacts: RunArtifacts):
         alpha_hit1=args.alpha_hit1,
         beta_early=args.beta_early,
         gamma_miss=args.gamma_miss,
+        threshold_grid_from=args.threshold_grid_from,
+        threshold_grid_to=args.threshold_grid_to,
+        threshold_grid_step=args.threshold_grid_step,
         delta_fp_b=args.delta_fp_b,
         abstain_margin=args.abstain_margin,
         embargo_bars=args.embargo_bars,
@@ -730,6 +739,9 @@ def run_tune(args, artifacts: RunArtifacts):
                 args.alpha_hit1,
                 args.beta_early,
                 args.gamma_miss,
+                threshold_grid_from=args.threshold_grid_from,
+                threshold_grid_to=args.threshold_grid_to,
+                threshold_grid_step=args.threshold_grid_step,
                 delta_fp_b=args.delta_fp_b,
                 abstain_margin=args.abstain_margin
             )
@@ -869,6 +881,9 @@ def run_tune(args, artifacts: RunArtifacts):
                 args.alpha_hit1,
                 args.beta_early,
                 args.gamma_miss,
+                threshold_grid_from=args.threshold_grid_from,
+                threshold_grid_to=args.threshold_grid_to,
+                threshold_grid_step=args.threshold_grid_step,
                 delta_fp_b=args.delta_fp_b,
                 abstain_margin=args.abstain_margin
             )
