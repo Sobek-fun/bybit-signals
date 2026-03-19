@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 import clickhouse_connect
@@ -7,6 +8,30 @@ import pandas as pd
 
 from pump_end_threshold.infra.clickhouse import DataLoader
 from pump_end_threshold.tools.pump_start_detection.labeler_lookahead import PumpLabelerLookahead
+
+
+def _normalize_symbol(token: str) -> str:
+    t = token.strip().upper()
+    if not t:
+        return ""
+    if t.endswith("USDT"):
+        return t
+    return f"{t}USDT"
+
+
+def _parse_symbols_from_csv(raw: str) -> list[str]:
+    out = []
+    for part in raw.split(","):
+        symbol = _normalize_symbol(part)
+        if symbol:
+            out.append(symbol)
+    return list(dict.fromkeys(out))
+
+
+def _parse_symbols_from_file(path: str) -> list[str]:
+    payload = Path(path).read_text(encoding="utf-8")
+    normalized = payload.replace("\n", ",")
+    return _parse_symbols_from_csv(normalized)
 
 
 def main():
@@ -41,6 +66,18 @@ def main():
     parser.add_argument("--base-squeeze-pct", type=float, default=0.02)
     parser.add_argument("--k1", type=float, default=2.5)
     parser.add_argument("--k2", type=float, default=1.2)
+    parser.add_argument(
+        "--symbols-csv",
+        type=str,
+        default="",
+        help="Optional comma-separated symbols/tokens (e.g. BTC,ETHUSDT,sol). If no USDT suffix, it is added."
+    )
+    parser.add_argument(
+        "--symbols-file",
+        type=str,
+        default="",
+        help="Optional file with symbols/tokens separated by commas/newlines. Has priority over auto symbol discovery."
+    )
 
     args = parser.parse_args()
 
@@ -64,20 +101,28 @@ def main():
         secure=secure
     )
 
-    print(f"Fetching symbols from {args.start_date} to {args.end_date}...")
-    symbols_query = """
-    SELECT DISTINCT symbol
-    FROM bybit.candles
-    WHERE open_time >= %(start_date)s
-      AND open_time <= %(end_date)s
-      AND interval = 1
-    ORDER BY symbol
-    """
-    result = client.query(symbols_query, parameters={
-        "start_date": start_dt,
-        "end_date": end_dt
-    })
-    symbols = [row[0] for row in result.result_rows]
+    symbols: list[str] = []
+    if args.symbols_file.strip():
+        symbols = _parse_symbols_from_file(args.symbols_file)
+        print(f"Using symbols from file: {args.symbols_file} ({len(symbols)})")
+    elif args.symbols_csv.strip():
+        symbols = _parse_symbols_from_csv(args.symbols_csv)
+        print(f"Using symbols from --symbols-csv ({len(symbols)})")
+    else:
+        print(f"Fetching symbols from {args.start_date} to {args.end_date}...")
+        symbols_query = """
+        SELECT DISTINCT symbol
+        FROM bybit.candles
+        WHERE open_time >= %(start_date)s
+          AND open_time <= %(end_date)s
+          AND interval = 1
+        ORDER BY symbol
+        """
+        result = client.query(symbols_query, parameters={
+            "start_date": start_dt,
+            "end_date": end_dt
+        })
+        symbols = [row[0] for row in result.result_rows]
 
     if not symbols:
         print("No symbols found for the specified date range")

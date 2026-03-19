@@ -41,17 +41,31 @@ def parse_pos_offsets(offsets_str: str) -> list:
     return [int(x.strip()) for x in offsets_str.split(',')]
 
 
+def _normalize_symbol(token: str) -> str:
+    t = token.strip().upper()
+    if not t:
+        return ""
+    if t.endswith("USDT"):
+        return t
+    return f"{t}USDT"
+
+
+def _parse_symbols_from_csv(raw: str) -> list[str]:
+    out = []
+    for part in raw.split(","):
+        symbol = _normalize_symbol(part)
+        if symbol:
+            out.append(symbol)
+    return list(dict.fromkeys(out))
+
+
 def load_symbols_from_file(path: str) -> list[str]:
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"symbols file not found: {path}")
-    symbols = []
-    for line in file_path.read_text(encoding='utf-8').splitlines():
-        s = line.strip()
-        if not s or s.startswith('#'):
-            continue
-        symbols.append(s.upper())
-    return symbols
+    payload = file_path.read_text(encoding="utf-8")
+    normalized = payload.replace("\n", ",")
+    return _parse_symbols_from_csv(normalized)
 
 
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
@@ -398,7 +412,7 @@ def run_build_dataset(args, artifacts: RunArtifacts):
     if args.symbols_file:
         allowed_symbols = set(load_symbols_from_file(args.symbols_file))
         before = len(labels_df)
-        labels_df = labels_df[labels_df['symbol'].str.upper().isin(allowed_symbols)].reset_index(drop=True)
+        labels_df = labels_df[labels_df['symbol'].astype(str).str.upper().isin(allowed_symbols)].reset_index(drop=True)
         log("INFO", "BUILD", f"filtered labels by symbols-file: {before} -> {len(labels_df)}")
     log("INFO", "BUILD",
         f"loaded {len(labels_df)} labels (A={len(labels_df[labels_df['pump_la_type'] == 'A'])}, B={len(labels_df[labels_df['pump_la_type'] == 'B'])})")
