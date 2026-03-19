@@ -424,12 +424,27 @@ def build_signal_path_metrics(
 
     one_minute_cache = {}
     max_horizon = max(horizons)
-
+    symbol_ranges = {}
     for symbol, group in signals.groupby('symbol'):
         start_time = group['open_time'].min()
         end_time = group['open_time'].max() + pd.Timedelta(minutes=max_horizon * 15 + 1)
-        df_1m = candles_loader.load_raw_1m_candles(symbol, start_time.to_pydatetime(), end_time.to_pydatetime())
-        one_minute_cache[symbol] = df_1m
+        symbol_ranges[symbol] = (start_time.to_pydatetime(), end_time.to_pydatetime())
+
+    if hasattr(candles_loader, 'load_raw_1m_candles_ranges'):
+        one_minute_cache = candles_loader.load_raw_1m_candles_ranges(symbol_ranges)
+    elif hasattr(candles_loader, 'load_raw_1m_candles_batch'):
+        symbols = list(symbol_ranges.keys())
+        global_start = min(v[0] for v in symbol_ranges.values())
+        global_end = max(v[1] for v in symbol_ranges.values())
+        one_minute_cache = candles_loader.load_raw_1m_candles_batch(
+            symbols=symbols,
+            start_time=global_start,
+            end_time=global_end,
+        )
+    else:
+        for symbol, (start_time, end_time) in symbol_ranges.items():
+            df_1m = candles_loader.load_raw_1m_candles(symbol, start_time, end_time)
+            one_minute_cache[symbol] = df_1m
 
     for h in horizons:
         h_tag = f"h{h}"

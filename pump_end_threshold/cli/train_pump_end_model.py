@@ -12,7 +12,11 @@ from pump_end_threshold.ml.dataset import load_labels, build_training_points, de
 from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
 from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
 from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
-from pump_end_threshold.ml.evaluate import evaluate_with_trade_quality, attach_signal_quality_columns
+from pump_end_threshold.ml.evaluate import (
+    evaluate_with_trade_quality,
+    attach_signal_quality_columns,
+    compute_signal_quality_metrics,
+)
 from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
 from pump_end_threshold.ml.tuning import (
     tune_model, train_final_model, get_rule_parameter_grid,
@@ -272,8 +276,10 @@ def calibrate_threshold_on_val(
         threshold_grid_to: float = 0.30,
         threshold_grid_step: float = 0.01,
         delta_fp_b: float = 3.0,
-        abstain_margin: float = 0.0
+        abstain_margin: float = 0.0,
+        clickhouse_dsn: str | None = None,
 ) -> dict:
+    t0 = time.perf_counter()
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     val_events = event_times[
         (event_times['open_time'] >= train_end) &
@@ -300,14 +306,23 @@ def calibrate_threshold_on_val(
 
     event_data = _prepare_event_data(predictions)
     rule_combinations = get_rule_parameter_grid()
+    loader = DataLoader(clickhouse_dsn) if clickhouse_dsn else None
+    log(
+        "INFO",
+        "TUNE",
+        f"calibration_debug start val_rows={len(val_df)} val_events={len(val_events)} "
+        f"rules={len(rule_combinations)} quality_mode={'on' if loader is not None else 'off'}"
+    )
 
     best_score = -float('inf')
+    best_quality_score = -float('inf')
     best_threshold = 0.1
     best_min_pending_bars = 1
     best_drop_delta = 0.0
-    all_sweeps = []
+    rule_payloads = []
 
     for rule_params in rule_combinations:
+        rule_t0 = time.perf_counter()
         min_pending_bars = rule_params['min_pending_bars']
         drop_delta = rule_params['drop_delta']
 
@@ -329,16 +344,210 @@ def calibrate_threshold_on_val(
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
         score = best_row['score']
-        sweep_with_rule = sweep_df.copy()
-        sweep_with_rule['min_pending_bars'] = min_pending_bars
-        sweep_with_rule['drop_delta'] = drop_delta
-        all_sweeps.append(sweep_with_rule)
-
         if score > best_score:
             best_score = score
             best_threshold = threshold
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
+
+        sweep_with_rule = sweep_df.copy()
+        sweep_with_rule['min_pending_bars'] = min_pending_bars
+        sweep_with_rule['drop_delta'] = drop_delta
+        sweep_with_rule['quality_score'] = pd.NA
+        sweep_with_rule['clean_2_3_share_h32'] = pd.NA
+        sweep_with_rule['clean_retrace_precision_2_3_h32'] = pd.NA
+        sweep_with_rule['pullback_before_squeeze_share_h32'] = pd.NA
+        sweep_with_rule['net_edge_median_h32'] = pd.NA
+        sweep_with_rule['pullback_median_h32'] = pd.NA
+        sweep_with_rule['squeeze_p75_h32'] = pd.NA
+        sweep_with_rule['dirty_no_pullback_2_3_share_h32'] = pd.NA
+        sweep_with_rule['signal_count_quality'] = pd.NA
+
+        candidate_signals = {}
+        top_candidates = 0
+        if loader is not None:
+            candidates_df = sweep_df[sweep_df['signal_count'] > 0].copy()
+            if not candidates_df.empty:
+                candidates_df['prefilter_score'] = candidates_df['score'] + 0.002 * candidates_df['signal_count']
+                candidates_df = candidates_df.sort_values('prefilter_score', ascending=False).head(8)
+                top_candidates = len(candidates_df)
+                extract_t0 = time.perf_counter()
+
+                for _, candidate in candidates_df.iterrows():
+                    candidate_threshold = float(candidate['threshold'])
+                    signals_df = extract_signals_verbose(
+                        predictions,
+                        candidate_threshold,
+                        signal_rule=signal_rule,
+                        min_pending_bars=min_pending_bars,
+                        drop_delta=drop_delta,
+                        abstain_margin=abstain_margin
+                    )
+                    if signals_df.empty:
+                        continue
+                    candidate_signals[candidate_threshold] = signals_df.copy()
+                extract_sec = time.perf_counter() - extract_t0
+                signals_total = sum(len(df) for df in candidate_signals.values())
+                log(
+                    "INFO",
+                    "TUNE",
+                    f"calibration_debug candidates mpb={min_pending_bars} dd={drop_delta:.2f} "
+                    f"top={top_candidates} non_empty={len(candidate_signals)} "
+                    f"signals_total={signals_total} extract_sec={extract_sec:.2f}"
+                )
+
+        rule_payloads.append({
+            'min_pending_bars': min_pending_bars,
+            'drop_delta': drop_delta,
+            'sweep_with_rule': sweep_with_rule,
+            'candidate_signals': candidate_signals,
+        })
+        log(
+            "INFO",
+            "TUNE",
+            f"calibration_debug rule_done mpb={min_pending_bars} dd={drop_delta:.2f} "
+            f"sweep_rows={len(sweep_df)} sec={time.perf_counter() - rule_t0:.2f}"
+        )
+
+    if loader is not None:
+        all_signal_frames = []
+        for payload in rule_payloads:
+            for signals_df in payload['candidate_signals'].values():
+                all_signal_frames.append(signals_df)
+
+        if all_signal_frames:
+            sample_df = all_signal_frames[0]
+            key_columns = [
+                c for c in ['event_id', 'symbol', 'open_time', 'event_type', 'signal_offset']
+                if c in sample_df.columns
+            ]
+            if not key_columns:
+                key_columns = ['symbol', 'open_time']
+
+            attach_t0 = time.perf_counter()
+            combined_signals = pd.concat(all_signal_frames, ignore_index=True)
+            combined_signals = combined_signals.drop_duplicates(subset=key_columns)
+            log(
+                "INFO",
+                "TUNE",
+                f"calibration_debug quality_attach_start rows={len(combined_signals)}"
+            )
+            combined_quality = attach_signal_quality_columns(combined_signals, loader, horizons=[32])
+            combined_quality['__signal_key'] = (
+                combined_quality[key_columns].astype(str).agg('|'.join, axis=1)
+            )
+            combined_quality = combined_quality.drop_duplicates(subset='__signal_key')
+            attach_sec = time.perf_counter() - attach_t0
+            log(
+                "INFO",
+                "TUNE",
+                f"calibration_debug quality_attach_done sec={attach_sec:.2f} rows={len(combined_quality)}"
+            )
+
+            for payload in rule_payloads:
+                min_pending_bars = payload['min_pending_bars']
+                drop_delta = payload['drop_delta']
+                quality_rows = []
+                for candidate_threshold, signals_df in payload['candidate_signals'].items():
+                    signals_with_keys = signals_df.copy()
+                    signals_with_keys['__signal_key'] = (
+                        signals_with_keys[key_columns].astype(str).agg('|'.join, axis=1)
+                    )
+                    candidate_quality_df = combined_quality[
+                        combined_quality['__signal_key'].isin(set(signals_with_keys['__signal_key']))
+                    ].copy()
+                    if candidate_quality_df.empty:
+                        continue
+
+                    sq = compute_signal_quality_metrics(
+                        signal_path_df=candidate_quality_df,
+                        horizon=32,
+                        squeeze_threshold=0.02,
+                        pullback_threshold=0.03
+                    )
+
+                    def _metric(name: str) -> float:
+                        value = sq.get(name, 0.0)
+                        if pd.isna(value):
+                            return 0.0
+                        return float(value)
+
+                    clean_2_3_share_h32 = _metric('clean_2_3_share_h32')
+                    clean_retrace_precision_2_3_h32 = _metric('clean_retrace_precision_2_3_h32')
+                    pullback_before_squeeze_share_2_3_h32 = _metric('pullback_before_squeeze_share_2_3_h32')
+                    net_edge_median_h32 = _metric('net_edge_median_h32')
+                    pullback_median_h32 = _metric('pullback_median_h32')
+                    squeeze_p75_h32 = _metric('squeeze_p75_h32')
+                    dirty_no_pullback_2_3_share_h32 = _metric('dirty_no_pullback_2_3_share_h32')
+                    signal_count_quality = int(len(signals_df))
+
+                    quality_score = (
+                        5.0 * clean_2_3_share_h32
+                        + 3.0 * clean_retrace_precision_2_3_h32
+                        + 2.0 * pullback_before_squeeze_share_2_3_h32
+                        + 20.0 * net_edge_median_h32
+                        + 8.0 * pullback_median_h32
+                        - 18.0 * squeeze_p75_h32
+                        - 5.0 * dirty_no_pullback_2_3_share_h32
+                        + 0.01 * min(signal_count_quality, 120)
+                        - 0.18 * max(0, 30 - signal_count_quality)
+                    )
+
+                    quality_rows.append({
+                        'threshold': candidate_threshold,
+                        'quality_score': quality_score,
+                        'clean_2_3_share_h32': clean_2_3_share_h32,
+                        'clean_retrace_precision_2_3_h32': clean_retrace_precision_2_3_h32,
+                        'pullback_before_squeeze_share_h32': pullback_before_squeeze_share_2_3_h32,
+                        'net_edge_median_h32': net_edge_median_h32,
+                        'pullback_median_h32': pullback_median_h32,
+                        'squeeze_p75_h32': squeeze_p75_h32,
+                        'dirty_no_pullback_2_3_share_h32': dirty_no_pullback_2_3_share_h32,
+                        'signal_count_quality': signal_count_quality,
+                    })
+
+                    if quality_score > best_quality_score:
+                        best_quality_score = quality_score
+                        best_threshold = candidate_threshold
+                        best_min_pending_bars = min_pending_bars
+                        best_drop_delta = drop_delta
+
+                if quality_rows:
+                    quality_df = pd.DataFrame(quality_rows)
+                    sweep_with_rule = payload['sweep_with_rule'].merge(
+                        quality_df,
+                        on='threshold',
+                        how='left',
+                        suffixes=('', '_quality'),
+                    )
+                    for col in [
+                        'quality_score',
+                        'clean_2_3_share_h32',
+                        'clean_retrace_precision_2_3_h32',
+                        'pullback_before_squeeze_share_h32',
+                        'net_edge_median_h32',
+                        'pullback_median_h32',
+                        'squeeze_p75_h32',
+                        'dirty_no_pullback_2_3_share_h32',
+                        'signal_count_quality',
+                    ]:
+                        q_col = f"{col}_quality"
+                        if q_col in sweep_with_rule.columns:
+                            sweep_with_rule[col] = sweep_with_rule[q_col].where(
+                                sweep_with_rule[q_col].notna(),
+                                sweep_with_rule[col],
+                            )
+                            sweep_with_rule = sweep_with_rule.drop(columns=[q_col])
+                    payload['sweep_with_rule'] = sweep_with_rule
+
+    all_sweeps = [payload['sweep_with_rule'] for payload in rule_payloads]
+    log(
+        "INFO",
+        "TUNE",
+        f"calibration_debug done sec={time.perf_counter() - t0:.2f} "
+        f"best_threshold={best_threshold:.3f} mpb={best_min_pending_bars} dd={best_drop_delta:.2f} "
+        f"best_quality_score={best_quality_score:.4f}"
+    )
 
     return {
         'threshold': best_threshold,
@@ -751,7 +960,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 threshold_grid_to=args.threshold_grid_to,
                 threshold_grid_step=args.threshold_grid_step,
                 delta_fp_b=args.delta_fp_b,
-                abstain_margin=args.abstain_margin
+                abstain_margin=args.abstain_margin,
+                clickhouse_dsn=args.clickhouse_dsn
             )
 
             best_threshold = calibration_result['threshold']

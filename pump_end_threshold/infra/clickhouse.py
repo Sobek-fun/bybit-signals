@@ -184,11 +184,18 @@ class DataLoader:
         ORDER BY open_time
         """
 
+        query_start = datetime.now()
         result = self.client.query(query, parameters={
             "symbol": symbol,
             "start": start_time,
             "end": end_time
         })
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"raw_1m slow query: {query_duration_ms:.0f}ms symbol={symbol} start={start_time} end={end_time} "
+                f"rows={len(result.result_rows)}")
 
         if not result.result_rows:
             return pd.DataFrame()
@@ -202,6 +209,116 @@ class DataLoader:
         df.set_index("open_time", inplace=True)
 
         return df
+
+    def load_raw_1m_candles_batch(self, symbols: list[str], start_time: datetime, end_time: datetime) -> dict[str, pd.DataFrame]:
+        if not symbols:
+            return {}
+        query = """
+        SELECT
+            symbol,
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume
+        FROM bybit.candles
+        WHERE symbol IN %(symbols)s
+          AND interval = 1
+          AND open_time >= %(start)s
+          AND open_time < %(end)s
+        ORDER BY symbol, open_time
+        """
+
+        query_start = datetime.now()
+        result = self.client.query(query, parameters={
+            "symbols": symbols,
+            "start": start_time,
+            "end": end_time
+        })
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"raw_1m batch slow query: {query_duration_ms:.0f}ms symbols={len(symbols)} "
+                f"start={start_time} end={end_time} rows={len(result.result_rows)}")
+
+        if not result.result_rows:
+            return {}
+
+        df_all = pd.DataFrame(
+            result.result_rows,
+            columns=["symbol", "open_time", "open", "high", "low", "close", "volume"]
+        )
+        df_all["open_time"] = pd.to_datetime(df_all["open_time"])
+
+        result_dict = {}
+        for symbol, group in df_all.groupby("symbol", sort=False):
+            symbol_df = group.drop(columns=["symbol"]).set_index("open_time")
+            result_dict[symbol] = symbol_df
+        return result_dict
+
+    def load_raw_1m_candles_ranges(self, symbol_ranges: dict[str, tuple[datetime, datetime]]) -> dict[str, pd.DataFrame]:
+        if not symbol_ranges:
+            return {}
+
+        clauses = []
+        ranges_count = 0
+        for symbol, (start_time, end_time) in symbol_ranges.items():
+            if start_time is None or end_time is None:
+                continue
+            if start_time >= end_time:
+                continue
+            symbol_safe = symbol.replace("'", "''")
+            start_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
+            end_str = end_time.strftime("%Y-%m-%d %H:%M:%S")
+            clauses.append(
+                f"(symbol = '{symbol_safe}' AND open_time >= toDateTime('{start_str}') "
+                f"AND open_time < toDateTime('{end_str}'))"
+            )
+            ranges_count += 1
+
+        if not clauses:
+            return {}
+
+        where_clause = " OR ".join(clauses)
+        query = f"""
+        SELECT
+            symbol,
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume
+        FROM bybit.candles
+        WHERE interval = 1
+          AND ({where_clause})
+        ORDER BY symbol, open_time
+        """
+
+        query_start = datetime.now()
+        result = self.client.query(query)
+        query_duration_ms = (datetime.now() - query_start).total_seconds() * 1000
+
+        if query_duration_ms > self.SLOW_QUERY_THRESHOLD_MS:
+            log("WARN", "DATA",
+                f"raw_1m ranges slow query: {query_duration_ms:.0f}ms symbols={ranges_count} rows={len(result.result_rows)}")
+
+        if not result.result_rows:
+            return {}
+
+        df_all = pd.DataFrame(
+            result.result_rows,
+            columns=["symbol", "open_time", "open", "high", "low", "close", "volume"]
+        )
+        df_all["open_time"] = pd.to_datetime(df_all["open_time"])
+
+        result_dict = {}
+        for symbol, group in df_all.groupby("symbol", sort=False):
+            symbol_df = group.drop(columns=["symbol"]).set_index("open_time")
+            result_dict[symbol] = symbol_df
+        return result_dict
 
     def load_transactions_range(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         query_template = """
