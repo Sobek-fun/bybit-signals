@@ -278,6 +278,12 @@ def calibrate_threshold_on_val(
         delta_fp_b: float = 3.0,
         abstain_margin: float = 0.0,
         clickhouse_dsn: str | None = None,
+        quality_density_mode: str = "raw_count",
+        quality_target_min_30d: float = 30.0,
+        quality_target_max_30d: float = 150.0,
+        quality_overflow_penalty: float = 0.03,
+        quality_top_k: int = 8,
+        quality_entry_shift_bars: int = 0,
 ) -> dict:
     t0 = time.perf_counter()
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
@@ -291,6 +297,7 @@ def calibrate_threshold_on_val(
         (features_df['open_time'] >= train_end) &
         (features_df['open_time'] < val_end)
         ].copy()
+    val_days = max(1.0, (val_end - train_end).total_seconds() / 86400.0)
 
     if len(val_df) == 0:
         return {
@@ -362,6 +369,7 @@ def calibrate_threshold_on_val(
         sweep_with_rule['squeeze_p75_h32'] = pd.NA
         sweep_with_rule['dirty_no_pullback_2_3_share_h32'] = pd.NA
         sweep_with_rule['signal_count_quality'] = pd.NA
+        sweep_with_rule['signals_per_30d_quality'] = pd.NA
 
         candidate_signals = {}
         top_candidates = 0
@@ -369,7 +377,9 @@ def calibrate_threshold_on_val(
             candidates_df = sweep_df[sweep_df['signal_count'] > 0].copy()
             if not candidates_df.empty:
                 candidates_df['prefilter_score'] = candidates_df['score'] + 0.002 * candidates_df['signal_count']
-                candidates_df = candidates_df.sort_values('prefilter_score', ascending=False).head(8)
+                candidates_df = candidates_df.sort_values('prefilter_score', ascending=False)
+                if quality_top_k > 0:
+                    candidates_df = candidates_df.head(quality_top_k)
                 top_candidates = len(candidates_df)
                 extract_t0 = time.perf_counter()
 
@@ -432,7 +442,12 @@ def calibrate_threshold_on_val(
                 "TUNE",
                 f"calibration_debug quality_attach_start rows={len(combined_signals)}"
             )
-            combined_quality = attach_signal_quality_columns(combined_signals, loader, horizons=[32])
+            combined_quality = attach_signal_quality_columns(
+                combined_signals,
+                loader,
+                horizons=[32],
+                entry_shift_bars=quality_entry_shift_bars,
+            )
             combined_quality['__signal_key'] = (
                 combined_quality[key_columns].astype(str).agg('|'.join, axis=1)
             )
@@ -480,6 +495,18 @@ def calibrate_threshold_on_val(
                     squeeze_p75_h32 = _metric('squeeze_p75_h32')
                     dirty_no_pullback_2_3_share_h32 = _metric('dirty_no_pullback_2_3_share_h32')
                     signal_count_quality = int(len(signals_df))
+                    signals_per_30d_quality = 30.0 * signal_count_quality / val_days
+
+                    if quality_density_mode == "per30d":
+                        density_reward = 0.01 * min(signals_per_30d_quality, 120.0)
+                        density_under_penalty = 0.18 * max(0.0, quality_target_min_30d - signals_per_30d_quality)
+                        density_over_penalty = quality_overflow_penalty * max(
+                            0.0, signals_per_30d_quality - quality_target_max_30d
+                        )
+                    else:
+                        density_reward = 0.01 * min(signal_count_quality, 120)
+                        density_under_penalty = 0.18 * max(0, 30 - signal_count_quality)
+                        density_over_penalty = 0.0
 
                     quality_score = (
                         5.0 * clean_2_3_share_h32
@@ -489,8 +516,9 @@ def calibrate_threshold_on_val(
                         + 8.0 * pullback_median_h32
                         - 18.0 * squeeze_p75_h32
                         - 5.0 * dirty_no_pullback_2_3_share_h32
-                        + 0.01 * min(signal_count_quality, 120)
-                        - 0.18 * max(0, 30 - signal_count_quality)
+                        + density_reward
+                        - density_under_penalty
+                        - density_over_penalty
                     )
 
                     quality_rows.append({
@@ -504,6 +532,7 @@ def calibrate_threshold_on_val(
                         'squeeze_p75_h32': squeeze_p75_h32,
                         'dirty_no_pullback_2_3_share_h32': dirty_no_pullback_2_3_share_h32,
                         'signal_count_quality': signal_count_quality,
+                        'signals_per_30d_quality': signals_per_30d_quality,
                     })
 
                     if quality_score > best_quality_score:
@@ -530,6 +559,7 @@ def calibrate_threshold_on_val(
                         'squeeze_p75_h32',
                         'dirty_no_pullback_2_3_share_h32',
                         'signal_count_quality',
+                        'signals_per_30d_quality',
                     ]:
                         q_col = f"{col}_quality"
                         if q_col in sweep_with_rule.columns:
@@ -649,20 +679,20 @@ def run_build_dataset(args, artifacts: RunArtifacts):
     features_df['sample_weight'] = 1.0
 
     b_offset0_mask = (features_df['pump_la_type'] == 'B') & (features_df['offset'] == 0)
-    features_df.loc[b_offset0_mask, 'sample_weight'] *= 10.0
+    features_df.loc[b_offset0_mask, 'sample_weight'] *= args.b_offset0_weight
 
     if 'pump_ctx' in features_df.columns:
         neg_pump_ctx_mask = (features_df['y'] == 0) & (features_df['pump_ctx'] == 1)
-        features_df.loc[neg_pump_ctx_mask, 'sample_weight'] *= 2.0
+        features_df.loc[neg_pump_ctx_mask, 'sample_weight'] *= args.neg_pump_ctx_weight
 
         neg_no_pump_ctx_mask = (features_df['y'] == 0) & (features_df['pump_ctx'] == 0)
-        features_df.loc[neg_no_pump_ctx_mask, 'sample_weight'] *= 0.2
+        features_df.loc[neg_no_pump_ctx_mask, 'sample_weight'] *= args.neg_no_pump_ctx_weight
 
     near_peak_mask = features_df['offset'].abs() <= 3
-    features_df.loc[near_peak_mask, 'sample_weight'] *= 1.5
+    features_df.loc[near_peak_mask, 'sample_weight'] *= args.near_peak_weight
 
     pos_offset0_mask = (features_df['y'] == 1) & (features_df['offset'] == 0)
-    features_df.loc[pos_offset0_mask, 'sample_weight'] *= 2.0
+    features_df.loc[pos_offset0_mask, 'sample_weight'] *= args.pos_offset0_weight
     now = time.perf_counter()
     log("INFO", "BUILD", f"stage=sample_weighting took={now - stage_t:.2f}s total={now - t0:.2f}s")
     stage_t = now
@@ -688,6 +718,16 @@ def run_train_only(args, artifacts: RunArtifacts):
         feature_columns = prune_feature_columns(feature_columns)
         log("INFO", "TRAIN",
             f"pruned features: {original_count} -> {len(feature_columns)} (removed {original_count - len(feature_columns)})")
+    if args.drop_pump_age_features:
+        drop_prefixes = (
+            "runup_age",
+            "pump_ctx_age",
+            "bars_since_new_high",
+            "near_peak_streak",
+        )
+        before = len(feature_columns)
+        feature_columns = [c for c in feature_columns if not c.startswith(drop_prefixes)]
+        log("INFO", "TRAIN", f"drop_pump_age_features: {before} -> {len(feature_columns)}")
 
     artifacts.save_feature_columns(feature_columns)
 
@@ -794,7 +834,8 @@ def run_train_only(args, artifacts: RunArtifacts):
         min_pending_bars=args.min_pending_bars,
         drop_delta=args.drop_delta,
         horizons=[16, 32],
-        abstain_margin=args.abstain_margin
+        abstain_margin=args.abstain_margin,
+        entry_shift_bars=args.quality_entry_shift_bars,
     )
     artifacts.save_metrics(val_metrics, 'val')
     log("INFO", "TRAIN",
@@ -817,7 +858,8 @@ def run_train_only(args, artifacts: RunArtifacts):
         min_pending_bars=args.min_pending_bars,
         drop_delta=args.drop_delta,
         horizons=[16, 32],
-        abstain_margin=args.abstain_margin
+        abstain_margin=args.abstain_margin,
+        entry_shift_bars=args.quality_entry_shift_bars,
     )
     artifacts.save_metrics(test_metrics, 'test')
     log("INFO", "TRAIN",
@@ -833,7 +875,12 @@ def run_train_only(args, artifacts: RunArtifacts):
         abstain_margin=args.abstain_margin
     )
     if loader is not None and not signals_df.empty:
-        signals_df = attach_signal_quality_columns(signals_df, loader, horizons=[16, 32])
+        signals_df = attach_signal_quality_columns(
+            signals_df,
+            loader,
+            horizons=[16, 32],
+            entry_shift_bars=args.quality_entry_shift_bars,
+        )
     signals_df = format_predicted_signals(signals_df)
     if loader is not None and not signals_df.empty:
         signals_df = enrich_with_trade_replay(signals_df, loader)
@@ -857,6 +904,16 @@ def run_tune(args, artifacts: RunArtifacts):
         feature_columns = prune_feature_columns(feature_columns)
         log("INFO", "TUNE",
             f"pruned features: {original_count} -> {len(feature_columns)} (removed {original_count - len(feature_columns)})")
+    if args.drop_pump_age_features:
+        drop_prefixes = (
+            "runup_age",
+            "pump_ctx_age",
+            "bars_since_new_high",
+            "near_peak_streak",
+        )
+        before = len(feature_columns)
+        feature_columns = [c for c in feature_columns if not c.startswith(drop_prefixes)]
+        log("INFO", "TUNE", f"drop_pump_age_features: {before} -> {len(feature_columns)}")
 
     artifacts.save_feature_columns(feature_columns)
 
@@ -901,7 +958,10 @@ def run_tune(args, artifacts: RunArtifacts):
         iterations=args.iterations,
         early_stopping_rounds=args.early_stopping_rounds,
         seed=args.seed,
-        tune_strategy=args.tune_strategy
+        tune_strategy=args.tune_strategy,
+        clickhouse_dsn=args.clickhouse_dsn,
+        cv_selection_mode=args.cv_selection_mode,
+        quality_top_k=args.quality_top_k,
     )
 
     best_result = tune_result
@@ -961,7 +1021,13 @@ def run_tune(args, artifacts: RunArtifacts):
                 threshold_grid_step=args.threshold_grid_step,
                 delta_fp_b=args.delta_fp_b,
                 abstain_margin=args.abstain_margin,
-                clickhouse_dsn=args.clickhouse_dsn
+                clickhouse_dsn=args.clickhouse_dsn,
+                quality_density_mode=args.quality_density_mode,
+                quality_target_min_30d=args.quality_target_min_30d,
+                quality_target_max_30d=args.quality_target_max_30d,
+                quality_overflow_penalty=args.quality_overflow_penalty,
+                quality_top_k=args.quality_top_k,
+                quality_entry_shift_bars=args.quality_entry_shift_bars,
             )
 
             best_threshold = calibration_result['threshold']
@@ -1001,7 +1067,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta,
                 horizons=[16, 32],
-                abstain_margin=args.abstain_margin
+                abstain_margin=args.abstain_margin,
+                entry_shift_bars=args.quality_entry_shift_bars,
             )
             artifacts.save_metrics(val_metrics, 'val')
 
@@ -1020,7 +1087,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta,
                 horizons=[16, 32],
-                abstain_margin=args.abstain_margin
+                abstain_margin=args.abstain_margin,
+                entry_shift_bars=args.quality_entry_shift_bars,
             )
             if loader is not None:
                 log("INFO", "TUNE", f"trade quality score: {test_metrics['trade_quality_score']:.4f}")
@@ -1042,7 +1110,12 @@ def run_tune(args, artifacts: RunArtifacts):
                 abstain_margin=args.abstain_margin
             )
             if loader is not None and not val_signals_df.empty:
-                val_signals_df = attach_signal_quality_columns(val_signals_df, loader, horizons=[16, 32])
+                val_signals_df = attach_signal_quality_columns(
+                    val_signals_df,
+                    loader,
+                    horizons=[16, 32],
+                    entry_shift_bars=args.quality_entry_shift_bars,
+                )
             val_signals_df = format_predicted_signals(val_signals_df)
             artifacts.save_predicted_signals_val(val_signals_df)
             log("INFO", "TUNE", f"saved {len(val_signals_df)} VAL predicted signals")
@@ -1056,7 +1129,12 @@ def run_tune(args, artifacts: RunArtifacts):
                 abstain_margin=args.abstain_margin
             )
             if loader is not None and not test_signals_df.empty:
-                test_signals_df = attach_signal_quality_columns(test_signals_df, loader, horizons=[16, 32])
+                test_signals_df = attach_signal_quality_columns(
+                    test_signals_df,
+                    loader,
+                    horizons=[16, 32],
+                    entry_shift_bars=args.quality_entry_shift_bars,
+                )
             test_signals_df = format_predicted_signals(test_signals_df)
             if loader is not None and not test_signals_df.empty:
                 test_signals_df = enrich_with_trade_replay(test_signals_df, loader)
@@ -1103,7 +1181,10 @@ def run_tune(args, artifacts: RunArtifacts):
                 threshold_grid_to=args.threshold_grid_to,
                 threshold_grid_step=args.threshold_grid_step,
                 delta_fp_b=args.delta_fp_b,
-                abstain_margin=args.abstain_margin
+                abstain_margin=args.abstain_margin,
+                clickhouse_dsn=args.clickhouse_dsn,
+                cv_selection_mode=args.cv_selection_mode,
+                quality_top_k=args.quality_top_k,
             )
             fold_threshold = fold_eval.get('threshold')
             fold_mpb = fold_eval.get('min_pending_bars')
@@ -1181,6 +1262,13 @@ def main():
     parser.add_argument("--gamma-miss", type=float, default=1.0)
     parser.add_argument("--delta-fp-b", type=float, default=3.0)
     parser.add_argument("--abstain-margin", type=float, default=0.0)
+    parser.add_argument("--quality-density-mode", type=str, choices=["raw_count", "per30d"], default="raw_count")
+    parser.add_argument("--quality-target-min-30d", type=float, default=30.0)
+    parser.add_argument("--quality-target-max-30d", type=float, default=150.0)
+    parser.add_argument("--quality-overflow-penalty", type=float, default=0.03)
+    parser.add_argument("--quality-top-k", type=int, default=8)
+    parser.add_argument("--quality-entry-shift-bars", type=int, default=0)
+    parser.add_argument("--cv-selection-mode", type=str, choices=["event_score", "quality_score"], default="event_score")
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")
@@ -1194,8 +1282,14 @@ def main():
     parser.add_argument("--min-train-months", type=int, default=3)
 
     parser.add_argument("--prune-features", action="store_true", default=False)
+    parser.add_argument("--drop-pump-age-features", action="store_true", default=False)
     parser.add_argument("--save-oos-signals", action="store_true", default=False,
                         help="Save OOS verbose signals from walk-forward CV folds (for regime guard dataset)")
+    parser.add_argument("--b-offset0-weight", type=float, default=10.0)
+    parser.add_argument("--neg-pump-ctx-weight", type=float, default=2.0)
+    parser.add_argument("--neg-no-pump-ctx-weight", type=float, default=0.2)
+    parser.add_argument("--near-peak-weight", type=float, default=1.5)
+    parser.add_argument("--pos-offset0-weight", type=float, default=2.0)
 
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)

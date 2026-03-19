@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from pump_end_threshold.ml.predict import predict_proba
+from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold.ml.evaluate import attach_signal_quality_columns, compute_signal_quality_metrics
+from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
 from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
 
 
@@ -190,7 +192,10 @@ def evaluate_fold(
         threshold_grid_step: float = 0.01,
         early_penalty_threshold: int = -5,
         delta_fp_b: float = 3.0,
-        abstain_margin: float = 0.0
+        abstain_margin: float = 0.0,
+        clickhouse_dsn: str | None = None,
+        cv_selection_mode: str = "event_score",
+        quality_top_k: int = 8,
 ) -> dict:
     val_df = features_df[features_df['split'] == 'val']
 
@@ -199,6 +204,8 @@ def evaluate_fold(
 
     predictions = predict_proba(model, val_df, feature_columns)
     event_data = _prepare_event_data(predictions)
+    quality_mode = cv_selection_mode == "quality_score" and clickhouse_dsn is not None
+    loader = DataLoader(clickhouse_dsn) if quality_mode else None
 
     rule_combinations = get_rule_parameter_grid()
 
@@ -229,30 +236,118 @@ def evaluate_fold(
         )
 
         best_row = sweep_df[sweep_df['threshold'] == threshold].iloc[0]
+        score = float(best_row['score'])
+        row_for_metrics = best_row
+        if loader is not None:
+            candidates_df = sweep_df[sweep_df['signal_count'] > 0].copy()
+            if not candidates_df.empty:
+                candidates_df['prefilter_score'] = candidates_df['score'] + 0.002 * candidates_df['signal_count']
+                candidates_df = candidates_df.sort_values('prefilter_score', ascending=False)
+                if quality_top_k > 0:
+                    candidates_df = candidates_df.head(quality_top_k)
+                candidate_signals: dict[float, pd.DataFrame] = {}
+                for _, candidate in candidates_df.iterrows():
+                    candidate_threshold = float(candidate['threshold'])
+                    signals_df = extract_signals_verbose(
+                        predictions,
+                        candidate_threshold,
+                        signal_rule=signal_rule,
+                        min_pending_bars=min_pending_bars,
+                        drop_delta=drop_delta,
+                        abstain_margin=abstain_margin,
+                    )
+                    if signals_df.empty:
+                        continue
+                    candidate_signals[candidate_threshold] = signals_df.copy()
+                if candidate_signals:
+                    sample_df = next(iter(candidate_signals.values()))
+                    key_columns = [
+                        c for c in ['event_id', 'symbol', 'open_time', 'event_type', 'signal_offset']
+                        if c in sample_df.columns
+                    ]
+                    if not key_columns:
+                        key_columns = ['symbol', 'open_time']
+                    combined_signals = pd.concat(list(candidate_signals.values()), ignore_index=True)
+                    combined_signals = combined_signals.drop_duplicates(subset=key_columns)
+                    combined_quality = attach_signal_quality_columns(combined_signals, loader, horizons=[32])
+                    combined_quality['__signal_key'] = (
+                        combined_quality[key_columns].astype(str).agg('|'.join, axis=1)
+                    )
+                    combined_quality = combined_quality.drop_duplicates(subset='__signal_key')
+                    best_quality_score = -np.inf
+                    best_quality_row = None
+                    for candidate_threshold, signals_df in candidate_signals.items():
+                        signals_with_keys = signals_df.copy()
+                        signals_with_keys['__signal_key'] = (
+                            signals_with_keys[key_columns].astype(str).agg('|'.join, axis=1)
+                        )
+                        candidate_quality_df = combined_quality[
+                            combined_quality['__signal_key'].isin(set(signals_with_keys['__signal_key']))
+                        ].copy()
+                        if candidate_quality_df.empty:
+                            continue
+                        sq = compute_signal_quality_metrics(
+                            signal_path_df=candidate_quality_df,
+                            horizon=32,
+                            squeeze_threshold=0.02,
+                            pullback_threshold=0.03,
+                        )
+
+                        def _metric(name: str) -> float:
+                            value = sq.get(name, 0.0)
+                            if pd.isna(value):
+                                return 0.0
+                            return float(value)
+
+                        clean_2_3_share_h32 = _metric('clean_2_3_share_h32')
+                        clean_retrace_precision_2_3_h32 = _metric('clean_retrace_precision_2_3_h32')
+                        pullback_before_squeeze_share_2_3_h32 = _metric('pullback_before_squeeze_share_2_3_h32')
+                        net_edge_median_h32 = _metric('net_edge_median_h32')
+                        pullback_median_h32 = _metric('pullback_median_h32')
+                        squeeze_p75_h32 = _metric('squeeze_p75_h32')
+                        dirty_no_pullback_2_3_share_h32 = _metric('dirty_no_pullback_2_3_share_h32')
+                        signal_count_quality = int(len(signals_df))
+                        quality_score = (
+                            5.0 * clean_2_3_share_h32
+                            + 3.0 * clean_retrace_precision_2_3_h32
+                            + 2.0 * pullback_before_squeeze_share_2_3_h32
+                            + 20.0 * net_edge_median_h32
+                            + 8.0 * pullback_median_h32
+                            - 18.0 * squeeze_p75_h32
+                            - 5.0 * dirty_no_pullback_2_3_share_h32
+                            + 0.01 * min(signal_count_quality, 120)
+                            - 0.18 * max(0, 30 - signal_count_quality)
+                        )
+                        if quality_score > best_quality_score:
+                            best_quality_score = quality_score
+                            best_quality_row = sweep_df[sweep_df['threshold'] == candidate_threshold].iloc[0]
+                    if best_quality_row is not None:
+                        score = float(best_quality_score)
+                        row_for_metrics = best_quality_row
 
         metrics = {
-            'hit0_rate': best_row['hit0_rate'],
-            'hit1_rate': best_row['hit1_rate'],
-            'early_rate': best_row['early_rate'],
-            'late_rate': best_row['late_rate'],
-            'miss_rate': best_row['miss_rate'],
-            'fp_b_rate': best_row.get('fp_b_rate', 0),
-            'signal_count': best_row.get('signal_count', 0),
-            'median_pred_offset': best_row['median_offset'],
-            'n_events': best_row['n_events']
+            'hit0_rate': row_for_metrics['hit0_rate'],
+            'hit1_rate': row_for_metrics['hit1_rate'],
+            'early_rate': row_for_metrics['early_rate'],
+            'late_rate': row_for_metrics['late_rate'],
+            'miss_rate': row_for_metrics['miss_rate'],
+            'fp_b_rate': row_for_metrics.get('fp_b_rate', 0),
+            'signal_count': row_for_metrics.get('signal_count', 0),
+            'median_pred_offset': row_for_metrics['median_offset'],
+            'n_events': row_for_metrics['n_events']
         }
 
-        median_offset = metrics.get('median_pred_offset')
-        if median_offset is not None and median_offset < early_penalty_threshold:
-            early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
-        else:
-            early_penalty = 0
-
-        score = float(best_row['score']) - early_penalty
+        if loader is None:
+            median_offset = metrics.get('median_pred_offset')
+            if median_offset is not None and median_offset < early_penalty_threshold:
+                early_penalty = abs(median_offset - early_penalty_threshold) * 0.1
+            else:
+                early_penalty = 0
+            score = score - early_penalty
 
         if score > best_score:
             best_score = score
-            best_threshold = threshold
+            best_threshold = float(row_for_metrics['threshold'])
             best_min_pending_bars = min_pending_bars
             best_drop_delta = drop_delta
             best_metrics = metrics
@@ -292,7 +387,10 @@ def run_cv(
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         seed: int = 42,
-        tune_strategy: str = 'threshold'
+        tune_strategy: str = 'threshold',
+        clickhouse_dsn: str | None = None,
+        cv_selection_mode: str = "event_score",
+        quality_top_k: int = 8,
 ) -> dict:
     fold_results = []
 
@@ -327,7 +425,10 @@ def run_cv(
             threshold_grid_to=threshold_grid_to,
             threshold_grid_step=threshold_grid_step,
             delta_fp_b=delta_fp_b,
-            abstain_margin=abstain_margin
+            abstain_margin=abstain_margin,
+            clickhouse_dsn=clickhouse_dsn,
+            cv_selection_mode=cv_selection_mode,
+            quality_top_k=quality_top_k,
         )
 
         fold_metrics['fold_idx'] = fold_idx
@@ -371,7 +472,10 @@ def tune_model(
         iterations: int = 1000,
         early_stopping_rounds: int = 50,
         seed: int = 42,
-        tune_strategy: str = 'threshold'
+        tune_strategy: str = 'threshold',
+        clickhouse_dsn: str | None = None,
+        cv_selection_mode: str = "event_score",
+        quality_top_k: int = 8,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -411,7 +515,10 @@ def tune_model(
             iterations=iterations,
             early_stopping_rounds=early_stopping_rounds,
             seed=seed,
-            tune_strategy=tune_strategy
+            tune_strategy=tune_strategy,
+            clickhouse_dsn=clickhouse_dsn,
+            cv_selection_mode=cv_selection_mode,
+            quality_top_k=quality_top_k,
         )
 
         fold_results = cv_result.get('fold_results', [])

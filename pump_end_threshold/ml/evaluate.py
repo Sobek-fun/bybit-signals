@@ -403,7 +403,8 @@ def build_signal_path_metrics(
         candles_loader,
         horizons: list | None = None,
         squeeze_threshold: float = PRIMARY_SQUEEZE_PCT,
-        pullback_threshold: float = PRIMARY_PULLBACK_PCT
+        pullback_threshold: float = PRIMARY_PULLBACK_PCT,
+        entry_shift_bars: int = 0,
 ) -> pd.DataFrame:
     if horizons is None:
         horizons = DEFAULT_SIGNAL_QUALITY_HORIZONS
@@ -426,8 +427,9 @@ def build_signal_path_metrics(
     max_horizon = max(horizons)
     symbol_ranges = {}
     for symbol, group in signals.groupby('symbol'):
-        start_time = group['open_time'].min()
-        end_time = group['open_time'].max() + pd.Timedelta(minutes=max_horizon * 15 + 1)
+        eval_times = group['open_time'] + pd.Timedelta(minutes=15 * entry_shift_bars)
+        start_time = eval_times.min()
+        end_time = eval_times.max() + pd.Timedelta(minutes=max_horizon * 15 + 1)
         symbol_ranges[symbol] = (start_time.to_pydatetime(), end_time.to_pydatetime())
 
     if hasattr(candles_loader, 'load_raw_1m_candles_ranges'):
@@ -463,11 +465,12 @@ def build_signal_path_metrics(
     for idx, row in out.iterrows():
         symbol = row['symbol']
         signal_time = pd.Timestamp(row['open_time'])
+        eval_time = signal_time + pd.Timedelta(minutes=15 * entry_shift_bars)
         df_1m = one_minute_cache.get(symbol, pd.DataFrame())
         if df_1m.empty:
             continue
 
-        pos = df_1m.index.searchsorted(signal_time)
+        pos = df_1m.index.searchsorted(eval_time)
         if pos >= len(df_1m):
             continue
         entry_time = pd.Timestamp(df_1m.index[pos])
@@ -480,8 +483,8 @@ def build_signal_path_metrics(
 
         for h in horizons:
             h_tag = f"h{h}"
-            horizon_end = signal_time + pd.Timedelta(minutes=h * 15)
-            window = df_1m[(df_1m.index >= signal_time) & (df_1m.index < horizon_end)]
+            horizon_end = eval_time + pd.Timedelta(minutes=h * 15)
+            window = df_1m[(df_1m.index >= eval_time) & (df_1m.index < horizon_end)]
             if window.empty:
                 continue
 
@@ -492,7 +495,7 @@ def build_signal_path_metrics(
             prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min = _compute_ordered_threshold_metrics(
                 window_df=window,
                 entry_price=entry_price,
-                entry_time=signal_time,
+                entry_time=eval_time,
                 candles_loader=candles_loader,
                 symbol=symbol,
                 squeeze_threshold=squeeze_threshold,
@@ -595,14 +598,16 @@ def attach_signal_quality_columns(
         candles_loader,
         horizons: list | None = None,
         squeeze_threshold: float = PRIMARY_SQUEEZE_PCT,
-        pullback_threshold: float = PRIMARY_PULLBACK_PCT
+        pullback_threshold: float = PRIMARY_PULLBACK_PCT,
+        entry_shift_bars: int = 0,
 ) -> pd.DataFrame:
     return build_signal_path_metrics(
         signals_df=signals_df,
         candles_loader=candles_loader,
         horizons=horizons,
         squeeze_threshold=squeeze_threshold,
-        pullback_threshold=pullback_threshold
+        pullback_threshold=pullback_threshold,
+        entry_shift_bars=entry_shift_bars,
     )
 
 
@@ -634,7 +639,8 @@ def evaluate_with_trade_quality(
         drop_delta: float = 0.0,
         horizons: list = None,
         event_data: dict = None,
-        abstain_margin: float = 0.0
+        abstain_margin: float = 0.0,
+        entry_shift_bars: int = 0,
 ) -> dict:
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
                                                 event_data, abstain_margin=abstain_margin)
@@ -656,7 +662,8 @@ def evaluate_with_trade_quality(
             candles_loader=candles_loader,
             horizons=horizons,
             squeeze_threshold=PRIMARY_SQUEEZE_PCT,
-            pullback_threshold=PRIMARY_PULLBACK_PCT
+            pullback_threshold=PRIMARY_PULLBACK_PCT,
+            entry_shift_bars=entry_shift_bars,
         )
         signal_quality = compute_signal_quality_metrics(
             signal_path_df=signal_path_df,
