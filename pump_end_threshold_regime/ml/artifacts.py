@@ -60,7 +60,7 @@ class RunArtifacts:
         df.to_csv(path, index=False)
 
     def save_predicted_signals(self, df: pd.DataFrame):
-        path = self.run_dir / "predicted_signals_holdout.csv"
+        path = self.run_dir / "predicted_signals_threshold_holdout.csv"
         df.to_csv(path, index=False)
 
     def save_predicted_signals_val(self, df: pd.DataFrame):

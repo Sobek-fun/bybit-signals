@@ -1,14 +1,18 @@
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    precision_recall_curve,
     average_precision_score,
     roc_auc_score,
     precision_score,
     recall_score
 )
 
-from pump_end_threshold.ml.threshold import _prepare_event_data
+from pump_end_threshold.ml.predict import build_pending_turn_down_decision_table, extract_signals
+
+PRIMARY_HORIZON_BARS = 32
+PRIMARY_SQUEEZE_PCT = 0.02
+PRIMARY_PULLBACK_PCT = 0.03
+DEFAULT_SIGNAL_QUALITY_HORIZONS = [16, 32]
 
 
 def compute_event_level_metrics(
@@ -20,76 +24,51 @@ def compute_event_level_metrics(
         event_data: dict = None,
         abstain_margin: float = 0.0
 ) -> dict:
-    if event_data is None:
-        event_data = _prepare_event_data(predictions_df)
+    decision_df = build_pending_turn_down_decision_table(
+        predictions_df=predictions_df,
+        threshold=threshold,
+        signal_rule=signal_rule,
+        min_pending_bars=min_pending_bars,
+        drop_delta=drop_delta,
+        abstain_margin=abstain_margin,
+        event_data=event_data,
+    )
 
-    hit0 = 0
-    hit1 = 0
-    early = 0
-    late = 0
-    miss = 0
-    offsets = []
+    if decision_df.empty:
+        return {
+            'n_events': 0,
+            'hit0': 0,
+            'hit0_rate': 0,
+            'hit0_or_hit1': 0,
+            'hit0_or_hit1_rate': 0,
+            'early': 0,
+            'early_rate': 0,
+            'late': 0,
+            'late_rate': 0,
+            'miss': 0,
+            'miss_rate': 0,
+            'avg_pred_offset': None,
+            'median_pred_offset': None,
+            'n_b': 0,
+            'false_positive_b': 0,
+            'true_negative_b': 0,
+            'fp_b_rate': 0,
+        }
 
-    false_positive_b = 0
-    true_negative_b = 0
-    n_b = 0
+    b_df = decision_df[decision_df['event_type'] == 'B']
+    a_df = decision_df[decision_df['event_type'] != 'B']
+    a_triggered = a_df[a_df['triggered']]
+    offsets = a_triggered['signal_offset'].dropna().to_numpy()
 
-    threshold_high = threshold
-    threshold_low = max(0.0, threshold - abstain_margin)
-
-    for event_id, data in event_data.items():
-        offsets_arr = data['offsets']
-        p_end = data['p_end']
-        event_type = data.get('event_type', 'A')
-
-        triggered = False
-        pending_count = 0
-        best_p = -1.0
-        best_offset = None
-
-        for i in range(len(offsets_arr)):
-            if p_end[i] >= threshold_high:
-                pending_count += 1
-                if p_end[i] > best_p:
-                    best_p = p_end[i]
-                    best_offset = offsets_arr[i]
-
-            if pending_count >= min_pending_bars and best_offset is not None:
-                drop_from_peak = best_p - p_end[i]
-                if p_end[i] < threshold_low or (drop_from_peak > 0 and drop_from_peak >= drop_delta):
-                    offset = best_offset
-                    triggered = True
-                    break
-
-            if p_end[i] < threshold_low:
-                pending_count = 0
-                best_p = -1.0
-                best_offset = None
-
-        if event_type == 'B':
-            n_b += 1
-            if triggered:
-                false_positive_b += 1
-            else:
-                true_negative_b += 1
-            continue
-
-        if not triggered:
-            miss += 1
-            continue
-
-        offsets.append(offset)
-
-        if offset == 0:
-            hit0 += 1
-        elif offset == 1:
-            hit1 += 1
-        elif offset < 0:
-            early += 1
-        else:
-            late += 1
-
-    n_a = len(event_data) - n_b
+    hit0 = int((offsets == 0).sum())
+    hit1 = int((offsets == 1).sum())
+    early = int((offsets < 0).sum())
+    late = int((offsets > 1).sum())
+    miss = int((~a_df['triggered']).sum())
+    false_positive_b = int((b_df['triggered']).sum())
+    true_negative_b = int((~b_df['triggered']).sum())
+    n_b = int(len(b_df))
+    n_a = int(len(a_df))
     n_events = n_a
 
     return {
@@ -104,8 +83,8 @@ def compute_event_level_metrics(
         'late_rate': late / n_events if n_events > 0 else 0,
         'miss': miss,
         'miss_rate': miss / n_events if n_events > 0 else 0,
-        'avg_pred_offset': np.mean(offsets) if offsets else None,
-        'median_pred_offset': np.median(offsets) if offsets else None,
+        'avg_pred_offset': float(np.mean(offsets)) if len(offsets) > 0 else None,
+        'median_pred_offset': float(np.median(offsets)) if len(offsets) > 0 else None,
         'n_b': n_b,
         'false_positive_b': false_positive_b,
         'true_negative_b': true_negative_b,
@@ -266,16 +245,383 @@ def compute_trade_quality_score(trade_metrics: dict, horizon: int = 32) -> float
     return score
 
 
+def _pair_key(squeeze_threshold: float, pullback_threshold: float) -> str:
+    squeeze_pct = int(round(squeeze_threshold * 100))
+    pullback_pct = int(round(pullback_threshold * 100))
+    return f"{squeeze_pct}_{pullback_pct}"
+
+
+def _empty_signal_quality_metrics(
+        horizon: int = PRIMARY_HORIZON_BARS,
+        squeeze_threshold: float = PRIMARY_SQUEEZE_PCT,
+        pullback_threshold: float = PRIMARY_PULLBACK_PCT
+) -> dict:
+    pair = _pair_key(squeeze_threshold, pullback_threshold)
+    h_tag = f"h{horizon}"
+    return {
+        f"squeeze_median_{h_tag}": np.nan,
+        f"squeeze_mean_{h_tag}": np.nan,
+        f"squeeze_p75_{h_tag}": np.nan,
+        f"pullback_median_{h_tag}": np.nan,
+        f"pullback_mean_{h_tag}": np.nan,
+        f"pullback_p75_{h_tag}": np.nan,
+        f"net_edge_median_{h_tag}": np.nan,
+        f"net_edge_mean_{h_tag}": np.nan,
+        f"clean_{pair}_count_{h_tag}": 0,
+        f"clean_{pair}_share_{h_tag}": 0.0,
+        f"dirty_retrace_{pair}_count_{h_tag}": 0,
+        f"dirty_retrace_{pair}_share_{h_tag}": 0.0,
+        f"clean_no_pullback_{pair}_count_{h_tag}": 0,
+        f"clean_no_pullback_{pair}_share_{h_tag}": 0.0,
+        f"dirty_no_pullback_{pair}_count_{h_tag}": 0,
+        f"dirty_no_pullback_{pair}_share_{h_tag}": 0.0,
+        f"clean_to_dirty_failure_ratio_{pair}_{h_tag}": 0.0,
+        f"clean_retrace_precision_{pair}_{h_tag}": 0.0,
+        f"low_squeeze_conversion_{pair}_{h_tag}": 0.0,
+        f"pullback_before_squeeze_share_{pair}_{h_tag}": 0.0,
+    }
+
+
+def _build_empty_signal_quality_frame(signals_df: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
+    out = signals_df.copy()
+    out['entry_time'] = pd.NaT
+    out['entry_price'] = np.nan
+    pair = _pair_key(PRIMARY_SQUEEZE_PCT, PRIMARY_PULLBACK_PCT)
+    pullback_pct_int = int(round(PRIMARY_PULLBACK_PCT * 100))
+    for h in horizons:
+        h_tag = f"h{h}"
+        out[f"squeeze_pct_{h_tag}"] = np.nan
+        out[f"pullback_pct_{h_tag}"] = np.nan
+        out[f"net_edge_pct_{h_tag}"] = np.nan
+        out[f"prepullback_squeeze_pct_{h_tag}_{pullback_pct_int}"] = np.nan
+        out[f"time_to_pullback_{pullback_pct_int}_{h_tag}"] = np.nan
+        out[f"time_to_squeeze_{int(round(PRIMARY_SQUEEZE_PCT * 100))}_{h_tag}"] = np.nan
+        out[f"clean_{pair}_{h_tag}"] = False
+        out[f"dirty_retrace_{pair}_{h_tag}"] = False
+        out[f"clean_no_pullback_{pair}_{h_tag}"] = False
+        out[f"dirty_no_pullback_{pair}_{h_tag}"] = False
+        out[f"pullback_before_squeeze_{pair}_{h_tag}"] = False
+    return out
+
+
+def _resolve_threshold_times_in_1s(
+        candles_loader,
+        symbol: str,
+        minute_start: pd.Timestamp,
+        entry_price: float,
+        squeeze_threshold: float,
+        pullback_threshold: float
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None, float | None]:
+    bars_1s = candles_loader.load_1s_bars_from_transactions(
+        symbol,
+        minute_start.to_pydatetime(),
+        (minute_start + pd.Timedelta(minutes=1)).to_pydatetime()
+    )
+    if bars_1s.empty:
+        return None, None, None
+
+    squeeze_time = None
+    pullback_time = None
+    prepullback_squeeze = 0.0
+
+    for sec_time, sec_bar in bars_1s.iterrows():
+        sec_squeeze = (float(sec_bar['high']) - entry_price) / entry_price
+        sec_pullback = (entry_price - float(sec_bar['low'])) / entry_price
+
+        if pullback_time is None:
+            if sec_pullback >= pullback_threshold:
+                pullback_time = pd.Timestamp(sec_time)
+            else:
+                prepullback_squeeze = max(prepullback_squeeze, sec_squeeze)
+
+        if squeeze_time is None and sec_squeeze >= squeeze_threshold:
+            squeeze_time = pd.Timestamp(sec_time)
+
+        if pullback_time is not None and squeeze_time is not None:
+            break
+
+    return squeeze_time, pullback_time, prepullback_squeeze
+
+
+def _compute_ordered_threshold_metrics(
+        window_df: pd.DataFrame,
+        entry_price: float,
+        entry_time: pd.Timestamp,
+        candles_loader,
+        symbol: str,
+        squeeze_threshold: float,
+        pullback_threshold: float
+) -> tuple[float, float | None, float | None]:
+    squeeze_time = None
+    pullback_time = None
+    prepullback_squeeze = 0.0
+
+    for minute_time, minute_bar in window_df.iterrows():
+        bar_squeeze = (float(minute_bar['high']) - entry_price) / entry_price
+        bar_pullback = (entry_price - float(minute_bar['low'])) / entry_price
+
+        same_bar_cross = pullback_time is None and bar_squeeze >= squeeze_threshold and bar_pullback >= pullback_threshold
+        if same_bar_cross:
+            sec_squeeze_time, sec_pullback_time, sec_prepullback = _resolve_threshold_times_in_1s(
+                candles_loader=candles_loader,
+                symbol=symbol,
+                minute_start=pd.Timestamp(minute_time),
+                entry_price=entry_price,
+                squeeze_threshold=squeeze_threshold,
+                pullback_threshold=pullback_threshold
+            )
+            if sec_prepullback is not None:
+                prepullback_squeeze = max(prepullback_squeeze, sec_prepullback)
+            else:
+                prepullback_squeeze = max(prepullback_squeeze, bar_squeeze)
+
+            if squeeze_time is None:
+                squeeze_time = sec_squeeze_time if sec_squeeze_time is not None else pd.Timestamp(minute_time)
+            if pullback_time is None:
+                pullback_time = sec_pullback_time if sec_pullback_time is not None else pd.Timestamp(minute_time)
+            continue
+
+        if pullback_time is None:
+            prepullback_squeeze = max(prepullback_squeeze, bar_squeeze)
+            if bar_pullback >= pullback_threshold:
+                pullback_time = pd.Timestamp(minute_time)
+
+        if squeeze_time is None and bar_squeeze >= squeeze_threshold:
+            squeeze_time = pd.Timestamp(minute_time)
+
+    time_to_pullback_min = None
+    time_to_squeeze_min = None
+    if pullback_time is not None:
+        time_to_pullback_min = (pullback_time - entry_time).total_seconds() / 60.0
+    if squeeze_time is not None:
+        time_to_squeeze_min = (squeeze_time - entry_time).total_seconds() / 60.0
+    return prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min
+
+
+def build_signal_path_metrics(
+        signals_df: pd.DataFrame,
+        candles_loader,
+        horizons: list | None = None,
+        squeeze_threshold: float = PRIMARY_SQUEEZE_PCT,
+        pullback_threshold: float = PRIMARY_PULLBACK_PCT,
+        entry_shift_bars: int = 0,
+) -> pd.DataFrame:
+    if horizons is None:
+        horizons = DEFAULT_SIGNAL_QUALITY_HORIZONS
+    horizons = sorted(set(int(h) for h in horizons))
+
+    if signals_df.empty:
+        return _build_empty_signal_quality_frame(signals_df, horizons)
+
+    signals = signals_df.copy()
+    signals['open_time'] = pd.to_datetime(signals['open_time'])
+    out = signals.copy()
+    out['entry_time'] = pd.NaT
+    out['entry_price'] = np.nan
+
+    pair = _pair_key(squeeze_threshold, pullback_threshold)
+    squeeze_pct_int = int(round(squeeze_threshold * 100))
+    pullback_pct_int = int(round(pullback_threshold * 100))
+
+    one_minute_cache = {}
+    max_horizon = max(horizons)
+    symbol_ranges = {}
+    for symbol, group in signals.groupby('symbol'):
+        eval_times = group['open_time'] + pd.Timedelta(minutes=15 * entry_shift_bars)
+        start_time = eval_times.min()
+        end_time = eval_times.max() + pd.Timedelta(minutes=max_horizon * 15 + 1)
+        symbol_ranges[symbol] = (start_time.to_pydatetime(), end_time.to_pydatetime())
+
+    if hasattr(candles_loader, 'load_raw_1m_candles_ranges'):
+        one_minute_cache = candles_loader.load_raw_1m_candles_ranges(symbol_ranges)
+    elif hasattr(candles_loader, 'load_raw_1m_candles_batch'):
+        symbols = list(symbol_ranges.keys())
+        global_start = min(v[0] for v in symbol_ranges.values())
+        global_end = max(v[1] for v in symbol_ranges.values())
+        one_minute_cache = candles_loader.load_raw_1m_candles_batch(
+            symbols=symbols,
+            start_time=global_start,
+            end_time=global_end,
+        )
+    else:
+        for symbol, (start_time, end_time) in symbol_ranges.items():
+            df_1m = candles_loader.load_raw_1m_candles(symbol, start_time, end_time)
+            one_minute_cache[symbol] = df_1m
+
+    for h in horizons:
+        h_tag = f"h{h}"
+        out[f"squeeze_pct_{h_tag}"] = np.nan
+        out[f"pullback_pct_{h_tag}"] = np.nan
+        out[f"net_edge_pct_{h_tag}"] = np.nan
+        out[f"prepullback_squeeze_pct_{h_tag}_{pullback_pct_int}"] = np.nan
+        out[f"time_to_pullback_{pullback_pct_int}_{h_tag}"] = np.nan
+        out[f"time_to_squeeze_{squeeze_pct_int}_{h_tag}"] = np.nan
+        out[f"clean_{pair}_{h_tag}"] = False
+        out[f"dirty_retrace_{pair}_{h_tag}"] = False
+        out[f"clean_no_pullback_{pair}_{h_tag}"] = False
+        out[f"dirty_no_pullback_{pair}_{h_tag}"] = False
+        out[f"pullback_before_squeeze_{pair}_{h_tag}"] = False
+
+    for idx, row in out.iterrows():
+        symbol = row['symbol']
+        signal_time = pd.Timestamp(row['open_time'])
+        eval_time = signal_time + pd.Timedelta(minutes=15 * entry_shift_bars)
+        df_1m = one_minute_cache.get(symbol, pd.DataFrame())
+        if df_1m.empty:
+            continue
+
+        pos = df_1m.index.searchsorted(eval_time)
+        if pos >= len(df_1m):
+            continue
+        entry_time = pd.Timestamp(df_1m.index[pos])
+        entry_price = float(df_1m.iloc[pos]['open'])
+        if entry_price <= 0:
+            continue
+
+        out.at[idx, 'entry_time'] = entry_time
+        out.at[idx, 'entry_price'] = entry_price
+
+        for h in horizons:
+            h_tag = f"h{h}"
+            horizon_end = eval_time + pd.Timedelta(minutes=h * 15)
+            window = df_1m[(df_1m.index >= eval_time) & (df_1m.index < horizon_end)]
+            if window.empty:
+                continue
+
+            squeeze_pct = (float(window['high'].max()) - entry_price) / entry_price
+            pullback_pct = (entry_price - float(window['low'].min())) / entry_price
+            net_edge_pct = pullback_pct - squeeze_pct
+
+            prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min = _compute_ordered_threshold_metrics(
+                window_df=window,
+                entry_price=entry_price,
+                entry_time=eval_time,
+                candles_loader=candles_loader,
+                symbol=symbol,
+                squeeze_threshold=squeeze_threshold,
+                pullback_threshold=pullback_threshold
+            )
+
+            pullback_hit = pullback_pct >= pullback_threshold
+            clean_retrace = pullback_hit and prepullback_squeeze <= squeeze_threshold
+            dirty_retrace = pullback_hit and prepullback_squeeze > squeeze_threshold
+            clean_no_pullback = (not pullback_hit) and squeeze_pct <= squeeze_threshold
+            dirty_no_pullback = (not pullback_hit) and squeeze_pct > squeeze_threshold
+
+            pullback_before_squeeze = False
+            if time_to_pullback_min is not None:
+                if time_to_squeeze_min is None:
+                    pullback_before_squeeze = True
+                else:
+                    pullback_before_squeeze = time_to_pullback_min < time_to_squeeze_min
+
+            out.at[idx, f"squeeze_pct_{h_tag}"] = squeeze_pct
+            out.at[idx, f"pullback_pct_{h_tag}"] = pullback_pct
+            out.at[idx, f"net_edge_pct_{h_tag}"] = net_edge_pct
+            out.at[idx, f"prepullback_squeeze_pct_{h_tag}_{pullback_pct_int}"] = prepullback_squeeze
+            out.at[idx, f"time_to_pullback_{pullback_pct_int}_{h_tag}"] = time_to_pullback_min
+            out.at[idx, f"time_to_squeeze_{squeeze_pct_int}_{h_tag}"] = time_to_squeeze_min
+            out.at[idx, f"clean_{pair}_{h_tag}"] = bool(clean_retrace)
+            out.at[idx, f"dirty_retrace_{pair}_{h_tag}"] = bool(dirty_retrace)
+            out.at[idx, f"clean_no_pullback_{pair}_{h_tag}"] = bool(clean_no_pullback)
+            out.at[idx, f"dirty_no_pullback_{pair}_{h_tag}"] = bool(dirty_no_pullback)
+            out.at[idx, f"pullback_before_squeeze_{pair}_{h_tag}"] = bool(pullback_before_squeeze)
+
+    return out
+
+
+def compute_signal_quality_metrics(
+        signal_path_df: pd.DataFrame,
+        horizon: int = PRIMARY_HORIZON_BARS,
+        squeeze_threshold: float = PRIMARY_SQUEEZE_PCT,
+        pullback_threshold: float = PRIMARY_PULLBACK_PCT
+) -> dict:
+    pair = _pair_key(squeeze_threshold, pullback_threshold)
+    h_tag = f"h{horizon}"
+    squeeze_col = f"squeeze_pct_{h_tag}"
+    pullback_col = f"pullback_pct_{h_tag}"
+    net_edge_col = f"net_edge_pct_{h_tag}"
+    clean_col = f"clean_{pair}_{h_tag}"
+    dirty_retrace_col = f"dirty_retrace_{pair}_{h_tag}"
+    clean_no_pullback_col = f"clean_no_pullback_{pair}_{h_tag}"
+    dirty_no_pullback_col = f"dirty_no_pullback_{pair}_{h_tag}"
+    pullback_before_col = f"pullback_before_squeeze_{pair}_{h_tag}"
+
+    if signal_path_df.empty or squeeze_col not in signal_path_df.columns:
+        return _empty_signal_quality_metrics(
+            horizon=horizon,
+            squeeze_threshold=squeeze_threshold,
+            pullback_threshold=pullback_threshold
+        )
+
+    valid = signal_path_df[signal_path_df[squeeze_col].notna() & signal_path_df[pullback_col].notna()].copy()
+    if valid.empty:
+        return _empty_signal_quality_metrics(
+            horizon=horizon,
+            squeeze_threshold=squeeze_threshold,
+            pullback_threshold=pullback_threshold
+        )
+
+    n = len(valid)
+    clean_count = int(valid[clean_col].sum())
+    dirty_retrace_count = int(valid[dirty_retrace_col].sum())
+    clean_no_pullback_count = int(valid[clean_no_pullback_col].sum())
+    dirty_no_pullback_count = int(valid[dirty_no_pullback_col].sum())
+
+    metrics = {
+        f"squeeze_median_{h_tag}": float(valid[squeeze_col].median()),
+        f"squeeze_mean_{h_tag}": float(valid[squeeze_col].mean()),
+        f"squeeze_p75_{h_tag}": float(valid[squeeze_col].quantile(0.75)),
+        f"pullback_median_{h_tag}": float(valid[pullback_col].median()),
+        f"pullback_mean_{h_tag}": float(valid[pullback_col].mean()),
+        f"pullback_p75_{h_tag}": float(valid[pullback_col].quantile(0.75)),
+        f"net_edge_median_{h_tag}": float(valid[net_edge_col].median()),
+        f"net_edge_mean_{h_tag}": float(valid[net_edge_col].mean()),
+        f"clean_{pair}_count_{h_tag}": clean_count,
+        f"clean_{pair}_share_{h_tag}": clean_count / n,
+        f"dirty_retrace_{pair}_count_{h_tag}": dirty_retrace_count,
+        f"dirty_retrace_{pair}_share_{h_tag}": dirty_retrace_count / n,
+        f"clean_no_pullback_{pair}_count_{h_tag}": clean_no_pullback_count,
+        f"clean_no_pullback_{pair}_share_{h_tag}": clean_no_pullback_count / n,
+        f"dirty_no_pullback_{pair}_count_{h_tag}": dirty_no_pullback_count,
+        f"dirty_no_pullback_{pair}_share_{h_tag}": dirty_no_pullback_count / n,
+        f"clean_to_dirty_failure_ratio_{pair}_{h_tag}": clean_count / max(1, dirty_no_pullback_count),
+        f"clean_retrace_precision_{pair}_{h_tag}": clean_count / max(1, clean_count + dirty_retrace_count),
+        f"low_squeeze_conversion_{pair}_{h_tag}": clean_count / max(1, clean_count + clean_no_pullback_count),
+        f"pullback_before_squeeze_share_{pair}_{h_tag}": float(valid[pullback_before_col].mean()),
+    }
+    return metrics
+
+
+def attach_signal_quality_columns(
+        signals_df: pd.DataFrame,
+        candles_loader,
+        horizons: list | None = None,
+        squeeze_threshold: float = PRIMARY_SQUEEZE_PCT,
+        pullback_threshold: float = PRIMARY_PULLBACK_PCT,
+        entry_shift_bars: int = 0,
+) -> pd.DataFrame:
+    return build_signal_path_metrics(
+        signals_df=signals_df,
+        candles_loader=candles_loader,
+        horizons=horizons,
+        squeeze_threshold=squeeze_threshold,
+        pullback_threshold=pullback_threshold,
+        entry_shift_bars=entry_shift_bars,
+    )
+
+
 def evaluate(
         predictions_df: pd.DataFrame,
         threshold: float,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
-        event_data: dict = None
+        event_data: dict = None,
+        abstain_margin: float = 0.0
 ) -> dict:
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
-                                                event_data)
+                                                event_data, abstain_margin=abstain_margin)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     return {
@@ -287,28 +633,49 @@ def evaluate(
 def evaluate_with_trade_quality(
         predictions_df: pd.DataFrame,
         threshold: float,
-        candles_loader,
+        candles_loader=None,
         signal_rule: str = 'pending_turn_down',
         min_pending_bars: int = 1,
         drop_delta: float = 0.0,
         horizons: list = None,
         event_data: dict = None,
-        abstain_margin: float = 0.0
+        abstain_margin: float = 0.0,
+        entry_shift_bars: int = 0,
 ) -> dict:
-    from pump_end_threshold.ml.predict import extract_signals
-
     event_metrics = compute_event_level_metrics(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
                                                 event_data, abstain_margin=abstain_margin)
     point_metrics = compute_point_level_metrics(predictions_df, threshold)
 
     signals_df = extract_signals(predictions_df, threshold, signal_rule, min_pending_bars, drop_delta,
                                  abstain_margin=abstain_margin)
-    trade_metrics = compute_trade_quality_metrics(signals_df, candles_loader, horizons)
-    trade_score = compute_trade_quality_score(trade_metrics)
+    trade_metrics = {}
+    trade_score = np.nan
+    signal_quality = _empty_signal_quality_metrics()
+
+    if candles_loader is not None:
+        if horizons is None:
+            horizons = DEFAULT_SIGNAL_QUALITY_HORIZONS
+        trade_metrics = compute_trade_quality_metrics(signals_df, candles_loader, horizons)
+        trade_score = compute_trade_quality_score(trade_metrics)
+        signal_path_df = build_signal_path_metrics(
+            signals_df=signals_df,
+            candles_loader=candles_loader,
+            horizons=horizons,
+            squeeze_threshold=PRIMARY_SQUEEZE_PCT,
+            pullback_threshold=PRIMARY_PULLBACK_PCT,
+            entry_shift_bars=entry_shift_bars,
+        )
+        signal_quality = compute_signal_quality_metrics(
+            signal_path_df=signal_path_df,
+            horizon=PRIMARY_HORIZON_BARS,
+            squeeze_threshold=PRIMARY_SQUEEZE_PCT,
+            pullback_threshold=PRIMARY_PULLBACK_PCT
+        )
 
     return {
         'event_level': event_metrics,
         'point_level': point_metrics,
         'trade_quality': trade_metrics,
+        'signal_quality': signal_quality,
         'trade_quality_score': trade_score
     }
