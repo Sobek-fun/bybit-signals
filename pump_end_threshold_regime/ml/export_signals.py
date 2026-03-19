@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
-from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.infra.logging import log
+from pump_end_threshold_regime.features.feature_builder import PumpFeatureBuilder
+from pump_end_threshold_regime.infra.clickhouse import DataLoader
+from pump_end_threshold_regime.infra.logging import log
 
 MIN_CANDLES = 873
 WARMUP_BARS = 25

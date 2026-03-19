@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from pump_end_threshold.infra.clickhouse import list_all_usdt_tokens
-from pump_end_threshold.ml.export_signals import export_signals
-from pump_end_threshold.ml.regime_inference import apply_guard_to_raw_signals
+from pump_end_threshold_regime.infra.clickhouse import list_all_usdt_tokens
+from pump_end_threshold_regime.ml.export_signals import export_signals
+from pump_end_threshold_regime.ml.regime_inference import apply_guard_to_raw_signals
 
 
 def log(level: str, component: str, message: str):

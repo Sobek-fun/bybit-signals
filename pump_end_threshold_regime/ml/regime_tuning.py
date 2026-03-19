@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from pump_end_threshold.ml.regime_evaluate import evaluate_regime, compute_cv_score
-from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_columns
-from pump_end_threshold.ml.regime_policy import RegimePolicy
+from pump_end_threshold_regime.ml.regime_evaluate import evaluate_regime, compute_cv_score
+from pump_end_threshold_regime.ml.regime_feature_schema import get_regime_feature_columns
+from pump_end_threshold_regime.ml.regime_policy import RegimePolicy
 
 
 def _safe_binary_metrics(y_true: pd.Series, y_score: np.ndarray) -> tuple:

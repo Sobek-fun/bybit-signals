@@ -6,25 +6,25 @@ from pathlib import Path
 
 import pandas as pd
 
-from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
-from pump_end_threshold.ml.artifacts import RunArtifacts
-from pump_end_threshold.ml.dataset import load_labels, build_training_points, deduplicate_points
-from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
-from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
-from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
-from pump_end_threshold.ml.evaluate import (
+from pump_end_threshold_regime.features.feature_builder import PumpFeatureBuilder
+from pump_end_threshold_regime.ml.artifacts import RunArtifacts
+from pump_end_threshold_regime.ml.dataset import load_labels, build_training_points, deduplicate_points
+from pump_end_threshold_regime.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
+from pump_end_threshold_regime.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
+from pump_end_threshold_regime.ml.threshold import threshold_sweep, _prepare_event_data
+from pump_end_threshold_regime.ml.evaluate import (
     evaluate_with_trade_quality,
     attach_signal_quality_columns,
     compute_signal_quality_metrics,
 )
-from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
-from pump_end_threshold.ml.tuning import (
+from pump_end_threshold_regime.ml.predict import predict_proba, extract_signals_verbose
+from pump_end_threshold_regime.ml.tuning import (
     tune_model, train_final_model, get_rule_parameter_grid,
     generate_walk_forward_folds, apply_fold_split, apply_fold_embargo,
     clip_fold_points, train_fold, evaluate_fold,
 )
-from pump_end_threshold.ml.feature_schema import prune_feature_columns
-from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold_regime.ml.feature_schema import prune_feature_columns
+from pump_end_threshold_regime.infra.clickhouse import DataLoader
 
 
 def log(level: str, component: str, message: str):

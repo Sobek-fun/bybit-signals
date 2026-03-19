@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from pump_end_threshold.infra.clickhouse import DataLoader
+from pump_end_threshold_regime.infra.clickhouse import DataLoader
 
 TP_PCT = 4.5
 SL_PCT = 10.0

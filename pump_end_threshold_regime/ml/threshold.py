@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from pump_end_threshold.ml.predict import prepare_event_data, build_pending_turn_down_decision_table
+from pump_end_threshold_regime.ml.predict import prepare_event_data, build_pending_turn_down_decision_table
 
 
 def _prepare_event_data(predictions_df: pd.DataFrame) -> dict:

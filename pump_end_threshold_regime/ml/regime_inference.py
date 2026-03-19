@@ -8,11 +8,11 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
-from pump_end_threshold.infra.clickhouse import DataLoader, get_liquid_universe
-from pump_end_threshold.infra.logging import log
-from pump_end_threshold.ml.regime_dataset import STRATEGY_STATE_MODE, build_strategy_state
-from pump_end_threshold.ml.regime_policy import RegimePolicy
+from pump_end_threshold_regime.features.regime_feature_builder import RegimeFeatureBuilder
+from pump_end_threshold_regime.infra.clickhouse import DataLoader, get_liquid_universe
+from pump_end_threshold_regime.infra.logging import log
+from pump_end_threshold_regime.ml.regime_dataset import STRATEGY_STATE_MODE, build_strategy_state
+from pump_end_threshold_regime.ml.regime_policy import RegimePolicy
 
 
 @dataclass

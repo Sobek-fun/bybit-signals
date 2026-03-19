@@ -14,10 +14,10 @@ import pandas as pd
 from catboost import CatBoostClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
-from pump_end_threshold.features.params import DEFAULT_PUMP_PARAMS
-from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.ml.regime_dataset import simulate_trade, compute_pause_value_targets
+from pump_end_threshold_regime.features.feature_builder import PumpFeatureBuilder
+from pump_end_threshold_regime.features.params import DEFAULT_PUMP_PARAMS
+from pump_end_threshold_regime.infra.clickhouse import DataLoader
+from pump_end_threshold_regime.ml.regime_dataset import simulate_trade, compute_pause_value_targets
 
 
 # ======================================================================================

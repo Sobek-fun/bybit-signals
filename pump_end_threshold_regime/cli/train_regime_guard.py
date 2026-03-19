@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from pump_end_threshold.ml.regime_evaluate import (
+from pump_end_threshold_regime.ml.regime_evaluate import (
     evaluate_regime,
     compute_regime_scorecard,
     build_pause_episodes,
@@ -14,14 +14,14 @@ from pump_end_threshold.ml.regime_evaluate import (
     save_btc_pause_overlay,
     build_pause_start_explanations,
 )
-from pump_end_threshold.ml.regime_feature_schema import get_regime_feature_columns
-from pump_end_threshold.ml.regime_tuning import (
+from pump_end_threshold_regime.ml.regime_feature_schema import get_regime_feature_columns
+from pump_end_threshold_regime.ml.regime_tuning import (
     tune_regime_guard,
     train_final_regime_model,
     resolve_policy_params,
 )
-from pump_end_threshold.ml.regime_policy import RegimePolicy
-from pump_end_threshold.ml.train import get_feature_importance
+from pump_end_threshold_regime.ml.regime_policy import RegimePolicy
+from pump_end_threshold_regime.ml.train import get_feature_importance
 
 
 def log(level: str, component: str, message: str):
@@ -425,7 +425,7 @@ def main():
 
             if args.clickhouse_dsn:
                 try:
-                    from pump_end_threshold.infra.clickhouse import DataLoader
+                    from pump_end_threshold_regime.infra.clickhouse import DataLoader
                     btc_loader = DataLoader(args.clickhouse_dsn)
                     t_min = filtered['open_time'].min() - timedelta(hours=6)
                     t_max = filtered['open_time'].max() + timedelta(hours=6)

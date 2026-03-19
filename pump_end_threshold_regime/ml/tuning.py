@@ -6,10 +6,10 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
-from pump_end_threshold.infra.clickhouse import DataLoader
-from pump_end_threshold.ml.evaluate import attach_signal_quality_columns, compute_signal_quality_metrics
-from pump_end_threshold.ml.predict import predict_proba, extract_signals_verbose
-from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
+from pump_end_threshold_regime.infra.clickhouse import DataLoader
+from pump_end_threshold_regime.ml.evaluate import attach_signal_quality_columns, compute_signal_quality_metrics
+from pump_end_threshold_regime.ml.predict import predict_proba, extract_signals_verbose
+from pump_end_threshold_regime.ml.threshold import threshold_sweep, _prepare_event_data
 
 
 def generate_walk_forward_folds(

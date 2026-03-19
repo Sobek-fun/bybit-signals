@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from pump_end_threshold.features.regime_feature_builder import RegimeFeatureBuilder
-from pump_end_threshold.infra.clickhouse import DataLoader, get_liquid_universe
-from pump_end_threshold.ml.regime_dataset import (
+from pump_end_threshold_regime.features.regime_feature_builder import RegimeFeatureBuilder
+from pump_end_threshold_regime.infra.clickhouse import DataLoader, get_liquid_universe
+from pump_end_threshold_regime.ml.regime_dataset import (
     build_strategy_state,
     compute_targets,
     BAR_MINUTES,
@@ -171,7 +171,7 @@ def main():
 
     pump_builder = None
     if args.include_detector_snapshot:
-        from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
+        from pump_end_threshold_regime.features.feature_builder import PumpFeatureBuilder
         pump_builder = PumpFeatureBuilder(
             ch_dsn=args.clickhouse_dsn,
             window_bars=30,
@@ -191,7 +191,7 @@ def main():
     log("INFO", "REGIME-DS", f"regime_features shape: {regime_features.shape}")
     log("INFO", "REGIME-DS", f"regime_features columns sample: {list(regime_features.columns)[:10]}")
 
-    from pump_end_threshold.ml.regime_dataset import build_regime_dataset as build_dataset_helper
+    from pump_end_threshold_regime.ml.regime_dataset import build_regime_dataset as build_dataset_helper
 
     dataset = build_dataset_helper(
         signals_df=signals_df,

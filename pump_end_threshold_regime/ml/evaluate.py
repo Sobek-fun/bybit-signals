@@ -7,7 +7,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from pump_end_threshold.ml.predict import build_pending_turn_down_decision_table, extract_signals
+from pump_end_threshold_regime.ml.predict import build_pending_turn_down_decision_table, extract_signals
 
 PRIMARY_HORIZON_BARS = 32
 PRIMARY_SQUEEZE_PCT = 0.02
