@@ -293,7 +293,7 @@ def calibrate_threshold_on_val(
         quality_overflow_penalty: float = 0.03,
         quality_top_k: int = 8,
         quality_entry_shift_bars: int = 0,
-        cv_selection_mode: str = "event_score",
+        final_calibration_mode: str = "quality_score",
         label_lookahead_bars: int = 0,
 ) -> dict:
     t0 = time.perf_counter()
@@ -326,14 +326,14 @@ def calibrate_threshold_on_val(
 
     event_data = _prepare_event_data(predictions)
     rule_combinations = get_rule_parameter_grid()
-    quality_mode = cv_selection_mode == "quality_score"
+    quality_mode = final_calibration_mode == "quality_score"
     loader = DataLoader(clickhouse_dsn) if (quality_mode and clickhouse_dsn) else None
     quality_signal_cutoff = val_end - timedelta(minutes=(quality_entry_shift_bars + label_lookahead_bars) * 15)
     log(
         "INFO",
         "TUNE",
         f"calibration_debug start val_rows={len(val_df)} val_events={len(val_events)} "
-        f"rules={len(rule_combinations)} quality_mode={'on' if loader is not None else 'off'}"
+        f"rules={len(rule_combinations)} quality_mode={'on' if loader is not None else 'off'} mode={final_calibration_mode}"
     )
 
     best_score = -float('inf')
@@ -1050,7 +1050,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 quality_overflow_penalty=args.quality_overflow_penalty,
                 quality_top_k=args.quality_top_k,
                 quality_entry_shift_bars=args.quality_entry_shift_bars,
-                cv_selection_mode=args.cv_selection_mode,
+                final_calibration_mode=args.final_calibration_mode,
                 label_lookahead_bars=label_lookahead_bars,
             )
 
@@ -1293,7 +1293,8 @@ def main():
     parser.add_argument("--quality-top-k", type=int, default=8)
     parser.add_argument("--quality-entry-shift-bars", type=int, default=0)
     parser.add_argument("--cv-selection-mode", type=str, choices=["event_score", "quality_score"], default="event_score")
-    parser.add_argument("--label-lookahead-bars", type=int, default=None)
+    parser.add_argument("--final-calibration-mode", type=str, choices=["event_score", "quality_score"], default="quality_score")
+    parser.add_argument("--label-lookahead-bars", type=int, default=32)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")
