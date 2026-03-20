@@ -1,0 +1,20 @@
+diff --git a/pump_end_threshold/ml/tuning.py b/pump_end_threshold/ml/tuning.py
+index 37c35d7..99a2e9d 100644
+--- a/pump_end_threshold/ml/tuning.py
++++ b/pump_end_threshold/ml/tuning.py
+@@ -185,7 +185,6 @@ def train_fold(
+         verbose=0,
+         eval_metric='Logloss',
+         use_best_model=True,
+-        auto_class_weights='Balanced'
+     )
+ 
+    model.fit(train_pool, eval_set=val_pool)
+@@ -622,7 +621,6 @@ def train_final_model(
+         random_seed=seed,
+         verbose=100,
+         eval_metric='Logloss',
+-        auto_class_weights='Balanced'
+     )
+ 
+     model.fit(train_pool)
