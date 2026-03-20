@@ -654,7 +654,8 @@ def run_build_dataset(args, artifacts: RunArtifacts):
         ch_dsn=args.clickhouse_dsn,
         window_bars=args.window_bars,
         warmup_bars=args.warmup_bars,
-        feature_set=args.feature_set
+        feature_set=args.feature_set,
+        market_symbol=args.market_symbol,
     )
 
     feature_input = points_df[['symbol', 'open_time']].copy()
@@ -1275,6 +1276,7 @@ def main():
     parser.add_argument("--window-bars", type=int, default=30)
     parser.add_argument("--warmup-bars", type=int, default=150)
     parser.add_argument("--feature-set", type=str, choices=["base", "extended"], default="base")
+    parser.add_argument("--market-symbol", type=str, default="BTCUSDT")
     parser.add_argument("--build-workers", type=int, default=8)
 
     parser.add_argument("--split-strategy", type=str, choices=["time", "ratio"], default="time")

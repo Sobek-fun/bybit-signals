@@ -33,24 +33,28 @@ class PumpEndModel:
         self.signal_rule = threshold_config.get('signal_rule', 'pending_turn_down')
         self.min_pending_bars = threshold_config.get('min_pending_bars', 1)
         self.drop_delta = threshold_config.get('drop_delta', 0.0)
+        self.abstain_margin = threshold_config.get('abstain_margin', 0.0)
 
         self.window_bars = 30
         self.warmup_bars = 150
         self.feature_set = "base"
+        self.market_symbol = "BTCUSDT"
 
         run_config_path = model_path / "run_config.json"
+        run_config = {}
         if run_config_path.exists():
             with open(run_config_path, 'r') as f:
                 run_config = json.load(f)
             self.window_bars = run_config.get('window_bars', 30)
             self.warmup_bars = run_config.get('warmup_bars', 150)
             self.feature_set = run_config.get('feature_set', 'base')
+        self.market_symbol = run_config.get("market_symbol", "BTCUSDT")
 
 
 class PumpEndSignalState:
     def __init__(self):
-        self.prev_p_end: dict[str, float] = {}
         self.pending_count: dict[str, int] = {}
+        self.best_p: dict[str, float] = {}
         self.last_signal_time: dict[str, datetime] = {}
         self.disarmed: dict[str, bool] = {}
 
@@ -61,30 +65,38 @@ class PumpEndSignalState:
             threshold: float,
             min_pending_bars: int,
             drop_delta: float,
-            current_time: datetime
+            current_time: datetime,
+            abstain_margin: float = 0.0
     ) -> bool:
-        prev = self.prev_p_end.get(symbol)
         count = self.pending_count.get(symbol, 0)
+        best_p = self.best_p.get(symbol, -1.0)
         is_disarmed = self.disarmed.get(symbol, False)
+        threshold_high = threshold
+        threshold_low = max(0.0, threshold - abstain_margin)
 
         triggered = False
 
-        if p_end >= threshold:
-            if not is_disarmed:
-                count += 1
-                if count >= min_pending_bars and prev is not None:
-                    drop = prev - p_end
-                    if p_end < prev and drop >= drop_delta:
-                        if self.last_signal_time.get(symbol) != current_time:
-                            triggered = True
-                            self.last_signal_time[symbol] = current_time
-                            self.disarmed[symbol] = True
-        else:
+        if (not is_disarmed) and p_end >= threshold_high:
+            count += 1
+            if p_end > best_p:
+                best_p = p_end
+
+        if count >= min_pending_bars and best_p >= 0.0:
+            drop_from_peak = best_p - p_end
+            if p_end < threshold_low or (drop_from_peak > 0 and drop_from_peak >= drop_delta):
+                if self.last_signal_time.get(symbol) != current_time:
+                    triggered = True
+                    self.last_signal_time[symbol] = current_time
+                    is_disarmed = True
+
+        if p_end < threshold_low:
             count = 0
-            self.disarmed[symbol] = False
+            best_p = -1.0
+            is_disarmed = False
 
         self.pending_count[symbol] = count
-        self.prev_p_end[symbol] = p_end
+        self.best_p[symbol] = best_p
+        self.disarmed[symbol] = is_disarmed
 
         return triggered
 
@@ -104,7 +116,7 @@ def _process_symbol_chunk(
         window_bars=model.window_bars,
         warmup_bars=model.warmup_bars,
         feature_set=model.feature_set,
-        market_symbol=None
+        market_symbol=model.market_symbol
     )
 
     csv_filename = f"signals_part_{worker_id}.csv"
@@ -200,7 +212,11 @@ def _process_single_symbol(
     if not valid_decision_times:
         return None
 
-    feature_rows = feature_builder.build_many_for_inference(df, symbol, valid_decision_times)
+    btc_df = None
+    if model.market_symbol and symbol != model.market_symbol:
+        btc_df = loader.load_candles_range(model.market_symbol, query_start_bucket, end_bucket + timedelta(minutes=15))
+
+    feature_rows = feature_builder.build_many_for_inference(df, symbol, valid_decision_times, btc_candles=btc_df)
 
     if not feature_rows:
         return None
@@ -227,7 +243,8 @@ def _process_single_symbol(
             model.threshold,
             model.min_pending_bars,
             model.drop_delta,
-            dt
+            dt,
+            abstain_margin=model.abstain_margin
         )
 
         if triggered and dt_from <= dt <= dt_to:
