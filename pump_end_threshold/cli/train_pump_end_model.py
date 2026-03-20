@@ -43,7 +43,12 @@ def parse_pos_offsets(offsets_str: str) -> list:
 
 
 def resolve_label_lookahead_bars(args) -> int:
-    return max(0, int(max(args.pullback_lookahead, args.squeeze_lookahead)))
+    explicit = getattr(args, "label_lookahead_bars", None)
+    if explicit is not None:
+        return max(0, int(explicit))
+    pullback = getattr(args, "pullback_lookahead", 0)
+    squeeze = getattr(args, "squeeze_lookahead", 0)
+    return max(0, int(max(pullback, squeeze)))
 
 
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
@@ -1288,6 +1293,7 @@ def main():
     parser.add_argument("--quality-top-k", type=int, default=8)
     parser.add_argument("--quality-entry-shift-bars", type=int, default=0)
     parser.add_argument("--cv-selection-mode", type=str, choices=["event_score", "quality_score"], default="event_score")
+    parser.add_argument("--label-lookahead-bars", type=int, default=None)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")
