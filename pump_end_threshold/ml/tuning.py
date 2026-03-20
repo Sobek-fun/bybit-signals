@@ -69,7 +69,7 @@ def apply_fold_split(points_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
     return points_df
 
 
-def clip_fold_points(points_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
+def clip_fold_points(points_df: pd.DataFrame, fold: dict, label_lookahead_bars: int = 0) -> pd.DataFrame:
     points_df = points_df.copy()
 
     train_mask = points_df['split'] == 'train'
@@ -78,6 +78,20 @@ def clip_fold_points(points_df: pd.DataFrame, fold: dict) -> pd.DataFrame:
     val_mask = points_df['split'] == 'val'
     points_df = points_df[
         ~(val_mask & ((points_df['open_time'] < fold['val_start']) | (points_df['open_time'] >= fold['val_end'])))]
+
+    if label_lookahead_bars > 0:
+        lookahead_delta = timedelta(minutes=label_lookahead_bars * 15)
+        train_cutoff = fold['train_end'] - lookahead_delta
+        val_cutoff = fold['val_end'] - lookahead_delta
+        event_times = points_df[points_df['offset'] == 0][['event_id', 'open_time', 'split']].drop_duplicates('event_id')
+        train_tail_events = event_times[
+            (event_times['split'] == 'train') & (event_times['open_time'] >= train_cutoff)
+        ]['event_id']
+        val_tail_events = event_times[
+            (event_times['split'] == 'val') & (event_times['open_time'] >= val_cutoff)
+        ]['event_id']
+        tail_events = pd.Index(train_tail_events).union(pd.Index(val_tail_events))
+        points_df = points_df[~points_df['event_id'].isin(tail_events)]
 
     return points_df.reset_index(drop=True)
 
@@ -391,6 +405,7 @@ def run_cv(
         clickhouse_dsn: str | None = None,
         cv_selection_mode: str = "event_score",
         quality_top_k: int = 8,
+        label_lookahead_bars: int = 0,
 ) -> dict:
     fold_results = []
 
@@ -399,7 +414,7 @@ def run_cv(
     for fold_idx, fold in enumerate(folds):
         fold_df = apply_fold_split(features_df, fold)
         fold_df = apply_fold_embargo(fold_df, fold, embargo_bars)
-        fold_df = clip_fold_points(fold_df, fold)
+        fold_df = clip_fold_points(fold_df, fold, label_lookahead_bars=label_lookahead_bars)
 
         model, _ = train_fold(
             fold_df,
@@ -476,6 +491,7 @@ def tune_model(
         clickhouse_dsn: str | None = None,
         cv_selection_mode: str = "event_score",
         quality_top_k: int = 8,
+        label_lookahead_bars: int = 0,
 ) -> dict:
     start_time = time.time()
     time_budget_sec = time_budget_min * 60
@@ -519,6 +535,7 @@ def tune_model(
             clickhouse_dsn=clickhouse_dsn,
             cv_selection_mode=cv_selection_mode,
             quality_top_k=quality_top_k,
+            label_lookahead_bars=label_lookahead_bars,
         )
 
         fold_results = cv_result.get('fold_results', [])
@@ -576,10 +593,15 @@ def train_final_model(
         train_end: datetime,
         iterations: int = 1000,
         seed: int = 42,
-        tune_strategy: str = 'threshold'
+        tune_strategy: str = 'threshold',
+        label_lookahead_bars: int = 0,
 ) -> CatBoostClassifier:
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     train_events = event_times[event_times['open_time'] < train_end]['event_id']
+    if label_lookahead_bars > 0:
+        lookahead_delta = timedelta(minutes=label_lookahead_bars * 15)
+        train_cutoff = train_end - lookahead_delta
+        train_events = event_times[event_times['open_time'] < train_cutoff]['event_id']
 
     train_df = features_df[
         (features_df['event_id'].isin(train_events)) &

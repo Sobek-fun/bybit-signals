@@ -42,6 +42,10 @@ def parse_pos_offsets(offsets_str: str) -> list:
     return [int(x.strip()) for x in offsets_str.split(',')]
 
 
+def resolve_label_lookahead_bars(args) -> int:
+    return max(0, int(max(args.pullback_lookahead, args.squeeze_lookahead)))
+
+
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
     required_cols = {'event_id', 'offset', 'y'}
     missing_cols = required_cols - set(features_df.columns)
@@ -284,18 +288,22 @@ def calibrate_threshold_on_val(
         quality_overflow_penalty: float = 0.03,
         quality_top_k: int = 8,
         quality_entry_shift_bars: int = 0,
+        cv_selection_mode: str = "event_score",
+        label_lookahead_bars: int = 0,
 ) -> dict:
     t0 = time.perf_counter()
+    label_lookahead_delta = timedelta(minutes=label_lookahead_bars * 15)
+    val_effective_end = val_end - label_lookahead_delta if label_lookahead_bars > 0 else val_end
     event_times = features_df[features_df['offset'] == 0][['event_id', 'open_time']].drop_duplicates('event_id')
     val_events = event_times[
         (event_times['open_time'] >= train_end) &
-        (event_times['open_time'] < val_end)
+        (event_times['open_time'] < val_effective_end)
         ]['event_id']
 
     val_df = features_df[
         (features_df['event_id'].isin(val_events)) &
         (features_df['open_time'] >= train_end) &
-        (features_df['open_time'] < val_end)
+        (features_df['open_time'] < val_effective_end)
         ].copy()
     val_days = max(1.0, (val_end - train_end).total_seconds() / 86400.0)
 
@@ -313,7 +321,9 @@ def calibrate_threshold_on_val(
 
     event_data = _prepare_event_data(predictions)
     rule_combinations = get_rule_parameter_grid()
-    loader = DataLoader(clickhouse_dsn) if clickhouse_dsn else None
+    quality_mode = cv_selection_mode == "quality_score"
+    loader = DataLoader(clickhouse_dsn) if (quality_mode and clickhouse_dsn) else None
+    quality_signal_cutoff = val_end - timedelta(minutes=(quality_entry_shift_bars + label_lookahead_bars) * 15)
     log(
         "INFO",
         "TUNE",
@@ -393,6 +403,10 @@ def calibrate_threshold_on_val(
                         drop_delta=drop_delta,
                         abstain_margin=abstain_margin
                     )
+                    if signals_df.empty:
+                        continue
+                    if 'open_time' in signals_df.columns:
+                        signals_df = signals_df[signals_df['open_time'] < quality_signal_cutoff].copy()
                     if signals_df.empty:
                         continue
                     candidate_signals[candidate_threshold] = signals_df.copy()
@@ -930,6 +944,7 @@ def run_tune(args, artifacts: RunArtifacts):
         test_end=test_end,
     )
     artifacts.save_dataset_manifest(dataset_manifest)
+    label_lookahead_bars = resolve_label_lookahead_bars(args)
 
     if train_end:
         cv_features_df = filter_features_by_event_time(features_df, train_end)
@@ -962,6 +977,7 @@ def run_tune(args, artifacts: RunArtifacts):
         clickhouse_dsn=args.clickhouse_dsn,
         cv_selection_mode=args.cv_selection_mode,
         quality_top_k=args.quality_top_k,
+        label_lookahead_bars=label_lookahead_bars,
     )
 
     best_result = tune_result
@@ -991,7 +1007,8 @@ def run_tune(args, artifacts: RunArtifacts):
             train_end,
             iterations=args.iterations,
             seed=args.seed,
-            tune_strategy=actual_strategy
+            tune_strategy=actual_strategy,
+            label_lookahead_bars=label_lookahead_bars,
         )
 
         artifacts.save_model(final_model)
@@ -1028,6 +1045,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 quality_overflow_penalty=args.quality_overflow_penalty,
                 quality_top_k=args.quality_top_k,
                 quality_entry_shift_bars=args.quality_entry_shift_bars,
+                cv_selection_mode=args.cv_selection_mode,
+                label_lookahead_bars=label_lookahead_bars,
             )
 
             best_threshold = calibration_result['threshold']
@@ -1153,7 +1172,7 @@ def run_tune(args, artifacts: RunArtifacts):
         for fold_idx, fold in enumerate(oos_folds):
             fold_df = apply_fold_split(cv_features_df if not train_end else features_df, fold)
             fold_df = apply_fold_embargo(fold_df, fold, args.embargo_bars)
-            fold_df = clip_fold_points(fold_df, fold)
+            fold_df = clip_fold_points(fold_df, fold, label_lookahead_bars=label_lookahead_bars)
 
             fold_model, _ = train_fold(
                 fold_df, oos_feature_columns, best_params,
