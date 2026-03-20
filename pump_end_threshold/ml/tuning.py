@@ -1,4 +1,5 @@
 import time
+import random
 from datetime import datetime, timedelta
 from itertools import product
 
@@ -117,10 +118,10 @@ def apply_fold_embargo(points_df: pd.DataFrame, fold: dict, embargo_bars: int) -
 
 def get_hyperparameter_grid() -> list:
     param_grid = {
-        'depth': [4, 6, 8],
-        'learning_rate': [0.01, 0.03, 0.1],
-        'l2_leaf_reg': [1.0, 3.0, 10.0],
-        'min_data_in_leaf': [1, 5, 10]
+        'depth': [5, 6, 8, 10],
+        'learning_rate': [0.01, 0.02, 0.03, 0.05],
+        'l2_leaf_reg': [3.0, 6.0, 10.0, 20.0],
+        'min_data_in_leaf': [1, 3, 5, 10]
     }
 
     keys = list(param_grid.keys())
@@ -502,6 +503,7 @@ def tune_model(
         raise ValueError("Not enough data to generate walk-forward folds")
 
     param_combinations = get_hyperparameter_grid()
+    random.Random(seed).shuffle(param_combinations)
 
     leaderboard = []
     best_result = None
