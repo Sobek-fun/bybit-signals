@@ -106,6 +106,14 @@ class RunArtifacts:
         with open(path, 'w') as f:
             json.dump(data, f, indent=2, default=str)
 
+    def save_best_threshold_eventcentric(self, threshold: float, signal_rule_params: dict = None):
+        data = {'threshold': threshold}
+        if signal_rule_params:
+            data.update(signal_rule_params)
+        path = self.run_dir / "best_threshold_eventcentric.json"
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+
     def save_leaderboard(self, df: pd.DataFrame):
         path = self.run_dir / "leaderboard.csv"
         df.to_csv(path, index=False)
