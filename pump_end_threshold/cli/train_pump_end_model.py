@@ -9,8 +9,10 @@ import pandas as pd
 from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
 from pump_end_threshold.ml.artifacts import RunArtifacts
 from pump_end_threshold.ml.dataset import load_labels, build_training_points, deduplicate_points
-from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, clip_points_to_split_bounds
-from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, get_feature_importance_grouped
+from pump_end_threshold.ml.split import time_split, ratio_split, get_split_info, apply_embargo, \
+    clip_points_to_split_bounds
+from pump_end_threshold.ml.train import train_model, get_feature_columns, get_feature_importance, \
+    get_feature_importance_grouped
 from pump_end_threshold.ml.threshold import threshold_sweep, _prepare_event_data
 from pump_end_threshold.ml.evaluate import (
     evaluate_with_trade_quality,
@@ -238,7 +240,8 @@ def build_holdout_window_summary_6h(signals_df: pd.DataFrame) -> pd.DataFrame:
     grouped['tp'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
     grouped['sl'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'sl').sum())).values
     grouped['timeout'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'timeout').sum())).values
-    grouped['ambiguous'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'ambiguous').sum())).values
+    grouped['ambiguous'] = df.groupby('window_start')['trade_outcome'].apply(
+        lambda s: int((s == 'ambiguous').sum())).values
     grouped['resolved'] = grouped['tp'] + grouped['sl']
     grouped['tp_rate_resolved'] = grouped['tp'] / grouped['resolved'].replace(0, pd.NA)
     grouped['sl_rate_resolved'] = grouped['sl'] / grouped['resolved'].replace(0, pd.NA)
@@ -390,16 +393,16 @@ def compute_shadow_quality_score(
         density_under_penalty = 0.18 * max(0.0, 30 - signal_count_quality)
         density_over_penalty = 0.0
     quality_score = (
-        5.0 * clean_2_3_share_h32
-        + 3.0 * clean_retrace_precision_2_3_h32
-        + 2.0 * pullback_before_squeeze_share_h32
-        + 20.0 * net_edge_median_h32
-        + 8.0 * pullback_median_h32
-        - 18.0 * squeeze_p75_h32
-        - 5.0 * dirty_no_pullback_2_3_share_h32
-        + density_reward
-        - density_under_penalty
-        - density_over_penalty
+            5.0 * clean_2_3_share_h32
+            + 3.0 * clean_retrace_precision_2_3_h32
+            + 2.0 * pullback_before_squeeze_share_h32
+            + 20.0 * net_edge_median_h32
+            + 8.0 * pullback_median_h32
+            - 18.0 * squeeze_p75_h32
+            - 5.0 * dirty_no_pullback_2_3_share_h32
+            + density_reward
+            - density_under_penalty
+            - density_over_penalty
     )
     metrics_df = pd.DataFrame([{
         'quality_score': quality_score,
@@ -502,7 +505,8 @@ def calibrate_threshold_on_val_live_shadow(
                 best_dd = dd
     sweep_df = pd.DataFrame(rows)
     if not sweep_df.empty:
-        sweep_df = sweep_df.sort_values(['quality_score', 'signal_count'], ascending=[False, False]).reset_index(drop=True)
+        sweep_df = sweep_df.sort_values(['quality_score', 'signal_count'], ascending=[False, False]).reset_index(
+            drop=True)
     return {
         'threshold': best_threshold,
         'min_pending_bars': best_mpb,
@@ -769,16 +773,16 @@ def calibrate_threshold_on_val(
                         density_over_penalty = 0.0
 
                     quality_score = (
-                        5.0 * clean_2_3_share_h32
-                        + 3.0 * clean_retrace_precision_2_3_h32
-                        + 2.0 * pullback_before_squeeze_share_2_3_h32
-                        + 20.0 * net_edge_median_h32
-                        + 8.0 * pullback_median_h32
-                        - 18.0 * squeeze_p75_h32
-                        - 5.0 * dirty_no_pullback_2_3_share_h32
-                        + density_reward
-                        - density_under_penalty
-                        - density_over_penalty
+                            5.0 * clean_2_3_share_h32
+                            + 3.0 * clean_retrace_precision_2_3_h32
+                            + 2.0 * pullback_before_squeeze_share_2_3_h32
+                            + 20.0 * net_edge_median_h32
+                            + 8.0 * pullback_median_h32
+                            - 18.0 * squeeze_p75_h32
+                            - 5.0 * dirty_no_pullback_2_3_share_h32
+                            + density_reward
+                            - density_under_penalty
+                            - density_over_penalty
                     )
 
                     quality_rows.append({
@@ -1504,11 +1508,13 @@ def run_tune(args, artifacts: RunArtifacts):
 
             val_live_shadow_metrics = {
                 "signal_count": int(len(live_shadow_val_signals)),
-                "signals_per_30d": float(30.0 * len(live_shadow_val_signals) / max(1.0, (val_end - train_end).total_seconds() / 86400.0)),
+                "signals_per_30d": float(
+                    30.0 * len(live_shadow_val_signals) / max(1.0, (val_end - train_end).total_seconds() / 86400.0)),
             }
             test_live_shadow_metrics = {
                 "signal_count": int(len(live_shadow_test_signals)),
-                "signals_per_30d": float(30.0 * len(live_shadow_test_signals) / max(1.0, (test_end - val_end).total_seconds() / 86400.0)),
+                "signals_per_30d": float(
+                    30.0 * len(live_shadow_test_signals) / max(1.0, (test_end - val_end).total_seconds() / 86400.0)),
             }
             artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
             artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
@@ -1644,8 +1650,10 @@ def main():
     parser.add_argument("--quality-overflow-penalty", type=float, default=0.03)
     parser.add_argument("--quality-top-k", type=int, default=8)
     parser.add_argument("--quality-entry-shift-bars", type=int, default=0)
-    parser.add_argument("--cv-selection-mode", type=str, choices=["event_score", "quality_score"], default="event_score")
-    parser.add_argument("--final-calibration-mode", type=str, choices=["event_score", "quality_score"], default="quality_score")
+    parser.add_argument("--cv-selection-mode", type=str, choices=["event_score", "quality_score"],
+                        default="event_score")
+    parser.add_argument("--final-calibration-mode", type=str, choices=["event_score", "quality_score"],
+                        default="quality_score")
     parser.add_argument("--label-lookahead-bars", type=int, default=32)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],

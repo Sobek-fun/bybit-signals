@@ -23,13 +23,19 @@ KEY_FILES = [
     "feature_importance.csv",
     "feature_importance_grouped.csv",
     "threshold_sweep.csv",
+    "calibration_sweep_val_live_shadow.csv",
+    "calibration_sweep_val_eventcentric.csv",
     "calibration_sweep_val.csv",
     "metrics_val.json",
+    "metrics_holdout_live_shadow.json",
+    "metrics_holdout_live_shadow_val.json",
+    "metrics_eventcentric_test.json",
     "metrics_test.json",
     "predictions_val.parquet",
     "predictions_test.parquet",
     "predicted_signals_val.csv",
     "predicted_signals_holdout.csv",
+    "predicted_signals_eventcentric_test.csv",
     "cv_oof_signals_verbose.parquet",
     "cv_oos_signals_verbose.parquet",
     "holdout_window_summary_6h.csv",
@@ -301,7 +307,7 @@ def summarize_cv(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
 
 def summarize_calibration(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
     best_threshold = load_json(first_existing(run_dir, ["best_threshold.json"])) or {}
-    sweep = load_table(first_existing(run_dir, ["calibration_sweep_val.csv", "threshold_sweep.csv"]))
+    sweep = load_table(first_existing(run_dir, ["calibration_sweep_val_live_shadow.csv", "calibration_sweep_val.csv", "threshold_sweep.csv"]))
 
     out = {
         "threshold": best_threshold.get("threshold"),
@@ -485,7 +491,9 @@ def summarize_signals_df(df: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame
 
 
 def summarize_holdout(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    metrics_flat = summarize_metrics_json(run_dir, "test")
+    metrics_flat = summarize_metrics_json(run_dir, "holdout_live_shadow")
+    if not metrics_flat:
+        metrics_flat = summarize_metrics_json(run_dir, "test")
     signals = load_table(first_existing(run_dir, ["predicted_signals_holdout.csv", "predicted_signals_holdout.parquet"]))
     signal_summary, monthly, worst_symbols, worst_6h = summarize_signals_df(signals)
 
@@ -494,6 +502,18 @@ def summarize_holdout(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame, pd.D
         merged.setdefault(k, v)
 
     return merged, signals, monthly, worst_symbols, worst_6h
+
+
+def summarize_eventcentric(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
+    metrics_flat = summarize_metrics_json(run_dir, "eventcentric_test")
+    if not metrics_flat:
+        metrics_flat = summarize_metrics_json(run_dir, "test")
+    signals = load_table(first_existing(run_dir, ["predicted_signals_eventcentric_test.csv", "predicted_signals_holdout.csv"]))
+    signal_summary, _monthly, _worst_symbols, _worst_6h = summarize_signals_df(signals)
+    merged = metrics_flat.copy()
+    for k, v in signal_summary.items():
+        merged.setdefault(k, v)
+    return merged, signals
 
 
 def summarize_val(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
@@ -641,6 +661,7 @@ def build_report(run_dir: Path) -> str:
     calibration_summary, sweep_df = summarize_calibration(run_dir)
     val_summary, val_signals = summarize_val(run_dir)
     holdout_summary, holdout_signals, monthly_df, worst_symbols_df, worst_6h_df = summarize_holdout(run_dir)
+    eventcentric_summary, _eventcentric_signals = summarize_eventcentric(run_dir)
     feature_summary, feature_importance, feature_grouped = summarize_importance(run_dir)
 
     findings = auto_findings(
@@ -933,6 +954,26 @@ def build_report(run_dir: Path) -> str:
         lines.append("### Worst symbols on holdout")
         lines.append("")
         lines.append(md_table(cols, rows))
+        lines.append("")
+
+    lines.append("## Event-centric diagnostics")
+    lines.append("")
+    if eventcentric_summary:
+        event_rows = [
+            ["signals", fmt(eventcentric_summary.get("signals"))],
+            ["hit0_rate", fmt_pct(eventcentric_summary.get("hit0_rate"))],
+            ["hit0_or_hit1_rate", fmt_pct(eventcentric_summary.get("hit0_or_hit1_rate"))],
+            ["early_rate", fmt_pct(eventcentric_summary.get("early_rate"))],
+            ["late_rate", fmt_pct(eventcentric_summary.get("late_rate"))],
+            ["miss_rate", fmt_pct(eventcentric_summary.get("miss_rate"))],
+            ["fp_b_rate", fmt_pct(eventcentric_summary.get("fp_b_rate"))],
+            ["pr_auc", fmt(eventcentric_summary.get("pr_auc"))],
+            ["roc_auc", fmt(eventcentric_summary.get("roc_auc"))],
+        ]
+        lines.append(md_table(["Metric", "Value"], event_rows))
+        lines.append("")
+    else:
+        lines.append("Event-centric artifacts not found.")
         lines.append("")
 
     lines.append("## Feature importance")
