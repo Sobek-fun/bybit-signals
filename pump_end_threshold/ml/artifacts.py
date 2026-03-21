@@ -73,8 +73,20 @@ class RunArtifacts:
         path = self.run_dir / "predicted_signals_holdout.csv"
         df.to_csv(path, index=False)
 
+    def save_predicted_signals_eventcentric_test(self, df: pd.DataFrame):
+        path = self.run_dir / "predicted_signals_eventcentric_test.csv"
+        df.to_csv(path, index=False)
+
     def save_predicted_signals_val(self, df: pd.DataFrame):
         path = self.run_dir / "predicted_signals_val.csv"
+        df.to_csv(path, index=False)
+
+    def save_predicted_signals_holdout_live_shadow(self, df: pd.DataFrame):
+        path = self.run_dir / "predicted_signals_holdout.csv"
+        df.to_csv(path, index=False)
+
+    def save_predicted_signals_holdout_live_shadow_val(self, df: pd.DataFrame):
+        path = self.run_dir / "predicted_signals_holdout_live_shadow_val.csv"
         df.to_csv(path, index=False)
 
     def save_predictions(self, df: pd.DataFrame, split_name: str):
@@ -117,13 +129,33 @@ class RunArtifacts:
         path = self.run_dir / "calibration_sweep_val.csv"
         df.to_csv(path, index=False)
 
+    def save_calibration_sweep_val_eventcentric(self, df: pd.DataFrame):
+        path = self.run_dir / "calibration_sweep_val_eventcentric.csv"
+        df.to_csv(path, index=False)
+
+    def save_calibration_sweep_val_live_shadow(self, df: pd.DataFrame):
+        path = self.run_dir / "calibration_sweep_val_live_shadow.csv"
+        df.to_csv(path, index=False)
+
     def save_holdout_window_summary_6h(self, df: pd.DataFrame):
         path = self.run_dir / "holdout_window_summary_6h.csv"
+        df.to_csv(path, index=False)
+
+    def save_eventcentric_window_summary_6h(self, df: pd.DataFrame):
+        path = self.run_dir / "eventcentric_window_summary_6h.csv"
         df.to_csv(path, index=False)
 
     def save_holdout_symbol_summary(self, df: pd.DataFrame):
         path = self.run_dir / "holdout_symbol_summary.csv"
         df.to_csv(path, index=False)
+
+    def save_eventcentric_symbol_summary(self, df: pd.DataFrame):
+        path = self.run_dir / "eventcentric_symbol_summary.csv"
+        df.to_csv(path, index=False)
+
+    def save_shadow_probability_stream(self, df: pd.DataFrame, split_name: str):
+        path = self.run_dir / f"shadow_probability_stream_{split_name}.parquet"
+        df.to_parquet(path, index=False)
 
     def save_folds(self, folds: list):
         path = self.run_dir / "folds.json"

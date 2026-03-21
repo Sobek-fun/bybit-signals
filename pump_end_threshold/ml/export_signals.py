@@ -173,6 +173,46 @@ def _process_single_symbol(
         dt_from: datetime,
         dt_to: datetime
 ) -> list:
+    stream_df = _predict_symbol_stream(
+        symbol=symbol,
+        loader=loader,
+        model=model,
+        feature_builder=feature_builder,
+        warmup_start=warmup_start,
+        dt_from=dt_from,
+        dt_to=dt_to,
+    )
+    if stream_df is None or stream_df.empty:
+        return None
+
+    signal_state = PumpEndSignalState()
+    triggered_signals = []
+
+    for row in stream_df.itertuples(index=False):
+        triggered = signal_state.update_and_check(
+            symbol,
+            float(row.p_end),
+            model.threshold,
+            model.min_pending_bars,
+            model.drop_delta,
+            row.open_time,
+            abstain_margin=model.abstain_margin
+        )
+        if triggered and dt_from <= row.open_time <= dt_to:
+            triggered_signals.append(row.open_time)
+
+    return triggered_signals
+
+
+def _predict_symbol_stream(
+        symbol: str,
+        loader: DataLoader,
+        model: PumpEndModel,
+        feature_builder: PumpFeatureBuilder,
+        warmup_start: datetime,
+        dt_from: datetime,
+        dt_to: datetime
+) -> pd.DataFrame | None:
     query_start_bucket = warmup_start - timedelta(minutes=15) - timedelta(minutes=(MIN_CANDLES - 1) * 15)
     end_bucket = dt_to - timedelta(minutes=15)
 
@@ -230,27 +270,131 @@ def _process_single_symbol(
         feature_values_list.append(fv)
 
     probas = model.model.predict_proba(feature_values_list)[:, 1]
-
-    signal_state = PumpEndSignalState()
-    triggered_signals = []
-
+    rows = []
     for i, dt in enumerate(valid_decision_times):
-        p_end = probas[i]
+        if dt_from <= dt <= dt_to:
+            rows.append({
+                "symbol": symbol,
+                "open_time": dt,
+                "p_end": float(probas[i]),
+            })
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+    return pd.DataFrame(rows)
 
-        triggered = signal_state.update_and_check(
-            symbol,
-            p_end,
-            model.threshold,
-            model.min_pending_bars,
-            model.drop_delta,
-            dt,
-            abstain_margin=model.abstain_margin
-        )
 
-        if triggered and dt_from <= dt <= dt_to:
-            triggered_signals.append(dt)
+def _process_symbol_chunk_probability_stream(
+        worker_id: int,
+        symbols_chunk: list,
+        ch_dsn: str,
+        model_dir: str,
+        dt_from: datetime,
+        dt_to: datetime
+) -> tuple:
+    loader = DataLoader(ch_dsn)
+    model = PumpEndModel(model_dir)
+    feature_builder = PumpFeatureBuilder(
+        ch_dsn=None,
+        window_bars=model.window_bars,
+        warmup_bars=model.warmup_bars,
+        feature_set=model.feature_set,
+        market_symbol=model.market_symbol
+    )
+    csv_filename = f"prob_stream_part_{worker_id}.csv"
+    csv_file = open(csv_filename, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["symbol", "open_time", "p_end"])
+    total_rows = 0
+    symbols_processed = 0
+    symbols_skipped = 0
+    errors = 0
+    warmup_start = dt_from - timedelta(minutes=WARMUP_BARS * 15)
+    for symbol in symbols_chunk:
+        try:
+            stream_df = _predict_symbol_stream(
+                symbol=symbol,
+                loader=loader,
+                model=model,
+                feature_builder=feature_builder,
+                warmup_start=warmup_start,
+                dt_from=dt_from,
+                dt_to=dt_to,
+            )
+            if stream_df is None or stream_df.empty:
+                symbols_skipped += 1
+                continue
+            for row in stream_df.itertuples(index=False):
+                csv_writer.writerow([row.symbol, row.open_time.strftime("%Y-%m-%d %H:%M:%S"), f"{float(row.p_end):.12f}"])
+                total_rows += 1
+            symbols_processed += 1
+        except Exception as e:
+            errors += 1
+            if errors <= 3:
+                log("WARN", f"EXPORT_STREAM_WORKER{worker_id}", f"symbol={symbol} error={type(e).__name__}: {str(e)}")
+    csv_file.close()
+    return worker_id, symbols_processed, symbols_skipped, total_rows, errors, csv_filename
 
-    return triggered_signals
+
+def export_probability_stream(
+        tokens: list,
+        ch_dsn: str,
+        model_dir: str,
+        dt_from: datetime,
+        dt_to: datetime,
+        workers: int,
+        out_parquet: str | None = None
+) -> pd.DataFrame:
+    dt_from = _align_to_15min(dt_from)
+    dt_to = _align_to_15min(dt_to)
+    symbols = [f"{token}USDT" for token in tokens]
+    if not symbols:
+        empty_df = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+        if out_parquet:
+            empty_df.to_parquet(out_parquet, index=False)
+        return empty_df
+    num_workers = min(workers, len(symbols))
+    chunk_size = len(symbols) // num_workers
+    remainder = len(symbols) % num_workers
+    chunks = []
+    start_idx = 0
+    for i in range(num_workers):
+        end_idx = start_idx + chunk_size + (1 if i < remainder else 0)
+        chunks.append(symbols[start_idx:end_idx])
+        start_idx = end_idx
+    part_files = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_symbol_chunk_probability_stream,
+                i + 1,
+                chunks[i],
+                ch_dsn,
+                model_dir,
+                dt_from,
+                dt_to
+            ): i + 1
+            for i in range(num_workers)
+        }
+        for future in as_completed(futures):
+            _, _, _, _, _, csv_file = future.result()
+            part_files.append(csv_file)
+    frames = []
+    for part_csv in part_files:
+        if os.path.exists(part_csv):
+            df = pd.read_csv(part_csv)
+            if not df.empty:
+                df["open_time"] = pd.to_datetime(df["open_time"])
+                frames.append(df)
+            os.remove(part_csv)
+    if not frames:
+        stream_df = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+    else:
+        stream_df = pd.concat(frames, ignore_index=True)
+        stream_df["p_end"] = stream_df["p_end"].astype(float)
+        stream_df = stream_df.sort_values(["open_time", "symbol"]).reset_index(drop=True)
+    if out_parquet:
+        stream_df.to_parquet(out_parquet, index=False)
+    return stream_df
 
 
 def export_signals(
