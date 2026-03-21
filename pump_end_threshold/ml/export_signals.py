@@ -324,7 +324,8 @@ def _process_symbol_chunk_probability_stream(
                 symbols_skipped += 1
                 continue
             for row in stream_df.itertuples(index=False):
-                csv_writer.writerow([row.symbol, row.open_time.strftime("%Y-%m-%d %H:%M:%S"), f"{float(row.p_end):.12f}"])
+                csv_writer.writerow(
+                    [row.symbol, row.open_time.strftime("%Y-%m-%d %H:%M:%S"), f"{float(row.p_end):.12f}"])
                 total_rows += 1
             symbols_processed += 1
         except Exception as e:
