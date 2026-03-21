@@ -26,6 +26,7 @@ from pump_end_threshold.ml.tuning import (
 from pump_end_threshold.ml.feature_schema import prune_feature_columns
 from pump_end_threshold.infra.clickhouse import DataLoader
 from pump_end_threshold.ml.regime_dataset import simulate_trade
+from pump_end_threshold.ml.export_signals import export_probability_stream, PumpEndSignalState
 
 
 def log(level: str, component: str, message: str):
@@ -269,6 +270,246 @@ def build_holdout_symbol_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
     resolved_pnl = df[df['trade_outcome'].isin(['tp', 'sl'])].groupby('symbol')['trade_pnl_pct'].sum()
     grouped['expectancy_resolved'] = grouped['symbol'].map(resolved_pnl) / grouped['resolved'].replace(0, pd.NA)
     return grouped.sort_values(['signals', 'symbol'], ascending=[False, True]).reset_index(drop=True)
+
+
+def resolve_universe_tokens(features_df: pd.DataFrame) -> list[str]:
+    if 'symbol' not in features_df.columns:
+        return []
+    symbols = sorted(str(s).upper() for s in features_df['symbol'].dropna().unique().tolist())
+    tokens = []
+    for symbol in symbols:
+        if symbol.endswith("USDT"):
+            tokens.append(symbol[:-4])
+        else:
+            tokens.append(symbol)
+    return sorted(set(tokens))
+
+
+def extract_signals_from_probability_stream(
+        probability_stream_df: pd.DataFrame,
+        threshold: float,
+        min_pending_bars: int,
+        drop_delta: float,
+        abstain_margin: float
+) -> pd.DataFrame:
+    if probability_stream_df.empty:
+        return pd.DataFrame(columns=['symbol', 'open_time'])
+    threshold_low = max(0.0, threshold - abstain_margin)
+    state = PumpEndSignalState()
+    rows = []
+    stream = probability_stream_df.sort_values(['symbol', 'open_time']).reset_index(drop=True)
+    for row in stream.itertuples(index=False):
+        fired = state.update_and_check(
+            symbol=str(row.symbol),
+            p_end=float(row.p_end),
+            threshold=float(threshold),
+            min_pending_bars=int(min_pending_bars),
+            drop_delta=float(drop_delta),
+            current_time=pd.to_datetime(row.open_time).to_pydatetime(),
+            abstain_margin=float(abstain_margin),
+        )
+        if fired:
+            rows.append({'symbol': str(row.symbol), 'open_time': pd.to_datetime(row.open_time)})
+    if not rows:
+        return pd.DataFrame(columns=['symbol', 'open_time'])
+    out = pd.DataFrame(rows)
+    out = out.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    return out
+
+
+def finalize_live_shadow_signals(
+        signals_df: pd.DataFrame,
+        loader: DataLoader | None,
+        quality_entry_shift_bars: int
+) -> pd.DataFrame:
+    if signals_df.empty:
+        return signals_df
+    out = signals_df.copy()
+    if loader is not None:
+        out = attach_signal_quality_columns(
+            out,
+            loader,
+            horizons=[16, 32],
+            entry_shift_bars=quality_entry_shift_bars,
+        )
+        out = enrich_with_trade_replay(out, loader)
+    out = out.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    return out
+
+
+def compute_shadow_quality_score(
+        signals_df: pd.DataFrame,
+        loader: DataLoader | None,
+        window_start: datetime,
+        window_end: datetime,
+        quality_entry_shift_bars: int,
+        quality_density_mode: str,
+        quality_target_min_30d: float,
+        quality_target_max_30d: float,
+        quality_overflow_penalty: float,
+) -> tuple[float, int, pd.DataFrame]:
+    if signals_df.empty:
+        return -float('inf'), 0, pd.DataFrame()
+    quality_df = signals_df.copy()
+    if loader is not None:
+        quality_df = attach_signal_quality_columns(
+            quality_df,
+            loader,
+            horizons=[32],
+            entry_shift_bars=quality_entry_shift_bars,
+        )
+    sq = compute_signal_quality_metrics(
+        signal_path_df=quality_df,
+        horizon=32,
+        squeeze_threshold=0.02,
+        pullback_threshold=0.03
+    )
+
+    def _metric(name: str) -> float:
+        value = sq.get(name, 0.0)
+        if pd.isna(value):
+            return 0.0
+        return float(value)
+
+    clean_2_3_share_h32 = _metric('clean_2_3_share_h32')
+    clean_retrace_precision_2_3_h32 = _metric('clean_retrace_precision_2_3_h32')
+    pullback_before_squeeze_share_h32 = _metric('pullback_before_squeeze_share_2_3_h32')
+    net_edge_median_h32 = _metric('net_edge_median_h32')
+    pullback_median_h32 = _metric('pullback_median_h32')
+    squeeze_p75_h32 = _metric('squeeze_p75_h32')
+    dirty_no_pullback_2_3_share_h32 = _metric('dirty_no_pullback_2_3_share_h32')
+    signal_count_quality = int(len(signals_df))
+    days = max(1.0, (window_end - window_start).total_seconds() / 86400.0)
+    signals_per_30d_quality = 30.0 * signal_count_quality / days
+    if quality_density_mode == "per30d":
+        density_reward = 0.01 * min(signals_per_30d_quality, 120.0)
+        density_under_penalty = 0.18 * max(0.0, quality_target_min_30d - signals_per_30d_quality)
+        density_over_penalty = quality_overflow_penalty * max(0.0, signals_per_30d_quality - quality_target_max_30d)
+    else:
+        density_reward = 0.01 * min(signal_count_quality, 120)
+        density_under_penalty = 0.18 * max(0.0, 30 - signal_count_quality)
+        density_over_penalty = 0.0
+    quality_score = (
+        5.0 * clean_2_3_share_h32
+        + 3.0 * clean_retrace_precision_2_3_h32
+        + 2.0 * pullback_before_squeeze_share_h32
+        + 20.0 * net_edge_median_h32
+        + 8.0 * pullback_median_h32
+        - 18.0 * squeeze_p75_h32
+        - 5.0 * dirty_no_pullback_2_3_share_h32
+        + density_reward
+        - density_under_penalty
+        - density_over_penalty
+    )
+    metrics_df = pd.DataFrame([{
+        'quality_score': quality_score,
+        'clean_2_3_share_h32': clean_2_3_share_h32,
+        'clean_retrace_precision_2_3_h32': clean_retrace_precision_2_3_h32,
+        'pullback_before_squeeze_share_h32': pullback_before_squeeze_share_h32,
+        'net_edge_median_h32': net_edge_median_h32,
+        'pullback_median_h32': pullback_median_h32,
+        'squeeze_p75_h32': squeeze_p75_h32,
+        'dirty_no_pullback_2_3_share_h32': dirty_no_pullback_2_3_share_h32,
+        'signal_count_quality': signal_count_quality,
+        'signals_per_30d_quality': signals_per_30d_quality,
+    }])
+    return float(quality_score), signal_count_quality, metrics_df
+
+
+def calibrate_threshold_on_val_live_shadow(
+        model_dir: str,
+        tokens: list[str],
+        clickhouse_dsn: str,
+        val_start: datetime,
+        val_end: datetime,
+        threshold_grid_from: float,
+        threshold_grid_to: float,
+        threshold_grid_step: float,
+        abstain_margin: float,
+        quality_density_mode: str,
+        quality_target_min_30d: float,
+        quality_target_max_30d: float,
+        quality_overflow_penalty: float,
+        quality_entry_shift_bars: int,
+        workers: int,
+        out_probability_stream_path: str | None = None,
+) -> dict:
+    probability_stream_df = export_probability_stream(
+        tokens=tokens,
+        ch_dsn=clickhouse_dsn,
+        model_dir=model_dir,
+        dt_from=val_start,
+        dt_to=val_end - timedelta(minutes=15),
+        workers=workers,
+        out_parquet=out_probability_stream_path,
+    )
+    if probability_stream_df.empty:
+        return {
+            'threshold': 0.1,
+            'min_pending_bars': 1,
+            'drop_delta': 0.0,
+            'calibration_sweep': pd.DataFrame(),
+            'probability_stream': probability_stream_df,
+        }
+    loader = DataLoader(clickhouse_dsn) if clickhouse_dsn else None
+    thresholds = []
+    cur = float(threshold_grid_from)
+    while cur <= threshold_grid_to + 1e-12:
+        thresholds.append(round(cur, 10))
+        cur += threshold_grid_step
+    rule_grid = get_rule_parameter_grid()
+    best_score = -float('inf')
+    best_threshold = thresholds[0] if thresholds else 0.1
+    best_mpb = 1
+    best_dd = 0.0
+    rows = []
+    for rule in rule_grid:
+        mpb = int(rule['min_pending_bars'])
+        dd = float(rule['drop_delta'])
+        for thr in thresholds:
+            signals_df = extract_signals_from_probability_stream(
+                probability_stream_df=probability_stream_df,
+                threshold=float(thr),
+                min_pending_bars=mpb,
+                drop_delta=dd,
+                abstain_margin=float(abstain_margin),
+            )
+            score, signal_count, metrics_df = compute_shadow_quality_score(
+                signals_df=signals_df,
+                loader=loader,
+                window_start=val_start,
+                window_end=val_end,
+                quality_entry_shift_bars=quality_entry_shift_bars,
+                quality_density_mode=quality_density_mode,
+                quality_target_min_30d=quality_target_min_30d,
+                quality_target_max_30d=quality_target_max_30d,
+                quality_overflow_penalty=quality_overflow_penalty,
+            )
+            row = {
+                'threshold': float(thr),
+                'min_pending_bars': mpb,
+                'drop_delta': dd,
+                'signal_count': signal_count,
+                'quality_score': score,
+            }
+            if not metrics_df.empty:
+                row.update(metrics_df.iloc[0].to_dict())
+            rows.append(row)
+            if score > best_score:
+                best_score = score
+                best_threshold = float(thr)
+                best_mpb = mpb
+                best_dd = dd
+    sweep_df = pd.DataFrame(rows)
+    if not sweep_df.empty:
+        sweep_df = sweep_df.sort_values(['quality_score', 'signal_count'], ascending=[False, False]).reset_index(drop=True)
+    return {
+        'threshold': best_threshold,
+        'min_pending_bars': best_mpb,
+        'drop_delta': best_dd,
+        'calibration_sweep': sweep_df,
+        'probability_stream': probability_stream_df,
+    }
 
 
 def calibrate_threshold_on_val(
@@ -889,7 +1130,7 @@ def run_train_only(args, artifacts: RunArtifacts):
         abstain_margin=args.abstain_margin,
         entry_shift_bars=args.quality_entry_shift_bars,
     )
-    artifacts.save_metrics(test_metrics, 'test')
+    artifacts.save_metrics(test_metrics, 'eventcentric_test')
     log("INFO", "TRAIN",
         f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
@@ -912,10 +1153,10 @@ def run_train_only(args, artifacts: RunArtifacts):
     signals_df = format_predicted_signals(signals_df)
     if loader is not None and not signals_df.empty:
         signals_df = enrich_with_trade_replay(signals_df, loader)
-    artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(signals_df))
-    artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(signals_df))
-    artifacts.save_predicted_signals(signals_df)
-    log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to holdout csv")
+    artifacts.save_eventcentric_window_summary_6h(build_holdout_window_summary_6h(signals_df))
+    artifacts.save_eventcentric_symbol_summary(build_holdout_symbol_summary(signals_df))
+    artifacts.save_predicted_signals_eventcentric_test(signals_df)
+    log("INFO", "TRAIN", f"saved {len(signals_df)} predicted signals to eventcentric test csv")
 
     log("INFO", "TRAIN", f"done. artifacts saved to {artifacts.get_path()}")
 
@@ -1045,7 +1286,7 @@ def run_tune(args, artifacts: RunArtifacts):
         if val_end:
             log("INFO", "TUNE", f"calibrating threshold on val window [{args.train_end}, {args.val_end})")
 
-            calibration_result = calibrate_threshold_on_val(
+            calibration_result_eventcentric = calibrate_threshold_on_val(
                 final_model,
                 features_df,
                 feature_columns,
@@ -1071,10 +1312,42 @@ def run_tune(args, artifacts: RunArtifacts):
                 label_lookahead_bars=label_lookahead_bars,
             )
 
-            best_threshold = calibration_result['threshold']
-            best_min_pending_bars = calibration_result['min_pending_bars']
-            best_drop_delta = calibration_result['drop_delta']
-            artifacts.save_calibration_sweep_val(calibration_result['calibration_sweep'])
+            artifacts.save_calibration_sweep_val_eventcentric(calibration_result_eventcentric['calibration_sweep'])
+            best_threshold = calibration_result_eventcentric['threshold']
+            best_min_pending_bars = calibration_result_eventcentric['min_pending_bars']
+            best_drop_delta = calibration_result_eventcentric['drop_delta']
+            artifacts.save_best_threshold(best_threshold, {
+                'signal_rule': actual_signal_rule,
+                'min_pending_bars': best_min_pending_bars,
+                'drop_delta': best_drop_delta,
+                'abstain_margin': args.abstain_margin
+            })
+
+            shadow_tokens = resolve_universe_tokens(features_df)
+            model_dir = str(artifacts.get_path())
+            calibration_result_shadow = calibrate_threshold_on_val_live_shadow(
+                model_dir=model_dir,
+                tokens=shadow_tokens,
+                clickhouse_dsn=args.clickhouse_dsn,
+                val_start=train_end,
+                val_end=val_end,
+                threshold_grid_from=args.threshold_grid_from,
+                threshold_grid_to=args.threshold_grid_to,
+                threshold_grid_step=args.threshold_grid_step,
+                abstain_margin=args.abstain_margin,
+                quality_density_mode=args.quality_density_mode,
+                quality_target_min_30d=args.quality_target_min_30d,
+                quality_target_max_30d=args.quality_target_max_30d,
+                quality_overflow_penalty=args.quality_overflow_penalty,
+                quality_entry_shift_bars=args.quality_entry_shift_bars,
+                workers=max(1, int(args.build_workers)),
+                out_probability_stream_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+            )
+            artifacts.save_calibration_sweep_val_live_shadow(calibration_result_shadow['calibration_sweep'])
+            artifacts.save_shadow_probability_stream(calibration_result_shadow['probability_stream'], 'val')
+            best_threshold = calibration_result_shadow['threshold']
+            best_min_pending_bars = calibration_result_shadow['min_pending_bars']
+            best_drop_delta = calibration_result_shadow['drop_delta']
 
             log("INFO", "TUNE",
                 f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
@@ -1138,7 +1411,7 @@ def run_tune(args, artifacts: RunArtifacts):
                     log("INFO", "TUNE",
                         f"MFE_32: median={mfe_stats.get('median', 0):.4f} pct_above_2pct={mfe_stats.get('pct_above_2pct', 0):.2f}")
 
-            artifacts.save_metrics(test_metrics, 'test')
+            artifacts.save_metrics(test_metrics, 'eventcentric_test')
             log("INFO", "TUNE",
                 f"test metrics: hit0={test_metrics['event_level']['hit0_rate']:.3f} early={test_metrics['event_level']['early_rate']:.3f} miss={test_metrics['event_level']['miss_rate']:.3f}")
 
@@ -1179,10 +1452,71 @@ def run_tune(args, artifacts: RunArtifacts):
             test_signals_df = format_predicted_signals(test_signals_df)
             if loader is not None and not test_signals_df.empty:
                 test_signals_df = enrich_with_trade_replay(test_signals_df, loader)
-            artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(test_signals_df))
-            artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(test_signals_df))
-            artifacts.save_predicted_signals(test_signals_df)
-            log("INFO", "TUNE", f"saved {len(test_signals_df)} predicted signals")
+            artifacts.save_eventcentric_window_summary_6h(build_holdout_window_summary_6h(test_signals_df))
+            artifacts.save_eventcentric_symbol_summary(build_holdout_symbol_summary(test_signals_df))
+            artifacts.save_predicted_signals_eventcentric_test(test_signals_df)
+            log("INFO", "TUNE", f"saved {len(test_signals_df)} eventcentric test predicted signals")
+
+            live_shadow_val_stream = export_probability_stream(
+                tokens=shadow_tokens,
+                ch_dsn=args.clickhouse_dsn,
+                model_dir=model_dir,
+                dt_from=train_end,
+                dt_to=val_end - timedelta(minutes=15),
+                workers=max(1, int(args.build_workers)),
+                out_parquet=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+            )
+            live_shadow_test_stream = export_probability_stream(
+                tokens=shadow_tokens,
+                ch_dsn=args.clickhouse_dsn,
+                model_dir=model_dir,
+                dt_from=val_end,
+                dt_to=test_end - timedelta(minutes=15),
+                workers=max(1, int(args.build_workers)),
+                out_parquet=str(artifacts.get_path() / "shadow_probability_stream_test.parquet"),
+            )
+            artifacts.save_shadow_probability_stream(live_shadow_test_stream, 'test')
+
+            live_shadow_val_signals = extract_signals_from_probability_stream(
+                probability_stream_df=live_shadow_val_stream,
+                threshold=best_threshold,
+                min_pending_bars=best_min_pending_bars,
+                drop_delta=best_drop_delta,
+                abstain_margin=args.abstain_margin,
+            )
+            live_shadow_test_signals = extract_signals_from_probability_stream(
+                probability_stream_df=live_shadow_test_stream,
+                threshold=best_threshold,
+                min_pending_bars=best_min_pending_bars,
+                drop_delta=best_drop_delta,
+                abstain_margin=args.abstain_margin,
+            )
+            live_shadow_val_signals = finalize_live_shadow_signals(
+                signals_df=live_shadow_val_signals,
+                loader=loader,
+                quality_entry_shift_bars=args.quality_entry_shift_bars,
+            )
+            live_shadow_test_signals = finalize_live_shadow_signals(
+                signals_df=live_shadow_test_signals,
+                loader=loader,
+                quality_entry_shift_bars=args.quality_entry_shift_bars,
+            )
+
+            val_live_shadow_metrics = {
+                "signal_count": int(len(live_shadow_val_signals)),
+                "signals_per_30d": float(30.0 * len(live_shadow_val_signals) / max(1.0, (val_end - train_end).total_seconds() / 86400.0)),
+            }
+            test_live_shadow_metrics = {
+                "signal_count": int(len(live_shadow_test_signals)),
+                "signals_per_30d": float(30.0 * len(live_shadow_test_signals) / max(1.0, (test_end - val_end).total_seconds() / 86400.0)),
+            }
+            artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
+            artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
+            artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
+            artifacts.save_predicted_signals_holdout_live_shadow(live_shadow_test_signals)
+            artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(live_shadow_test_signals))
+            artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(live_shadow_test_signals))
+            log("INFO", "TUNE", f"saved {len(live_shadow_test_signals)} live-shadow holdout predicted signals")
 
     if args.save_oos_signals:
         log("INFO", "TUNE", "collecting OOS verbose signals from walk-forward folds")
