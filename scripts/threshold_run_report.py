@@ -307,7 +307,18 @@ def summarize_cv(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
 
 def summarize_calibration(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
     best_threshold = load_json(first_existing(run_dir, ["best_threshold.json"])) or {}
-    sweep = load_table(first_existing(run_dir, ["calibration_sweep_val_live_shadow.csv", "calibration_sweep_val.csv", "threshold_sweep.csv"]))
+    shadow_sweep_path = first_existing(run_dir, ["calibration_sweep_val_live_shadow.csv"])
+    if shadow_sweep_path:
+        sweep = load_table(shadow_sweep_path)
+        ranking_col = "quality_score"
+        best_cols = ("quality_score", "signal_count", "signal_count_quality", "signals_per_30d_quality")
+    else:
+        sweep = load_table(first_existing(run_dir, ["calibration_sweep_val.csv", "threshold_sweep.csv"]))
+        ranking_col = "score"
+        best_cols = (
+            "score", "hit0_rate", "hit1_rate", "early_rate", "late_rate", "miss_rate", "fp_b_rate",
+            "avg_offset", "median_offset", "signal_count", "signals_total"
+        )
 
     out = {
         "threshold": best_threshold.get("threshold"),
@@ -315,16 +326,17 @@ def summarize_calibration(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
         "min_pending_bars": best_threshold.get("min_pending_bars"),
         "drop_delta": best_threshold.get("drop_delta"),
         "abstain_margin": best_threshold.get("abstain_margin"),
+        "calibration_mode": "live_shadow_quality" if shadow_sweep_path else "eventcentric",
     }
 
     if not sweep.empty:
         sw = sweep.copy()
-        if "score" in sw.columns:
-            sw["score"] = pd.to_numeric(sw["score"], errors="coerce")
-            best_idx = sw["score"].idxmax()
+        if ranking_col in sw.columns:
+            sw[ranking_col] = pd.to_numeric(sw[ranking_col], errors="coerce")
+            best_idx = sw[ranking_col].idxmax()
             if pd.notna(best_idx):
                 best_row = sw.loc[best_idx]
-                for col in ("score", "hit0_rate", "hit1_rate", "early_rate", "late_rate", "miss_rate", "fp_b_rate", "avg_offset", "median_offset", "signal_count", "signals_total"):
+                for col in best_cols:
                     if col in best_row:
                         out[f"best_{col}"] = best_row[col]
 
@@ -490,25 +502,162 @@ def summarize_signals_df(df: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame
     return out, monthly, worst_symbols, worst_6h
 
 
+def _augment_holdout_quality_from_signals(summary: dict[str, Any], signals: pd.DataFrame) -> dict[str, Any]:
+    if signals.empty:
+        return summary
+    out = dict(summary)
+    work = signals.copy()
+
+    def _num(col: str) -> pd.Series:
+        return pd.to_numeric(work[col], errors="coerce") if col in work.columns else pd.Series(dtype=float)
+
+    def _bool(col: str) -> pd.Series:
+        if col not in work.columns:
+            return pd.Series(dtype=bool)
+        s = work[col]
+        if s.dtype == bool:
+            return s.fillna(False)
+        return s.astype(str).str.lower().isin(["true", "1", "yes", "y"])
+
+    squeeze_h32 = _num("squeeze_pct_h32")
+    pullback_h32 = _num("pullback_pct_h32")
+    net_edge_h32 = _num("net_edge_pct_h32")
+    if out.get("squeeze_median_h32") is None and not squeeze_h32.empty and squeeze_h32.notna().any():
+        out["squeeze_median_h32"] = float(squeeze_h32.median())
+    if out.get("squeeze_p75_h32") is None and not squeeze_h32.empty and squeeze_h32.notna().any():
+        out["squeeze_p75_h32"] = float(squeeze_h32.quantile(0.75))
+    if out.get("pullback_median_h32") is None and not pullback_h32.empty and pullback_h32.notna().any():
+        out["pullback_median_h32"] = float(pullback_h32.median())
+    if out.get("pullback_p75_h32") is None and not pullback_h32.empty and pullback_h32.notna().any():
+        out["pullback_p75_h32"] = float(pullback_h32.quantile(0.75))
+    if out.get("net_edge_median_h32") is None and not net_edge_h32.empty and net_edge_h32.notna().any():
+        out["net_edge_median_h32"] = float(net_edge_h32.median())
+
+    clean_23 = _bool("clean_2_3_h32")
+    dirty_retrace_23 = _bool("dirty_retrace_2_3_h32")
+    clean_no_pullback_23 = _bool("clean_no_pullback_2_3_h32")
+    dirty_no_pullback_23 = _bool("dirty_no_pullback_2_3_h32")
+    pullback_before_squeeze_23 = _bool("pullback_before_squeeze_2_3_h32")
+    total = max(1, int(len(work)))
+
+    if out.get("clean_2_3_count_h32") is None and not clean_23.empty:
+        out["clean_2_3_count_h32"] = int(clean_23.sum())
+    if out.get("clean_2_3_share_h32") is None and not clean_23.empty:
+        out["clean_2_3_share_h32"] = float(clean_23.mean())
+    if out.get("dirty_retrace_2_3_count_h32") is None and not dirty_retrace_23.empty:
+        out["dirty_retrace_2_3_count_h32"] = int(dirty_retrace_23.sum())
+    if out.get("dirty_retrace_2_3_share_h32") is None and not dirty_retrace_23.empty:
+        out["dirty_retrace_2_3_share_h32"] = float(dirty_retrace_23.mean())
+    if out.get("clean_no_pullback_2_3_count_h32") is None and not clean_no_pullback_23.empty:
+        out["clean_no_pullback_2_3_count_h32"] = int(clean_no_pullback_23.sum())
+    if out.get("clean_no_pullback_2_3_share_h32") is None and not clean_no_pullback_23.empty:
+        out["clean_no_pullback_2_3_share_h32"] = float(clean_no_pullback_23.mean())
+    if out.get("dirty_no_pullback_2_3_count_h32") is None and not dirty_no_pullback_23.empty:
+        out["dirty_no_pullback_2_3_count_h32"] = int(dirty_no_pullback_23.sum())
+    if out.get("dirty_no_pullback_2_3_share_h32") is None and not dirty_no_pullback_23.empty:
+        out["dirty_no_pullback_2_3_share_h32"] = float(dirty_no_pullback_23.mean())
+    if out.get("pullback_before_squeeze_share_2_3_h32") is None and not pullback_before_squeeze_23.empty:
+        out["pullback_before_squeeze_share_2_3_h32"] = float(pullback_before_squeeze_23.mean())
+
+    clean_count = int(clean_23.sum()) if not clean_23.empty else 0
+    dirty_retrace_count = int(dirty_retrace_23.sum()) if not dirty_retrace_23.empty else 0
+    dirty_no_pullback_count = int(dirty_no_pullback_23.sum()) if not dirty_no_pullback_23.empty else 0
+    denom_precision = clean_count + dirty_retrace_count
+    denom_failure = dirty_retrace_count + dirty_no_pullback_count
+    if out.get("clean_retrace_precision_2_3_h32") is None and denom_precision > 0:
+        out["clean_retrace_precision_2_3_h32"] = float(clean_count / denom_precision)
+    if out.get("clean_to_dirty_failure_ratio_2_3_h32") is None and denom_failure > 0:
+        out["clean_to_dirty_failure_ratio_2_3_h32"] = float(clean_count / denom_failure)
+
+    prepull = _num("prepullback_squeeze_pct_h32_3")
+    if out.get("low_squeeze_conversion_2_3_h32") is None and not prepull.empty and prepull.notna().any() and not clean_23.empty:
+        low_mask = prepull <= 0.02
+        if low_mask.any():
+            out["low_squeeze_conversion_2_3_h32"] = float(clean_23[low_mask].mean())
+
+    mfe = _num("mfe_pct")
+    mae = _num("mae_pct")
+    if out.get("mfe_short_32_median") is None and not mfe.empty and mfe.notna().any():
+        out["mfe_short_32_median"] = float(mfe.median())
+    if out.get("mfe_short_32_pct_above_2pct") is None and not mfe.empty and mfe.notna().any():
+        out["mfe_short_32_pct_above_2pct"] = float((mfe >= 2.0).mean())
+    if out.get("mae_short_32_median") is None and not mae.empty and mae.notna().any():
+        out["mae_short_32_median"] = float(mae.median())
+
+    if out.get("trade_quality_score") is None:
+        clean_share = out.get("clean_2_3_share_h32")
+        clean_precision = out.get("clean_retrace_precision_2_3_h32")
+        pullback_before = out.get("pullback_before_squeeze_share_2_3_h32")
+        net_edge_median = out.get("net_edge_median_h32")
+        pullback_median = out.get("pullback_median_h32")
+        squeeze_p75 = out.get("squeeze_p75_h32")
+        dirty_no_pullback_share = out.get("dirty_no_pullback_2_3_share_h32")
+        signals_per_30d = out.get("signals_per_30d")
+        required = [
+            clean_share,
+            clean_precision,
+            pullback_before,
+            net_edge_median,
+            pullback_median,
+            squeeze_p75,
+            dirty_no_pullback_share,
+            signals_per_30d,
+        ]
+        if all(v is not None and not pd.isna(v) for v in required):
+            density_reward = 0.01 * min(float(signals_per_30d), 120.0)
+            density_under_penalty = 0.18 * max(0.0, 35.0 - float(signals_per_30d))
+            density_over_penalty = 0.08 * max(0.0, float(signals_per_30d) - 75.0)
+            out["trade_quality_score"] = (
+                5.0 * float(clean_share)
+                + 3.0 * float(clean_precision)
+                + 2.0 * float(pullback_before)
+                + 20.0 * float(net_edge_median)
+                + 8.0 * float(pullback_median)
+                - 18.0 * float(squeeze_p75)
+                - 5.0 * float(dirty_no_pullback_share)
+                + density_reward
+                - density_under_penalty
+                - density_over_penalty
+            )
+
+    return out
+
+
 def summarize_holdout(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     metrics_flat = summarize_metrics_json(run_dir, "holdout_live_shadow")
-    if not metrics_flat:
-        metrics_flat = summarize_metrics_json(run_dir, "test")
     signals = load_table(first_existing(run_dir, ["predicted_signals_holdout.csv", "predicted_signals_holdout.parquet"]))
     signal_summary, monthly, worst_symbols, worst_6h = summarize_signals_df(signals)
 
     merged = metrics_flat.copy()
-    for k, v in signal_summary.items():
-        merged.setdefault(k, v)
+    canonical_keys = {
+        "signals",
+        "signals_per_30d",
+        "symbols",
+        "tp",
+        "sl",
+        "timeout",
+        "ambiguous",
+        "tp_rate_resolved",
+        "sl_rate_resolved",
+        "pnl_sum",
+        "expectancy_all",
+        "expectancy_resolved",
+        "profit_factor",
+        "max_losing_streak",
+        "worst_6h_pnl",
+        "worst_24h_pnl",
+    }
+    for k in canonical_keys:
+        if k in signal_summary:
+            merged[k] = signal_summary[k]
+    merged = _augment_holdout_quality_from_signals(merged, signals)
 
     return merged, signals, monthly, worst_symbols, worst_6h
 
 
 def summarize_eventcentric(run_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
     metrics_flat = summarize_metrics_json(run_dir, "eventcentric_test")
-    if not metrics_flat:
-        metrics_flat = summarize_metrics_json(run_dir, "test")
-    signals = load_table(first_existing(run_dir, ["predicted_signals_eventcentric_test.csv", "predicted_signals_holdout.csv"]))
+    signals = load_table(first_existing(run_dir, ["predicted_signals_eventcentric_test.csv"]))
     signal_summary, _monthly, _worst_symbols, _worst_6h = summarize_signals_df(signals)
     merged = metrics_flat.copy()
     for k, v in signal_summary.items():
@@ -788,33 +937,56 @@ def build_report(run_dir: Path) -> str:
 
     lines.append("## Val calibration")
     lines.append("")
+    is_live_shadow_calibration = calibration_summary.get("calibration_mode") == "live_shadow_quality"
+    calib_title = "live-shadow quality calibration" if is_live_shadow_calibration else "event-centric calibration"
+    lines.append(f"Mode: {calib_title}.")
+    lines.append("")
     calib_rows = [
         ["threshold", fmt(calibration_summary.get("threshold"))],
         ["signal_rule", fmt(calibration_summary.get("signal_rule"))],
         ["min_pending_bars", fmt(calibration_summary.get("min_pending_bars"))],
         ["drop_delta", fmt(calibration_summary.get("drop_delta"))],
         ["abstain_margin", fmt(calibration_summary.get("abstain_margin"))],
-        ["best_score", fmt(calibration_summary.get("best_score"))],
-        ["best_hit0_rate", fmt_pct(calibration_summary.get("best_hit0_rate"))],
-        ["best_hit1_rate", fmt_pct(calibration_summary.get("best_hit1_rate"))],
-        ["best_early_rate", fmt_pct(calibration_summary.get("best_early_rate"))],
-        ["best_late_rate", fmt_pct(calibration_summary.get("best_late_rate"))],
-        ["best_miss_rate", fmt_pct(calibration_summary.get("best_miss_rate"))],
-        ["best_fp_b_rate", fmt_pct(calibration_summary.get("best_fp_b_rate"))],
-        ["best_median_offset", fmt(calibration_summary.get("best_median_offset"))],
-        ["best_signal_count", fmt(calibration_summary.get("best_signal_count") or calibration_summary.get("best_signals_total"))],
     ]
+    if is_live_shadow_calibration:
+        calib_rows.extend([
+            ["best_quality_score", fmt(calibration_summary.get("best_quality_score"))],
+            ["best_signal_count", fmt(calibration_summary.get("best_signal_count"))],
+            ["best_signal_count_quality", fmt(calibration_summary.get("best_signal_count_quality"))],
+            ["best_signals_per_30d_quality", fmt(calibration_summary.get("best_signals_per_30d_quality"))],
+        ])
+    else:
+        calib_rows.extend([
+            ["best_score", fmt(calibration_summary.get("best_score"))],
+            ["best_hit0_rate", fmt_pct(calibration_summary.get("best_hit0_rate"))],
+            ["best_hit1_rate", fmt_pct(calibration_summary.get("best_hit1_rate"))],
+            ["best_early_rate", fmt_pct(calibration_summary.get("best_early_rate"))],
+            ["best_late_rate", fmt_pct(calibration_summary.get("best_late_rate"))],
+            ["best_miss_rate", fmt_pct(calibration_summary.get("best_miss_rate"))],
+            ["best_fp_b_rate", fmt_pct(calibration_summary.get("best_fp_b_rate"))],
+            ["best_median_offset", fmt(calibration_summary.get("best_median_offset"))],
+            ["best_signal_count", fmt(calibration_summary.get("best_signal_count") or calibration_summary.get("best_signals_total"))],
+        ])
     lines.append(md_table(["Metric", "Value"], calib_rows))
     lines.append("")
 
     if not sweep_df.empty:
         sw = sweep_df.copy()
-        if "score" in sw.columns:
+        if is_live_shadow_calibration and "quality_score" in sw.columns:
+            sw = sw.sort_values("quality_score", ascending=False)
+        elif "score" in sw.columns:
             sw = sw.sort_values("score", ascending=False)
-        top_cols = [c for c in [
-            "threshold", "min_pending_bars", "drop_delta", "score", "hit0_rate", "hit1_rate",
-            "early_rate", "late_rate", "miss_rate", "fp_b_rate", "avg_offset", "median_offset", "signal_count", "signals_total"
-        ] if c in sw.columns]
+        if is_live_shadow_calibration:
+            top_cols = [c for c in [
+                "threshold", "min_pending_bars", "drop_delta", "quality_score",
+                "signal_count", "signal_count_quality", "signals_per_30d_quality"
+            ] if c in sw.columns]
+        else:
+            top_cols = [c for c in [
+                "threshold", "min_pending_bars", "drop_delta", "score", "hit0_rate", "hit1_rate",
+                "early_rate", "late_rate", "miss_rate", "fp_b_rate", "avg_offset", "median_offset", "signal_count",
+                "signals_total"
+            ] if c in sw.columns]
         if top_cols:
             rows: list[list[Any]] = []
             for _, row in sw[top_cols].head(10).iterrows():

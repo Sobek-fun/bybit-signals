@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -109,6 +110,7 @@ def _process_symbol_chunk(
         dt_from: datetime,
         dt_to: datetime
 ) -> tuple:
+    worker_t0 = time.perf_counter()
     loader = DataLoader(ch_dsn)
     model = PumpEndModel(model_dir)
     feature_builder = PumpFeatureBuilder(
@@ -130,10 +132,13 @@ def _process_symbol_chunk(
     errors = 0
 
     warmup_start = dt_from - timedelta(minutes=WARMUP_BARS * 15)
+    log("INFO", f"EXPORT_WORKER{worker_id}",
+        f"start symbols={len(symbols_chunk)} from={dt_from} to={dt_to} warmup_start={warmup_start}")
 
     for symbol in symbols_chunk:
+        symbol_t0 = time.perf_counter()
         try:
-            result = _process_single_symbol(
+            result, diag = _process_single_symbol(
                 symbol=symbol,
                 loader=loader,
                 model=model,
@@ -145,6 +150,10 @@ def _process_symbol_chunk(
 
             if result is None:
                 symbols_skipped += 1
+                log("INFO", f"EXPORT_WORKER{worker_id}",
+                    f"symbol={symbol} stage=skip "
+                    f"candles={diag.get('candles_rows', 0)} valid_decisions={diag.get('decision_valid', 0)} "
+                    f"sec_total={diag.get('total_sec', 0.0):.2f} sec_symbol={time.perf_counter() - symbol_t0:.2f}")
                 continue
 
             for sig_time in result:
@@ -153,6 +162,16 @@ def _process_symbol_chunk(
                 total_signals += 1
 
             symbols_processed += 1
+            log("INFO", f"EXPORT_WORKER{worker_id}",
+                f"symbol={symbol} stage=done "
+                f"candles={diag.get('candles_rows', 0)} btc_candles={diag.get('btc_rows', 0)} "
+                f"decision_total={diag.get('decision_total', 0)} decision_valid={diag.get('decision_valid', 0)} "
+                f"feature_rows={diag.get('feature_rows', 0)} stream_rows={diag.get('stream_rows', 0)} "
+                f"signals={len(result)} "
+                f"sec_load={diag.get('sec_load', 0.0):.2f} sec_validate={diag.get('sec_validate', 0.0):.2f} "
+                f"sec_features={diag.get('sec_features', 0.0):.2f} sec_infer={diag.get('sec_infer', 0.0):.2f} "
+                f"sec_replay={diag.get('sec_replay', 0.0):.2f} sec_total={diag.get('total_sec', 0.0):.2f} "
+                f"sec_symbol={time.perf_counter() - symbol_t0:.2f}")
 
         except Exception as e:
             errors += 1
@@ -160,6 +179,9 @@ def _process_symbol_chunk(
                 log("WARN", f"EXPORT_WORKER{worker_id}", f"symbol={symbol} error={type(e).__name__}: {str(e)}")
 
     csv_file.close()
+    log("INFO", f"EXPORT_WORKER{worker_id}",
+        f"finish processed={symbols_processed} skipped={symbols_skipped} signals={total_signals} "
+        f"errors={errors} sec_total={time.perf_counter() - worker_t0:.2f}")
 
     return worker_id, symbols_processed, symbols_skipped, total_signals, errors, csv_filename
 
@@ -172,8 +194,8 @@ def _process_single_symbol(
         warmup_start: datetime,
         dt_from: datetime,
         dt_to: datetime
-) -> list:
-    stream_df = _predict_symbol_stream(
+) -> tuple[list | None, dict]:
+    stream_df, diag = _predict_symbol_stream(
         symbol=symbol,
         loader=loader,
         model=model,
@@ -183,8 +205,9 @@ def _process_single_symbol(
         dt_to=dt_to,
     )
     if stream_df is None or stream_df.empty:
-        return None
+        return None, diag
 
+    replay_t0 = time.perf_counter()
     signal_state = PumpEndSignalState()
     triggered_signals = []
 
@@ -201,7 +224,9 @@ def _process_single_symbol(
         if triggered and dt_from <= row.open_time <= dt_to:
             triggered_signals.append(row.open_time)
 
-    return triggered_signals
+    diag["sec_replay"] = time.perf_counter() - replay_t0
+    diag["total_sec"] = diag.get("total_sec", 0.0) + diag["sec_replay"]
+    return triggered_signals, diag
 
 
 def _predict_symbol_stream(
@@ -212,20 +237,40 @@ def _predict_symbol_stream(
         warmup_start: datetime,
         dt_from: datetime,
         dt_to: datetime
-) -> pd.DataFrame | None:
+) -> tuple[pd.DataFrame | None, dict]:
+    t0 = time.perf_counter()
     query_start_bucket = warmup_start - timedelta(minutes=15) - timedelta(minutes=(MIN_CANDLES - 1) * 15)
     end_bucket = dt_to - timedelta(minutes=15)
-
+    diag = {
+        "candles_rows": 0,
+        "btc_rows": 0,
+        "decision_total": 0,
+        "decision_valid": 0,
+        "feature_rows": 0,
+        "stream_rows": 0,
+        "sec_load": 0.0,
+        "sec_validate": 0.0,
+        "sec_features": 0.0,
+        "sec_infer": 0.0,
+        "sec_replay": 0.0,
+        "total_sec": 0.0,
+    }
+    load_t0 = time.perf_counter()
     df = loader.load_candles_range(symbol, query_start_bucket, end_bucket + timedelta(minutes=15))
+    diag["sec_load"] = time.perf_counter() - load_t0
+    diag["candles_rows"] = int(len(df))
 
     if df.empty:
-        return None
+        diag["total_sec"] = time.perf_counter() - t0
+        return None, diag
 
+    validate_t0 = time.perf_counter()
     all_decision_times = pd.date_range(
         start=warmup_start,
         end=dt_to,
         freq='15min'
     ).tolist()
+    diag["decision_total"] = int(len(all_decision_times))
 
     valid_decision_times = []
     for dt in all_decision_times:
@@ -248,19 +293,28 @@ def _predict_symbol_stream(
         if len(actual_range) == MIN_CANDLES and len(expected_range) == MIN_CANDLES:
             if (actual_range == expected_range).all():
                 valid_decision_times.append(dt)
+    diag["sec_validate"] = time.perf_counter() - validate_t0
+    diag["decision_valid"] = int(len(valid_decision_times))
 
     if not valid_decision_times:
-        return None
+        diag["total_sec"] = time.perf_counter() - t0
+        return None, diag
 
     btc_df = None
     if model.market_symbol and symbol != model.market_symbol:
         btc_df = loader.load_candles_range(model.market_symbol, query_start_bucket, end_bucket + timedelta(minutes=15))
+        diag["btc_rows"] = int(len(btc_df))
 
+    feat_t0 = time.perf_counter()
     feature_rows = feature_builder.build_many_for_inference(df, symbol, valid_decision_times, btc_candles=btc_df)
+    diag["sec_features"] = time.perf_counter() - feat_t0
+    diag["feature_rows"] = int(len(feature_rows)) if feature_rows else 0
 
     if not feature_rows:
-        return None
+        diag["total_sec"] = time.perf_counter() - t0
+        return None, diag
 
+    infer_t0 = time.perf_counter()
     feature_values_list = []
     for row in feature_rows:
         fv = []
@@ -272,15 +326,17 @@ def _predict_symbol_stream(
     probas = model.model.predict_proba(feature_values_list)[:, 1]
     rows = []
     for i, dt in enumerate(valid_decision_times):
-        if dt_from <= dt <= dt_to:
-            rows.append({
-                "symbol": symbol,
-                "open_time": dt,
-                "p_end": float(probas[i]),
-            })
+        rows.append({
+            "symbol": symbol,
+            "open_time": dt,
+            "p_end": float(probas[i]),
+        })
+    diag["sec_infer"] = time.perf_counter() - infer_t0
+    diag["stream_rows"] = int(len(rows))
+    diag["total_sec"] = time.perf_counter() - t0
     if not rows:
-        return pd.DataFrame(columns=["symbol", "open_time", "p_end"])
-    return pd.DataFrame(rows)
+        return pd.DataFrame(columns=["symbol", "open_time", "p_end"]), diag
+    return pd.DataFrame(rows), diag
 
 
 def _process_symbol_chunk_probability_stream(
@@ -291,6 +347,7 @@ def _process_symbol_chunk_probability_stream(
         dt_from: datetime,
         dt_to: datetime
 ) -> tuple:
+    worker_t0 = time.perf_counter()
     loader = DataLoader(ch_dsn)
     model = PumpEndModel(model_dir)
     feature_builder = PumpFeatureBuilder(
@@ -309,9 +366,12 @@ def _process_symbol_chunk_probability_stream(
     symbols_skipped = 0
     errors = 0
     warmup_start = dt_from - timedelta(minutes=WARMUP_BARS * 15)
+    log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+        f"start symbols={len(symbols_chunk)} from={dt_from} to={dt_to} warmup_start={warmup_start}")
     for symbol in symbols_chunk:
+        symbol_t0 = time.perf_counter()
         try:
-            stream_df = _predict_symbol_stream(
+            stream_df, diag = _predict_symbol_stream(
                 symbol=symbol,
                 loader=loader,
                 model=model,
@@ -322,17 +382,32 @@ def _process_symbol_chunk_probability_stream(
             )
             if stream_df is None or stream_df.empty:
                 symbols_skipped += 1
+                log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+                    f"symbol={symbol} stage=skip "
+                    f"candles={diag.get('candles_rows', 0)} valid_decisions={diag.get('decision_valid', 0)} "
+                    f"sec_total={diag.get('total_sec', 0.0):.2f} sec_symbol={time.perf_counter() - symbol_t0:.2f}")
                 continue
             for row in stream_df.itertuples(index=False):
                 csv_writer.writerow(
                     [row.symbol, row.open_time.strftime("%Y-%m-%d %H:%M:%S"), f"{float(row.p_end):.12f}"])
                 total_rows += 1
             symbols_processed += 1
+            log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+                f"symbol={symbol} stage=done "
+                f"candles={diag.get('candles_rows', 0)} btc_candles={diag.get('btc_rows', 0)} "
+                f"decision_total={diag.get('decision_total', 0)} decision_valid={diag.get('decision_valid', 0)} "
+                f"feature_rows={diag.get('feature_rows', 0)} stream_rows={diag.get('stream_rows', 0)} "
+                f"sec_load={diag.get('sec_load', 0.0):.2f} sec_validate={diag.get('sec_validate', 0.0):.2f} "
+                f"sec_features={diag.get('sec_features', 0.0):.2f} sec_infer={diag.get('sec_infer', 0.0):.2f} "
+                f"sec_total={diag.get('total_sec', 0.0):.2f} sec_symbol={time.perf_counter() - symbol_t0:.2f}")
         except Exception as e:
             errors += 1
             if errors <= 3:
                 log("WARN", f"EXPORT_STREAM_WORKER{worker_id}", f"symbol={symbol} error={type(e).__name__}: {str(e)}")
     csv_file.close()
+    log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+        f"finish processed={symbols_processed} skipped={symbols_skipped} rows={total_rows} "
+        f"errors={errors} sec_total={time.perf_counter() - worker_t0:.2f}")
     return worker_id, symbols_processed, symbols_skipped, total_rows, errors, csv_filename
 
 
