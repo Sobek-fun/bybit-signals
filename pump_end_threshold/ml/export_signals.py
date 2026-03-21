@@ -236,7 +236,9 @@ def _predict_symbol_stream(
         feature_builder: PumpFeatureBuilder,
         warmup_start: datetime,
         dt_from: datetime,
-        dt_to: datetime
+        dt_to: datetime,
+        btc_candles_prepared: pd.DataFrame | None = None,
+        stream_fast_mode: bool = False,
 ) -> tuple[pd.DataFrame | None, dict]:
     t0 = time.perf_counter()
     query_start_bucket = warmup_start - timedelta(minutes=15) - timedelta(minutes=(MIN_CANDLES - 1) * 15)
@@ -302,11 +304,21 @@ def _predict_symbol_stream(
 
     btc_df = None
     if model.market_symbol and symbol != model.market_symbol:
-        btc_df = loader.load_candles_range(model.market_symbol, query_start_bucket, end_bucket + timedelta(minutes=15))
-        diag["btc_rows"] = int(len(btc_df))
+        if btc_candles_prepared is not None and not btc_candles_prepared.empty:
+            btc_df = btc_candles_prepared
+            diag["btc_rows"] = int(len(btc_df))
+        else:
+            btc_df = loader.load_candles_range(model.market_symbol, query_start_bucket, end_bucket + timedelta(minutes=15))
+            diag["btc_rows"] = int(len(btc_df))
 
     feat_t0 = time.perf_counter()
-    feature_rows = feature_builder.build_many_for_inference(df, symbol, valid_decision_times, btc_candles=btc_df)
+    feature_rows = feature_builder.build_many_for_inference(
+        df,
+        symbol,
+        valid_decision_times,
+        btc_candles=btc_df,
+        disable_heavy_liquidity=bool(stream_fast_mode),
+    )
     diag["sec_features"] = time.perf_counter() - feat_t0
     diag["feature_rows"] = int(len(feature_rows)) if feature_rows else 0
 
@@ -345,7 +357,8 @@ def _process_symbol_chunk_probability_stream(
         ch_dsn: str,
         model_dir: str,
         dt_from: datetime,
-        dt_to: datetime
+        dt_to: datetime,
+        stream_fast_mode: bool = False,
 ) -> tuple:
     worker_t0 = time.perf_counter()
     loader = DataLoader(ch_dsn)
@@ -366,6 +379,27 @@ def _process_symbol_chunk_probability_stream(
     symbols_skipped = 0
     errors = 0
     warmup_start = dt_from - timedelta(minutes=WARMUP_BARS * 15)
+    btc_prepared = None
+    if model.market_symbol:
+        query_start_bucket = warmup_start - timedelta(minutes=15) - timedelta(minutes=(MIN_CANDLES - 1) * 15)
+        end_bucket = dt_to - timedelta(minutes=15)
+        btc_raw = loader.load_candles_range(model.market_symbol, query_start_bucket, end_bucket + timedelta(minutes=15))
+        if not btc_raw.empty:
+            btc_prepared = btc_raw.copy()
+            btc_prepared['btc_ret_1'] = btc_prepared['close'] / btc_prepared['close'].shift(1) - 1
+            w = min(model.window_bars, 16)
+            btc_prepared[f'btc_cum_ret_{w}'] = btc_prepared['close'] / btc_prepared['close'].shift(w) - 1
+            tr = pd.concat([
+                btc_prepared['high'] - btc_prepared['low'],
+                (btc_prepared['high'] - btc_prepared['close'].shift(1)).abs(),
+                (btc_prepared['low'] - btc_prepared['close'].shift(1)).abs()
+            ], axis=1).max(axis=1)
+            btc_prepared['btc_atr_norm'] = tr.rolling(window=14).mean() / btc_prepared['close']
+            rolling_max = btc_prepared['close'].rolling(window=model.window_bars).max()
+            btc_prepared['btc_drawdown'] = (btc_prepared['close'] - rolling_max) / rolling_max
+            sma_20 = btc_prepared['close'].rolling(window=20).mean()
+            std_20 = btc_prepared['close'].rolling(window=20).std()
+            btc_prepared['btc_bb_width'] = std_20 / sma_20
     log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
         f"start symbols={len(symbols_chunk)} from={dt_from} to={dt_to} warmup_start={warmup_start}")
     for symbol in symbols_chunk:
@@ -379,6 +413,8 @@ def _process_symbol_chunk_probability_stream(
                 warmup_start=warmup_start,
                 dt_from=dt_from,
                 dt_to=dt_to,
+                btc_candles_prepared=btc_prepared,
+                stream_fast_mode=stream_fast_mode,
             )
             if stream_df is None or stream_df.empty:
                 symbols_skipped += 1
@@ -418,7 +454,8 @@ def export_probability_stream(
         dt_from: datetime,
         dt_to: datetime,
         workers: int,
-        out_parquet: str | None = None
+        out_parquet: str | None = None,
+        stream_fast_mode: bool = False,
 ) -> pd.DataFrame:
     dt_from = _align_to_15min(dt_from)
     dt_to = _align_to_15min(dt_to)
@@ -447,7 +484,8 @@ def export_probability_stream(
                 ch_dsn,
                 model_dir,
                 dt_from,
-                dt_to
+                dt_to,
+                stream_fast_mode
             ): i + 1
             for i in range(num_workers)
         }
