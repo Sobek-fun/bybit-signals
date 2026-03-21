@@ -54,6 +54,17 @@ def resolve_label_lookahead_bars(args) -> int:
     return max(0, int(max(pullback, squeeze)))
 
 
+def parse_shadow_final_splits(value: str) -> set[str]:
+    allowed = {"val", "test"}
+    parts = [x.strip().lower() for x in str(value).split(",") if x.strip()]
+    if not parts:
+        return {"val", "test"}
+    unknown = [x for x in parts if x not in allowed]
+    if unknown:
+        raise ValueError(f"unknown shadow final split(s): {unknown}")
+    return set(parts)
+
+
 def validate_features_parquet(features_df: pd.DataFrame, points_df: pd.DataFrame) -> pd.DataFrame:
     required_cols = {'event_id', 'offset', 'y'}
     missing_cols = required_cols - set(features_df.columns)
@@ -585,6 +596,7 @@ def calibrate_threshold_on_val_live_shadow(
         quality_entry_shift_bars: int,
         label_lookahead_bars: int,
         workers: int,
+        stream_fast_mode: bool = False,
         out_probability_stream_path: str | None = None,
 ) -> dict:
     probability_stream_df = export_probability_stream(
@@ -594,6 +606,7 @@ def calibrate_threshold_on_val_live_shadow(
         dt_from=val_start,
         dt_to=val_end - timedelta(minutes=15),
         workers=workers,
+        stream_fast_mode=stream_fast_mode,
         out_parquet=out_probability_stream_path,
     )
     if probability_stream_df.empty:
@@ -617,6 +630,7 @@ def calibrate_threshold_on_val_live_shadow(
     best_mpb = 1
     best_dd = 0.0
     rows = []
+    candidate_payloads = []
     for rule in rule_grid:
         mpb = int(rule['min_pending_bars'])
         dd = float(rule['drop_delta'])
@@ -631,36 +645,85 @@ def calibrate_threshold_on_val_live_shadow(
                 eval_end=val_end,
             )
             signals_df = signals_df[signals_df['open_time'] < quality_signal_cutoff].copy() if not signals_df.empty else signals_df
-            score, signal_count, metrics_df = compute_shadow_quality_score(
-                signals_df=signals_df,
-                loader=loader,
-                window_start=val_start,
-                window_end=val_end,
-                quality_entry_shift_bars=quality_entry_shift_bars,
-                quality_density_mode=quality_density_mode,
-                quality_target_min_30d=quality_target_min_30d,
-                quality_target_max_30d=quality_target_max_30d,
-                quality_overflow_penalty=quality_overflow_penalty,
-            )
             row = {
                 'threshold': float(thr),
                 'min_pending_bars': mpb,
                 'drop_delta': dd,
-                'signal_count': signal_count,
-                'quality_score': score,
+                'signal_count': int(len(signals_df)),
+                'quality_score': -float('inf'),
             }
-            if not metrics_df.empty:
-                row.update(metrics_df.iloc[0].to_dict())
             rows.append(row)
-            if score > best_score:
-                best_score = score
-                best_threshold = float(thr)
-                best_mpb = mpb
-                best_dd = dd
+            if signals_df.empty:
+                continue
+            if loader is None:
+                score, _signal_count, metrics_df = compute_shadow_quality_score(
+                    signals_df=signals_df,
+                    loader=None,
+                    window_start=val_start,
+                    window_end=val_end,
+                    quality_entry_shift_bars=quality_entry_shift_bars,
+                    quality_density_mode=quality_density_mode,
+                    quality_target_min_30d=quality_target_min_30d,
+                    quality_target_max_30d=quality_target_max_30d,
+                    quality_overflow_penalty=quality_overflow_penalty,
+                )
+                rows[-1]['quality_score'] = score
+                if not metrics_df.empty:
+                    rows[-1].update(metrics_df.iloc[0].to_dict())
+            else:
+                candidate_payloads.append({
+                    'row_idx': len(rows) - 1,
+                    'signals_df': signals_df,
+                })
+    if loader is not None and candidate_payloads:
+        combined_frames = []
+        for payload in candidate_payloads:
+            candidate_df = payload['signals_df'].copy()
+            if candidate_df.empty:
+                continue
+            candidate_df['__signal_key'] = candidate_df[['symbol', 'open_time']].astype(str).agg('|'.join, axis=1)
+            combined_frames.append(candidate_df)
+        if combined_frames:
+            combined_signals = pd.concat(combined_frames, ignore_index=True).drop_duplicates('__signal_key')
+            combined_quality = attach_signal_quality_columns(
+                combined_signals.drop(columns=['__signal_key'], errors='ignore'),
+                loader,
+                horizons=[32],
+                entry_shift_bars=quality_entry_shift_bars,
+            )
+            combined_quality['__signal_key'] = combined_quality[['symbol', 'open_time']].astype(str).agg('|'.join, axis=1)
+            combined_quality = combined_quality.drop_duplicates('__signal_key')
+            for payload in candidate_payloads:
+                row_idx = int(payload['row_idx'])
+                candidate_df = payload['signals_df'].copy()
+                if candidate_df.empty:
+                    continue
+                candidate_df['__signal_key'] = candidate_df[['symbol', 'open_time']].astype(str).agg('|'.join, axis=1)
+                candidate_quality = combined_quality[combined_quality['__signal_key'].isin(set(candidate_df['__signal_key']))]
+                candidate_quality = candidate_quality.drop(columns=['__signal_key'], errors='ignore').copy()
+                score, _signal_count, metrics_df = compute_shadow_quality_score(
+                    signals_df=candidate_quality,
+                    loader=None,
+                    window_start=val_start,
+                    window_end=val_end,
+                    quality_entry_shift_bars=quality_entry_shift_bars,
+                    quality_density_mode=quality_density_mode,
+                    quality_target_min_30d=quality_target_min_30d,
+                    quality_target_max_30d=quality_target_max_30d,
+                    quality_overflow_penalty=quality_overflow_penalty,
+                )
+                rows[row_idx]['quality_score'] = score
+                if not metrics_df.empty:
+                    rows[row_idx].update(metrics_df.iloc[0].to_dict())
     sweep_df = pd.DataFrame(rows)
     if not sweep_df.empty:
         sweep_df = sweep_df.sort_values(['quality_score', 'signal_count'], ascending=[False, False]).reset_index(
             drop=True)
+        best_row = sweep_df.iloc[0]
+        best_score = float(best_row.get('quality_score', -float('inf')))
+        best_threshold = float(best_row.get('threshold', best_threshold))
+        best_mpb = int(best_row.get('min_pending_bars', best_mpb))
+        best_dd = float(best_row.get('drop_delta', best_dd))
     return {
         'threshold': best_threshold,
         'min_pending_bars': best_mpb,
@@ -1366,6 +1429,7 @@ def run_tune(args, artifacts: RunArtifacts):
     )
     artifacts.save_dataset_manifest(dataset_manifest)
     label_lookahead_bars = resolve_label_lookahead_bars(args)
+    shadow_final_splits = parse_shadow_final_splits(args.shadow_final_splits)
 
     if train_end:
         cv_features_df = filter_features_by_event_time(features_df, train_end)
@@ -1483,40 +1547,41 @@ def run_tune(args, artifacts: RunArtifacts):
 
             shadow_tokens = resolve_universe_tokens(features_df)
             model_dir = str(artifacts.get_path())
-            calibration_result_shadow = calibrate_threshold_on_val_live_shadow(
-                model_dir=model_dir,
-                tokens=shadow_tokens,
-                clickhouse_dsn=args.clickhouse_dsn,
-                val_start=train_end,
-                val_end=val_end,
-                threshold_grid_from=args.threshold_grid_from,
-                threshold_grid_to=args.threshold_grid_to,
-                threshold_grid_step=args.threshold_grid_step,
-                abstain_margin=args.abstain_margin,
-                quality_density_mode=args.quality_density_mode,
-                quality_target_min_30d=args.quality_target_min_30d,
-                quality_target_max_30d=args.quality_target_max_30d,
-                quality_overflow_penalty=args.quality_overflow_penalty,
-                quality_entry_shift_bars=args.quality_entry_shift_bars,
-                label_lookahead_bars=label_lookahead_bars,
-                workers=max(1, int(args.build_workers)),
-                out_probability_stream_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
-            )
-            artifacts.save_calibration_sweep_val_live_shadow(calibration_result_shadow['calibration_sweep'])
-            artifacts.save_shadow_probability_stream(calibration_result_shadow['probability_stream'], 'val')
-            best_threshold = calibration_result_shadow['threshold']
-            best_min_pending_bars = calibration_result_shadow['min_pending_bars']
-            best_drop_delta = calibration_result_shadow['drop_delta']
-
+            calibration_result_shadow = None
+            if not args.skip_shadow_val_calibration:
+                calibration_result_shadow = calibrate_threshold_on_val_live_shadow(
+                    model_dir=model_dir,
+                    tokens=shadow_tokens,
+                    clickhouse_dsn=args.clickhouse_dsn,
+                    val_start=train_end,
+                    val_end=val_end,
+                    threshold_grid_from=args.threshold_grid_from,
+                    threshold_grid_to=args.threshold_grid_to,
+                    threshold_grid_step=args.threshold_grid_step,
+                    abstain_margin=args.abstain_margin,
+                    quality_density_mode=args.quality_density_mode,
+                    quality_target_min_30d=args.quality_target_min_30d,
+                    quality_target_max_30d=args.quality_target_max_30d,
+                    quality_overflow_penalty=args.quality_overflow_penalty,
+                    quality_entry_shift_bars=args.quality_entry_shift_bars,
+                    label_lookahead_bars=label_lookahead_bars,
+                    workers=max(1, int(args.build_workers)),
+                    stream_fast_mode=False,
+                    out_probability_stream_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+                )
+                artifacts.save_calibration_sweep_val_live_shadow(calibration_result_shadow['calibration_sweep'])
+                artifacts.save_shadow_probability_stream(calibration_result_shadow['probability_stream'], 'val')
+                best_threshold = calibration_result_shadow['threshold']
+                best_min_pending_bars = calibration_result_shadow['min_pending_bars']
+                best_drop_delta = calibration_result_shadow['drop_delta']
+                artifacts.save_best_threshold(best_threshold, {
+                    'signal_rule': actual_signal_rule,
+                    'min_pending_bars': best_min_pending_bars,
+                    'drop_delta': best_drop_delta,
+                    'abstain_margin': args.abstain_margin
+                })
             log("INFO", "TUNE",
                 f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
-
-            artifacts.save_best_threshold(best_threshold, {
-                'signal_rule': actual_signal_rule,
-                'min_pending_bars': best_min_pending_bars,
-                'drop_delta': best_drop_delta,
-                'abstain_margin': args.abstain_margin
-            })
 
             features_df = time_split(features_df, train_end, val_end)
 
@@ -1616,15 +1681,22 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_predicted_signals_eventcentric_test(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} eventcentric test predicted signals")
 
-            live_shadow_val_stream = export_probability_stream(
-                tokens=shadow_tokens,
-                ch_dsn=args.clickhouse_dsn,
-                model_dir=model_dir,
-                dt_from=train_end,
-                dt_to=val_end - timedelta(minutes=15),
-                workers=max(1, int(args.build_workers)),
-                out_parquet=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
-            )
+            live_shadow_val_stream = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+            if "val" in shadow_final_splits:
+                if calibration_result_shadow is not None and isinstance(calibration_result_shadow.get('probability_stream'),
+                                                                        pd.DataFrame):
+                    live_shadow_val_stream = calibration_result_shadow['probability_stream'].copy()
+                else:
+                    live_shadow_val_stream = export_probability_stream(
+                        tokens=shadow_tokens,
+                        ch_dsn=args.clickhouse_dsn,
+                        model_dir=model_dir,
+                        dt_from=train_end,
+                        dt_to=val_end - timedelta(minutes=15),
+                        workers=max(1, int(args.build_workers)),
+                        stream_fast_mode=False,
+                        out_parquet=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+                    )
             live_shadow_test_stream = export_probability_stream(
                 tokens=shadow_tokens,
                 ch_dsn=args.clickhouse_dsn,
@@ -1632,19 +1704,22 @@ def run_tune(args, artifacts: RunArtifacts):
                 dt_from=val_end,
                 dt_to=test_end - timedelta(minutes=15),
                 workers=max(1, int(args.build_workers)),
+                stream_fast_mode=False,
                 out_parquet=str(artifacts.get_path() / "shadow_probability_stream_test.parquet"),
             )
             artifacts.save_shadow_probability_stream(live_shadow_test_stream, 'test')
 
-            live_shadow_val_signals = extract_signals_from_probability_stream(
-                probability_stream_df=live_shadow_val_stream,
-                threshold=best_threshold,
-                min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta,
-                abstain_margin=args.abstain_margin,
-                eval_start=train_end,
-                eval_end=val_end,
-            )
+            live_shadow_val_signals = pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
+            if "val" in shadow_final_splits:
+                live_shadow_val_signals = extract_signals_from_probability_stream(
+                    probability_stream_df=live_shadow_val_stream,
+                    threshold=best_threshold,
+                    min_pending_bars=best_min_pending_bars,
+                    drop_delta=best_drop_delta,
+                    abstain_margin=args.abstain_margin,
+                    eval_start=train_end,
+                    eval_end=val_end,
+                )
             live_shadow_test_signals = extract_signals_from_probability_stream(
                 probability_stream_df=live_shadow_test_stream,
                 threshold=best_threshold,
@@ -1654,28 +1729,18 @@ def run_tune(args, artifacts: RunArtifacts):
                 eval_start=val_end,
                 eval_end=test_end,
             )
-            live_shadow_val_signals = finalize_live_shadow_signals(
-                signals_df=live_shadow_val_signals,
-                loader=loader,
-                quality_entry_shift_bars=args.quality_entry_shift_bars,
-            )
+            if "val" in shadow_final_splits:
+                live_shadow_val_signals = finalize_live_shadow_signals(
+                    signals_df=live_shadow_val_signals,
+                    loader=loader,
+                    quality_entry_shift_bars=args.quality_entry_shift_bars,
+                )
             live_shadow_test_signals = finalize_live_shadow_signals(
                 signals_df=live_shadow_test_signals,
                 loader=loader,
                 quality_entry_shift_bars=args.quality_entry_shift_bars,
             )
 
-            val_live_shadow_metrics = build_live_shadow_metrics(
-                signals_df=live_shadow_val_signals,
-                window_start=train_end,
-                window_end=val_end,
-                loader=loader,
-                quality_entry_shift_bars=args.quality_entry_shift_bars,
-                quality_density_mode=args.quality_density_mode,
-                quality_target_min_30d=args.quality_target_min_30d,
-                quality_target_max_30d=args.quality_target_max_30d,
-                quality_overflow_penalty=args.quality_overflow_penalty,
-            )
             test_live_shadow_metrics = build_live_shadow_metrics(
                 signals_df=live_shadow_test_signals,
                 window_start=val_end,
@@ -1687,12 +1752,24 @@ def run_tune(args, artifacts: RunArtifacts):
                 quality_target_max_30d=args.quality_target_max_30d,
                 quality_overflow_penalty=args.quality_overflow_penalty,
             )
-            artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
             artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
-            artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
             artifacts.save_predicted_signals_holdout_live_shadow(live_shadow_test_signals)
             artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(live_shadow_test_signals))
             artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(live_shadow_test_signals))
+            if "val" in shadow_final_splits:
+                val_live_shadow_metrics = build_live_shadow_metrics(
+                    signals_df=live_shadow_val_signals,
+                    window_start=train_end,
+                    window_end=val_end,
+                    loader=loader,
+                    quality_entry_shift_bars=args.quality_entry_shift_bars,
+                    quality_density_mode=args.quality_density_mode,
+                    quality_target_min_30d=args.quality_target_min_30d,
+                    quality_target_max_30d=args.quality_target_max_30d,
+                    quality_overflow_penalty=args.quality_overflow_penalty,
+                )
+                artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
+                artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
             log("INFO", "TUNE", f"saved {len(live_shadow_test_signals)} live-shadow holdout predicted signals")
 
     if args.save_oos_signals:
@@ -1826,6 +1903,9 @@ def main():
     parser.add_argument("--final-calibration-mode", type=str, choices=["event_score", "quality_score"],
                         default="quality_score")
     parser.add_argument("--label-lookahead-bars", type=int, default=32)
+    parser.add_argument("--skip-shadow-val-calibration", action="store_true", default=False)
+    parser.add_argument("--shadow-final-splits", type=str, default="val,test")
+    parser.add_argument("--stream-fast-mode", action="store_true", default=False)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")

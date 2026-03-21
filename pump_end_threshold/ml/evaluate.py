@@ -432,18 +432,34 @@ def build_signal_path_metrics(
         end_time = eval_times.max() + pd.Timedelta(minutes=max_horizon * 15 + 1)
         symbol_ranges[symbol] = (start_time.to_pydatetime(), end_time.to_pydatetime())
 
-    if hasattr(candles_loader, 'load_raw_1m_candles_ranges'):
-        one_minute_cache = candles_loader.load_raw_1m_candles_ranges(symbol_ranges)
-    elif hasattr(candles_loader, 'load_raw_1m_candles_batch'):
+    if hasattr(candles_loader, 'load_raw_1m_candles_batch'):
         symbols = list(symbol_ranges.keys())
         global_start = min(v[0] for v in symbol_ranges.values())
         global_end = max(v[1] for v in symbol_ranges.values())
-        one_minute_cache = candles_loader.load_raw_1m_candles_batch(
-            symbols=symbols,
-            start_time=global_start,
-            end_time=global_end,
-        )
+        global_span_minutes = max(1.0, (global_end - global_start).total_seconds() / 60.0)
+        range_minutes_total = float(sum(max(0.0, (v[1] - v[0]).total_seconds() / 60.0) for v in symbol_ranges.values()))
+        overlap_ratio = range_minutes_total / global_span_minutes if global_span_minutes > 0 else 1.0
+        use_batch = len(symbols) >= 20 or overlap_ratio >= 8.0
+        if use_batch:
+            one_minute_cache = candles_loader.load_raw_1m_candles_batch(
+                symbols=symbols,
+                start_time=global_start,
+                end_time=global_end,
+            )
+        elif hasattr(candles_loader, 'load_raw_1m_candles_ranges'):
+            one_minute_cache = candles_loader.load_raw_1m_candles_ranges(symbol_ranges)
+        else:
+            one_minute_cache = candles_loader.load_raw_1m_candles_batch(
+                symbols=symbols,
+                start_time=global_start,
+                end_time=global_end,
+            )
+    elif hasattr(candles_loader, 'load_raw_1m_candles_ranges'):
+        one_minute_cache = candles_loader.load_raw_1m_candles_ranges(symbol_ranges)
     else:
+        symbols = list(symbol_ranges.keys())
+        global_start = min(v[0] for v in symbol_ranges.values())
+        global_end = max(v[1] for v in symbol_ranges.values())
         for symbol, (start_time, end_time) in symbol_ranges.items():
             df_1m = candles_loader.load_raw_1m_candles(symbol, start_time, end_time)
             one_minute_cache[symbol] = df_1m

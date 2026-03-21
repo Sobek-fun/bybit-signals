@@ -258,7 +258,8 @@ class PumpFeatureBuilder:
             df_candles: pd.DataFrame,
             symbol: str,
             decision_open_times: list,
-            btc_candles: pd.DataFrame = None
+            btc_candles: pd.DataFrame = None,
+            disable_heavy_liquidity: bool = False,
     ) -> list:
         if not decision_open_times:
             return []
@@ -273,7 +274,8 @@ class PumpFeatureBuilder:
 
         df = self._calculate_base_indicators(df)
         df = self._calculate_pump_detector_features(df)
-        df = self._calculate_liquidity_features(df, events_liq)
+        if not disable_heavy_liquidity:
+            df = self._calculate_liquidity_features(df, events_liq)
 
         if self.feature_set == "extended":
             df = self._calculate_extended_indicators(df)
@@ -283,16 +285,22 @@ class PumpFeatureBuilder:
                 df = self._join_btc_features_self(df)
             elif btc_candles is not None and not btc_candles.empty:
                 btc_df = btc_candles.copy()
-                btc_df['btc_ret_1'] = btc_df['close'] / btc_df['close'].shift(1) - 1
                 w = min(self.window_bars, 16)
-                btc_df[f'btc_cum_ret_{w}'] = btc_df['close'] / btc_df['close'].shift(w) - 1
-                tr = pd.concat([btc_df['high'] - btc_df['low'], (btc_df['high'] - btc_df['close'].shift(1)).abs(), (btc_df['low'] - btc_df['close'].shift(1)).abs()], axis=1).max(axis=1)
-                btc_df['btc_atr_norm'] = tr.rolling(window=14).mean() / btc_df['close']
-                rolling_max = btc_df['close'].rolling(window=self.window_bars).max()
-                btc_df['btc_drawdown'] = (btc_df['close'] - rolling_max) / rolling_max
-                sma_20 = btc_df['close'].rolling(window=20).mean()
-                std_20 = btc_df['close'].rolling(window=20).std()
-                btc_df['btc_bb_width'] = std_20 / sma_20
+                required_btc_cols = ['btc_ret_1', f'btc_cum_ret_{w}', 'btc_atr_norm', 'btc_drawdown', 'btc_bb_width']
+                if not all(col in btc_df.columns for col in required_btc_cols):
+                    btc_df['btc_ret_1'] = btc_df['close'] / btc_df['close'].shift(1) - 1
+                    btc_df[f'btc_cum_ret_{w}'] = btc_df['close'] / btc_df['close'].shift(w) - 1
+                    tr = pd.concat([
+                        btc_df['high'] - btc_df['low'],
+                        (btc_df['high'] - btc_df['close'].shift(1)).abs(),
+                        (btc_df['low'] - btc_df['close'].shift(1)).abs()
+                    ], axis=1).max(axis=1)
+                    btc_df['btc_atr_norm'] = tr.rolling(window=14).mean() / btc_df['close']
+                    rolling_max = btc_df['close'].rolling(window=self.window_bars).max()
+                    btc_df['btc_drawdown'] = (btc_df['close'] - rolling_max) / rolling_max
+                    sma_20 = btc_df['close'].rolling(window=20).mean()
+                    std_20 = btc_df['close'].rolling(window=20).std()
+                    btc_df['btc_bb_width'] = std_20 / sma_20
                 df = self._join_btc_features(df, btc_df)
             else:
                 df = self._join_btc_features(df, pd.DataFrame())
