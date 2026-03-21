@@ -205,6 +205,13 @@ def enrich_with_trade_replay(signals_df: pd.DataFrame, loader: DataLoader) -> pd
                     'trade_pnl_pct', 'mfe_pct', 'mae_pct', 'holding_bars']:
             signals_df[col] = []
         return signals_df
+    if 'event_id' not in signals_df.columns:
+        tmp = signals_df.copy()
+        tmp['event_id'] = tmp.apply(
+            lambda r: f"{str(r['symbol']).upper()}|{pd.to_datetime(r['open_time']).strftime('%Y%m%d_%H%M%S')}",
+            axis=1,
+        )
+        signals_df = tmp
 
     rows = []
     for row in signals_df.itertuples():
@@ -232,9 +239,10 @@ def build_holdout_window_summary_6h(signals_df: pd.DataFrame) -> pd.DataFrame:
             'tp_rate_resolved', 'sl_rate_resolved', 'pnl_sum', 'expectancy_all', 'expectancy_resolved'
         ])
     df = signals_df.copy()
+    id_col = 'event_id' if 'event_id' in df.columns else 'signal_id'
     df['window_start'] = pd.to_datetime(df['open_time']).dt.floor('6h')
     grouped = df.groupby('window_start', as_index=False).agg(
-        signals=('event_id', 'count'),
+        signals=(id_col, 'count'),
         pnl_sum=('trade_pnl_pct', 'sum')
     )
     grouped['tp'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
@@ -258,8 +266,9 @@ def build_holdout_symbol_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
             'tp_rate_resolved', 'sl_rate_resolved', 'pnl_sum', 'expectancy_all', 'expectancy_resolved'
         ])
     df = signals_df.copy()
+    id_col = 'event_id' if 'event_id' in df.columns else 'signal_id'
     grouped = df.groupby('symbol', as_index=False).agg(
-        signals=('event_id', 'count'),
+        signals=(id_col, 'count'),
         pnl_sum=('trade_pnl_pct', 'sum')
     )
     grouped['tp'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
@@ -293,11 +302,12 @@ def extract_signals_from_probability_stream(
         threshold: float,
         min_pending_bars: int,
         drop_delta: float,
-        abstain_margin: float
+        abstain_margin: float,
+        eval_start: datetime | None = None,
+        eval_end: datetime | None = None,
 ) -> pd.DataFrame:
     if probability_stream_df.empty:
-        return pd.DataFrame(columns=['symbol', 'open_time'])
-    threshold_low = max(0.0, threshold - abstain_margin)
+        return pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
     state = PumpEndSignalState()
     rows = []
     stream = probability_stream_df.sort_values(['symbol', 'open_time']).reset_index(drop=True)
@@ -312,9 +322,16 @@ def extract_signals_from_probability_stream(
             abstain_margin=float(abstain_margin),
         )
         if fired:
-            rows.append({'symbol': str(row.symbol), 'open_time': pd.to_datetime(row.open_time)})
+            open_time = pd.to_datetime(row.open_time)
+            if eval_start is not None and open_time < pd.to_datetime(eval_start):
+                continue
+            if eval_end is not None and open_time > pd.to_datetime(eval_end):
+                continue
+            symbol = str(row.symbol).upper()
+            event_id = f"{symbol}|{open_time.strftime('%Y%m%d_%H%M%S')}"
+            rows.append({'event_id': event_id, 'symbol': symbol, 'open_time': open_time})
     if not rows:
-        return pd.DataFrame(columns=['symbol', 'open_time'])
+        return pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
     out = pd.DataFrame(rows)
     out = out.sort_values(['open_time', 'symbol']).reset_index(drop=True)
     return out
@@ -338,6 +355,138 @@ def finalize_live_shadow_signals(
         out = enrich_with_trade_replay(out, loader)
     out = out.sort_values(['open_time', 'symbol']).reset_index(drop=True)
     return out
+
+
+def _max_losing_streak(outcomes: list[str]) -> int:
+    streak = 0
+    max_streak = 0
+    for outcome in outcomes:
+        if str(outcome).lower() == 'sl':
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak
+
+
+def _worst_window_pnl(signals_df: pd.DataFrame, pnl_col: str, hours: int) -> float | None:
+    if signals_df.empty or 'open_time' not in signals_df.columns or pnl_col not in signals_df.columns:
+        return None
+    work = signals_df[['open_time', pnl_col]].copy()
+    work['open_time'] = pd.to_datetime(work['open_time'], errors='coerce')
+    work[pnl_col] = pd.to_numeric(work[pnl_col], errors='coerce').fillna(0.0)
+    work = work.dropna(subset=['open_time']).sort_values('open_time').reset_index(drop=True)
+    if work.empty:
+        return None
+    worst = 0.0
+    window = pd.Timedelta(hours=hours)
+    for i in range(len(work)):
+        start = work.iloc[i]['open_time']
+        end = start + window
+        total = float(work.loc[(work['open_time'] >= start) & (work['open_time'] < end), pnl_col].sum())
+        worst = min(worst, total)
+    return worst
+
+
+def build_live_shadow_metrics(
+        signals_df: pd.DataFrame,
+        window_start: datetime,
+        window_end: datetime,
+        loader: DataLoader | None,
+        quality_entry_shift_bars: int,
+        quality_density_mode: str,
+        quality_target_min_30d: float,
+        quality_target_max_30d: float,
+        quality_overflow_penalty: float,
+) -> dict:
+    metrics: dict = {}
+    work = signals_df.copy()
+    if work.empty:
+        metrics['signals'] = 0
+        metrics['symbols'] = 0
+        metrics['signals_per_30d'] = 0.0
+        metrics['trade_quality_score'] = None
+        return metrics
+
+    work['open_time'] = pd.to_datetime(work['open_time'], errors='coerce')
+    work = work.dropna(subset=['open_time']).sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    signal_count = int(len(work))
+    days = max(1.0, (window_end - window_start).total_seconds() / 86400.0)
+    metrics['signals'] = signal_count
+    metrics['symbols'] = int(work['symbol'].nunique()) if 'symbol' in work.columns else 0
+    metrics['signals_per_30d'] = float(30.0 * signal_count / days)
+
+    if 'trade_outcome' in work.columns:
+        outcomes = work['trade_outcome'].astype(str).str.lower()
+        metrics['tp'] = int((outcomes == 'tp').sum())
+        metrics['sl'] = int((outcomes == 'sl').sum())
+        metrics['timeout'] = int((outcomes == 'timeout').sum())
+        metrics['ambiguous'] = int((outcomes == 'ambiguous').sum())
+        resolved_mask = outcomes.isin(['tp', 'sl'])
+        if resolved_mask.any():
+            resolved = outcomes[resolved_mask]
+            metrics['tp_rate_resolved'] = float((resolved == 'tp').mean())
+            metrics['sl_rate_resolved'] = float((resolved == 'sl').mean())
+        else:
+            metrics['tp_rate_resolved'] = None
+            metrics['sl_rate_resolved'] = None
+        metrics['max_losing_streak'] = _max_losing_streak(outcomes.tolist())
+
+    pnl_col = None
+    for candidate in ('trade_pnl_pct', 'pnl_pct'):
+        if candidate in work.columns:
+            pnl_col = candidate
+            break
+    if pnl_col is not None:
+        work[pnl_col] = pd.to_numeric(work[pnl_col], errors='coerce').fillna(0.0)
+        pnl = work[pnl_col]
+        metrics['pnl_sum'] = float(pnl.sum())
+        metrics['expectancy_all'] = float(pnl.mean()) if len(pnl) else None
+        if 'trade_outcome' in work.columns:
+            outcomes = work['trade_outcome'].astype(str).str.lower()
+            resolved_mask = outcomes.isin(['tp', 'sl'])
+            if resolved_mask.any():
+                metrics['expectancy_resolved'] = float(work.loc[resolved_mask, pnl_col].mean())
+            else:
+                metrics['expectancy_resolved'] = None
+        gross_profit = float(work.loc[work[pnl_col] > 0, pnl_col].sum())
+        gross_loss = float(-work.loc[work[pnl_col] < 0, pnl_col].sum())
+        metrics['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else None
+        metrics['worst_6h_pnl'] = _worst_window_pnl(work, pnl_col, 6)
+        metrics['worst_24h_pnl'] = _worst_window_pnl(work, pnl_col, 24)
+
+    quality_df = work
+    if loader is not None and 'squeeze_pct_h32' not in quality_df.columns:
+        quality_df = attach_signal_quality_columns(
+            quality_df,
+            loader,
+            horizons=[32],
+            entry_shift_bars=quality_entry_shift_bars,
+        )
+    signal_quality = compute_signal_quality_metrics(
+        signal_path_df=quality_df,
+        horizon=32,
+        squeeze_threshold=0.02,
+        pullback_threshold=0.03
+    )
+    metrics.update(signal_quality)
+
+    quality_score, _signal_count_quality, quality_metrics_df = compute_shadow_quality_score(
+        signals_df=quality_df,
+        loader=None,
+        window_start=window_start,
+        window_end=window_end,
+        quality_entry_shift_bars=quality_entry_shift_bars,
+        quality_density_mode=quality_density_mode,
+        quality_target_min_30d=quality_target_min_30d,
+        quality_target_max_30d=quality_target_max_30d,
+        quality_overflow_penalty=quality_overflow_penalty,
+    )
+    metrics['trade_quality_score'] = quality_score if quality_score != -float('inf') else None
+    if not quality_metrics_df.empty:
+        metrics.update(quality_metrics_df.iloc[0].to_dict())
+
+    return metrics
 
 
 def compute_shadow_quality_score(
@@ -434,6 +583,7 @@ def calibrate_threshold_on_val_live_shadow(
         quality_target_max_30d: float,
         quality_overflow_penalty: float,
         quality_entry_shift_bars: int,
+        label_lookahead_bars: int,
         workers: int,
         out_probability_stream_path: str | None = None,
 ) -> dict:
@@ -461,6 +611,7 @@ def calibrate_threshold_on_val_live_shadow(
         thresholds.append(round(cur, 10))
         cur += threshold_grid_step
     rule_grid = get_rule_parameter_grid()
+    quality_signal_cutoff = val_end - timedelta(minutes=(quality_entry_shift_bars + label_lookahead_bars) * 15)
     best_score = -float('inf')
     best_threshold = thresholds[0] if thresholds else 0.1
     best_mpb = 1
@@ -476,7 +627,10 @@ def calibrate_threshold_on_val_live_shadow(
                 min_pending_bars=mpb,
                 drop_delta=dd,
                 abstain_margin=float(abstain_margin),
+                eval_start=val_start,
+                eval_end=val_end,
             )
+            signals_df = signals_df[signals_df['open_time'] < quality_signal_cutoff].copy() if not signals_df.empty else signals_df
             score, signal_count, metrics_df = compute_shadow_quality_score(
                 signals_df=signals_df,
                 loader=loader,
@@ -1344,6 +1498,7 @@ def run_tune(args, artifacts: RunArtifacts):
                 quality_target_max_30d=args.quality_target_max_30d,
                 quality_overflow_penalty=args.quality_overflow_penalty,
                 quality_entry_shift_bars=args.quality_entry_shift_bars,
+                label_lookahead_bars=label_lookahead_bars,
                 workers=max(1, int(args.build_workers)),
                 out_probability_stream_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
             )
@@ -1487,6 +1642,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin,
+                eval_start=train_end,
+                eval_end=val_end,
             )
             live_shadow_test_signals = extract_signals_from_probability_stream(
                 probability_stream_df=live_shadow_test_stream,
@@ -1494,6 +1651,8 @@ def run_tune(args, artifacts: RunArtifacts):
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin,
+                eval_start=val_end,
+                eval_end=test_end,
             )
             live_shadow_val_signals = finalize_live_shadow_signals(
                 signals_df=live_shadow_val_signals,
@@ -1506,16 +1665,28 @@ def run_tune(args, artifacts: RunArtifacts):
                 quality_entry_shift_bars=args.quality_entry_shift_bars,
             )
 
-            val_live_shadow_metrics = {
-                "signal_count": int(len(live_shadow_val_signals)),
-                "signals_per_30d": float(
-                    30.0 * len(live_shadow_val_signals) / max(1.0, (val_end - train_end).total_seconds() / 86400.0)),
-            }
-            test_live_shadow_metrics = {
-                "signal_count": int(len(live_shadow_test_signals)),
-                "signals_per_30d": float(
-                    30.0 * len(live_shadow_test_signals) / max(1.0, (test_end - val_end).total_seconds() / 86400.0)),
-            }
+            val_live_shadow_metrics = build_live_shadow_metrics(
+                signals_df=live_shadow_val_signals,
+                window_start=train_end,
+                window_end=val_end,
+                loader=loader,
+                quality_entry_shift_bars=args.quality_entry_shift_bars,
+                quality_density_mode=args.quality_density_mode,
+                quality_target_min_30d=args.quality_target_min_30d,
+                quality_target_max_30d=args.quality_target_max_30d,
+                quality_overflow_penalty=args.quality_overflow_penalty,
+            )
+            test_live_shadow_metrics = build_live_shadow_metrics(
+                signals_df=live_shadow_test_signals,
+                window_start=val_end,
+                window_end=test_end,
+                loader=loader,
+                quality_entry_shift_bars=args.quality_entry_shift_bars,
+                quality_density_mode=args.quality_density_mode,
+                quality_target_min_30d=args.quality_target_min_30d,
+                quality_target_max_30d=args.quality_target_max_30d,
+                quality_overflow_penalty=args.quality_overflow_penalty,
+            )
             artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
             artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
             artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
