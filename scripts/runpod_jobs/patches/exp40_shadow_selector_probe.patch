@@ -1,0 +1,24 @@
+diff --git a/pump_end_threshold/cli/train_pump_end_model.py b/pump_end_threshold/cli/train_pump_end_model.py
+index a2a5070..5a0cb44 100644
+--- a/pump_end_threshold/cli/train_pump_end_model.py
++++ b/pump_end_threshold/cli/train_pump_end_model.py
+@@ -1504,9 +1504,19 @@ def run_tune(args, artifacts: RunArtifacts):
+             )
+             artifacts.save_calibration_sweep_val_live_shadow(calibration_result_shadow['calibration_sweep'])
+             artifacts.save_shadow_probability_stream(calibration_result_shadow['probability_stream'], 'val')
++            best_threshold = calibration_result_shadow['threshold']
++            best_min_pending_bars = calibration_result_shadow['min_pending_bars']
++            best_drop_delta = calibration_result_shadow['drop_delta']
+             log("INFO", "TUNE",
+                 f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
+ 
++            artifacts.save_best_threshold(best_threshold, {
++                'signal_rule': actual_signal_rule,
++                'min_pending_bars': best_min_pending_bars,
++                'drop_delta': best_drop_delta,
++                'abstain_margin': args.abstain_margin
++            })
++
+             features_df = time_split(features_df, train_end, val_end)
+ 
+             if args.embargo_bars > 0:

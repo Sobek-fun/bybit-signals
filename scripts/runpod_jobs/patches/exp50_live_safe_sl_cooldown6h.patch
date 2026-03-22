@@ -1,0 +1,55 @@
+--- a/pump_end_threshold/cli/train_pump_end_model.py
++++ b/pump_end_threshold/cli/train_pump_end_model.py
+@@ -503,6 +503,44 @@
+     return out
+ 
+ 
++def _apply_same_symbol_resolved_sl_cooldown(signals_df: pd.DataFrame, cooldown_hours: float = 6.0) -> pd.DataFrame:
++    required_cols = {"symbol", "open_time", "trade_outcome", "exit_time"}
++    if signals_df.empty or not required_cols.issubset(set(signals_df.columns)):
++        return signals_df
++
++    work = signals_df.copy()
++    work["open_time"] = pd.to_datetime(work["open_time"], errors="coerce")
++    work["exit_time"] = pd.to_datetime(work["exit_time"], errors="coerce")
++    work = work.dropna(subset=["open_time"]).sort_values(["open_time", "symbol"]).reset_index(drop=True)
++
++    cooldown_delta = pd.Timedelta(hours=float(cooldown_hours))
++    kept_rows = []
++    last_sl_exit_by_symbol: dict[str, pd.Timestamp] = {}
++
++    for row in work.itertuples(index=False):
++        symbol = str(getattr(row, "symbol", "")).upper()
++        open_time = pd.to_datetime(getattr(row, "open_time", None), errors="coerce")
++        if pd.isna(open_time):
++            continue
++
++        last_sl_exit = last_sl_exit_by_symbol.get(symbol)
++        if last_sl_exit is not None and last_sl_exit <= open_time < (last_sl_exit + cooldown_delta):
++            continue
++
++        kept_rows.append(row._asdict())
++
++        trade_outcome = str(getattr(row, "trade_outcome", "")).lower()
++        exit_time = pd.to_datetime(getattr(row, "exit_time", None), errors="coerce")
++        if trade_outcome == "sl" and pd.notna(exit_time):
++            last_sl_exit_by_symbol[symbol] = exit_time
++
++    if not kept_rows:
++        return work.iloc[0:0].copy()
++    out = pd.DataFrame(kept_rows)
++    out = out.sort_values(["open_time", "symbol"]).reset_index(drop=True)
++    return out
++
++
+ def finalize_live_shadow_signals(
+         signals_df: pd.DataFrame,
+         loader: DataLoader | None,
+@@ -542,6 +580,7 @@
+             )
+         t_replay = time.perf_counter()
+         out = enrich_with_trade_replay(out, loader)
++        out = _apply_same_symbol_resolved_sl_cooldown(out, cooldown_hours=6.0)
+         replay_elapsed = time.perf_counter() - t_replay
+         outcomes = out['trade_outcome'].astype(str).str.lower() if 'trade_outcome' in out.columns else pd.Series([], dtype=str)
+         ambiguous_count = int((outcomes == 'ambiguous').sum()) if not outcomes.empty else 0

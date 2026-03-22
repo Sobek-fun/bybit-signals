@@ -1,0 +1,15 @@
+diff --git a/pump_end_threshold/ml/tuning.py b/pump_end_threshold/ml/tuning.py
+index d8ed462..46f6acb 100644
+--- a/pump_end_threshold/ml/tuning.py
++++ b/pump_end_threshold/ml/tuning.py
+@@ -136,8 +136,8 @@ def get_hyperparameter_grid() -> list:
+ 
+ def get_rule_parameter_grid() -> list:
+     rule_grid = {
+-        'min_pending_bars': [2, 3, 4],
+-        'drop_delta': [0.0, 0.01, 0.02, 0.03]
++        'min_pending_bars': [1, 2, 3, 4],
++        'drop_delta': [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]
+     }
+ 
+     keys = list(rule_grid.keys())

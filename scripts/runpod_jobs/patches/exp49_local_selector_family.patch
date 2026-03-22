@@ -1,0 +1,13 @@
+--- a/pump_end_threshold/ml/tuning.py
++++ b/pump_end_threshold/ml/tuning.py
+@@ -136,8 +136,8 @@
+ 
+ def get_rule_parameter_grid() -> list:
+     rule_grid = {
+-        'min_pending_bars': [1, 2, 3, 4],
+-        'drop_delta': [0.0, 0.005, 0.01, 0.02, 0.03, 0.04]
++        'min_pending_bars': [2],
++        'drop_delta': [0.01, 0.02, 0.03]
+     }
+ 
+     keys = list(rule_grid.keys())
