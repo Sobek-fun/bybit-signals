@@ -136,8 +136,8 @@ def get_hyperparameter_grid() -> list:
 
 def get_rule_parameter_grid() -> list:
     rule_grid = {
-        'min_pending_bars': [2, 3, 4],
-        'drop_delta': [0.0, 0.01, 0.02, 0.03]
+        'min_pending_bars': [1, 2, 3, 4],
+        'drop_delta': [0.0, 0.005, 0.01, 0.02, 0.03, 0.04]
     }
 
     keys = list(rule_grid.keys())
