@@ -1879,171 +1879,145 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_predicted_signals_eventcentric_test(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} eventcentric test predicted signals")
 
-            progress_path = artifacts.get_path() / "progress.json"
-            _write_shadow_progress(
-                progress_path=progress_path,
-                stage="SHADOW_POST",
-                done=0,
-                total=1,
-                elapsed_sec=0.0,
-                eta_sec=None,
-                current_artifact="holdout_live_shadow",
-            )
-            live_shadow_val_stream = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
-            live_shadow_val_parts: list[str] = []
-            if "val" in shadow_final_splits:
-                if calibration_result_shadow is not None and isinstance(calibration_result_shadow.get('probability_stream'),
-                                                                        pd.DataFrame):
-                    live_shadow_val_stream = calibration_result_shadow['probability_stream'].copy()
-                else:
-                    val_export = export_probability_stream(
-                        tokens=shadow_tokens,
-                        ch_dsn=args.clickhouse_dsn,
-                        model_dir=model_dir,
-                        dt_from=train_end,
-                        dt_to=val_end - timedelta(minutes=15),
-                        workers=max(1, int(args.build_workers)),
-                        stream_fast_mode=False,
-                        out_parquet=None,
-                        return_mode="parts",
-                        keep_parts=True,
-                        parts_dir=str(artifacts.get_path() / "shadow_probability_stream_val_parts"),
-                    )
-                    live_shadow_val_parts = list(val_export.get("part_files", []))
-                    if args.save_shadow_probability_stream:
-                        _save_probability_stream_from_parts(
-                            part_files=live_shadow_val_parts,
-                            out_parquet_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
-                        )
-                    val_stats = val_export.get("stats", {})
-                    log(
-                        "INFO",
-                        "SHADOW_POST",
-                        f"stage=val_export_done symbols={val_stats.get('symbols_done', 0)}/{val_stats.get('symbols_total', 0)} "
-                        f"rows={val_stats.get('rows_total', 0)} errors={val_stats.get('errors', 0)} "
-                        f"sec_total={float(val_stats.get('elapsed_sec', 0.0)):.2f}"
-                    )
-            test_export = export_probability_stream(
-                tokens=shadow_tokens,
-                ch_dsn=args.clickhouse_dsn,
-                model_dir=model_dir,
-                dt_from=val_end,
-                dt_to=test_end - timedelta(minutes=15),
-                workers=max(1, int(args.build_workers)),
-                stream_fast_mode=False,
-                out_parquet=None,
-                return_mode="parts",
-                keep_parts=True,
-                parts_dir=str(artifacts.get_path() / "shadow_probability_stream_test_parts"),
-            )
-            live_shadow_test_parts = list(test_export.get("part_files", []))
-            if args.save_shadow_probability_stream:
-                _save_probability_stream_from_parts(
-                    part_files=live_shadow_test_parts,
-                    out_parquet_path=str(artifacts.get_path() / "shadow_probability_stream_test.parquet"),
+            if not args.skip_final_live_shadow:
+                progress_path = artifacts.get_path() / "progress.json"
+                _write_shadow_progress(
+                    progress_path=progress_path,
+                    stage="SHADOW_POST",
+                    done=0,
+                    total=1,
+                    elapsed_sec=0.0,
+                    eta_sec=None,
+                    current_artifact="holdout_live_shadow",
                 )
-            test_stats = test_export.get("stats", {})
-            log(
-                "INFO",
-                "SHADOW_POST",
-                f"stage=test_export_done symbols={test_stats.get('symbols_done', 0)}/{test_stats.get('symbols_total', 0)} "
-                f"rows={test_stats.get('rows_total', 0)} errors={test_stats.get('errors', 0)} "
-                f"sec_total={float(test_stats.get('elapsed_sec', 0.0)):.2f}"
-            )
+                live_shadow_val_stream = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+                live_shadow_val_parts: list[str] = []
+                if "val" in shadow_final_splits:
+                    if calibration_result_shadow is not None and isinstance(calibration_result_shadow.get('probability_stream'),
+                                                                            pd.DataFrame):
+                        live_shadow_val_stream = calibration_result_shadow['probability_stream'].copy()
+                    else:
+                        val_export = export_probability_stream(
+                            tokens=shadow_tokens,
+                            ch_dsn=args.clickhouse_dsn,
+                            model_dir=model_dir,
+                            dt_from=train_end,
+                            dt_to=val_end - timedelta(minutes=15),
+                            workers=max(1, int(args.build_workers)),
+                            stream_fast_mode=False,
+                            out_parquet=None,
+                            return_mode="parts",
+                            keep_parts=True,
+                            parts_dir=str(artifacts.get_path() / "shadow_probability_stream_val_parts"),
+                        )
+                        live_shadow_val_parts = list(val_export.get("part_files", []))
+                        if args.save_shadow_probability_stream:
+                            _save_probability_stream_from_parts(
+                                part_files=live_shadow_val_parts,
+                                out_parquet_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+                            )
+                        val_stats = val_export.get("stats", {})
+                        log(
+                            "INFO",
+                            "SHADOW_POST",
+                            f"stage=val_export_done symbols={val_stats.get('symbols_done', 0)}/{val_stats.get('symbols_total', 0)} "
+                            f"rows={val_stats.get('rows_total', 0)} errors={val_stats.get('errors', 0)} "
+                            f"sec_total={float(val_stats.get('elapsed_sec', 0.0)):.2f}"
+                        )
+                test_export = export_probability_stream(
+                    tokens=shadow_tokens,
+                    ch_dsn=args.clickhouse_dsn,
+                    model_dir=model_dir,
+                    dt_from=val_end,
+                    dt_to=test_end - timedelta(minutes=15),
+                    workers=max(1, int(args.build_workers)),
+                    stream_fast_mode=False,
+                    out_parquet=None,
+                    return_mode="parts",
+                    keep_parts=True,
+                    parts_dir=str(artifacts.get_path() / "shadow_probability_stream_test_parts"),
+                )
+                live_shadow_test_parts = list(test_export.get("part_files", []))
+                if args.save_shadow_probability_stream:
+                    _save_probability_stream_from_parts(
+                        part_files=live_shadow_test_parts,
+                        out_parquet_path=str(artifacts.get_path() / "shadow_probability_stream_test.parquet"),
+                    )
+                test_stats = test_export.get("stats", {})
+                log(
+                    "INFO",
+                    "SHADOW_POST",
+                    f"stage=test_export_done symbols={test_stats.get('symbols_done', 0)}/{test_stats.get('symbols_total', 0)} "
+                    f"rows={test_stats.get('rows_total', 0)} errors={test_stats.get('errors', 0)} "
+                    f"sec_total={float(test_stats.get('elapsed_sec', 0.0)):.2f}"
+                )
 
-            live_shadow_val_signals = pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
-            if "val" in shadow_final_splits:
-                if live_shadow_val_parts:
-                    live_shadow_val_signals = extract_signals_from_probability_stream_parts(
-                        part_files=live_shadow_val_parts,
-                        threshold=best_threshold,
-                        min_pending_bars=best_min_pending_bars,
-                        drop_delta=best_drop_delta,
-                        abstain_margin=args.abstain_margin,
-                        eval_start=train_end,
-                        eval_end=val_end,
+                live_shadow_val_signals = pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
+                if "val" in shadow_final_splits:
+                    if live_shadow_val_parts:
+                        live_shadow_val_signals = extract_signals_from_probability_stream_parts(
+                            part_files=live_shadow_val_parts,
+                            threshold=best_threshold,
+                            min_pending_bars=best_min_pending_bars,
+                            drop_delta=best_drop_delta,
+                            abstain_margin=args.abstain_margin,
+                            eval_start=train_end,
+                            eval_end=val_end,
+                            progress_path=progress_path,
+                            current_artifact="predicted_signals_holdout_live_shadow_val.csv",
+                        )
+                    else:
+                        live_shadow_val_signals = extract_signals_from_probability_stream(
+                            probability_stream_df=live_shadow_val_stream,
+                            threshold=best_threshold,
+                            min_pending_bars=best_min_pending_bars,
+                            drop_delta=best_drop_delta,
+                            abstain_margin=args.abstain_margin,
+                            eval_start=train_end,
+                            eval_end=val_end,
+                        )
+                live_shadow_test_signals = extract_signals_from_probability_stream_parts(
+                    part_files=live_shadow_test_parts,
+                    threshold=best_threshold,
+                    min_pending_bars=best_min_pending_bars,
+                    drop_delta=best_drop_delta,
+                    abstain_margin=args.abstain_margin,
+                    eval_start=val_end,
+                    eval_end=test_end,
+                    progress_path=progress_path,
+                    current_artifact="predicted_signals_holdout.csv",
+                )
+                if "val" in shadow_final_splits:
+                    live_shadow_val_signals = finalize_live_shadow_signals(
+                        signals_df=live_shadow_val_signals,
+                        loader=loader,
+                        quality_entry_shift_bars=args.quality_entry_shift_bars,
                         progress_path=progress_path,
                         current_artifact="predicted_signals_holdout_live_shadow_val.csv",
                     )
-                else:
-                    live_shadow_val_signals = extract_signals_from_probability_stream(
-                        probability_stream_df=live_shadow_val_stream,
-                        threshold=best_threshold,
-                        min_pending_bars=best_min_pending_bars,
-                        drop_delta=best_drop_delta,
-                        abstain_margin=args.abstain_margin,
-                        eval_start=train_end,
-                        eval_end=val_end,
-                    )
-            live_shadow_test_signals = extract_signals_from_probability_stream_parts(
-                part_files=live_shadow_test_parts,
-                threshold=best_threshold,
-                min_pending_bars=best_min_pending_bars,
-                drop_delta=best_drop_delta,
-                abstain_margin=args.abstain_margin,
-                eval_start=val_end,
-                eval_end=test_end,
-                progress_path=progress_path,
-                current_artifact="predicted_signals_holdout.csv",
-            )
-            if "val" in shadow_final_splits:
-                live_shadow_val_signals = finalize_live_shadow_signals(
-                    signals_df=live_shadow_val_signals,
+                live_shadow_test_signals = finalize_live_shadow_signals(
+                    signals_df=live_shadow_test_signals,
                     loader=loader,
                     quality_entry_shift_bars=args.quality_entry_shift_bars,
                     progress_path=progress_path,
-                    current_artifact="predicted_signals_holdout_live_shadow_val.csv",
+                    current_artifact="predicted_signals_holdout.csv",
                 )
-            live_shadow_test_signals = finalize_live_shadow_signals(
-                signals_df=live_shadow_test_signals,
-                loader=loader,
-                quality_entry_shift_bars=args.quality_entry_shift_bars,
-                progress_path=progress_path,
-                current_artifact="predicted_signals_holdout.csv",
-            )
 
-            t_metrics = time.perf_counter()
-            log("INFO", "SHADOW_METRICS", f"stage=metrics_start signals={len(live_shadow_test_signals)}")
-            _write_shadow_progress(
-                progress_path=progress_path,
-                stage="SHADOW_METRICS",
-                done=0,
-                total=max(1, len(live_shadow_test_signals)),
-                elapsed_sec=0.0,
-                eta_sec=None,
-                current_artifact="metrics_holdout_live_shadow.json",
-            )
-            test_live_shadow_metrics = build_live_shadow_metrics(
-                signals_df=live_shadow_test_signals,
-                window_start=val_end,
-                window_end=test_end,
-                loader=loader,
-                quality_entry_shift_bars=args.quality_entry_shift_bars,
-                quality_density_mode=args.quality_density_mode,
-                quality_target_min_30d=args.quality_target_min_30d,
-                quality_target_max_30d=args.quality_target_max_30d,
-                quality_overflow_penalty=args.quality_overflow_penalty,
-            )
-            metrics_elapsed = time.perf_counter() - t_metrics
-            log("INFO", "SHADOW_METRICS", f"stage=metrics_done signals={len(live_shadow_test_signals)} sec_total={metrics_elapsed:.2f}")
-            _write_shadow_progress(
-                progress_path=progress_path,
-                stage="SHADOW_METRICS",
-                done=max(1, len(live_shadow_test_signals)),
-                total=max(1, len(live_shadow_test_signals)),
-                elapsed_sec=metrics_elapsed,
-                eta_sec=0.0,
-                current_artifact="metrics_holdout_live_shadow.json",
-            )
-            artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
-            artifacts.save_predicted_signals_holdout_live_shadow(live_shadow_test_signals)
-            artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(live_shadow_test_signals))
-            artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(live_shadow_test_signals))
-            if "val" in shadow_final_splits:
-                val_live_shadow_metrics = build_live_shadow_metrics(
-                    signals_df=live_shadow_val_signals,
-                    window_start=train_end,
-                    window_end=val_end,
+                t_metrics = time.perf_counter()
+                log("INFO", "SHADOW_METRICS", f"stage=metrics_start signals={len(live_shadow_test_signals)}")
+                _write_shadow_progress(
+                    progress_path=progress_path,
+                    stage="SHADOW_METRICS",
+                    done=0,
+                    total=max(1, len(live_shadow_test_signals)),
+                    elapsed_sec=0.0,
+                    eta_sec=None,
+                    current_artifact="metrics_holdout_live_shadow.json",
+                )
+                test_live_shadow_metrics = build_live_shadow_metrics(
+                    signals_df=live_shadow_test_signals,
+                    window_start=val_end,
+                    window_end=test_end,
                     loader=loader,
                     quality_entry_shift_bars=args.quality_entry_shift_bars,
                     quality_density_mode=args.quality_density_mode,
@@ -2051,23 +2025,59 @@ def run_tune(args, artifacts: RunArtifacts):
                     quality_target_max_30d=args.quality_target_max_30d,
                     quality_overflow_penalty=args.quality_overflow_penalty,
                 )
-                artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
-                artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
-            for path in live_shadow_val_parts + live_shadow_test_parts:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-            _write_shadow_progress(
-                progress_path=progress_path,
-                stage="SHADOW_POST",
-                done=1,
-                total=1,
-                elapsed_sec=0.0,
-                eta_sec=0.0,
-                current_artifact="holdout_live_shadow_done",
-            )
-            log("INFO", "TUNE", f"saved {len(live_shadow_test_signals)} live-shadow holdout predicted signals")
+                metrics_elapsed = time.perf_counter() - t_metrics
+                log("INFO", "SHADOW_METRICS", f"stage=metrics_done signals={len(live_shadow_test_signals)} sec_total={metrics_elapsed:.2f}")
+                _write_shadow_progress(
+                    progress_path=progress_path,
+                    stage="SHADOW_METRICS",
+                    done=max(1, len(live_shadow_test_signals)),
+                    total=max(1, len(live_shadow_test_signals)),
+                    elapsed_sec=metrics_elapsed,
+                    eta_sec=0.0,
+                    current_artifact="metrics_holdout_live_shadow.json",
+                )
+                artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
+                artifacts.save_predicted_signals_holdout_live_shadow(live_shadow_test_signals)
+                artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(live_shadow_test_signals))
+                artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(live_shadow_test_signals))
+                if "val" in shadow_final_splits:
+                    val_live_shadow_metrics = build_live_shadow_metrics(
+                        signals_df=live_shadow_val_signals,
+                        window_start=train_end,
+                        window_end=val_end,
+                        loader=loader,
+                        quality_entry_shift_bars=args.quality_entry_shift_bars,
+                        quality_density_mode=args.quality_density_mode,
+                        quality_target_min_30d=args.quality_target_min_30d,
+                        quality_target_max_30d=args.quality_target_max_30d,
+                        quality_overflow_penalty=args.quality_overflow_penalty,
+                    )
+                    artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
+                    artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
+                for path in live_shadow_val_parts + live_shadow_test_parts:
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                _write_shadow_progress(
+                    progress_path=progress_path,
+                    stage="SHADOW_POST",
+                    done=1,
+                    total=1,
+                    elapsed_sec=0.0,
+                    eta_sec=0.0,
+                    current_artifact="holdout_live_shadow_done",
+                )
+                log("INFO", "TUNE", f"saved {len(live_shadow_test_signals)} live-shadow holdout predicted signals")
+            else:
+                log(
+                    "INFO",
+                    "TUNE",
+                    f"skip-final-live-shadow enabled; promoting {len(test_signals_df)} eventcentric test signals to holdout artifacts",
+                )
+                artifacts.save_predicted_signals(test_signals_df)
+                artifacts.save_holdout_window_summary_6h(build_holdout_window_summary_6h(test_signals_df))
+                artifacts.save_holdout_symbol_summary(build_holdout_symbol_summary(test_signals_df))
 
     if args.save_oos_signals:
         log("INFO", "TUNE", "collecting OOS verbose signals from walk-forward folds")
@@ -2204,6 +2214,7 @@ def main():
     parser.add_argument("--shadow-final-splits", type=str, default="val,test")
     parser.add_argument("--stream-fast-mode", action="store_true", default=False)
     parser.add_argument("--save-shadow-probability-stream", action="store_true", default=False)
+    parser.add_argument("--skip-final-live-shadow", action="store_true", default=False)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")
