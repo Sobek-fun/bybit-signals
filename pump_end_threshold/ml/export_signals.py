@@ -1,6 +1,6 @@
-import csv
 import json
 import os
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -121,10 +121,8 @@ def _process_symbol_chunk(
         market_symbol=model.market_symbol
     )
 
-    csv_filename = f"signals_part_{worker_id}.csv"
-    csv_file = open(csv_filename, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['symbol', 'timestamp'])
+    part_filename = f"signals_part_{worker_id}.parquet"
+    part_rows = []
 
     total_signals = 0
     symbols_processed = 0
@@ -157,8 +155,10 @@ def _process_symbol_chunk(
                 continue
 
             for sig_time in result:
-                timestamp_str = sig_time.strftime('%Y-%m-%d %H:%M:%S')
-                csv_writer.writerow([symbol, timestamp_str])
+                part_rows.append({
+                    "symbol": symbol,
+                    "timestamp": sig_time,
+                })
                 total_signals += 1
 
             symbols_processed += 1
@@ -178,12 +178,13 @@ def _process_symbol_chunk(
             if errors <= 3:
                 log("WARN", f"EXPORT_WORKER{worker_id}", f"symbol={symbol} error={type(e).__name__}: {str(e)}")
 
-    csv_file.close()
+    part_df = pd.DataFrame(part_rows, columns=["symbol", "timestamp"])
+    part_df.to_parquet(part_filename, index=False)
     log("INFO", f"EXPORT_WORKER{worker_id}",
         f"finish processed={symbols_processed} skipped={symbols_skipped} signals={total_signals} "
         f"errors={errors} sec_total={time.perf_counter() - worker_t0:.2f}")
 
-    return worker_id, symbols_processed, symbols_skipped, total_signals, errors, csv_filename
+    return worker_id, symbols_processed, symbols_skipped, total_signals, errors, part_filename
 
 
 def _process_single_symbol(
@@ -267,34 +268,26 @@ def _predict_symbol_stream(
         return None, diag
 
     validate_t0 = time.perf_counter()
-    all_decision_times = pd.date_range(
-        start=warmup_start,
-        end=dt_to,
-        freq='15min'
-    ).tolist()
-    diag["decision_total"] = int(len(all_decision_times))
+    if dt_to >= warmup_start:
+        diag["decision_total"] = int((dt_to - warmup_start) // timedelta(minutes=15)) + 1
+    else:
+        diag["decision_total"] = 0
 
-    valid_decision_times = []
-    for dt in all_decision_times:
-        expected_bucket_start = dt - timedelta(minutes=15)
-        if expected_bucket_start not in df.index:
-            continue
-
-        idx = df.index.get_loc(expected_bucket_start)
-        if idx < MIN_CANDLES - 1:
-            continue
-
-        start_idx = idx - (MIN_CANDLES - 1)
-        expected_range = pd.date_range(
-            start=df.index[start_idx],
-            end=expected_bucket_start,
-            freq='15min'
+    index = pd.DatetimeIndex(df.index)
+    required_history_bars = MIN_CANDLES
+    bucket_start_min = warmup_start - timedelta(minutes=15)
+    bucket_start_max = dt_to - timedelta(minutes=15)
+    if len(index) == 0 or bucket_start_max < bucket_start_min:
+        valid_decision_times = []
+    else:
+        step_ok = pd.Series(index, index=index).diff().eq(pd.Timedelta(minutes=15)).fillna(False)
+        streak_len = step_ok.groupby((~step_ok).cumsum()).cumsum().to_numpy(dtype=np.int64) + 1
+        valid_bucket_mask = (
+            (streak_len >= required_history_bars)
+            & (index >= bucket_start_min)
+            & (index <= bucket_start_max)
         )
-        actual_range = df.index[start_idx:idx + 1]
-
-        if len(actual_range) == MIN_CANDLES and len(expected_range) == MIN_CANDLES:
-            if (actual_range == expected_range).all():
-                valid_decision_times.append(dt)
+        valid_decision_times = (index[valid_bucket_mask] + pd.Timedelta(minutes=15)).tolist()
     diag["sec_validate"] = time.perf_counter() - validate_t0
     diag["decision_valid"] = int(len(valid_decision_times))
 
@@ -327,38 +320,35 @@ def _predict_symbol_stream(
         return None, diag
 
     infer_t0 = time.perf_counter()
-    feature_values_list = []
-    for row in feature_rows:
-        fv = []
-        for name in model.feature_names:
-            val = row.get(name)
-            fv.append(np.nan if val is None else val)
-        feature_values_list.append(fv)
-
-    probas = model.model.predict_proba(feature_values_list)[:, 1]
-    rows = []
-    for i, dt in enumerate(valid_decision_times):
-        rows.append({
-            "symbol": symbol,
-            "open_time": dt,
-            "p_end": float(probas[i]),
-        })
+    feat_df = pd.DataFrame(feature_rows)
+    X = feat_df.reindex(columns=model.feature_names)
+    probas = model.model.predict_proba(X)[:, 1]
+    if "open_time" in feat_df.columns:
+        open_times = pd.to_datetime(feat_df["open_time"])
+    else:
+        open_times = pd.to_datetime(valid_decision_times[:len(probas)])
+    rows = pd.DataFrame({
+        "symbol": symbol,
+        "open_time": open_times,
+        "p_end": probas.astype(float),
+    })
     diag["sec_infer"] = time.perf_counter() - infer_t0
     diag["stream_rows"] = int(len(rows))
     diag["total_sec"] = time.perf_counter() - t0
-    if not rows:
+    if rows.empty:
         return pd.DataFrame(columns=["symbol", "open_time", "p_end"]), diag
-    return pd.DataFrame(rows), diag
+    return rows.reset_index(drop=True), diag
 
 
 def _process_symbol_chunk_probability_stream(
-        worker_id: int,
+        task_id: int,
         symbols_chunk: list,
         ch_dsn: str,
         model_dir: str,
         dt_from: datetime,
         dt_to: datetime,
         stream_fast_mode: bool = False,
+        part_dir: str | None = None,
 ) -> tuple:
     worker_t0 = time.perf_counter()
     loader = DataLoader(ch_dsn)
@@ -370,10 +360,10 @@ def _process_symbol_chunk_probability_stream(
         feature_set=model.feature_set,
         market_symbol=model.market_symbol
     )
-    csv_filename = f"prob_stream_part_{worker_id}.csv"
-    csv_file = open(csv_filename, "w", newline="")
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["symbol", "open_time", "p_end"])
+    if part_dir is None:
+        part_dir = os.getcwd()
+    part_filename = os.path.join(part_dir, f"prob_stream_part_{task_id:05d}.parquet")
+    part_frames = []
     total_rows = 0
     symbols_processed = 0
     symbols_skipped = 0
@@ -400,7 +390,7 @@ def _process_symbol_chunk_probability_stream(
             sma_20 = btc_prepared['close'].rolling(window=20).mean()
             std_20 = btc_prepared['close'].rolling(window=20).std()
             btc_prepared['btc_bb_width'] = std_20 / sma_20
-    log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+    log("INFO", f"EXPORT_STREAM_WORKER{task_id}",
         f"start symbols={len(symbols_chunk)} from={dt_from} to={dt_to} warmup_start={warmup_start}")
     for symbol in symbols_chunk:
         symbol_t0 = time.perf_counter()
@@ -418,17 +408,15 @@ def _process_symbol_chunk_probability_stream(
             )
             if stream_df is None or stream_df.empty:
                 symbols_skipped += 1
-                log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+                log("INFO", f"EXPORT_STREAM_WORKER{task_id}",
                     f"symbol={symbol} stage=skip "
                     f"candles={diag.get('candles_rows', 0)} valid_decisions={diag.get('decision_valid', 0)} "
                     f"sec_total={diag.get('total_sec', 0.0):.2f} sec_symbol={time.perf_counter() - symbol_t0:.2f}")
                 continue
-            for row in stream_df.itertuples(index=False):
-                csv_writer.writerow(
-                    [row.symbol, row.open_time.strftime("%Y-%m-%d %H:%M:%S"), f"{float(row.p_end):.12f}"])
-                total_rows += 1
+            part_frames.append(stream_df[["symbol", "open_time", "p_end"]].copy())
+            total_rows += int(len(stream_df))
             symbols_processed += 1
-            log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+            log("INFO", f"EXPORT_STREAM_WORKER{task_id}",
                 f"symbol={symbol} stage=done "
                 f"candles={diag.get('candles_rows', 0)} btc_candles={diag.get('btc_rows', 0)} "
                 f"decision_total={diag.get('decision_total', 0)} decision_valid={diag.get('decision_valid', 0)} "
@@ -439,12 +427,15 @@ def _process_symbol_chunk_probability_stream(
         except Exception as e:
             errors += 1
             if errors <= 3:
-                log("WARN", f"EXPORT_STREAM_WORKER{worker_id}", f"symbol={symbol} error={type(e).__name__}: {str(e)}")
-    csv_file.close()
-    log("INFO", f"EXPORT_STREAM_WORKER{worker_id}",
+                log("WARN", f"EXPORT_STREAM_WORKER{task_id}", f"symbol={symbol} error={type(e).__name__}: {str(e)}")
+    if part_frames:
+        pd.concat(part_frames, ignore_index=True).to_parquet(part_filename, index=False)
+    else:
+        pd.DataFrame(columns=["symbol", "open_time", "p_end"]).to_parquet(part_filename, index=False)
+    log("INFO", f"EXPORT_STREAM_WORKER{task_id}",
         f"finish processed={symbols_processed} skipped={symbols_skipped} rows={total_rows} "
         f"errors={errors} sec_total={time.perf_counter() - worker_t0:.2f}")
-    return worker_id, symbols_processed, symbols_skipped, total_rows, errors, csv_filename
+    return task_id, symbols_processed, symbols_skipped, total_rows, errors, part_filename
 
 
 def export_probability_stream(
@@ -456,58 +447,113 @@ def export_probability_stream(
         workers: int,
         out_parquet: str | None = None,
         stream_fast_mode: bool = False,
-) -> pd.DataFrame:
+        return_mode: str = "dataframe",
+        keep_parts: bool = False,
+        parts_dir: str | None = None,
+) -> pd.DataFrame | dict:
+    if return_mode not in {"dataframe", "parts"}:
+        raise ValueError("return_mode must be 'dataframe' or 'parts'")
     dt_from = _align_to_15min(dt_from)
     dt_to = _align_to_15min(dt_to)
     symbols = [f"{token}USDT" for token in tokens]
     if not symbols:
         empty_df = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
-        if out_parquet:
+        if out_parquet and return_mode == "dataframe":
             empty_df.to_parquet(out_parquet, index=False)
+        if return_mode == "parts":
+            return {
+                "part_files": [],
+                "stats": {
+                    "symbols_total": 0,
+                    "symbols_done": 0,
+                    "rows_total": 0,
+                    "errors": 0,
+                    "elapsed_sec": 0.0,
+                },
+            }
         return empty_df
+    created_parts_dir = False
+    if parts_dir is None:
+        parts_dir = tempfile.mkdtemp(prefix="prob_stream_parts_")
+        created_parts_dir = True
+    os.makedirs(parts_dir, exist_ok=True)
+    t0 = time.perf_counter()
     num_workers = min(workers, len(symbols))
-    chunk_size = len(symbols) // num_workers
-    remainder = len(symbols) % num_workers
-    chunks = []
-    start_idx = 0
-    for i in range(num_workers):
-        end_idx = start_idx + chunk_size + (1 if i < remainder else 0)
-        chunks.append(symbols[start_idx:end_idx])
-        start_idx = end_idx
+    target_tasks = max(1, num_workers * 8)
+    micro_batch_size = max(1, min(4, int(np.ceil(len(symbols) / target_tasks))))
+    micro_batches = [symbols[i:i + micro_batch_size] for i in range(0, len(symbols), micro_batch_size)]
     part_files = []
+    done_symbols = 0
+    total_symbols = len(symbols)
+    total_rows = 0
+    total_errors = 0
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = {
             executor.submit(
                 _process_symbol_chunk_probability_stream,
                 i + 1,
-                chunks[i],
+                micro_batches[i],
                 ch_dsn,
                 model_dir,
                 dt_from,
                 dt_to,
-                stream_fast_mode
+                stream_fast_mode,
+                parts_dir,
             ): i + 1
-            for i in range(num_workers)
+            for i in range(len(micro_batches))
         }
         for future in as_completed(futures):
-            _, _, _, _, _, csv_file = future.result()
-            part_files.append(csv_file)
+            task_id, _, _, rows_count, errors_count, part_file = future.result()
+            part_files.append(part_file)
+            done_symbols += len(micro_batches[task_id - 1])
+            total_rows += int(rows_count)
+            total_errors += int(errors_count)
+            log("INFO", "EXPORT_STREAM", f"progress symbols_done={done_symbols}/{total_symbols}")
+    part_files = sorted(part_files)
+    stats = {
+        "symbols_total": total_symbols,
+        "symbols_done": done_symbols,
+        "rows_total": total_rows,
+        "errors": total_errors,
+        "elapsed_sec": time.perf_counter() - t0,
+    }
+    if return_mode == "parts":
+        if (not keep_parts) and created_parts_dir:
+            for part_file in part_files:
+                if os.path.exists(part_file):
+                    os.remove(part_file)
+            try:
+                os.rmdir(parts_dir)
+            except OSError:
+                pass
+            part_files = []
+        return {
+            "part_files": part_files,
+            "stats": stats,
+            "parts_dir": parts_dir,
+        }
     frames = []
-    for part_csv in part_files:
-        if os.path.exists(part_csv):
-            df = pd.read_csv(part_csv)
+    for part_file in part_files:
+        if os.path.exists(part_file):
+            df = pd.read_parquet(part_file)
             if not df.empty:
-                df["open_time"] = pd.to_datetime(df["open_time"])
                 frames.append(df)
-            os.remove(part_csv)
+            if not keep_parts:
+                os.remove(part_file)
     if not frames:
         stream_df = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
     else:
         stream_df = pd.concat(frames, ignore_index=True)
+        stream_df["open_time"] = pd.to_datetime(stream_df["open_time"])
         stream_df["p_end"] = stream_df["p_end"].astype(float)
         stream_df = stream_df.sort_values(["open_time", "symbol"]).reset_index(drop=True)
     if out_parquet:
         stream_df.to_parquet(out_parquet, index=False)
+    if (not keep_parts) and created_parts_dir:
+        try:
+            os.rmdir(parts_dir)
+        except OSError:
+            pass
     return stream_df
 
 
@@ -563,8 +609,8 @@ def export_signals(
         }
 
         for future in as_completed(futures):
-            worker_id, processed, skipped, signals, errors, csv_file = future.result()
-            part_files.append(csv_file)
+            worker_id, processed, skipped, signals, errors, part_file = future.result()
+            part_files.append(part_file)
             total_processed += processed
             total_skipped += skipped
             total_signals += signals
@@ -574,18 +620,21 @@ def export_signals(
             log("INFO", "EXPORT",
                 f"worker={worker_id} done processed={processed} skipped={skipped} signals={signals} errors={errors} time={worker_time:.1f}s")
 
-    with open(out_csv, 'w', newline='') as outfile:
-        csv_writer = csv.writer(outfile)
-        csv_writer.writerow(['symbol', 'timestamp'])
+    frames = []
+    for part_file in part_files:
+        if os.path.exists(part_file):
+            part_df = pd.read_parquet(part_file)
+            if not part_df.empty:
+                frames.append(part_df)
+            os.remove(part_file)
 
-        for part_csv in part_files:
-            if os.path.exists(part_csv):
-                with open(part_csv, 'r') as infile:
-                    reader = csv.reader(infile)
-                    next(reader)
-                    for row in reader:
-                        csv_writer.writerow(row)
-                os.remove(part_csv)
+    if frames:
+        out_df = pd.concat(frames, ignore_index=True)
+        out_df["timestamp"] = pd.to_datetime(out_df["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        out_df = out_df.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    else:
+        out_df = pd.DataFrame(columns=["symbol", "timestamp"])
+    out_df.to_csv(out_csv, index=False)
 
     total_time = (datetime.now() - start_time).total_seconds()
 

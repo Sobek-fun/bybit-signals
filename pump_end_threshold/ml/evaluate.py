@@ -398,6 +398,64 @@ def _compute_ordered_threshold_metrics(
     return prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min
 
 
+def _compute_ordered_threshold_metrics_from_arrays(
+        window_times: np.ndarray,
+        window_high: np.ndarray,
+        window_low: np.ndarray,
+        entry_price: float,
+        entry_time: pd.Timestamp,
+        candles_loader,
+        symbol: str,
+        squeeze_threshold: float,
+        pullback_threshold: float
+) -> tuple[float, float | None, float | None]:
+    squeeze_time = None
+    pullback_time = None
+    prepullback_squeeze = 0.0
+
+    for i in range(len(window_times)):
+        minute_time = pd.Timestamp(window_times[i])
+        bar_squeeze = (float(window_high[i]) - entry_price) / entry_price
+        bar_pullback = (entry_price - float(window_low[i])) / entry_price
+
+        same_bar_cross = pullback_time is None and bar_squeeze >= squeeze_threshold and bar_pullback >= pullback_threshold
+        if same_bar_cross:
+            sec_squeeze_time, sec_pullback_time, sec_prepullback = _resolve_threshold_times_in_1s(
+                candles_loader=candles_loader,
+                symbol=symbol,
+                minute_start=minute_time,
+                entry_price=entry_price,
+                squeeze_threshold=squeeze_threshold,
+                pullback_threshold=pullback_threshold
+            )
+            if sec_prepullback is not None:
+                prepullback_squeeze = max(prepullback_squeeze, sec_prepullback)
+            else:
+                prepullback_squeeze = max(prepullback_squeeze, bar_squeeze)
+
+            if squeeze_time is None:
+                squeeze_time = sec_squeeze_time if sec_squeeze_time is not None else minute_time
+            if pullback_time is None:
+                pullback_time = sec_pullback_time if sec_pullback_time is not None else minute_time
+            continue
+
+        if pullback_time is None:
+            prepullback_squeeze = max(prepullback_squeeze, bar_squeeze)
+            if bar_pullback >= pullback_threshold:
+                pullback_time = minute_time
+
+        if squeeze_time is None and bar_squeeze >= squeeze_threshold:
+            squeeze_time = minute_time
+
+    time_to_pullback_min = None
+    time_to_squeeze_min = None
+    if pullback_time is not None:
+        time_to_pullback_min = (pullback_time - entry_time).total_seconds() / 60.0
+    if squeeze_time is not None:
+        time_to_squeeze_min = (squeeze_time - entry_time).total_seconds() / 60.0
+    return prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min
+
+
 def build_signal_path_metrics(
         signals_df: pd.DataFrame,
         candles_loader,
@@ -478,38 +536,73 @@ def build_signal_path_metrics(
         out[f"dirty_no_pullback_{pair}_{h_tag}"] = False
         out[f"pullback_before_squeeze_{pair}_{h_tag}"] = False
 
-    for idx, row in out.iterrows():
-        symbol = row['symbol']
-        signal_time = pd.Timestamp(row['open_time'])
-        eval_time = signal_time + pd.Timedelta(minutes=15 * entry_shift_bars)
-        df_1m = one_minute_cache.get(symbol, pd.DataFrame())
+    n_rows = len(out)
+    column_buffers: dict[str, np.ndarray] = {}
+    column_buffers['entry_time'] = np.full(n_rows, np.datetime64("NaT"), dtype="datetime64[ns]")
+    column_buffers['entry_price'] = np.full(n_rows, np.nan, dtype=float)
+    for h in horizons:
+        h_tag = f"h{h}"
+        column_buffers[f"squeeze_pct_{h_tag}"] = np.full(n_rows, np.nan, dtype=float)
+        column_buffers[f"pullback_pct_{h_tag}"] = np.full(n_rows, np.nan, dtype=float)
+        column_buffers[f"net_edge_pct_{h_tag}"] = np.full(n_rows, np.nan, dtype=float)
+        column_buffers[f"prepullback_squeeze_pct_{h_tag}_{pullback_pct_int}"] = np.full(n_rows, np.nan, dtype=float)
+        column_buffers[f"time_to_pullback_{pullback_pct_int}_{h_tag}"] = np.full(n_rows, np.nan, dtype=float)
+        column_buffers[f"time_to_squeeze_{squeeze_pct_int}_{h_tag}"] = np.full(n_rows, np.nan, dtype=float)
+        column_buffers[f"clean_{pair}_{h_tag}"] = np.zeros(n_rows, dtype=bool)
+        column_buffers[f"dirty_retrace_{pair}_{h_tag}"] = np.zeros(n_rows, dtype=bool)
+        column_buffers[f"clean_no_pullback_{pair}_{h_tag}"] = np.zeros(n_rows, dtype=bool)
+        column_buffers[f"dirty_no_pullback_{pair}_{h_tag}"] = np.zeros(n_rows, dtype=bool)
+        column_buffers[f"pullback_before_squeeze_{pair}_{h_tag}"] = np.zeros(n_rows, dtype=bool)
+
+    symbol_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    for symbol, df_1m in one_minute_cache.items():
         if df_1m.empty:
             continue
+        symbol_cache[str(symbol)] = (
+            df_1m.index.to_numpy(dtype="datetime64[ns]"),
+            df_1m['open'].to_numpy(dtype=float),
+            df_1m['high'].to_numpy(dtype=float),
+            df_1m['low'].to_numpy(dtype=float),
+        )
 
-        pos = df_1m.index.searchsorted(eval_time)
-        if pos >= len(df_1m):
+    for row_idx, row in enumerate(out.itertuples(index=False)):
+        symbol = str(row.symbol)
+        signal_time = pd.Timestamp(row.open_time)
+        eval_time = signal_time + pd.Timedelta(minutes=15 * entry_shift_bars)
+        if symbol not in symbol_cache:
             continue
-        entry_time = pd.Timestamp(df_1m.index[pos])
-        entry_price = float(df_1m.iloc[pos]['open'])
+        idx_values, open_values, high_values, low_values = symbol_cache[symbol]
+        eval_np = np.datetime64(eval_time.to_datetime64())
+        pos = int(np.searchsorted(idx_values, eval_np, side='left'))
+        if pos >= len(idx_values):
+            continue
+        entry_time = pd.Timestamp(idx_values[pos])
+        entry_price = float(open_values[pos])
         if entry_price <= 0:
             continue
 
-        out.at[idx, 'entry_time'] = entry_time
-        out.at[idx, 'entry_price'] = entry_price
+        column_buffers['entry_time'][row_idx] = entry_time.to_datetime64()
+        column_buffers['entry_price'][row_idx] = entry_price
 
         for h in horizons:
             h_tag = f"h{h}"
             horizon_end = eval_time + pd.Timedelta(minutes=h * 15)
-            window = df_1m[(df_1m.index >= eval_time) & (df_1m.index < horizon_end)]
-            if window.empty:
+            end_np = np.datetime64(horizon_end.to_datetime64())
+            end_pos = int(np.searchsorted(idx_values, end_np, side='left'))
+            if end_pos <= pos:
                 continue
+            window_times = idx_values[pos:end_pos]
+            window_high = high_values[pos:end_pos]
+            window_low = low_values[pos:end_pos]
 
-            squeeze_pct = (float(window['high'].max()) - entry_price) / entry_price
-            pullback_pct = (entry_price - float(window['low'].min())) / entry_price
+            squeeze_pct = (float(np.max(window_high)) - entry_price) / entry_price
+            pullback_pct = (entry_price - float(np.min(window_low))) / entry_price
             net_edge_pct = pullback_pct - squeeze_pct
 
-            prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min = _compute_ordered_threshold_metrics(
-                window_df=window,
+            prepullback_squeeze, time_to_pullback_min, time_to_squeeze_min = _compute_ordered_threshold_metrics_from_arrays(
+                window_times=window_times,
+                window_high=window_high,
+                window_low=window_low,
                 entry_price=entry_price,
                 entry_time=eval_time,
                 candles_loader=candles_loader,
@@ -531,17 +624,24 @@ def build_signal_path_metrics(
                 else:
                     pullback_before_squeeze = time_to_pullback_min < time_to_squeeze_min
 
-            out.at[idx, f"squeeze_pct_{h_tag}"] = squeeze_pct
-            out.at[idx, f"pullback_pct_{h_tag}"] = pullback_pct
-            out.at[idx, f"net_edge_pct_{h_tag}"] = net_edge_pct
-            out.at[idx, f"prepullback_squeeze_pct_{h_tag}_{pullback_pct_int}"] = prepullback_squeeze
-            out.at[idx, f"time_to_pullback_{pullback_pct_int}_{h_tag}"] = time_to_pullback_min
-            out.at[idx, f"time_to_squeeze_{squeeze_pct_int}_{h_tag}"] = time_to_squeeze_min
-            out.at[idx, f"clean_{pair}_{h_tag}"] = bool(clean_retrace)
-            out.at[idx, f"dirty_retrace_{pair}_{h_tag}"] = bool(dirty_retrace)
-            out.at[idx, f"clean_no_pullback_{pair}_{h_tag}"] = bool(clean_no_pullback)
-            out.at[idx, f"dirty_no_pullback_{pair}_{h_tag}"] = bool(dirty_no_pullback)
-            out.at[idx, f"pullback_before_squeeze_{pair}_{h_tag}"] = bool(pullback_before_squeeze)
+            column_buffers[f"squeeze_pct_{h_tag}"][row_idx] = squeeze_pct
+            column_buffers[f"pullback_pct_{h_tag}"][row_idx] = pullback_pct
+            column_buffers[f"net_edge_pct_{h_tag}"][row_idx] = net_edge_pct
+            column_buffers[f"prepullback_squeeze_pct_{h_tag}_{pullback_pct_int}"][row_idx] = prepullback_squeeze
+            column_buffers[f"time_to_pullback_{pullback_pct_int}_{h_tag}"][row_idx] = (
+                np.nan if time_to_pullback_min is None else float(time_to_pullback_min)
+            )
+            column_buffers[f"time_to_squeeze_{squeeze_pct_int}_{h_tag}"][row_idx] = (
+                np.nan if time_to_squeeze_min is None else float(time_to_squeeze_min)
+            )
+            column_buffers[f"clean_{pair}_{h_tag}"][row_idx] = bool(clean_retrace)
+            column_buffers[f"dirty_retrace_{pair}_{h_tag}"][row_idx] = bool(dirty_retrace)
+            column_buffers[f"clean_no_pullback_{pair}_{h_tag}"][row_idx] = bool(clean_no_pullback)
+            column_buffers[f"dirty_no_pullback_{pair}_{h_tag}"][row_idx] = bool(dirty_no_pullback)
+            column_buffers[f"pullback_before_squeeze_{pair}_{h_tag}"][row_idx] = bool(pullback_before_squeeze)
+
+    for col_name, values in column_buffers.items():
+        out[col_name] = values
 
     return out
 

@@ -1,9 +1,11 @@
 import argparse
 import hashlib
+import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from pump_end_threshold.features.feature_builder import PumpFeatureBuilder
@@ -210,6 +212,46 @@ def format_predicted_signals(signals_df: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
+def _write_shadow_progress(
+        progress_path: Path,
+        stage: str,
+        done: int,
+        total: int,
+        elapsed_sec: float,
+        eta_sec: float | None,
+        current_artifact: str
+):
+    payload = {
+        "stage": str(stage),
+        "done": int(done),
+        "total": int(total),
+        "elapsed_sec": float(max(0.0, elapsed_sec)),
+        "eta_sec": None if eta_sec is None else float(max(0.0, eta_sec)),
+        "current_artifact": str(current_artifact),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
+
+
+def _save_probability_stream_from_parts(part_files: list[str], out_parquet_path: str):
+    frames = []
+    for part_file in part_files:
+        if Path(part_file).exists():
+            part_df = pd.read_parquet(part_file, columns=["symbol", "open_time", "p_end"])
+            if not part_df.empty:
+                frames.append(part_df)
+    if frames:
+        stream_df = pd.concat(frames, ignore_index=True)
+        stream_df["open_time"] = pd.to_datetime(stream_df["open_time"], errors="coerce")
+        stream_df["p_end"] = pd.to_numeric(stream_df["p_end"], errors="coerce")
+        stream_df = stream_df.dropna(subset=["open_time", "p_end"])
+        stream_df = stream_df.sort_values(["open_time", "symbol"]).reset_index(drop=True)
+    else:
+        stream_df = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+    stream_df.to_parquet(out_parquet_path, index=False)
+
+
 def enrich_with_trade_replay(signals_df: pd.DataFrame, loader: DataLoader) -> pd.DataFrame:
     if signals_df.empty:
         for col in ['entry_time', 'entry_price', 'exit_time', 'exit_price', 'trade_outcome',
@@ -218,15 +260,29 @@ def enrich_with_trade_replay(signals_df: pd.DataFrame, loader: DataLoader) -> pd
         return signals_df
     if 'event_id' not in signals_df.columns:
         tmp = signals_df.copy()
-        tmp['event_id'] = tmp.apply(
-            lambda r: f"{str(r['symbol']).upper()}|{pd.to_datetime(r['open_time']).strftime('%Y%m%d_%H%M%S')}",
-            axis=1,
+        open_time_series = pd.to_datetime(tmp['open_time'])
+        tmp['event_id'] = (
+            tmp['symbol'].astype(str).str.upper()
+            + '|'
+            + open_time_series.dt.strftime('%Y%m%d_%H%M%S')
         )
         signals_df = tmp
 
+    candle_cache = {}
+    entry_shift_bars = 1
+    max_horizon_bars = 200
+    bar_minutes = 15
+    for symbol, group in signals_df.groupby('symbol', sort=False):
+        open_times = pd.to_datetime(group['open_time'])
+        entry_start = open_times.min() + timedelta(minutes=entry_shift_bars * bar_minutes)
+        entry_end = open_times.max() + timedelta(minutes=(entry_shift_bars + max_horizon_bars) * bar_minutes)
+        full_df = loader.load_raw_1m_candles(symbol, entry_start, entry_end)
+        if not full_df.empty:
+            candle_cache[symbol] = (full_df, entry_start, entry_end)
+
     rows = []
-    for row in signals_df.itertuples():
-        result = simulate_trade(loader, row.symbol, row.open_time)
+    for row in signals_df.itertuples(index=False):
+        result = simulate_trade(loader, row.symbol, row.open_time, candle_cache=candle_cache)
         rows.append({
             'event_id': row.event_id,
             'entry_time': result.get('entry_time'),
@@ -256,11 +312,21 @@ def build_holdout_window_summary_6h(signals_df: pd.DataFrame) -> pd.DataFrame:
         signals=(id_col, 'count'),
         pnl_sum=('trade_pnl_pct', 'sum')
     )
-    grouped['tp'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
-    grouped['sl'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'sl').sum())).values
-    grouped['timeout'] = df.groupby('window_start')['trade_outcome'].apply(lambda s: int((s == 'timeout').sum())).values
-    grouped['ambiguous'] = df.groupby('window_start')['trade_outcome'].apply(
-        lambda s: int((s == 'ambiguous').sum())).values
+    outcome_counts = (
+        df.assign(trade_outcome=df['trade_outcome'].astype(str).str.lower())
+        .groupby(['window_start', 'trade_outcome'])
+        .size()
+        .unstack(fill_value=0)
+    )
+    outcome_cols = ['tp', 'sl', 'timeout', 'ambiguous']
+    outcome_counts = outcome_counts.reindex(columns=outcome_cols, fill_value=0)
+    grouped = grouped.set_index('window_start')
+    counts_aligned = outcome_counts.reindex(grouped.index, fill_value=0)
+    grouped['tp'] = counts_aligned['tp'].astype(int)
+    grouped['sl'] = counts_aligned['sl'].astype(int)
+    grouped['timeout'] = counts_aligned['timeout'].astype(int)
+    grouped['ambiguous'] = counts_aligned['ambiguous'].astype(int)
+    grouped = grouped.reset_index()
     grouped['resolved'] = grouped['tp'] + grouped['sl']
     grouped['tp_rate_resolved'] = grouped['tp'] / grouped['resolved'].replace(0, pd.NA)
     grouped['sl_rate_resolved'] = grouped['sl'] / grouped['resolved'].replace(0, pd.NA)
@@ -282,10 +348,21 @@ def build_holdout_symbol_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
         signals=(id_col, 'count'),
         pnl_sum=('trade_pnl_pct', 'sum')
     )
-    grouped['tp'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'tp').sum())).values
-    grouped['sl'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'sl').sum())).values
-    grouped['timeout'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'timeout').sum())).values
-    grouped['ambiguous'] = df.groupby('symbol')['trade_outcome'].apply(lambda s: int((s == 'ambiguous').sum())).values
+    outcome_counts = (
+        df.assign(trade_outcome=df['trade_outcome'].astype(str).str.lower())
+        .groupby(['symbol', 'trade_outcome'])
+        .size()
+        .unstack(fill_value=0)
+    )
+    outcome_cols = ['tp', 'sl', 'timeout', 'ambiguous']
+    outcome_counts = outcome_counts.reindex(columns=outcome_cols, fill_value=0)
+    grouped = grouped.set_index('symbol')
+    counts_aligned = outcome_counts.reindex(grouped.index, fill_value=0)
+    grouped['tp'] = counts_aligned['tp'].astype(int)
+    grouped['sl'] = counts_aligned['sl'].astype(int)
+    grouped['timeout'] = counts_aligned['timeout'].astype(int)
+    grouped['ambiguous'] = counts_aligned['ambiguous'].astype(int)
+    grouped = grouped.reset_index()
     grouped['resolved'] = grouped['tp'] + grouped['sl']
     grouped['tp_rate_resolved'] = grouped['tp'] / grouped['resolved'].replace(0, pd.NA)
     grouped['sl_rate_resolved'] = grouped['sl'] / grouped['resolved'].replace(0, pd.NA)
@@ -348,22 +425,144 @@ def extract_signals_from_probability_stream(
     return out
 
 
+def extract_signals_from_probability_stream_parts(
+        part_files: list[str],
+        threshold: float,
+        min_pending_bars: int,
+        drop_delta: float,
+        abstain_margin: float,
+        eval_start: datetime | None = None,
+        eval_end: datetime | None = None,
+        progress_path: Path | None = None,
+        current_artifact: str = "",
+) -> pd.DataFrame:
+    if not part_files:
+        return pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
+    state = PumpEndSignalState()
+    fired_rows = []
+    rows_done = 0
+    signals_found = 0
+    parts_done = 0
+    total_parts = len(part_files)
+    t0 = time.perf_counter()
+    for part_file in part_files:
+        part_df = pd.read_parquet(part_file, columns=["symbol", "open_time", "p_end"])
+        if not part_df.empty:
+            part_df["open_time"] = pd.to_datetime(part_df["open_time"], errors="coerce")
+            part_df = part_df.dropna(subset=["open_time"]).sort_values(["symbol", "open_time"]).reset_index(drop=True)
+            for row in part_df.itertuples(index=False):
+                symbol = str(row.symbol)
+                open_time = pd.to_datetime(row.open_time)
+                fired = state.update_and_check(
+                    symbol=symbol,
+                    p_end=float(row.p_end),
+                    threshold=float(threshold),
+                    min_pending_bars=int(min_pending_bars),
+                    drop_delta=float(drop_delta),
+                    current_time=open_time.to_pydatetime(),
+                    abstain_margin=float(abstain_margin),
+                )
+                if fired:
+                    if eval_start is not None and open_time < pd.to_datetime(eval_start):
+                        continue
+                    if eval_end is not None and open_time > pd.to_datetime(eval_end):
+                        continue
+                    symbol_up = symbol.upper()
+                    event_id = f"{symbol_up}|{open_time.strftime('%Y%m%d_%H%M%S')}"
+                    fired_rows.append({'event_id': event_id, 'symbol': symbol_up, 'open_time': open_time})
+                    signals_found += 1
+            rows_done += int(len(part_df))
+        parts_done += 1
+        elapsed = time.perf_counter() - t0
+        rows_per_sec = rows_done / elapsed if elapsed > 0 else 0.0
+        parts_per_sec = parts_done / elapsed if elapsed > 0 else 0.0
+        eta_sec = ((total_parts - parts_done) / parts_per_sec) if parts_per_sec > 0 else None
+        eta_text = f"{eta_sec:.1f}" if eta_sec is not None else "null"
+        log(
+            "INFO",
+            "SHADOW_EXTRACT",
+            f"parts_done={parts_done}/{total_parts} rows_done={rows_done} "
+            f"rows_total_est={int(rows_done / parts_done * total_parts) if parts_done else 0} "
+            f"signals_found={signals_found} elapsed_sec={elapsed:.2f} "
+            f"rows_per_sec={rows_per_sec:.1f} eta_sec={eta_text}"
+        )
+        if progress_path is not None:
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_EXTRACT",
+                done=parts_done,
+                total=total_parts,
+                elapsed_sec=elapsed,
+                eta_sec=eta_sec,
+                current_artifact=current_artifact,
+            )
+    if not fired_rows:
+        return pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
+    out = pd.DataFrame(fired_rows)
+    out = out.sort_values(['open_time', 'symbol']).reset_index(drop=True)
+    return out
+
+
 def finalize_live_shadow_signals(
         signals_df: pd.DataFrame,
         loader: DataLoader | None,
-        quality_entry_shift_bars: int
+        quality_entry_shift_bars: int,
+        progress_path: Path | None = None,
+        current_artifact: str = "",
 ) -> pd.DataFrame:
     if signals_df.empty:
         return signals_df
     out = signals_df.copy()
     if loader is not None:
+        t_quality = time.perf_counter()
         out = attach_signal_quality_columns(
             out,
             loader,
             horizons=[16, 32],
             entry_shift_bars=quality_entry_shift_bars,
         )
+        quality_elapsed = time.perf_counter() - t_quality
+        signals_total = int(len(out))
+        signals_per_sec = (signals_total / quality_elapsed) if quality_elapsed > 0 else 0.0
+        log(
+            "INFO",
+            "SHADOW_QUALITY",
+            f"signals_total={signals_total} symbols_total={int(out['symbol'].nunique()) if 'symbol' in out.columns else 0} "
+            f"sec_compute={quality_elapsed:.2f} signals_per_sec={signals_per_sec:.1f} eta_sec=0.0"
+        )
+        if progress_path is not None:
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_QUALITY",
+                done=signals_total,
+                total=signals_total,
+                elapsed_sec=quality_elapsed,
+                eta_sec=0.0,
+                current_artifact=current_artifact,
+            )
+        t_replay = time.perf_counter()
         out = enrich_with_trade_replay(out, loader)
+        replay_elapsed = time.perf_counter() - t_replay
+        outcomes = out['trade_outcome'].astype(str).str.lower() if 'trade_outcome' in out.columns else pd.Series([], dtype=str)
+        ambiguous_count = int((outcomes == 'ambiguous').sum()) if not outcomes.empty else 0
+        sec_per_100 = (replay_elapsed / max(1, len(out))) * 100.0
+        log(
+            "INFO",
+            "SHADOW_REPLAY",
+            f"signals_done={len(out)}/{len(out)} symbols_done={int(out['symbol'].nunique()) if 'symbol' in out.columns else 0}/{int(out['symbol'].nunique()) if 'symbol' in out.columns else 0} "
+            f"ambiguous_count={ambiguous_count} replayed_1s_count={ambiguous_count} "
+            f"sec_total={replay_elapsed:.2f} sec_per_100_signals={sec_per_100:.2f} eta_sec=0.0"
+        )
+        if progress_path is not None:
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_REPLAY",
+                done=int(len(out)),
+                total=int(len(out)),
+                elapsed_sec=replay_elapsed,
+                eta_sec=0.0,
+                current_artifact=current_artifact,
+            )
     out = out.sort_values(['open_time', 'symbol']).reset_index(drop=True)
     return out
 
@@ -389,13 +588,19 @@ def _worst_window_pnl(signals_df: pd.DataFrame, pnl_col: str, hours: int) -> flo
     work = work.dropna(subset=['open_time']).sort_values('open_time').reset_index(drop=True)
     if work.empty:
         return None
+    grouped = work.groupby('open_time', sort=True, as_index=False)[pnl_col].sum()
+    if grouped.empty:
+        return None
+    times = grouped['open_time'].to_numpy(dtype='datetime64[ns]')
+    sums = grouped[pnl_col].to_numpy(dtype=float)
+    prefix = np.concatenate(([0.0], np.cumsum(sums)))
+    window = np.timedelta64(hours, 'h')
     worst = 0.0
-    window = pd.Timedelta(hours=hours)
-    for i in range(len(work)):
-        start = work.iloc[i]['open_time']
-        end = start + window
-        total = float(work.loc[(work['open_time'] >= start) & (work['open_time'] < end), pnl_col].sum())
-        worst = min(worst, total)
+    for i in range(len(times)):
+        end_idx = int(np.searchsorted(times, times[i] + window, side='left'))
+        total = float(prefix[end_idx] - prefix[i])
+        if total < worst:
+            worst = total
     return worst
 
 
@@ -1567,19 +1772,12 @@ def run_tune(args, artifacts: RunArtifacts):
                     label_lookahead_bars=label_lookahead_bars,
                     workers=max(1, int(args.build_workers)),
                     stream_fast_mode=False,
-                    out_probability_stream_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+                    out_probability_stream_path=(
+                        str(artifacts.get_path() / "shadow_probability_stream_val.parquet")
+                        if args.save_shadow_probability_stream else None
+                    ),
                 )
                 artifacts.save_calibration_sweep_val_live_shadow(calibration_result_shadow['calibration_sweep'])
-                artifacts.save_shadow_probability_stream(calibration_result_shadow['probability_stream'], 'val')
-                best_threshold = calibration_result_shadow['threshold']
-                best_min_pending_bars = calibration_result_shadow['min_pending_bars']
-                best_drop_delta = calibration_result_shadow['drop_delta']
-                artifacts.save_best_threshold(best_threshold, {
-                    'signal_rule': actual_signal_rule,
-                    'min_pending_bars': best_min_pending_bars,
-                    'drop_delta': best_drop_delta,
-                    'abstain_margin': args.abstain_margin
-                })
             log("INFO", "TUNE",
                 f"calibrated: threshold={best_threshold:.3f} min_pending_bars={best_min_pending_bars} drop_delta={best_drop_delta}")
 
@@ -1681,13 +1879,24 @@ def run_tune(args, artifacts: RunArtifacts):
             artifacts.save_predicted_signals_eventcentric_test(test_signals_df)
             log("INFO", "TUNE", f"saved {len(test_signals_df)} eventcentric test predicted signals")
 
+            progress_path = artifacts.get_path() / "progress.json"
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_POST",
+                done=0,
+                total=1,
+                elapsed_sec=0.0,
+                eta_sec=None,
+                current_artifact="holdout_live_shadow",
+            )
             live_shadow_val_stream = pd.DataFrame(columns=["symbol", "open_time", "p_end"])
+            live_shadow_val_parts: list[str] = []
             if "val" in shadow_final_splits:
                 if calibration_result_shadow is not None and isinstance(calibration_result_shadow.get('probability_stream'),
                                                                         pd.DataFrame):
                     live_shadow_val_stream = calibration_result_shadow['probability_stream'].copy()
                 else:
-                    live_shadow_val_stream = export_probability_stream(
+                    val_export = export_probability_stream(
                         tokens=shadow_tokens,
                         ch_dsn=args.clickhouse_dsn,
                         model_dir=model_dir,
@@ -1695,9 +1904,26 @@ def run_tune(args, artifacts: RunArtifacts):
                         dt_to=val_end - timedelta(minutes=15),
                         workers=max(1, int(args.build_workers)),
                         stream_fast_mode=False,
-                        out_parquet=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+                        out_parquet=None,
+                        return_mode="parts",
+                        keep_parts=True,
+                        parts_dir=str(artifacts.get_path() / "shadow_probability_stream_val_parts"),
                     )
-            live_shadow_test_stream = export_probability_stream(
+                    live_shadow_val_parts = list(val_export.get("part_files", []))
+                    if args.save_shadow_probability_stream:
+                        _save_probability_stream_from_parts(
+                            part_files=live_shadow_val_parts,
+                            out_parquet_path=str(artifacts.get_path() / "shadow_probability_stream_val.parquet"),
+                        )
+                    val_stats = val_export.get("stats", {})
+                    log(
+                        "INFO",
+                        "SHADOW_POST",
+                        f"stage=val_export_done symbols={val_stats.get('symbols_done', 0)}/{val_stats.get('symbols_total', 0)} "
+                        f"rows={val_stats.get('rows_total', 0)} errors={val_stats.get('errors', 0)} "
+                        f"sec_total={float(val_stats.get('elapsed_sec', 0.0)):.2f}"
+                    )
+            test_export = export_probability_stream(
                 tokens=shadow_tokens,
                 ch_dsn=args.clickhouse_dsn,
                 model_dir=model_dir,
@@ -1705,42 +1931,88 @@ def run_tune(args, artifacts: RunArtifacts):
                 dt_to=test_end - timedelta(minutes=15),
                 workers=max(1, int(args.build_workers)),
                 stream_fast_mode=False,
-                out_parquet=str(artifacts.get_path() / "shadow_probability_stream_test.parquet"),
+                out_parquet=None,
+                return_mode="parts",
+                keep_parts=True,
+                parts_dir=str(artifacts.get_path() / "shadow_probability_stream_test_parts"),
             )
-            artifacts.save_shadow_probability_stream(live_shadow_test_stream, 'test')
+            live_shadow_test_parts = list(test_export.get("part_files", []))
+            if args.save_shadow_probability_stream:
+                _save_probability_stream_from_parts(
+                    part_files=live_shadow_test_parts,
+                    out_parquet_path=str(artifacts.get_path() / "shadow_probability_stream_test.parquet"),
+                )
+            test_stats = test_export.get("stats", {})
+            log(
+                "INFO",
+                "SHADOW_POST",
+                f"stage=test_export_done symbols={test_stats.get('symbols_done', 0)}/{test_stats.get('symbols_total', 0)} "
+                f"rows={test_stats.get('rows_total', 0)} errors={test_stats.get('errors', 0)} "
+                f"sec_total={float(test_stats.get('elapsed_sec', 0.0)):.2f}"
+            )
 
             live_shadow_val_signals = pd.DataFrame(columns=['event_id', 'symbol', 'open_time'])
             if "val" in shadow_final_splits:
-                live_shadow_val_signals = extract_signals_from_probability_stream(
-                    probability_stream_df=live_shadow_val_stream,
-                    threshold=best_threshold,
-                    min_pending_bars=best_min_pending_bars,
-                    drop_delta=best_drop_delta,
-                    abstain_margin=args.abstain_margin,
-                    eval_start=train_end,
-                    eval_end=val_end,
-                )
-            live_shadow_test_signals = extract_signals_from_probability_stream(
-                probability_stream_df=live_shadow_test_stream,
+                if live_shadow_val_parts:
+                    live_shadow_val_signals = extract_signals_from_probability_stream_parts(
+                        part_files=live_shadow_val_parts,
+                        threshold=best_threshold,
+                        min_pending_bars=best_min_pending_bars,
+                        drop_delta=best_drop_delta,
+                        abstain_margin=args.abstain_margin,
+                        eval_start=train_end,
+                        eval_end=val_end,
+                        progress_path=progress_path,
+                        current_artifact="predicted_signals_holdout_live_shadow_val.csv",
+                    )
+                else:
+                    live_shadow_val_signals = extract_signals_from_probability_stream(
+                        probability_stream_df=live_shadow_val_stream,
+                        threshold=best_threshold,
+                        min_pending_bars=best_min_pending_bars,
+                        drop_delta=best_drop_delta,
+                        abstain_margin=args.abstain_margin,
+                        eval_start=train_end,
+                        eval_end=val_end,
+                    )
+            live_shadow_test_signals = extract_signals_from_probability_stream_parts(
+                part_files=live_shadow_test_parts,
                 threshold=best_threshold,
                 min_pending_bars=best_min_pending_bars,
                 drop_delta=best_drop_delta,
                 abstain_margin=args.abstain_margin,
                 eval_start=val_end,
                 eval_end=test_end,
+                progress_path=progress_path,
+                current_artifact="predicted_signals_holdout.csv",
             )
             if "val" in shadow_final_splits:
                 live_shadow_val_signals = finalize_live_shadow_signals(
                     signals_df=live_shadow_val_signals,
                     loader=loader,
                     quality_entry_shift_bars=args.quality_entry_shift_bars,
+                    progress_path=progress_path,
+                    current_artifact="predicted_signals_holdout_live_shadow_val.csv",
                 )
             live_shadow_test_signals = finalize_live_shadow_signals(
                 signals_df=live_shadow_test_signals,
                 loader=loader,
                 quality_entry_shift_bars=args.quality_entry_shift_bars,
+                progress_path=progress_path,
+                current_artifact="predicted_signals_holdout.csv",
             )
 
+            t_metrics = time.perf_counter()
+            log("INFO", "SHADOW_METRICS", f"stage=metrics_start signals={len(live_shadow_test_signals)}")
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_METRICS",
+                done=0,
+                total=max(1, len(live_shadow_test_signals)),
+                elapsed_sec=0.0,
+                eta_sec=None,
+                current_artifact="metrics_holdout_live_shadow.json",
+            )
             test_live_shadow_metrics = build_live_shadow_metrics(
                 signals_df=live_shadow_test_signals,
                 window_start=val_end,
@@ -1751,6 +2023,17 @@ def run_tune(args, artifacts: RunArtifacts):
                 quality_target_min_30d=args.quality_target_min_30d,
                 quality_target_max_30d=args.quality_target_max_30d,
                 quality_overflow_penalty=args.quality_overflow_penalty,
+            )
+            metrics_elapsed = time.perf_counter() - t_metrics
+            log("INFO", "SHADOW_METRICS", f"stage=metrics_done signals={len(live_shadow_test_signals)} sec_total={metrics_elapsed:.2f}")
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_METRICS",
+                done=max(1, len(live_shadow_test_signals)),
+                total=max(1, len(live_shadow_test_signals)),
+                elapsed_sec=metrics_elapsed,
+                eta_sec=0.0,
+                current_artifact="metrics_holdout_live_shadow.json",
             )
             artifacts.save_metrics(test_live_shadow_metrics, "holdout_live_shadow")
             artifacts.save_predicted_signals_holdout_live_shadow(live_shadow_test_signals)
@@ -1770,6 +2053,20 @@ def run_tune(args, artifacts: RunArtifacts):
                 )
                 artifacts.save_metrics(val_live_shadow_metrics, "holdout_live_shadow_val")
                 artifacts.save_predicted_signals_holdout_live_shadow_val(live_shadow_val_signals)
+            for path in live_shadow_val_parts + live_shadow_test_parts:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _write_shadow_progress(
+                progress_path=progress_path,
+                stage="SHADOW_POST",
+                done=1,
+                total=1,
+                elapsed_sec=0.0,
+                eta_sec=0.0,
+                current_artifact="holdout_live_shadow_done",
+            )
             log("INFO", "TUNE", f"saved {len(live_shadow_test_signals)} live-shadow holdout predicted signals")
 
     if args.save_oos_signals:
@@ -1906,6 +2203,7 @@ def main():
     parser.add_argument("--skip-shadow-val-calibration", action="store_true", default=False)
     parser.add_argument("--shadow-final-splits", type=str, default="val,test")
     parser.add_argument("--stream-fast-mode", action="store_true", default=False)
+    parser.add_argument("--save-shadow-probability-stream", action="store_true", default=False)
 
     parser.add_argument("--signal-rule", type=str, choices=["pending_turn_down"],
                         default="pending_turn_down")

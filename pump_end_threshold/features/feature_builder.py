@@ -305,11 +305,9 @@ class PumpFeatureBuilder:
             else:
                 df = self._join_btc_features(df, pd.DataFrame())
 
-        for dt in decision_open_times:
-            if dt not in df.index:
-                df.loc[dt] = np.nan
-
-        df = df.sort_index()
+        decision_index = pd.DatetimeIndex(decision_open_times).unique()
+        full_index = df.index.union(decision_index)
+        df = df.reindex(full_index).sort_index()
         df = self._apply_decision_shift(df)
 
         events_extract = pd.DataFrame([{
