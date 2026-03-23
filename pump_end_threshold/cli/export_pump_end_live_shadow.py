@@ -13,6 +13,7 @@ from pump_end_threshold.cli.train_pump_end_model import (
     extract_signals_from_probability_stream,
     finalize_live_shadow_signals,
     parse_date_exclusive,
+    parse_shadow_final_splits,
     resolve_universe_tokens,
 )
 from pump_end_threshold.infra.clickhouse import DataLoader
@@ -114,6 +115,8 @@ def main():
     parser.add_argument("--symbols-csv", type=str, default=None)
     parser.add_argument("--dataset-parquet", type=str, default=None)
     parser.add_argument("--split", type=str, choices=["val", "test", "both"], default="test")
+    parser.add_argument("--skip-shadow-val-calibration", action="store_true", default=False)
+    parser.add_argument("--shadow-final-splits", type=str, default=None)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--stream-fast-mode", action="store_true", default=False)
     args = parser.parse_args()
@@ -151,7 +154,16 @@ def main():
     quality_target_max_30d = float(run_config.get("quality_target_max_30d", 75.0))
     quality_overflow_penalty = float(run_config.get("quality_overflow_penalty", 0.08))
 
-    split_targets = ["val", "test"] if args.split == "both" else [args.split]
+    if args.shadow_final_splits:
+        split_targets = sorted(parse_shadow_final_splits(args.shadow_final_splits))
+    else:
+        split_targets = ["val", "test"] if args.split == "both" else [args.split]
+    if args.skip_shadow_val_calibration:
+        log(
+            "INFO",
+            "EXPORT_LIVE_SHADOW",
+            "skip-shadow-val-calibration is set; threshold recalibration is not performed in export mode",
+        )
     log("INFO", "EXPORT_LIVE_SHADOW", f"resolved split_targets={','.join(split_targets)} tokens={len(tokens)}")
     if "val" in split_targets:
         val_export_started = time.perf_counter()
