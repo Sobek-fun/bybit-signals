@@ -1,0 +1,70 @@
+--- a/pump_end_threshold/ml/tuning.py
++++ b/pump_end_threshold/ml/tuning.py
+@@ -594,6 +594,8 @@
+         params: dict,
+         train_end: datetime,
+         iterations: int = 1000,
++        early_stopping_rounds: int = 150,
++        final_eval_tail_days: int = 21,
+         seed: int = 42,
+         tune_strategy: str = 'threshold',
+         label_lookahead_bars: int = 0,
+@@ -610,12 +612,12 @@
+         (features_df['open_time'] < train_end)
+         ]
+ 
+-    X_train = train_df[feature_columns]
+-    y_train = train_df['y']
+-    w_train = train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
+-    train_pool = Pool(X_train, y_train, weight=w_train)
+-
+-    model = CatBoostClassifier(
++    tail_start = train_end - timedelta(days=final_eval_tail_days)
++    fit_df = train_df[train_df['open_time'] < tail_start]
++    eval_df = train_df[train_df['open_time'] >= tail_start]
++    eval_valid = len(eval_df) >= 500 and eval_df['y'].nunique() >= 2 and len(fit_df) > 0 and fit_df['y'].nunique() >= 2
++
++    model_kwargs = dict(
+         iterations=iterations,
+         depth=params['depth'],
+         learning_rate=params['learning_rate'],
+@@ -627,6 +629,28 @@
+         auto_class_weights='Balanced'
+     )
+ 
+-    model.fit(train_pool)
++    if eval_valid:
++        model_kwargs['use_best_model'] = True
++        model_kwargs['early_stopping_rounds'] = early_stopping_rounds
++        fit_pool = Pool(
++            fit_df[feature_columns],
++            fit_df['y'],
++            weight=fit_df['sample_weight'].values if 'sample_weight' in fit_df.columns else None
++        )
++        eval_pool = Pool(
++            eval_df[feature_columns],
++            eval_df['y'],
++            weight=eval_df['sample_weight'].values if 'sample_weight' in eval_df.columns else None
++        )
++        model = CatBoostClassifier(**model_kwargs)
++        model.fit(fit_pool, eval_set=eval_pool)
++    else:
++        train_pool = Pool(
++            train_df[feature_columns],
++            train_df['y'],
++            weight=train_df['sample_weight'].values if 'sample_weight' in train_df.columns else None
++        )
++        model = CatBoostClassifier(**model_kwargs)
++        model.fit(train_pool)
+ 
+     return model
+--- a/pump_end_threshold/cli/train_pump_end_model.py
++++ b/pump_end_threshold/cli/train_pump_end_model.py
+@@ -1696,6 +1696,7 @@
+             best_result['best_params'],
+             train_end,
+             iterations=args.iterations,
++            early_stopping_rounds=args.early_stopping_rounds,
+             seed=args.seed,
+             tune_strategy=actual_strategy,
+             label_lookahead_bars=label_lookahead_bars,
