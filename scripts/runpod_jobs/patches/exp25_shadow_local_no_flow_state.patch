@@ -1,0 +1,28 @@
+--- a/pump_end_threshold/ml/regime_feature_schema.py
++++ b/pump_end_threshold/ml/regime_feature_schema.py
+@@ -94,6 +94,13 @@ LOCAL_ONLY_EXCLUDED_COLUMNS = {
+     'strat_last_closed_is_tp',
+ }
+ 
++LOCAL_NO_FLOW_STATE_EXCLUDED_PREFIXES = LOCAL_ONLY_EXCLUDED_PREFIXES + (
++    'raw_signals_',
++    'unique_symbols_',
++    'max_symbol_',
++    'signal_density_',
++)
++
+ 
+ def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) -> list:
+     features = []
+@@ -107,6 +114,11 @@ def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) -
+                 continue
+             if any(col.startswith(p) for p in LOCAL_ONLY_EXCLUDED_PREFIXES):
+                 continue
++        if feature_profile == 'local_no_flow_state':
++            if col in LOCAL_ONLY_EXCLUDED_COLUMNS:
++                continue
++            if any(col.startswith(p) for p in LOCAL_NO_FLOW_STATE_EXCLUDED_PREFIXES):
++                continue
+         if feature_profile == 'token_only' and not col.startswith('token_'):
+             continue
+         features.append(col)

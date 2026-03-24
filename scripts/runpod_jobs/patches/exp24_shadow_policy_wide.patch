@@ -1,0 +1,79 @@
+--- a/pump_end_threshold/ml/regime_tuning.py
++++ b/pump_end_threshold/ml/regime_tuning.py
+@@ -96,6 +96,12 @@
+             {'pause_on_quantile': 0.90, 'resume_quantile': 0.70, 'resume_confirm_signals': 1},
+             {'pause_on_quantile': 0.92, 'resume_quantile': 0.75, 'resume_confirm_signals': 1},
+         ]
++    if preset == 'selective_local_wide':
++        return [
++            {'pause_on_quantile': 0.95, 'resume_quantile': 0.60, 'resume_confirm_signals': 1},
++            {'pause_on_quantile': 0.97, 'resume_quantile': 0.60, 'resume_confirm_signals': 2},
++            {'pause_on_quantile': 0.98, 'resume_quantile': 0.50, 'resume_confirm_signals': 2},
++        ]
+     probe_quantile = 0.88 if max_blocked_share < 0.25 else 0.80
+     return [
+         {'pause_on_quantile': probe_quantile, 'resume_quantile': 0.55, 'resume_confirm_signals': 2},
+@@ -120,6 +126,12 @@
+             'pause_on_quantile': [0.85, 0.88, 0.90, 0.92, 0.95],
+             'resume_quantile': [0.60, 0.65, 0.70, 0.75],
+             'resume_confirm_signals': [1],
++        }
++    elif preset == 'selective_local_wide':
++        policy_grid = {
++            'pause_on_quantile': [0.95, 0.97, 0.98],
++            'resume_quantile': [0.50, 0.60, 0.65],
++            'resume_confirm_signals': [1, 2],
+         }
+     elif preset == 'low':
+         policy_grid = {
+@@ -155,6 +167,9 @@
+     val_df = val_df.dropna(subset=[target_col])
+ 
+     if len(train_df) == 0 or len(val_df) == 0:
++        return None, None, None
++
++    if train_df[target_col].nunique(dropna=True) < 2 or val_df[target_col].nunique(dropna=True) < 2:
+         return None, None, None
+ 
+     X_train = train_df[feature_columns]
+@@ -488,12 +503,12 @@
+                         score_mode=score_mode,
+                         target_col=target_col,
+                     )
+-                    downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid',
+-                                                                                                    False) else -np.inf
++                    downstream_score = downstream_eval.get('score', -np.inf) if downstream_eval.get('valid', False) else -np.inf
+                     if np.isfinite(downstream_score):
+                         downstream_scores.append(float(downstream_score))
+ 
+-        if len(fold_scores) >= min_valid_folds:
++        valid_model_folds = len(downstream_scores) if model_selection_mode == 'downstream_cv' else len(fold_scores)
++        if valid_model_folds >= min_valid_folds:
+             mean_ap = np.mean([s['ap'] for s in fold_scores])
+             mean_auc = np.mean([s['auc'] for s in fold_scores])
+             mean_brier = np.mean([s['brier'] for s in fold_scores])
+@@ -512,11 +527,11 @@
+                 'mean_downstream_cv': mean_downstream_cv,
+                 'model_score': model_score,
+                 'std_ap': np.std([s['ap'] for s in fold_scores]),
+-                'n_valid_folds': len(fold_scores),
++                'n_valid_folds': valid_model_folds,
+             })
+ 
+     if best_params is None and results:
+-        fallback = max(results, key=lambda r: r.get('mean_ap', -np.inf))
++        fallback = max(results, key=lambda r: r.get('model_score', -np.inf))
+         param_keys = ['depth', 'learning_rate', 'l2_leaf_reg', 'min_data_in_leaf', 'random_strength',
+                       'bagging_temperature', 'rsm']
+         best_params = {k: fallback[k] for k in param_keys if k in fallback}
+--- a/pump_end_threshold/cli/train_regime_guard.py
++++ b/pump_end_threshold/cli/train_regime_guard.py
+@@ -93,7 +93,7 @@
+                         choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
+                         help="Scoring mode for hyperparameter optimization")
+     parser.add_argument("--policy-grid", type=str, default="default",
+-                        choices=["default", "conservative", "aggressive", "selective_local", "low"],
++                        choices=["default", "conservative", "aggressive", "selective_local", "selective_local_wide", "low"],
+                         help="Policy parameter grid preset")
+     parser.add_argument("--model-selection-mode", type=str, default="downstream_cv",
+                         choices=["downstream_cv", "mean_ap"],
