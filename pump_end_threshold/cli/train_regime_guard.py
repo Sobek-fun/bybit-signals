@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from pump_end_threshold.ml.regime_evaluate import (
@@ -19,6 +20,8 @@ from pump_end_threshold.ml.regime_tuning import (
     tune_regime_guard,
     train_final_regime_model,
     resolve_policy_params,
+    generate_regime_walk_forward_folds,
+    apply_regime_fold_split,
 )
 from pump_end_threshold.ml.regime_policy import RegimePolicy
 from pump_end_threshold.ml.train import get_feature_importance
@@ -64,6 +67,82 @@ def _feature_family(name: str) -> str:
     return 'other'
 
 
+def _build_cv_preflight(
+        dataset_df: pd.DataFrame,
+        target_col: str,
+        fold_months: int,
+        min_train_months: int,
+        fold_days: int,
+        min_train_days: int,
+        embargo_signals: int,
+        embargo_hours: float,
+        max_cv_folds: int | None,
+) -> tuple[pd.DataFrame, dict, list]:
+    folds = generate_regime_walk_forward_folds(
+        dataset_df,
+        fold_months=fold_months,
+        min_train_months=min_train_months,
+        fold_days=fold_days,
+        min_train_days=min_train_days,
+        max_folds=max_cv_folds,
+    )
+    if not folds:
+        raise ValueError("Not enough data to generate walk-forward folds for preflight")
+
+    rows = []
+    for fold_idx, fold in enumerate(folds):
+        fold_df = apply_regime_fold_split(
+            dataset_df,
+            fold,
+            embargo_signals=embargo_signals,
+            embargo_hours=embargo_hours,
+        )
+        train_labeled = fold_df[(fold_df['split'] == 'train') & (fold_df[target_col].notna())].copy()
+        val_labeled = fold_df[(fold_df['split'] == 'val') & (fold_df[target_col].notna())].copy()
+        if 'sample_weight' in train_labeled.columns:
+            train_labeled = train_labeled[train_labeled['sample_weight'].notna()].copy()
+
+        train_labeled_rows = int(len(train_labeled))
+        val_labeled_rows = int(len(val_labeled))
+        train_pos = int((train_labeled[target_col] == 1).sum())
+        train_neg = int((train_labeled[target_col] == 0).sum())
+        val_pos = int((val_labeled[target_col] == 1).sum())
+        val_neg = int((val_labeled[target_col] == 0).sum())
+        train_nunique = int(train_labeled[target_col].nunique(dropna=True))
+        val_nunique = int(val_labeled[target_col].nunique(dropna=True))
+        viable_model_fold = (
+            train_labeled_rows >= 2 and
+            val_labeled_rows >= 2 and
+            train_nunique >= 2 and
+            val_nunique >= 2
+        )
+
+        rows.append({
+            'fold_idx': fold_idx,
+            'train_start': fold['train_start'],
+            'train_end': fold['train_end'],
+            'val_start': fold['val_start'],
+            'val_end': fold['val_end'],
+            'train_labeled_rows': train_labeled_rows,
+            'val_labeled_rows': val_labeled_rows,
+            'train_pos': train_pos,
+            'train_neg': train_neg,
+            'val_pos': val_pos,
+            'val_neg': val_neg,
+            'train_nunique': train_nunique,
+            'val_nunique': val_nunique,
+            'viable_model_fold': bool(viable_model_fold),
+        })
+
+    preflight_df = pd.DataFrame(rows)
+    summary = {
+        'n_folds': int(len(preflight_df)),
+        'n_viable_model_folds': int(preflight_df['viable_model_fold'].sum()),
+        'n_nonviable_model_folds': int((~preflight_df['viable_model_fold']).sum()),
+    }
+    return preflight_df, summary, folds
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train regime guard model")
     parser.add_argument("--dataset-parquet", type=str, required=True,
@@ -93,13 +172,17 @@ def main():
                         choices=["pnl_after", "pnl_improvement", "block_value", "comprehensive"],
                         help="Scoring mode for hyperparameter optimization")
     parser.add_argument("--policy-grid", type=str, default="default",
-                        choices=["default", "conservative", "aggressive", "selective_local", "low"],
+                        choices=["default", "conservative", "aggressive", "selective_local", "selective_local_wide", "low"],
                         help="Policy parameter grid preset")
     parser.add_argument("--model-selection-mode", type=str, default="downstream_cv",
                         choices=["downstream_cv", "mean_ap"],
                         help="Model selection objective during model tuning")
     parser.add_argument("--feature-profile", type=str, default=None,
                         help="Feature profile: local_only excludes market/breadth/outcome-derived columns")
+    parser.add_argument("--model-tuning-seeds", type=int, default=3,
+                        help="Number of random seeds for model tuning")
+    parser.add_argument("--max-cv-folds", type=int, default=None,
+                        help="Use only latest N CV folds for tuning/preflight")
     parser.add_argument("--disable-auto-class-weights", action="store_true",
                         help="Disable auto_class_weights in CatBoost (use manual sample_weight instead)")
     parser.add_argument("--run-dir", type=str, default=None,
@@ -186,6 +269,38 @@ def main():
     else:
         cv_data = dataset
 
+    log("INFO", "REGIME", "running CV preflight")
+    cv_preflight_df, cv_preflight_summary, preflight_folds = _build_cv_preflight(
+        cv_data,
+        target_col=args.target_col,
+        fold_months=args.fold_months,
+        min_train_months=args.min_train_months,
+        fold_days=args.fold_days,
+        min_train_days=args.min_train_days,
+        embargo_signals=args.embargo_signals,
+        embargo_hours=args.embargo_hours,
+        max_cv_folds=args.max_cv_folds,
+    )
+    cv_preflight_df.to_csv(run_dir / "cv_preflight.csv", index=False)
+    cv_preflight_summary.update({
+        'target_col': args.target_col,
+        'min_valid_folds_required': int(args.min_valid_folds),
+        'max_cv_folds': args.max_cv_folds,
+        'n_folds_after_limit': int(len(preflight_folds)),
+    })
+    with open(run_dir / "cv_preflight_summary.json", 'w') as f:
+        json.dump(cv_preflight_summary, f, indent=2, default=str)
+    log(
+        "INFO",
+        "REGIME",
+        f"cv preflight viable folds: {cv_preflight_summary['n_viable_model_folds']}/{cv_preflight_summary['n_folds']}",
+    )
+    if cv_preflight_summary['n_viable_model_folds'] < args.min_valid_folds:
+        raise ValueError(
+            f"CV preflight failed: viable_model_folds={cv_preflight_summary['n_viable_model_folds']} "
+            f"< min_valid_folds={args.min_valid_folds}"
+        )
+
     log("INFO", "REGIME", f"starting tuning with time_budget={args.time_budget_min}min")
     tune_result = tune_regime_guard(
         cv_data,
@@ -207,6 +322,8 @@ def main():
         policy_grid_preset=args.policy_grid,
         model_selection_mode=args.model_selection_mode,
         feature_profile=args.feature_profile,
+        model_tuning_seeds=args.model_tuning_seeds,
+        max_cv_folds=args.max_cv_folds,
     )
 
     log("INFO", "REGIME",
@@ -216,8 +333,29 @@ def main():
     log("INFO", "REGIME", f"best model params: {tune_result['best_model_params']}")
     log("INFO", "REGIME", f"best policy params: {tune_result['best_policy_params']}")
 
+    best_cv_result = tune_result.get('best_cv_result', {}) or {}
     best_policy_params_raw = tune_result['best_policy_params']
     resolved_policy_params = tune_result.get('policy_tuning', {}).get('resolved_thresholds')
+    needs_numeric_resolution = (
+        best_policy_params_raw is not None and (
+            'pause_on_quantile' in best_policy_params_raw or
+            'resume_quantile' in best_policy_params_raw
+        )
+    )
+    if (
+            tune_result.get('trials_completed', 0) == 0 or
+            not np.isfinite(tune_result.get('best_score', -np.inf)) or
+            best_cv_result.get('n_valid_folds', 0) < args.min_valid_folds or
+            (needs_numeric_resolution and resolved_policy_params is None)
+    ):
+        raise ValueError(
+            "Tuning failed hard-checks: "
+            f"trials_completed={tune_result.get('trials_completed', 0)}, "
+            f"best_score={tune_result.get('best_score')}, "
+            f"best_cv_n_valid_folds={best_cv_result.get('n_valid_folds', 0)}, "
+            f"resolved_policy_params_present={resolved_policy_params is not None}"
+        )
+
     best_policy_params_to_save = resolved_policy_params if resolved_policy_params else best_policy_params_raw
     if ('pause_on_quantile' in best_policy_params_to_save) or ('resume_quantile' in best_policy_params_to_save):
         raise ValueError("Failed to resolve quantile policy to numeric thresholds on train-side calibration")
