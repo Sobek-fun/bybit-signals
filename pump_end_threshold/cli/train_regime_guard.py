@@ -540,6 +540,14 @@ def main():
             accepted.to_parquet(run_dir / "test_accepted.parquet", index=False)
             blocked.to_parquet(run_dir / "test_blocked.parquet", index=False)
 
+            if 'symbol' in accepted.columns and 'open_time' in accepted.columns:
+                allowed_signals_csv = accepted[['symbol', 'open_time']].copy()
+                allowed_signals_csv = allowed_signals_csv.rename(columns={'open_time': 'timestamp'})
+                allowed_signals_csv = allowed_signals_csv.sort_values(['timestamp', 'symbol'])
+                allowed_signals_csv = allowed_signals_csv.drop_duplicates(subset=['symbol', 'timestamp'])
+                allowed_signals_csv.to_csv(run_dir / "test_allowed_signals.csv", index=False)
+                log("INFO", "REGIME", f"Saved {len(allowed_signals_csv)} allowed signals to test_allowed_signals.csv")
+
             if not blocked.empty and 'symbol' in blocked.columns and 'open_time' in blocked.columns:
                 blocked_signals_csv = blocked[['symbol', 'open_time']].copy()
                 blocked_signals_csv = blocked_signals_csv.rename(columns={'open_time': 'timestamp'})
