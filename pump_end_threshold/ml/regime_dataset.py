@@ -56,6 +56,17 @@ TARGET_PROFILES = {
         'good_value_threshold': 15.0,
         'good_sl_rate_threshold': 0.40,
     },
+    'pause_value_12h_v4_rr72_balanced': {
+        'window_hours': 12,
+        'min_resolved': 2,
+        'tp_value': 7.0,
+        'sl_value': 2.0,
+        'timeout_penalty': 1.0,
+        'bad_value_threshold': -4.0,
+        'bad_sl_rate_threshold': 0.50,
+        'good_value_threshold': 10.0,
+        'good_sl_rate_threshold': 0.50,
+    },
 }
 
 

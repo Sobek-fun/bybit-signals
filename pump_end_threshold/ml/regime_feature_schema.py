@@ -94,6 +94,21 @@ LOCAL_ONLY_EXCLUDED_COLUMNS = {
     'strat_last_closed_is_tp',
 }
 
+LOCAL_NO_FLOW_STATE_EXCLUDED_PREFIXES = LOCAL_ONLY_EXCLUDED_PREFIXES + (
+    'raw_signals_',
+    'unique_symbols_',
+    'max_symbol_',
+    'signal_density_',
+)
+
+LOCAL_NO_TOKEN_LIQUIDITY_EXCLUDED_PREFIXES = LOCAL_ONLY_EXCLUDED_PREFIXES + (
+    'token_trades_count_',
+)
+
+LOCAL_NO_TOKEN_LIQUIDITY_EXCLUDED_COLUMNS = LOCAL_ONLY_EXCLUDED_COLUMNS | {
+    'token_vol_ratio_20',
+}
+
 
 def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) -> list:
     features = []
@@ -106,6 +121,16 @@ def get_regime_feature_columns(df: pd.DataFrame, feature_profile: str = None) ->
             if col in LOCAL_ONLY_EXCLUDED_COLUMNS:
                 continue
             if any(col.startswith(p) for p in LOCAL_ONLY_EXCLUDED_PREFIXES):
+                continue
+        if feature_profile == 'local_no_flow_state':
+            if col in LOCAL_ONLY_EXCLUDED_COLUMNS:
+                continue
+            if any(col.startswith(p) for p in LOCAL_NO_FLOW_STATE_EXCLUDED_PREFIXES):
+                continue
+        if feature_profile == 'local_no_token_liquidity':
+            if col in LOCAL_NO_TOKEN_LIQUIDITY_EXCLUDED_COLUMNS:
+                continue
+            if any(col.startswith(p) for p in LOCAL_NO_TOKEN_LIQUIDITY_EXCLUDED_PREFIXES):
                 continue
         if feature_profile == 'token_only' and not col.startswith('token_'):
             continue

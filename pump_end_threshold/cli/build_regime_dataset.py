@@ -61,6 +61,10 @@ def main():
                         help="Target profile name (e.g., pause_value_12h_v2_all, pause_value_12h_v2_curated)")
     parser.add_argument("--feature-profile", type=str, default=None,
                         help="Feature profile name for documentation/versioning")
+    parser.add_argument("--signals-open-time-from", type=str, default=None,
+                        help="Inclusive lower bound for signals open_time (YYYY-MM-DD or datetime)")
+    parser.add_argument("--signals-open-time-to", type=str, default=None,
+                        help="Exclusive upper bound for signals open_time (YYYY-MM-DD or datetime)")
 
     args = parser.parse_args()
 
@@ -85,11 +89,24 @@ def main():
     signals_df['open_time'] = pd.to_datetime(signals_df['open_time'])
     signals_df = signals_df.sort_values('open_time').reset_index(drop=True)
 
+    before_date_filter = len(signals_df)
+    if args.signals_open_time_from is not None:
+        open_time_from = pd.to_datetime(args.signals_open_time_from)
+        signals_df = signals_df[signals_df['open_time'] >= open_time_from]
+    if args.signals_open_time_to is not None:
+        open_time_to = pd.to_datetime(args.signals_open_time_to)
+        signals_df = signals_df[signals_df['open_time'] < open_time_to]
+    signals_df = signals_df.reset_index(drop=True)
+    log("INFO", "REGIME-DS", f"filtered by open_time: {before_date_filter} -> {len(signals_df)}")
+
     if args.symbols_file:
         allowed_symbols = set(load_symbols_from_file(args.symbols_file))
-        before = len(signals_df)
+        before_symbols_filter = len(signals_df)
         signals_df = signals_df[signals_df['symbol'].isin(allowed_symbols)].reset_index(drop=True)
-        log("INFO", "REGIME-DS", f"filtered by symbols-file: {before} -> {len(signals_df)}")
+        log("INFO", "REGIME-DS", f"filtered by symbols-file: {before_symbols_filter} -> {len(signals_df)}")
+
+    if signals_df.empty:
+        raise ValueError("No signals left after open_time/symbol filters")
 
     if 'signal_id' not in signals_df.columns:
         if 'event_id' in signals_df.columns:
@@ -104,6 +121,12 @@ def main():
         signals_df['event_type'] = 'A'
 
     log("INFO", "REGIME-DS", f"loaded {len(signals_df)} signals")
+    log(
+        "INFO",
+        "REGIME-DS",
+        f"signals summary: date_from={signals_df['open_time'].min()}, "
+        f"date_to={signals_df['open_time'].max()}, symbols={signals_df['symbol'].nunique()}, rows={len(signals_df)}",
+    )
 
     loader = DataLoader(args.clickhouse_dsn)
 
@@ -130,7 +153,8 @@ def main():
         signals_df, loader,
         tp_pct=args.tp_pct,
         sl_pct=args.sl_pct,
-        max_horizon_bars=args.max_horizon_bars
+        max_horizon_bars=args.max_horizon_bars,
+        trade_replay_source=args.trade_replay_source,
     )
     log("INFO", "REGIME-DS", f"trades simulated: {len(trades_df)}")
 
@@ -241,6 +265,9 @@ def main():
         if len(valid) > 0:
             log("INFO", "REGIME-DS",
                 f"target_pause_value_next_12h: positive_rate={valid.mean():.3f}, n_valid={len(valid)}, n_nan={dataset['target_pause_value_next_12h'].isna().sum()}")
+            if valid.mean() < 0.05 or valid.mean() > 0.95:
+                log("WARN", "REGIME-DS",
+                    f"target_pause_value_next_12h rate is outside sanity range [0.05, 0.95]: {valid.mean():.3f}")
 
     if run_dir:
         config = {
@@ -258,6 +285,8 @@ def main():
             'target_profile': args.target_profile,
             'feature_profile': args.feature_profile,
             'symbols_file': args.symbols_file,
+            'signals_open_time_from': args.signals_open_time_from,
+            'signals_open_time_to': args.signals_open_time_to,
             'fixed_universe_file': args.fixed_universe_file,
             'strategy_state_mode': STRATEGY_STATE_MODE,
         }
@@ -334,6 +363,8 @@ def main():
             'trade_replay_source': args.trade_replay_source,
             'target_profile': args.target_profile,
             'symbols_file': args.symbols_file,
+            'signals_open_time_from': args.signals_open_time_from,
+            'signals_open_time_to': args.signals_open_time_to,
             'fixed_universe_file': args.fixed_universe_file,
             'strategy_state_mode': STRATEGY_STATE_MODE,
         }
