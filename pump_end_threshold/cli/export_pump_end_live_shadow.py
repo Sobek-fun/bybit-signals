@@ -72,6 +72,29 @@ def _split_bounds(run_config: dict) -> tuple[datetime, datetime, datetime]:
     return train_end, val_end, test_end
 
 
+def _parse_cli_datetime(value: str, *, is_end: bool) -> datetime:
+    text = str(value).strip()
+    if len(text) == 10:
+        try:
+            day = datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid datetime value '{value}', expected YYYY-MM-DD or ISO datetime"
+            ) from exc
+        return day + timedelta(days=1) if is_end else day
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid datetime value '{value}', expected YYYY-MM-DD or ISO datetime"
+        ) from exc
+    if dt.tzinfo is not None:
+        raise ValueError(
+            f"timezone-aware datetime '{value}' is not supported; pass a naive datetime"
+        )
+    return dt
+
+
 def _count_unique_symbols(df: pd.DataFrame) -> int:
     if df.empty or "symbol" not in df.columns:
         return 0
@@ -119,6 +142,18 @@ def main():
     parser.add_argument("--shadow-final-splits", type=str, default=None)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--stream-fast-mode", action="store_true", default=False)
+    parser.add_argument(
+        "--dt-from",
+        type=str,
+        default=None,
+        help="Optional export window start (YYYY-MM-DD or ISO datetime), overrides split default start",
+    )
+    parser.add_argument(
+        "--dt-to",
+        type=str,
+        default=None,
+        help="Optional export window end (YYYY-MM-DD or ISO datetime), overrides split default end",
+    )
     args = parser.parse_args()
     script_started = time.perf_counter()
     log("INFO", "EXPORT_LIVE_SHADOW", f"start run_dir={args.run_dir} split={args.split} workers={args.workers}")
@@ -135,6 +170,21 @@ def main():
         raise SystemExit(f"catboost_model.cbm not found in {run_dir}")
 
     train_end, val_end, test_end = _split_bounds(run_config)
+    override_eval_start = _parse_cli_datetime(args.dt_from, is_end=False) if args.dt_from else None
+    override_eval_end = _parse_cli_datetime(args.dt_to, is_end=True) if args.dt_to else None
+    if args.split == "both" and (override_eval_start is not None or override_eval_end is not None):
+        raise ValueError(
+            "Custom --dt-from/--dt-to are only supported with --split val or --split test; "
+            "for split=both run two separate exports"
+        )
+    if (
+        override_eval_start is not None
+        and override_eval_end is not None
+        and override_eval_end <= override_eval_start
+    ):
+        raise ValueError(
+            f"invalid custom window: dt_to ({override_eval_end}) must be greater than dt_from ({override_eval_start})"
+        )
     tokens = _resolve_tokens(
         run_dir=run_dir,
         run_config=run_config,
@@ -166,14 +216,25 @@ def main():
         )
     log("INFO", "EXPORT_LIVE_SHADOW", f"resolved split_targets={','.join(split_targets)} tokens={len(tokens)}")
     if "val" in split_targets:
+        val_eval_start = override_eval_start or train_end
+        val_eval_end = override_eval_end or val_end
+        val_stream_to = val_eval_end - timedelta(minutes=15)
+        if val_eval_end <= val_eval_start:
+            raise ValueError(
+                f"invalid val export window: end ({val_eval_end}) must be greater than start ({val_eval_start})"
+            )
+        if val_stream_to < val_eval_start:
+            raise ValueError(
+                f"invalid val export window: stream end ({val_stream_to}) is earlier than start ({val_eval_start})"
+            )
         val_export_started = time.perf_counter()
-        log("INFO", "EXPORT_STREAM", f"split=val start tokens={len(tokens)} dt_from={train_end} dt_to={val_end - timedelta(minutes=15)}")
+        log("INFO", "EXPORT_STREAM", f"split=val start tokens={len(tokens)} dt_from={val_eval_start} dt_to={val_stream_to}")
         val_stream = export_probability_stream(
             tokens=tokens,
             ch_dsn=args.clickhouse_dsn,
             model_dir=str(run_dir),
-            dt_from=train_end,
-            dt_to=val_end - timedelta(minutes=15),
+            dt_from=val_eval_start,
+            dt_to=val_stream_to,
             workers=max(1, int(args.workers)),
             out_parquet=str(run_dir / "shadow_probability_stream_val.parquet"),
             stream_fast_mode=args.stream_fast_mode,
@@ -195,8 +256,8 @@ def main():
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
             abstain_margin=abstain_margin,
-            eval_start=train_end,
-            eval_end=val_end,
+            eval_start=val_eval_start,
+            eval_end=val_eval_end,
         )
         log(
             "INFO",
@@ -239,8 +300,8 @@ def main():
         )
         val_metrics = build_live_shadow_metrics(
             signals_df=val_signals,
-            window_start=train_end,
-            window_end=val_end,
+            window_start=val_eval_start,
+            window_end=val_eval_end,
             loader=loader,
             quality_entry_shift_bars=quality_entry_shift_bars,
             quality_density_mode=quality_density_mode,
@@ -267,14 +328,25 @@ def main():
         )
 
     if "test" in split_targets:
+        test_eval_start = override_eval_start or val_end
+        test_eval_end = override_eval_end or test_end
+        test_stream_to = test_eval_end - timedelta(minutes=15)
+        if test_eval_end <= test_eval_start:
+            raise ValueError(
+                f"invalid test export window: end ({test_eval_end}) must be greater than start ({test_eval_start})"
+            )
+        if test_stream_to < test_eval_start:
+            raise ValueError(
+                f"invalid test export window: stream end ({test_stream_to}) is earlier than start ({test_eval_start})"
+            )
         test_export_started = time.perf_counter()
-        log("INFO", "EXPORT_STREAM", f"split=test start tokens={len(tokens)} dt_from={val_end} dt_to={test_end - timedelta(minutes=15)}")
+        log("INFO", "EXPORT_STREAM", f"split=test start tokens={len(tokens)} dt_from={test_eval_start} dt_to={test_stream_to}")
         test_stream = export_probability_stream(
             tokens=tokens,
             ch_dsn=args.clickhouse_dsn,
             model_dir=str(run_dir),
-            dt_from=val_end,
-            dt_to=test_end - timedelta(minutes=15),
+            dt_from=test_eval_start,
+            dt_to=test_stream_to,
             workers=max(1, int(args.workers)),
             out_parquet=str(run_dir / "shadow_probability_stream_test.parquet"),
             stream_fast_mode=args.stream_fast_mode,
@@ -296,8 +368,8 @@ def main():
             min_pending_bars=min_pending_bars,
             drop_delta=drop_delta,
             abstain_margin=abstain_margin,
-            eval_start=val_end,
-            eval_end=test_end,
+            eval_start=test_eval_start,
+            eval_end=test_eval_end,
         )
         log(
             "INFO",
@@ -340,8 +412,8 @@ def main():
         )
         test_metrics = build_live_shadow_metrics(
             signals_df=test_signals,
-            window_start=val_end,
-            window_end=test_end,
+            window_start=test_eval_start,
+            window_end=test_eval_end,
             loader=loader,
             quality_entry_shift_bars=quality_entry_shift_bars,
             quality_density_mode=quality_density_mode,
