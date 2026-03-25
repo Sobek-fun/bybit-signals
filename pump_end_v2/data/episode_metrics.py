@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import math
+
+import pandas as pd
+
+from pump_end_v2.contracts import OutcomeClass
+from pump_end_v2.logging import stage_done, stage_start
+
+
+def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
+    stage_start("METRICS", "METRICS")
+    if resolved_rows.empty:
+        stage_done("METRICS", "METRICS episodes_total=0 good_episode_share=0.0000")
+        return pd.DataFrame(
+            columns=[
+                "episode_id",
+                "symbol",
+                "episode_open_time",
+                "episode_close_time",
+                "duration_bars",
+                "total_rows",
+                "resolved_rows",
+                "good_row_count",
+                "good_zone_width_bars",
+                "ideal_entry_row_id",
+                "ideal_entry_bar_open_time",
+                "ideal_pullback_pct",
+                "ideal_prepullback_squeeze_pct",
+                "ideal_net_edge_pct",
+                "bars_open_to_ideal_entry",
+                "episode_outcome_class",
+            ]
+        )
+    summary_rows: list[dict[str, object]] = []
+    for episode_id, gdf in resolved_rows.groupby("episode_id", sort=False):
+        gdf = gdf.sort_values("context_bar_open_time", kind="mergesort").reset_index(drop=True)
+        total_rows = len(gdf)
+        resolved_count = int(gdf["is_resolved"].sum())
+        good_row_count = int((gdf["target_good_short_now"] == 1).sum())
+        good_zone_width_bars = int((gdf["target_good_short_now"] == 1).sum())
+        ideal_row = gdf[gdf["is_ideal_entry"]]
+        if ideal_row.empty:
+            ideal_entry_row_id = pd.NA
+            ideal_entry_bar_open_time = pd.NaT
+            ideal_pullback_pct = math.nan
+            ideal_prepullback_squeeze_pct = math.nan
+            ideal_net_edge_pct = math.nan
+            bars_open_to_ideal_entry = math.nan
+        else:
+            ideal = ideal_row.iloc[0]
+            ideal_entry_row_id = ideal["decision_row_id"]
+            ideal_entry_bar_open_time = ideal["entry_bar_open_time"]
+            ideal_pullback_pct = float(ideal["future_pullback_pct"])
+            ideal_prepullback_squeeze_pct = float(ideal["future_prepullback_squeeze_pct"])
+            ideal_net_edge_pct = float(ideal["future_net_edge_pct"])
+            bars_open_to_ideal_entry = int(
+                (ideal_entry_bar_open_time - gdf["episode_open_time"].iloc[0]).total_seconds() // (15 * 60)
+            )
+        if good_row_count > 0:
+            episode_outcome_class = OutcomeClass.REVERSAL.value
+        elif (gdf["future_outcome_class"] == OutcomeClass.CONTINUATION.value).any():
+            episode_outcome_class = OutcomeClass.CONTINUATION.value
+        else:
+            episode_outcome_class = OutcomeClass.FLAT.value
+        summary_rows.append(
+            {
+                "episode_id": episode_id,
+                "symbol": gdf["symbol"].iloc[0],
+                "episode_open_time": gdf["episode_open_time"].iloc[0],
+                "episode_close_time": gdf["episode_close_time"].iloc[0],
+                "duration_bars": int(gdf["duration_bars"].iloc[0]),
+                "total_rows": total_rows,
+                "resolved_rows": resolved_count,
+                "good_row_count": good_row_count,
+                "good_zone_width_bars": good_zone_width_bars,
+                "ideal_entry_row_id": ideal_entry_row_id,
+                "ideal_entry_bar_open_time": ideal_entry_bar_open_time,
+                "ideal_pullback_pct": ideal_pullback_pct,
+                "ideal_prepullback_squeeze_pct": ideal_prepullback_squeeze_pct,
+                "ideal_net_edge_pct": ideal_net_edge_pct,
+                "bars_open_to_ideal_entry": bars_open_to_ideal_entry,
+                "episode_outcome_class": episode_outcome_class,
+            }
+        )
+    summary_df = pd.DataFrame(summary_rows)
+    good_episode_share = (
+        float((summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean())
+        if not summary_df.empty
+        else 0.0
+    )
+    stage_done(
+        "METRICS",
+        f"METRICS episodes_total={len(summary_df)} good_episode_share={good_episode_share:.4f}",
+    )
+    return summary_df
+
+
+def build_event_quality_report(summary_df: pd.DataFrame) -> dict[str, float]:
+    if summary_df.empty:
+        return {
+            "episodes_total": 0,
+            "episodes_per_30d": 0.0,
+            "reversal_share": 0.0,
+            "continuation_share": 0.0,
+            "flat_share": 0.0,
+            "median_bars_open_to_ideal_entry": math.nan,
+            "median_ideal_pullback_pct": math.nan,
+            "median_ideal_remaining_squeeze_pct": math.nan,
+            "good_episode_share": 0.0,
+            "mean_good_zone_width_bars": 0.0,
+        }
+    episodes_total = int(len(summary_df))
+    open_times = pd.to_datetime(summary_df["episode_open_time"], utc=True, errors="coerce")
+    span_days = (open_times.max() - open_times.min()).total_seconds() / 86400.0
+    if span_days <= 0:
+        episodes_per_30d = float(episodes_total) * 30.0
+    else:
+        episodes_per_30d = float(episodes_total) / (span_days / 30.0)
+    reversal_share = float((summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean())
+    continuation_share = float((summary_df["episode_outcome_class"] == OutcomeClass.CONTINUATION.value).mean())
+    flat_share = float((summary_df["episode_outcome_class"] == OutcomeClass.FLAT.value).mean())
+    return {
+        "episodes_total": episodes_total,
+        "episodes_per_30d": episodes_per_30d,
+        "reversal_share": reversal_share,
+        "continuation_share": continuation_share,
+        "flat_share": flat_share,
+        "median_bars_open_to_ideal_entry": float(summary_df["bars_open_to_ideal_entry"].median()),
+        "median_ideal_pullback_pct": float(summary_df["ideal_pullback_pct"].median()),
+        "median_ideal_remaining_squeeze_pct": float(summary_df["ideal_prepullback_squeeze_pct"].median()),
+        "good_episode_share": reversal_share,
+        "mean_good_zone_width_bars": float(summary_df["good_zone_width_bars"].mean()),
+    }
