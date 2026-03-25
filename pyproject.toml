@@ -9,6 +9,7 @@ dependencies = [
     "catboost>=1.2.8",
     "clickhouse-connect>=0.10.0",
     "ipykernel>=7.2.0",
+    "numba>=0.61.2",
     "pandas>=2.3.3",
     "pandas-ta>=0.4.71b0",
     "pyarrow>=22.0.0",
