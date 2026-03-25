@@ -4,7 +4,6 @@ import pandas as pd
 from catboost import CatBoostClassifier
 
 from pump_end_v2.config import GateModelConfig
-from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.gate.dataset import GATE_TARGET_META_COLUMNS, build_gate_dataset
 from pump_end_v2.gate.feature_view import GATE_FEATURE_COLUMNS, GATE_IDENTITY_COLUMNS, build_gate_feature_view
 from pump_end_v2.gate.model import build_gate_model, fit_gate_model, predict_gate_scores
@@ -40,7 +39,6 @@ def build_gate_val_scored_signals_and_datasets(
     token_state_df: pd.DataFrame,
     reference_state_df: pd.DataFrame,
     breadth_state_df: pd.DataFrame,
-    execution_contract: ExecutionContract,
     gate_model_config: GateModelConfig,
     base_block_threshold: float,
 ) -> tuple[CatBoostClassifier, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -49,14 +47,12 @@ def build_gate_val_scored_signals_and_datasets(
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
-        execution_contract=execution_contract,
     )
     val_feature_view_df = build_gate_feature_view(
         candidate_signals_df=val_candidate_signals_df,
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
-        execution_contract=execution_contract,
     )
     train_gate_dataset_df = build_gate_dataset(train_feature_view_df, train_oof_candidate_signals_df)
     val_gate_dataset_df = build_gate_dataset(val_feature_view_df, val_candidate_signals_df)
@@ -92,7 +88,6 @@ def build_gate_test_scored_signals(
     token_state_df: pd.DataFrame,
     reference_state_df: pd.DataFrame,
     breadth_state_df: pd.DataFrame,
-    execution_contract: ExecutionContract,
     gate_model_config: GateModelConfig,
 ) -> tuple[CatBoostClassifier, pd.DataFrame, pd.DataFrame]:
     train_feature_view_df = build_gate_feature_view(
@@ -100,14 +95,12 @@ def build_gate_test_scored_signals(
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
-        execution_contract=execution_contract,
     )
     test_feature_view_df = build_gate_feature_view(
         candidate_signals_df=test_candidate_signals_df,
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
-        execution_contract=execution_contract,
     )
     train_gate_dataset_df = build_gate_dataset(train_feature_view_df, train_oof_candidate_signals_df)
     test_gate_dataset_df = build_gate_dataset(test_feature_view_df, test_candidate_signals_df)
