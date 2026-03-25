@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import math
+import time
 
 import pandas as pd
 
 from pump_end_v2.config import ResolverConfig
 from pump_end_v2.contracts import OutcomeClass, TargetReason
-from pump_end_v2.logging import stage_done, stage_start
+from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
 def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config: ResolverConfig) -> pd.DataFrame:
-    stage_start("RESOLVER", "RESOLVER")
+    started = time.perf_counter()
+    stage_start("RESOLVER", "RESOLVE_ROWS")
     if decision_rows.empty:
-        stage_done("RESOLVER", "RESOLVER rows_total=0 resolved_rows=0 good_rows=0 reversal_share=0.0000")
-        return decision_rows.copy()
+        out = decision_rows.copy()
+        log_info("RESOLVER", "summary rows_total=0 resolved_rows=0 good_rows=0 reversal_share=0.0000")
+        stage_done("RESOLVER", "RESOLVE_ROWS", elapsed_sec=time.perf_counter() - started)
+        return out
     resolved = decision_rows.copy()
     resolved["is_resolved"] = False
     resolved["entry_price"] = math.nan
@@ -96,13 +100,14 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
     resolved_rows_count = int(resolved["is_resolved"].sum())
     good_rows = int((resolved["target_good_short_now"] == 1).sum())
     reversal_share = good_rows / resolved_rows_count if resolved_rows_count else 0.0
-    stage_done(
+    log_info(
         "RESOLVER",
         (
-            f"RESOLVER rows_total={len(resolved)} "
+            f"summary rows_total={len(resolved)} "
             f"resolved_rows={resolved_rows_count} good_rows={good_rows} reversal_share={reversal_share:.4f}"
         ),
     )
+    stage_done("RESOLVER", "RESOLVE_ROWS", elapsed_sec=time.perf_counter() - started)
     return resolved
 
 

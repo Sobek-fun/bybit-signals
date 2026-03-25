@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import math
+import time
 
 import pandas as pd
 
 from pump_end_v2.contracts import OutcomeClass
-from pump_end_v2.logging import stage_done, stage_start
+from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
 def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
-    stage_start("METRICS", "METRICS")
+    started = time.perf_counter()
+    stage_start("METRICS", "BUILD_EPISODE_SUMMARY")
     if resolved_rows.empty:
-        stage_done("METRICS", "METRICS episodes_total=0 good_episode_share=0.0000")
-        return pd.DataFrame(
+        out = pd.DataFrame(
             columns=[
                 "episode_id",
                 "symbol",
@@ -32,6 +33,9 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "episode_outcome_class",
             ]
         )
+        log_info("METRICS", "summary episodes_total=0 good_episode_share=0.0000")
+        stage_done("METRICS", "BUILD_EPISODE_SUMMARY", elapsed_sec=time.perf_counter() - started)
+        return out
     summary_rows: list[dict[str, object]] = []
     for episode_id, gdf in resolved_rows.groupby("episode_id", sort=False):
         gdf = gdf.sort_values("context_bar_open_time", kind="mergesort").reset_index(drop=True)
@@ -68,8 +72,8 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "episode_id": episode_id,
                 "symbol": gdf["symbol"].iloc[0],
                 "episode_open_time": gdf["episode_open_time"].iloc[0],
-                "episode_close_time": gdf["episode_close_time"].iloc[0],
-                "duration_bars": int(gdf["duration_bars"].iloc[0]),
+                "episode_close_time": gdf["context_bar_open_time"].max(),
+                "duration_bars": int(gdf["episode_age_bars"].max()),
                 "total_rows": total_rows,
                 "resolved_rows": resolved_count,
                 "good_row_count": good_row_count,
@@ -89,10 +93,11 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
         if not summary_df.empty
         else 0.0
     )
-    stage_done(
+    log_info(
         "METRICS",
-        f"METRICS episodes_total={len(summary_df)} good_episode_share={good_episode_share:.4f}",
+        f"summary episodes_total={len(summary_df)} good_episode_share={good_episode_share:.4f}",
     )
+    stage_done("METRICS", "BUILD_EPISODE_SUMMARY", elapsed_sec=time.perf_counter() - started)
     return summary_df
 
 
