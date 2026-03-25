@@ -44,9 +44,16 @@ class ResolverConfig:
 class V2Config:
     raw: dict[str, Any]
     splits: SplitBounds
+    references: ReferenceSymbolsConfig
     event_opener: EventOpenerConfig
     resolver: ResolverConfig
     execution: ExecutionContract
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceSymbolsConfig:
+    btc_symbol: str
+    eth_symbol: str
 
 
 def load_toml_config(path: str | Path) -> dict[str, Any]:
@@ -70,6 +77,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _validate_execution(config["execution"])
     _validate_compute(config["compute"])
     splits = _build_splits(config["splits"])
+    references = _build_references(config["data"]["references"])
     event_opener = _build_event_opener(config["data"]["event_opener"])
     resolver = _build_resolver(config["data"]["resolver"])
     execution = ExecutionContract(
@@ -82,6 +90,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     return V2Config(
         raw=copy.deepcopy(config),
         splits=splits,
+        references=references,
         event_opener=event_opener,
         resolver=resolver,
         execution=execution,
@@ -130,8 +139,12 @@ def _validate_data(data_section: dict[str, Any]) -> None:
     resolver_section = data_section.get("resolver")
     if not isinstance(resolver_section, dict):
         raise ValueError("missing required section: data.resolver")
+    references_section = data_section.get("references")
+    if not isinstance(references_section, dict):
+        raise ValueError("missing required section: data.references")
     _validate_event_opener(event_opener_section)
     _validate_resolver(resolver_section)
+    _validate_references(references_section)
 
 
 def _validate_non_negative(section: dict[str, Any], section_name: str) -> None:
@@ -235,6 +248,23 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
         flat_max_abs_move_pct=_require_positive_float(
             section.get("flat_max_abs_move_pct"), "data.resolver.flat_max_abs_move_pct"
         ),
+    )
+
+
+def _validate_references(section: dict[str, Any]) -> None:
+    _build_references(section)
+
+
+def _build_references(section: dict[str, Any]) -> ReferenceSymbolsConfig:
+    btc_symbol = section.get("btc_symbol")
+    if not isinstance(btc_symbol, str) or not btc_symbol.strip():
+        raise ValueError("data.references.btc_symbol must be a non-empty string")
+    eth_symbol = section.get("eth_symbol")
+    if not isinstance(eth_symbol, str) or not eth_symbol.strip():
+        raise ValueError("data.references.eth_symbol must be a non-empty string")
+    return ReferenceSymbolsConfig(
+        btc_symbol=btc_symbol.strip(),
+        eth_symbol=eth_symbol.strip(),
     )
 
 

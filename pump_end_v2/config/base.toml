@@ -2,6 +2,10 @@
 source_root = "."
 timeframe = "15m"
 
+[data.references]
+btc_symbol = "BTCUSDT"
+eth_symbol = "ETHUSDT"
+
 [data.event_opener]
 runup_lookback_bars = 12
 min_runup_pct = 0.08

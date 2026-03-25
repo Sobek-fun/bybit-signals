@@ -12,6 +12,8 @@ ALLOWED_COMPONENTS = {
     "RESOLVER",
     "ROWS",
     "METRICS",
+    "LAYERS",
+    "FEATURES",
 }
 
 
