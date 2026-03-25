@@ -64,6 +64,20 @@ class DetectorPolicyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GateConfig:
+    block_threshold: float
+
+
+@dataclass(frozen=True, slots=True)
+class GateModelConfig:
+    iterations: int
+    depth: int
+    learning_rate: float
+    l2_leaf_reg: float
+    random_seed: int
+
+
+@dataclass(frozen=True, slots=True)
 class ReferenceSymbolsConfig:
     btc_symbol: str
     eth_symbol: str
@@ -79,6 +93,8 @@ class V2Config:
     detector_model: DetectorModelConfig
     detector_cv: DetectorCVConfig
     detector_policy: DetectorPolicyConfig
+    gate_config: GateConfig
+    gate_model: GateModelConfig
     execution: ExecutionContract
 
 
@@ -99,7 +115,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _validate_splits(config["splits"])
     _validate_data(config["data"])
     _validate_detector(config["detector"])
-    _validate_non_negative(config["gate"], "gate")
+    _validate_gate(config["gate"])
     _validate_execution(config["execution"])
     _validate_compute(config["compute"])
     splits = _build_splits(config["splits"])
@@ -109,6 +125,8 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     detector_model = _build_detector_model(config["detector"])
     detector_cv = _build_detector_cv(config["detector"])
     detector_policy = _build_detector_policy(config["detector"])
+    gate_config = _build_gate_config(config["gate"])
+    gate_model = _build_gate_model(config["gate"])
     execution = ExecutionContract(
         tp_pct=float(config["execution"]["tp_pct"]),
         sl_pct=float(config["execution"]["sl_pct"]),
@@ -125,6 +143,8 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         detector_model=detector_model,
         detector_cv=detector_cv,
         detector_policy=detector_policy,
+        gate_config=gate_config,
+        gate_model=gate_model,
         execution=execution,
     )
 
@@ -185,6 +205,11 @@ def _validate_detector(detector_section: dict[str, Any]) -> None:
     _build_detector_model(detector_section)
     _build_detector_cv(detector_section)
     _build_detector_policy(detector_section)
+
+
+def _validate_gate(gate_section: dict[str, Any]) -> None:
+    _build_gate_config(gate_section)
+    _build_gate_model(gate_section)
 
 
 def _validate_non_negative(section: dict[str, Any], section_name: str) -> None:
@@ -348,6 +373,26 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
         arm_score_min=arm_score_min,
         fire_score_floor=fire_score_floor,
         turn_down_delta=turn_down_delta,
+    )
+
+
+def _build_gate_config(section: dict[str, Any]) -> GateConfig:
+    block_threshold = float(section.get("block_threshold"))
+    if not (0.0 < block_threshold <= 1.0):
+        raise ValueError("gate.block_threshold must satisfy 0 < x <= 1")
+    return GateConfig(block_threshold=block_threshold)
+
+
+def _build_gate_model(section: dict[str, Any]) -> GateModelConfig:
+    model_section = section.get("model")
+    if not isinstance(model_section, dict):
+        raise ValueError("missing required section: gate.model")
+    return GateModelConfig(
+        iterations=_require_positive_int(model_section.get("iterations"), "gate.model.iterations"),
+        depth=_require_positive_int(model_section.get("depth"), "gate.model.depth"),
+        learning_rate=_require_positive_float(model_section.get("learning_rate"), "gate.model.learning_rate"),
+        l2_leaf_reg=_require_positive_float(model_section.get("l2_leaf_reg"), "gate.model.l2_leaf_reg"),
+        random_seed=_require_non_negative_int(model_section.get("random_seed"), "gate.model.random_seed"),
     )
 
 

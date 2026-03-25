@@ -17,6 +17,7 @@ ALLOWED_COMPONENTS = {
     "DETECTOR",
     "CV",
     "POLICY",
+    "GATE",
 }
 
 

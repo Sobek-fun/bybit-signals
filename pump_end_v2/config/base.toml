@@ -48,6 +48,13 @@ max_folds = 6
 [gate]
 block_threshold = 0.60
 
+[gate.model]
+iterations = 400
+depth = 5
+learning_rate = 0.05
+l2_leaf_reg = 3.0
+random_seed = 42
+
 [execution]
 tp_pct = 0.045
 sl_pct = 0.03
