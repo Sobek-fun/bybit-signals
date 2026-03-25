@@ -19,6 +19,7 @@ from pump_end_v2.detector.splits import (
     generate_detector_walkforward_folds,
     summarize_detector_splits,
 )
+from pump_end_v2.detector.target_metrics import build_detector_target_metrics
 
 __all__ = [
     "build_detector_dataset",
@@ -41,5 +42,6 @@ __all__ = [
     "build_detector_train_oof_candidate_signal_ledger",
     "build_detector_test_policy_rows",
     "build_detector_test_candidate_signal_ledger",
+    "build_detector_target_metrics",
 ]
 
