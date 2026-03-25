@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 
 from pump_end_v2.config import EventOpenerConfig
-from pump_end_v2.logging import stage_done, stage_start
+from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
-def open_causal_pump_episodes(df: pd.DataFrame, config: EventOpenerConfig) -> pd.DataFrame:
-    stage_start("EVENT", "EVENT")
+def open_causal_pump_episodes(token_state_df: pd.DataFrame, config: EventOpenerConfig) -> pd.DataFrame:
+    started = time.perf_counter()
+    stage_start("EVENT", "OPEN_EPISODES")
     episodes: list[dict[str, object]] = []
-    for symbol, sdf in df.groupby("symbol", sort=False):
+    for symbol, sdf in token_state_df.groupby("symbol", sort=False):
         episodes.extend(_open_symbol_episodes(symbol, sdf.reset_index(drop=True), config))
     episodes_df = pd.DataFrame(
         episodes,
@@ -25,19 +28,19 @@ def open_causal_pump_episodes(df: pd.DataFrame, config: EventOpenerConfig) -> pd
             "max_runup_pct_during_episode",
         ],
     )
-    stage_done(
+    log_info(
         "EVENT",
-        f"EVENT symbols={df['symbol'].nunique()} bars={len(df)} episodes_total={len(episodes_df)}",
+        f"summary symbols={token_state_df['symbol'].nunique() if not token_state_df.empty else 0} bars={len(token_state_df)} episodes_total={len(episodes_df)}",
     )
+    stage_done("EVENT", "OPEN_EPISODES", elapsed_sec=time.perf_counter() - started)
     return episodes_df
 
 
 def _open_symbol_episodes(symbol: str, sdf: pd.DataFrame, config: EventOpenerConfig) -> list[dict[str, object]]:
-    rows = _build_context_rows(sdf, config)
     result: list[dict[str, object]] = []
     active: dict[str, object] | None = None
     next_open_idx = 0
-    for i, row in rows.iterrows():
+    for i, row in sdf.iterrows():
         if active is None:
             if i >= next_open_idx and bool(row["pump_context_flag"]):
                 open_time = row["open_time"]
@@ -65,26 +68,9 @@ def _open_symbol_episodes(symbol: str, sdf: pd.DataFrame, config: EventOpenerCon
             active = None
             next_open_idx = i + config.cooldown_bars + 1
     if active is not None:
-        close_time = rows["open_time"].iloc[-1]
+        close_time = sdf["open_time"].iloc[-1]
         result.append(_close_episode(active, close_time, "data_end"))
     return result
-
-
-def _build_context_rows(sdf: pd.DataFrame, config: EventOpenerConfig) -> pd.DataFrame:
-    frame = sdf.copy()
-    frame["rolling_min_low"] = frame["low"].rolling(window=config.runup_lookback_bars, min_periods=1).min()
-    frame["runup_pct"] = frame["close"] / frame["rolling_min_low"] - 1.0
-    frame["rolling_max_high"] = frame["high"].rolling(window=config.near_high_lookback_bars, min_periods=1).max()
-    frame["near_high_flag"] = frame["close"] >= frame["rolling_max_high"] * (1.0 - config.near_high_tol_pct)
-    frame["rolling_mean_volume"] = frame["volume"].rolling(window=config.volume_ratio_lookback_bars, min_periods=1).mean()
-    frame["volume_ratio"] = frame["volume"] / frame["rolling_mean_volume"]
-    frame["volume_ratio"] = frame["volume_ratio"].replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
-    frame["pump_context_flag"] = (
-        (frame["runup_pct"] >= config.min_runup_pct)
-        & frame["near_high_flag"]
-        & (frame["volume_ratio"] >= config.min_volume_ratio)
-    )
-    return frame
 
 
 def _resolve_expiry_reason(active: dict[str, object], row: pd.Series, config: EventOpenerConfig) -> str | None:
