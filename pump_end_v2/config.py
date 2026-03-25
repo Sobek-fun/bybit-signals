@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -41,19 +41,37 @@ class ResolverConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class V2Config:
-    raw: dict[str, Any]
-    splits: SplitBounds
-    references: ReferenceSymbolsConfig
-    event_opener: EventOpenerConfig
-    resolver: ResolverConfig
-    execution: ExecutionContract
+class DetectorModelConfig:
+    iterations: int
+    depth: int
+    learning_rate: float
+    l2_leaf_reg: float
+    random_seed: int
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorCVConfig:
+    min_train_days: int
+    fold_span_days: int
+    max_folds: int
 
 
 @dataclass(frozen=True, slots=True)
 class ReferenceSymbolsConfig:
     btc_symbol: str
     eth_symbol: str
+
+
+@dataclass(frozen=True, slots=True)
+class V2Config:
+    raw: dict[str, Any]
+    splits: SplitBounds
+    references: ReferenceSymbolsConfig
+    event_opener: EventOpenerConfig
+    resolver: ResolverConfig
+    detector_model: DetectorModelConfig
+    detector_cv: DetectorCVConfig
+    execution: ExecutionContract
 
 
 def load_toml_config(path: str | Path) -> dict[str, Any]:
@@ -72,7 +90,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _reject_feature_flags(config)
     _validate_splits(config["splits"])
     _validate_data(config["data"])
-    _validate_non_negative(config["detector"], "detector")
+    _validate_detector(config["detector"])
     _validate_non_negative(config["gate"], "gate")
     _validate_execution(config["execution"])
     _validate_compute(config["compute"])
@@ -80,6 +98,8 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     references = _build_references(config["data"]["references"])
     event_opener = _build_event_opener(config["data"]["event_opener"])
     resolver = _build_resolver(config["data"]["resolver"])
+    detector_model = _build_detector_model(config["detector"])
+    detector_cv = _build_detector_cv(config["detector"])
     execution = ExecutionContract(
         tp_pct=float(config["execution"]["tp_pct"]),
         sl_pct=float(config["execution"]["sl_pct"]),
@@ -93,6 +113,8 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         references=references,
         event_opener=event_opener,
         resolver=resolver,
+        detector_model=detector_model,
+        detector_cv=detector_cv,
         execution=execution,
     )
 
@@ -106,9 +128,10 @@ def _parse_date(value: Any, name: str) -> datetime:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be YYYY-MM-DD string")
     try:
-        return datetime.strptime(value, "%Y-%m-%d")
+        day_start = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
     except ValueError as exc:
         raise ValueError(f"{name} must be YYYY-MM-DD string") from exc
+    return day_start + timedelta(days=1) - timedelta(microseconds=1)
 
 
 def _build_splits(splits_section: dict[str, Any]) -> SplitBounds:
@@ -145,6 +168,12 @@ def _validate_data(data_section: dict[str, Any]) -> None:
     _validate_event_opener(event_opener_section)
     _validate_resolver(resolver_section)
     _validate_references(references_section)
+
+
+def _validate_detector(detector_section: dict[str, Any]) -> None:
+    _validate_non_negative(detector_section, "detector")
+    _build_detector_model(detector_section)
+    _build_detector_cv(detector_section)
 
 
 def _validate_non_negative(section: dict[str, Any], section_name: str) -> None:
@@ -262,9 +291,35 @@ def _build_references(section: dict[str, Any]) -> ReferenceSymbolsConfig:
     eth_symbol = section.get("eth_symbol")
     if not isinstance(eth_symbol, str) or not eth_symbol.strip():
         raise ValueError("data.references.eth_symbol must be a non-empty string")
+    if btc_symbol.strip() == eth_symbol.strip():
+        raise ValueError("data.references.btc_symbol must differ from data.references.eth_symbol")
     return ReferenceSymbolsConfig(
         btc_symbol=btc_symbol.strip(),
         eth_symbol=eth_symbol.strip(),
+    )
+
+
+def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+    model_section = section.get("model")
+    if not isinstance(model_section, dict):
+        raise ValueError("missing required section: detector.model")
+    return DetectorModelConfig(
+        iterations=_require_positive_int(model_section.get("iterations"), "detector.model.iterations"),
+        depth=_require_positive_int(model_section.get("depth"), "detector.model.depth"),
+        learning_rate=_require_positive_float(model_section.get("learning_rate"), "detector.model.learning_rate"),
+        l2_leaf_reg=_require_positive_float(model_section.get("l2_leaf_reg"), "detector.model.l2_leaf_reg"),
+        random_seed=_require_non_negative_int(model_section.get("random_seed"), "detector.model.random_seed"),
+    )
+
+
+def _build_detector_cv(section: dict[str, Any]) -> DetectorCVConfig:
+    cv_section = section.get("cv")
+    if not isinstance(cv_section, dict):
+        raise ValueError("missing required section: detector.cv")
+    return DetectorCVConfig(
+        min_train_days=_require_positive_int(cv_section.get("min_train_days"), "detector.cv.min_train_days"),
+        fold_span_days=_require_positive_int(cv_section.get("fold_span_days"), "detector.cv.fold_span_days"),
+        max_folds=_require_positive_int(cv_section.get("max_folds"), "detector.cv.max_folds"),
     )
 
 

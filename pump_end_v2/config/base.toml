@@ -33,6 +33,18 @@ arm_score_min = 0.55
 fire_score_floor = 0.50
 turn_down_delta = 0.03
 
+[detector.model]
+iterations = 600
+depth = 6
+learning_rate = 0.05
+l2_leaf_reg = 3.0
+random_seed = 42
+
+[detector.cv]
+min_train_days = 90
+fold_span_days = 30
+max_folds = 6
+
 [gate]
 block_threshold = 0.60
 
