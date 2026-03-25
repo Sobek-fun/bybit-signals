@@ -160,6 +160,73 @@ def build_detector_val_policy_rows(
     return model, scored
 
 
+def build_detector_test_policy_rows(
+    dataset_df: pd.DataFrame,
+    split_bounds: SplitBounds,
+    resolver_config: ResolverConfig,
+    event_opener_config: EventOpenerConfig,
+    detector_model_config: DetectorModelConfig,
+) -> tuple[CatBoostClassifier, pd.DataFrame]:
+    _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
+    log_info("POLICY", "policy test scoring rows build start")
+    frame = _prepare_dataset_frame(dataset_df)
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
+    effective_train_end = pd.Timestamp(split_bounds.train_end) - purge_gap_timedelta
+    train_fit = frame[
+        (frame["dataset_split"] == "train")
+        & frame["trainable_row"].astype(bool)
+        & (frame["context_bar_open_time"] <= effective_train_end)
+    ].copy()
+    if train_fit.empty:
+        raise ValueError("no trainable train rows available for detector test policy scoring")
+    model = build_detector_model(detector_model_config)
+    fit_detector_model(model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now")
+    test_rows = frame[frame["dataset_split"] == "test"].copy()
+    if test_rows.empty:
+        scored = pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
+        log_info("POLICY", "detector test policy rows build done rows_total=0 context_rows=0 active_rows=0")
+        return model, scored
+    active_window_end = pd.Timestamp(split_bounds.test_end)
+    test_active = test_rows[
+        _build_active_eligibility_mask(
+            test_rows,
+            resolver_config=resolver_config,
+            active_window_end=active_window_end,
+        )
+    ].copy()
+    if test_active.empty:
+        scored = pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
+        log_info("POLICY", "detector test policy rows build done rows_total=0 context_rows=0 active_rows=0")
+        return model, scored
+    active_start = test_active["context_bar_open_time"].min()
+    warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
+    warmup_start = active_start - warmup_timedelta
+    warmup_rows = frame[
+        (frame["context_bar_open_time"] >= warmup_start)
+        & (frame["context_bar_open_time"] < active_start)
+    ].copy()
+    warmup_rows["policy_context_only"] = True
+    test_active["policy_context_only"] = False
+    score_window = pd.concat([warmup_rows, test_active], ignore_index=True)
+    score_window = score_window.drop_duplicates(subset=["decision_row_id"], keep="last").reset_index(drop=True)
+    scored = _score_policy_window(
+        model=model,
+        rows_to_score=score_window,
+        score_source="test_forward",
+        fold_id=pd.NA,
+    )
+    context_rows = int(scored["policy_context_only"].sum()) if len(scored) > 0 else 0
+    active_rows = int((~scored["policy_context_only"]).sum()) if len(scored) > 0 else 0
+    log_info(
+        "POLICY",
+        (
+            "detector test policy rows build done "
+            f"rows_total={len(scored)} context_rows={context_rows} active_rows={active_rows}"
+        ),
+    )
+    return model, scored
+
+
 def build_detector_train_oof_policy_rows(
     dataset_df: pd.DataFrame,
     split_bounds: SplitBounds,
@@ -373,6 +440,36 @@ def build_detector_val_candidate_signal_ledger(
         detector_policy_config=detector_policy_config,
     )
     metrics = build_detector_policy_metrics(candidate_signals_df, episode_policy_summary_df)
+    return model, candidate_signals_df, episode_policy_summary_df, metrics
+
+
+def build_detector_test_candidate_signal_ledger(
+    dataset_df: pd.DataFrame,
+    split_bounds: SplitBounds,
+    resolver_config: ResolverConfig,
+    event_opener_config: EventOpenerConfig,
+    detector_model_config: DetectorModelConfig,
+    detector_policy_config: DetectorPolicyConfig,
+) -> tuple[CatBoostClassifier, pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    model, scored_rows_df = build_detector_test_policy_rows(
+        dataset_df=dataset_df,
+        split_bounds=split_bounds,
+        resolver_config=resolver_config,
+        event_opener_config=event_opener_config,
+        detector_model_config=detector_model_config,
+    )
+    candidate_signals_df, episode_policy_summary_df = apply_episode_aware_detector_policy(
+        scored_rows_df=scored_rows_df,
+        detector_policy_config=detector_policy_config,
+    )
+    metrics = build_detector_policy_metrics(candidate_signals_df, episode_policy_summary_df)
+    log_info(
+        "POLICY",
+        (
+            "detector test candidate ledger done "
+            f"episodes_total={int(metrics['episodes_total'])} signals_total={len(candidate_signals_df)}"
+        ),
+    )
     return model, candidate_signals_df, episode_policy_summary_df, metrics
 
 
