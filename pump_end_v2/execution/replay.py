@@ -16,6 +16,8 @@ _DECISION_REQUIRED_COLUMNS: tuple[str, ...] = (
     "decision_time",
     "entry_bar_open_time",
     "gate_decision",
+)
+_DECISION_OPTIONAL_PASSTHROUGH_COLUMNS: tuple[str, ...] = (
     "gate_block_threshold",
     "p_block",
     "target_block_signal",
@@ -74,6 +76,9 @@ def replay_short_signals_with_symbol_lock(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     _require_columns(decision_df, _DECISION_REQUIRED_COLUMNS, "decision_df")
     decisions = decision_df.copy().reset_index(drop=False).rename(columns={"index": "_row_order"})
+    optional_passthrough_columns = [
+        column for column in _DECISION_OPTIONAL_PASSTHROUGH_COLUMNS if column in decisions.columns
+    ]
     decisions["context_bar_open_time"] = pd.to_datetime(decisions["context_bar_open_time"], utc=True, errors="raise")
     decisions["decision_time"] = pd.to_datetime(decisions["decision_time"], utc=True, errors="raise")
     decisions["entry_bar_open_time"] = pd.to_datetime(decisions["entry_bar_open_time"], utc=True, errors="raise")
@@ -145,6 +150,23 @@ def replay_short_signals_with_symbol_lock(
         )
         lock_until_by_symbol[symbol] = pd.Timestamp(outcome_data["exit_time"])
     decisions = decisions.sort_values("_row_order", kind="mergesort").drop(columns=["_row_order"])
+    decisions = decisions[
+        [
+            *[column for column in _DECISION_REQUIRED_COLUMNS if column in decisions.columns],
+            *optional_passthrough_columns,
+            *[
+                column
+                for column in decisions.columns
+                if column
+                not in {
+                    *_DECISION_REQUIRED_COLUMNS,
+                    *optional_passthrough_columns,
+                    *_EXECUTION_OUTPUT_COLUMNS,
+                }
+            ],
+            *_EXECUTION_OUTPUT_COLUMNS,
+        ]
+    ]
     executed_signals_df = decisions[decisions["execution_status"] == "executed"].copy().reset_index(drop=True)
     blocked_gate = int((decisions["execution_status"] == "blocked_gate").sum())
     blocked_symbol_lock = int((decisions["execution_status"] == "blocked_symbol_lock").sum())
