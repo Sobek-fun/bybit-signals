@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 FIFTEEN_MINUTES = timedelta(minutes=15)
+FIFTEEN_MINUTES_SECONDS = int(FIFTEEN_MINUTES.total_seconds())
 
 
 def normalize_timestamp(value: datetime | str) -> datetime:
@@ -31,11 +32,9 @@ def context_to_decision_time(context_bar_open_time: datetime | str) -> datetime:
 
 def ceil_to_15m(ts: datetime | str) -> datetime:
     dt = normalize_timestamp(ts)
-    aligned = dt.replace(second=0, microsecond=0)
-    delta_minutes = aligned.minute % 15
-    if delta_minutes == 0:
-        return aligned
-    return aligned + timedelta(minutes=(15 - delta_minutes))
+    epoch_seconds = dt.timestamp()
+    ceiled = int(-(-epoch_seconds // FIFTEEN_MINUTES_SECONDS) * FIFTEEN_MINUTES_SECONDS)
+    return datetime.fromtimestamp(ceiled, tz=UTC)
 
 
 def decision_to_entry_bar_open_time(decision_time: datetime | str, entry_shift_bars: int = 0) -> datetime:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from pump_end_v2.time_utils import is_15m_grid, validate_causality
+from pump_end_v2.time_utils import decision_to_entry_bar_open_time, is_15m_grid, validate_causality
 
 
 class OutcomeClass(StrEnum):
@@ -90,8 +90,9 @@ class CandidateSignalRef:
             raise ValueError("symbol must be non-empty")
         if not is_15m_grid(self.entry_bar_open_time):
             raise ValueError("entry_bar_open_time must be aligned to 15m grid")
-        if self.entry_bar_open_time < self.fire_decision_time:
-            raise ValueError("entry_bar_open_time must not be earlier than fire_decision_time")
+        min_entry = decision_to_entry_bar_open_time(self.fire_decision_time, entry_shift_bars=0)
+        if self.entry_bar_open_time < min_entry:
+            raise ValueError("entry_bar_open_time must not be earlier than allowed entry grid")
 
 
 @dataclass(frozen=True, slots=True)

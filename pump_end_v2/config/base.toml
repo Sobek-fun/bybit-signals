@@ -1,0 +1,44 @@
+[data]
+source_root = "."
+timeframe = "15m"
+
+[data.event_opener]
+runup_lookback_bars = 12
+min_runup_pct = 0.08
+near_high_lookback_bars = 8
+near_high_tol_pct = 0.01
+volume_ratio_lookback_bars = 20
+min_volume_ratio = 1.5
+max_episode_bars = 32
+expiry_drawdown_pct = 0.04
+cooldown_bars = 8
+
+[data.resolver]
+horizon_bars = 32
+success_pullback_pct = 0.03
+max_prepullback_squeeze_pct = 0.02
+flat_max_abs_move_pct = 0.01
+
+[splits]
+train_end = "2024-12-31"
+val_end = "2025-06-30"
+test_end = "2025-12-31"
+
+[detector]
+arm_score_min = 0.55
+fire_score_floor = 0.50
+turn_down_delta = 0.03
+
+[gate]
+block_threshold = 0.60
+
+[execution]
+tp_pct = 0.045
+sl_pct = 0.03
+max_hold_bars = 96
+entry_shift_bars = 0
+replay_resolution = "1m"
+
+[compute]
+runs_root = "artifacts/pump_end_v2"
+max_workers = 4

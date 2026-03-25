@@ -20,9 +20,32 @@ class SplitBounds:
 
 
 @dataclass(frozen=True, slots=True)
+class EventOpenerConfig:
+    runup_lookback_bars: int
+    min_runup_pct: float
+    near_high_lookback_bars: int
+    near_high_tol_pct: float
+    volume_ratio_lookback_bars: int
+    min_volume_ratio: float
+    max_episode_bars: int
+    expiry_drawdown_pct: float
+    cooldown_bars: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResolverConfig:
+    horizon_bars: int
+    success_pullback_pct: float
+    max_prepullback_squeeze_pct: float
+    flat_max_abs_move_pct: float
+
+
+@dataclass(frozen=True, slots=True)
 class V2Config:
     raw: dict[str, Any]
     splits: SplitBounds
+    event_opener: EventOpenerConfig
+    resolver: ResolverConfig
     execution: ExecutionContract
 
 
@@ -47,6 +70,8 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _validate_execution(config["execution"])
     _validate_compute(config["compute"])
     splits = _build_splits(config["splits"])
+    event_opener = _build_event_opener(config["data"]["event_opener"])
+    resolver = _build_resolver(config["data"]["resolver"])
     execution = ExecutionContract(
         tp_pct=float(config["execution"]["tp_pct"]),
         sl_pct=float(config["execution"]["sl_pct"]),
@@ -54,7 +79,13 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         entry_shift_bars=int(config["execution"]["entry_shift_bars"]),
         replay_resolution=str(config["execution"]["replay_resolution"]),
     )
-    return V2Config(raw=copy.deepcopy(config), splits=splits, execution=execution)
+    return V2Config(
+        raw=copy.deepcopy(config),
+        splits=splits,
+        event_opener=event_opener,
+        resolver=resolver,
+        execution=execution,
+    )
 
 
 def load_and_validate_config(path: str | Path) -> V2Config:
@@ -93,6 +124,14 @@ def _validate_data(data_section: dict[str, Any]) -> None:
             raise ValueError(f"data.{key} must be a non-empty path")
         if not Path(path_value).exists():
             raise ValueError(f"data.{key} path does not exist: {path_value}")
+    event_opener_section = data_section.get("event_opener")
+    if not isinstance(event_opener_section, dict):
+        raise ValueError("missing required section: data.event_opener")
+    resolver_section = data_section.get("resolver")
+    if not isinstance(resolver_section, dict):
+        raise ValueError("missing required section: data.resolver")
+    _validate_event_opener(event_opener_section)
+    _validate_resolver(resolver_section)
 
 
 def _validate_non_negative(section: dict[str, Any], section_name: str) -> None:
@@ -120,6 +159,83 @@ def _validate_compute(compute_section: dict[str, Any]) -> None:
     max_workers = int(compute_section.get("max_workers", 1))
     if max_workers < 1:
         raise ValueError("compute.max_workers must be >= 1")
+
+
+def _require_positive_int(value: Any, field_name: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return parsed
+
+
+def _require_non_negative_int(value: Any, field_name: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return parsed
+
+
+def _require_positive_float(value: Any, field_name: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return parsed
+
+
+def _require_non_negative_float(value: Any, field_name: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return parsed
+
+
+def _validate_event_opener(section: dict[str, Any]) -> None:
+    _build_event_opener(section)
+
+
+def _validate_resolver(section: dict[str, Any]) -> None:
+    _build_resolver(section)
+
+
+def _build_event_opener(section: dict[str, Any]) -> EventOpenerConfig:
+    return EventOpenerConfig(
+        runup_lookback_bars=_require_positive_int(
+            section.get("runup_lookback_bars"), "data.event_opener.runup_lookback_bars"
+        ),
+        min_runup_pct=_require_positive_float(section.get("min_runup_pct"), "data.event_opener.min_runup_pct"),
+        near_high_lookback_bars=_require_positive_int(
+            section.get("near_high_lookback_bars"), "data.event_opener.near_high_lookback_bars"
+        ),
+        near_high_tol_pct=_require_non_negative_float(
+            section.get("near_high_tol_pct"), "data.event_opener.near_high_tol_pct"
+        ),
+        volume_ratio_lookback_bars=_require_positive_int(
+            section.get("volume_ratio_lookback_bars"), "data.event_opener.volume_ratio_lookback_bars"
+        ),
+        min_volume_ratio=_require_positive_float(
+            section.get("min_volume_ratio"), "data.event_opener.min_volume_ratio"
+        ),
+        max_episode_bars=_require_positive_int(section.get("max_episode_bars"), "data.event_opener.max_episode_bars"),
+        expiry_drawdown_pct=_require_positive_float(
+            section.get("expiry_drawdown_pct"), "data.event_opener.expiry_drawdown_pct"
+        ),
+        cooldown_bars=_require_non_negative_int(section.get("cooldown_bars"), "data.event_opener.cooldown_bars"),
+    )
+
+
+def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
+    return ResolverConfig(
+        horizon_bars=_require_positive_int(section.get("horizon_bars"), "data.resolver.horizon_bars"),
+        success_pullback_pct=_require_positive_float(
+            section.get("success_pullback_pct"), "data.resolver.success_pullback_pct"
+        ),
+        max_prepullback_squeeze_pct=_require_positive_float(
+            section.get("max_prepullback_squeeze_pct"), "data.resolver.max_prepullback_squeeze_pct"
+        ),
+        flat_max_abs_move_pct=_require_positive_float(
+            section.get("flat_max_abs_move_pct"), "data.resolver.flat_max_abs_move_pct"
+        ),
+    )
 
 
 def _reject_feature_flags(value: Any, path: str = "config") -> None:
