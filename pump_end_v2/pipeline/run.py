@@ -19,6 +19,7 @@ from pump_end_v2.detector import (
     assign_detector_dataset_splits,
     build_detector_dataset,
     build_detector_policy_metrics,
+    build_detector_target_metrics,
     build_detector_test_policy_rows,
     build_detector_train_oof_candidate_signal_ledger,
     build_detector_val_policy_rows,
@@ -87,24 +88,28 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     stage_done("PIPELINE", "INPUT_LOADING")
 
     stage_start("PIPELINE", "PREPARED_LAYERS")
-    token_state = build_token_state_layer(bars_15m, config.event_opener)
-    reference_state = build_reference_state_layer(token_state, config.references.btc_symbol, config.references.eth_symbol)
-    breadth_state = build_breadth_state_layer(token_state, config.references.btc_symbol, config.references.eth_symbol)
+    token_state_full = build_token_state_layer(bars_15m, config.event_opener)
+    reference_symbols = {config.references.btc_symbol, config.references.eth_symbol}
+    token_state_tradable = token_state_full[~token_state_full["symbol"].isin(reference_symbols)].copy()
+    reference_state = build_reference_state_layer(
+        token_state_full, config.references.btc_symbol, config.references.eth_symbol
+    )
+    breadth_state = build_breadth_state_layer(token_state_full, config.references.btc_symbol, config.references.eth_symbol)
     stage_done("PIPELINE", "PREPARED_LAYERS")
 
     stage_start("PIPELINE", "EVENT_CORE")
-    episodes = open_causal_pump_episodes(token_state, config.event_opener)
-    decision_rows = build_decision_rows(token_state, episodes, config.execution)
+    episodes = open_causal_pump_episodes(token_state_tradable, config.event_opener)
+    decision_rows = build_decision_rows(token_state_tradable, episodes, config.execution)
     resolved_rows = resolve_decision_rows(bars_15m, decision_rows, config.resolver)
     episode_summary = build_episode_summary(resolved_rows)
     event_quality_report = build_event_quality_report(episode_summary)
     stage_done("PIPELINE", "EVENT_CORE")
 
     stage_start("PIPELINE", "DETECTOR_DATASET")
-    episode_state = build_episode_state_layer(token_state, episodes, decision_rows)
+    episode_state = build_episode_state_layer(token_state_tradable, episodes, decision_rows)
     detector_feature_view = build_detector_feature_view(
         decision_rows,
-        token_state,
+        token_state_tradable,
         reference_state,
         breadth_state,
         episode_state,
@@ -112,6 +117,22 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     detector_dataset = build_detector_dataset(detector_feature_view, resolved_rows)
     detector_dataset = assign_detector_dataset_splits(detector_dataset, config.splits)
     stage_done("PIPELINE", "DETECTOR_DATASET")
+
+    stage_start("PIPELINE", "DETECTOR_TRAIN_OOF")
+    (
+        train_oof_candidate_signals_df,
+        train_oof_episode_policy_summary_df,
+        detector_train_oof_policy_metrics,
+    ) = build_detector_train_oof_candidate_signal_ledger(
+        dataset_df=detector_dataset,
+        split_bounds=config.splits,
+        resolver_config=config.resolver,
+        event_opener_config=config.event_opener,
+        detector_cv_config=config.detector_cv,
+        detector_model_config=config.detector_model,
+        detector_policy_config=config.detector_policy,
+    )
+    stage_done("PIPELINE", "DETECTOR_TRAIN_OOF")
 
     stage_start("PIPELINE", "DETECTOR_VAL_POLICY")
     _, val_policy_rows = build_detector_val_policy_rows(
@@ -131,23 +152,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         val_candidate_signals_df,
         val_episode_policy_summary_df,
     )
+    detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
     stage_done("PIPELINE", "DETECTOR_VAL_POLICY")
-
-    stage_start("PIPELINE", "DETECTOR_TRAIN_OOF")
-    (
-        train_oof_candidate_signals_df,
-        train_oof_episode_policy_summary_df,
-        detector_train_oof_policy_metrics,
-    ) = build_detector_train_oof_candidate_signal_ledger(
-        dataset_df=detector_dataset,
-        split_bounds=config.splits,
-        resolver_config=config.resolver,
-        event_opener_config=config.event_opener,
-        detector_cv_config=config.detector_cv,
-        detector_model_config=config.detector_model,
-        detector_policy_config=selected_detector_policy,
-    )
-    stage_done("PIPELINE", "DETECTOR_TRAIN_OOF")
 
     stage_start("PIPELINE", "DETECTOR_TEST")
     detector_model_test, test_policy_rows = build_detector_test_policy_rows(
@@ -164,6 +170,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         test_candidate_signals_df,
         test_episode_policy_summary_df,
     )
+    detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
     stage_done("PIPELINE", "DETECTOR_TEST")
 
     stage_start("PIPELINE", "GATE_VAL")
@@ -176,10 +183,9 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     ) = build_gate_val_scored_signals_and_datasets(
         train_oof_candidate_signals_df,
         val_candidate_signals_df,
-        token_state,
+        token_state_tradable,
         reference_state,
         breadth_state,
-        config.execution,
         config.gate_model,
         config.gate_config.block_threshold,
     )
@@ -197,10 +203,9 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     gate_model_test, test_scored_signals_df, gate_dataset_test_df = build_gate_test_scored_signals(
         train_oof_candidate_signals_df,
         test_candidate_signals_df,
-        token_state,
+        token_state_tradable,
         reference_state,
         breadth_state,
-        config.execution,
         config.gate_model,
     )
     test_gate_decisions_df, _ = apply_gate_block_threshold(test_scored_signals_df, selected_gate_threshold)
@@ -246,7 +251,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     eval_test_dir = manager.stage_output_dir(run_context.run_dir, "eval", "test")
     reports_dir = manager.stage_output_dir(run_context.run_dir, "reports")
 
-    _save_df_and_log(token_state, prepared_dir / "token_state.parquet")
+    _save_df_and_log(token_state_full, prepared_dir / "token_state.parquet")
     _save_df_and_log(reference_state, prepared_dir / "reference_state.parquet")
     _save_df_and_log(breadth_state, prepared_dir / "breadth_state.parquet")
     _save_df_and_log(episodes, prepared_dir / "episodes.parquet")
@@ -269,10 +274,12 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_df_and_log(val_candidate_signals_df, detector_dir / "val_candidate_signals.parquet")
     _save_df_and_log(val_episode_policy_summary_df, detector_dir / "val_episode_policy_summary.parquet")
     _save_json_and_log(detector_val_policy_metrics, detector_dir / "val_policy_metrics.json")
+    _save_json_and_log(detector_val_target_metrics, detector_dir / "val_target_metrics.json")
     _save_df_and_log(test_policy_rows, detector_dir / "test_policy_rows.parquet")
     _save_df_and_log(test_candidate_signals_df, detector_dir / "test_candidate_signals.parquet")
     _save_df_and_log(test_episode_policy_summary_df, detector_dir / "test_episode_policy_summary.parquet")
     _save_json_and_log(detector_test_policy_metrics, detector_dir / "test_policy_metrics.json")
+    _save_json_and_log(detector_test_target_metrics, detector_dir / "test_target_metrics.json")
     _save_model_and_log(detector_model_test, detector_dir / "model_train_only.cbm")
 
     _save_df_and_log(val_scored_signals_df, gate_dir / "val_scored_signals.parquet")
@@ -288,6 +295,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_df_and_log(test_scored_signals_df, gate_dir / "test_scored_signals.parquet")
     _save_model_and_log(gate_model_test, gate_dir / "model_train_oof.cbm")
 
+    _save_df_and_log(val_gate_decisions_df, eval_val_dir / "candidate_signals.parquet")
     _save_df_and_log(val_execution_decisions_df, eval_val_dir / "gate_decisions.parquet")
     _save_df_and_log(val_executed_signals_df, eval_val_dir / "executed_signals.csv")
     _save_json_and_log(val_metrics, eval_val_dir / "metrics.json")
@@ -297,6 +305,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_df_and_log(val_symbol_report, eval_val_dir / "symbol_report.csv")
     _save_df_and_log(val_monthly_report, eval_val_dir / "monthly_report.csv")
 
+    _save_df_and_log(test_gate_decisions_df, eval_test_dir / "candidate_signals.parquet")
     holdout_signals_path = _save_df_and_log(test_executed_signals_df, eval_test_dir / "test_signals_holdout.csv")
     _save_df_and_log(test_execution_decisions_df, eval_test_dir / "gate_decisions.parquet")
     _save_json_and_log(test_metrics, eval_test_dir / "metrics_holdout.json")
