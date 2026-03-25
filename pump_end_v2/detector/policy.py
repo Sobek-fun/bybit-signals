@@ -119,6 +119,8 @@ def apply_episode_aware_detector_policy(
         fold_id = group["fold_id"].iloc[0] if has_fold_id else pd.NA
         active_rows = group.loc[~group["policy_context_only"]]
         active_rows_total = int(len(active_rows))
+        if active_rows_total == 0:
+            continue
         good_episode_flag = bool((pd.to_numeric(active_rows["target_good_short_now"], errors="coerce") == 1).any())
         armed_flag = False
         had_arm = False
