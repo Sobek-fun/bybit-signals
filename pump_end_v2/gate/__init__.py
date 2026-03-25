@@ -6,6 +6,10 @@ from pump_end_v2.gate.model import (
     fit_gate_on_train_oof_and_score_val,
     predict_gate_scores,
 )
+from pump_end_v2.gate.pipeline import (
+    build_gate_test_scored_signals,
+    build_gate_val_scored_signals_and_threshold,
+)
 from pump_end_v2.gate.threshold import (
     apply_gate_block_threshold,
     build_gate_threshold_grid,
@@ -29,5 +33,7 @@ __all__ = [
     "build_gate_threshold_metrics",
     "sweep_gate_block_threshold",
     "select_gate_block_threshold",
+    "build_gate_val_scored_signals_and_threshold",
+    "build_gate_test_scored_signals",
 ]
 
