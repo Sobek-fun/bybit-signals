@@ -18,6 +18,7 @@ ALLOWED_COMPONENTS = {
     "CV",
     "POLICY",
     "GATE",
+    "EXECUTION",
 }
 
 
