@@ -31,6 +31,15 @@ def build_detector_feature_view(
             "lower_wick_pct",
             "rolling_volatility_4",
             "rolling_volatility_12",
+            "rsi_like_14",
+            "mfi_like_14",
+            "macd_line",
+            "macd_hist",
+            "heat_flag",
+            "fade_flag",
+            "dollar_volume",
+            "dollar_volume_ratio_12",
+            "liquidity_score_12",
         ]
     ].rename(columns={"open_time": "context_bar_open_time"})
     frame = base.merge(token_cols, on=["symbol", "context_bar_open_time"], how="left")
@@ -51,6 +60,12 @@ def build_detector_feature_view(
             [
                 "decision_row_id",
                 "episode_runup_from_open_pct",
+                "episode_extension_from_open_pct",
+                "bars_since_episode_high",
+                "drawdown_from_episode_high_so_far",
+                "high_retest_count",
+                "high_persistence_4",
+                "episode_pump_context_streak",
             ]
         ],
         on="decision_row_id",

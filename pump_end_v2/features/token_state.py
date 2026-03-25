@@ -25,6 +25,15 @@ TOKEN_STATE_COLUMNS: tuple[str, ...] = (
     "lower_wick_pct",
     "rolling_volatility_4",
     "rolling_volatility_12",
+    "rsi_like_14",
+    "mfi_like_14",
+    "macd_line",
+    "macd_hist",
+    "heat_flag",
+    "fade_flag",
+    "dollar_volume",
+    "dollar_volume_ratio_12",
+    "liquidity_score_12",
     "runup_pct",
     "recent_high_distance_pct",
     "near_high_flag",
@@ -70,6 +79,42 @@ def _build_symbol_token_state(symbol: str, sdf: pd.DataFrame, cfg: EventOpenerCo
     frame["lower_wick_pct"] = _safe_ratio(frame[["open", "close"]].min(axis=1) - frame["low"], frame["open"])
     frame["rolling_volatility_4"] = frame["close_ret_1"].rolling(window=4, min_periods=1).std(ddof=0)
     frame["rolling_volatility_12"] = frame["close_ret_1"].rolling(window=12, min_periods=1).std(ddof=0)
+    close_delta = frame["close"].diff()
+    gains = close_delta.clip(lower=0.0).fillna(0.0)
+    losses = (-close_delta.clip(upper=0.0)).fillna(0.0)
+    avg_gain = gains.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean()
+    avg_loss = losses.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean()
+    rs = _safe_ratio(avg_gain, avg_loss.where(avg_loss > 0.0, np.nan))
+    frame["rsi_like_14"] = 100.0 - (100.0 / (1.0 + rs))
+    frame["rsi_like_14"] = frame["rsi_like_14"].fillna(50.0).clip(lower=0.0, upper=100.0)
+    typical_price = (frame["high"] + frame["low"] + frame["close"]) / 3.0
+    raw_money_flow = typical_price * frame["volume"]
+    pos_flow = raw_money_flow.where(close_delta > 0.0, 0.0)
+    neg_flow = raw_money_flow.where(close_delta < 0.0, 0.0).abs()
+    pos_flow_sum = pos_flow.rolling(window=14, min_periods=1).sum()
+    neg_flow_sum = neg_flow.rolling(window=14, min_periods=1).sum()
+    money_flow_ratio = _safe_ratio(pos_flow_sum, neg_flow_sum.where(neg_flow_sum > 0.0, np.nan))
+    frame["mfi_like_14"] = 100.0 - (100.0 / (1.0 + money_flow_ratio))
+    frame["mfi_like_14"] = frame["mfi_like_14"].fillna(50.0).clip(lower=0.0, upper=100.0)
+    ema12 = frame["close"].ewm(span=12, adjust=False, min_periods=1).mean()
+    ema26 = frame["close"].ewm(span=26, adjust=False, min_periods=1).mean()
+    frame["macd_line"] = ema12 - ema26
+    macd_signal = frame["macd_line"].ewm(span=9, adjust=False, min_periods=1).mean()
+    frame["macd_hist"] = frame["macd_line"] - macd_signal
+    frame["heat_flag"] = (
+        (frame["rsi_like_14"] >= 70.0)
+        & (frame["mfi_like_14"] >= 70.0)
+        & (frame["macd_hist"] > 0.0)
+    )
+    frame["fade_flag"] = (
+        (frame["rsi_like_14"] <= 45.0)
+        & (frame["mfi_like_14"] <= 45.0)
+        & (frame["macd_hist"] <= 0.0)
+    )
+    frame["dollar_volume"] = frame["close"] * frame["volume"]
+    frame["rolling_mean_dollar_volume_12"] = frame["dollar_volume"].rolling(window=12, min_periods=1).mean()
+    frame["dollar_volume_ratio_12"] = _safe_ratio(frame["dollar_volume"], frame["rolling_mean_dollar_volume_12"])
+    frame["liquidity_score_12"] = np.log1p(frame["rolling_mean_dollar_volume_12"].clip(lower=0.0))
     frame["rolling_min_low"] = frame["low"].rolling(window=cfg.runup_lookback_bars, min_periods=1).min()
     frame["runup_pct"] = _safe_ratio(frame["close"], frame["rolling_min_low"]) - 1.0
     frame["rolling_max_high"] = frame["high"].rolling(window=cfg.near_high_lookback_bars, min_periods=1).max()
@@ -82,6 +127,8 @@ def _build_symbol_token_state(symbol: str, sdf: pd.DataFrame, cfg: EventOpenerCo
         & frame["near_high_flag"].fillna(False)
         & (frame["volume_ratio"] >= cfg.min_volume_ratio)
     )
+    frame["heat_flag"] = frame["heat_flag"].fillna(False).astype(bool)
+    frame["fade_flag"] = frame["fade_flag"].fillna(False).astype(bool)
     frame["near_high_flag"] = frame["near_high_flag"].fillna(False).astype(bool)
     frame["pump_context_flag"] = frame["pump_context_flag"].fillna(False).astype(bool)
     return frame
