@@ -7,6 +7,7 @@ from pathlib import Path
 from pump_end_v2.artifacts import ArtifactManager
 from pump_end_v2.config import REQUIRED_SECTIONS, load_and_validate_config
 from pump_end_v2.logging import log_info, stage_done, stage_start
+from pump_end_v2.pipeline import run_pump_end_v2_pipeline
 from pump_end_v2.run_context import create_run_context
 
 
@@ -47,9 +48,10 @@ def run_dry_run(config_path: str) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    if not args.dry_run:
-        parser.error("only --dry-run mode is supported in module 1")
-    return run_dry_run(args.config)
+    if args.dry_run:
+        return run_dry_run(args.config)
+    run_pump_end_v2_pipeline(args.config)
+    return 0
 
 
 if __name__ == "__main__":

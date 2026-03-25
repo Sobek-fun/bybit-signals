@@ -84,10 +84,18 @@ class ReferenceSymbolsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DataFilesConfig:
+    bars_15m_path: str
+    bars_1m_path: str
+    bars_1s_path: str
+
+
+@dataclass(frozen=True, slots=True)
 class V2Config:
     raw: dict[str, Any]
     splits: SplitBounds
     references: ReferenceSymbolsConfig
+    data_files: DataFilesConfig
     event_opener: EventOpenerConfig
     resolver: ResolverConfig
     detector_model: DetectorModelConfig
@@ -120,6 +128,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _validate_compute(config["compute"])
     splits = _build_splits(config["splits"])
     references = _build_references(config["data"]["references"])
+    data_files = _build_data_files(config["data"]["files"])
     event_opener = _build_event_opener(config["data"]["event_opener"])
     resolver = _build_resolver(config["data"]["resolver"])
     detector_model = _build_detector_model(config["detector"])
@@ -138,6 +147,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         raw=copy.deepcopy(config),
         splits=splits,
         references=references,
+        data_files=data_files,
         event_opener=event_opener,
         resolver=resolver,
         detector_model=detector_model,
@@ -195,9 +205,13 @@ def _validate_data(data_section: dict[str, Any]) -> None:
     references_section = data_section.get("references")
     if not isinstance(references_section, dict):
         raise ValueError("missing required section: data.references")
+    files_section = data_section.get("files")
+    if not isinstance(files_section, dict):
+        raise ValueError("missing required section: data.files")
     _validate_event_opener(event_opener_section)
     _validate_resolver(resolver_section)
     _validate_references(references_section)
+    _validate_data_files(files_section)
 
 
 def _validate_detector(detector_section: dict[str, Any]) -> None:
@@ -332,6 +346,27 @@ def _build_references(section: dict[str, Any]) -> ReferenceSymbolsConfig:
     return ReferenceSymbolsConfig(
         btc_symbol=btc_symbol.strip(),
         eth_symbol=eth_symbol.strip(),
+    )
+
+
+def _validate_data_files(section: dict[str, Any]) -> None:
+    _build_data_files(section)
+
+
+def _build_data_files(section: dict[str, Any]) -> DataFilesConfig:
+    bars_15m_path = section.get("bars_15m_path")
+    if not isinstance(bars_15m_path, str) or not bars_15m_path.strip():
+        raise ValueError("data.files.bars_15m_path must be a non-empty string")
+    bars_1m_path = section.get("bars_1m_path")
+    if not isinstance(bars_1m_path, str) or not bars_1m_path.strip():
+        raise ValueError("data.files.bars_1m_path must be a non-empty string")
+    bars_1s_path = section.get("bars_1s_path")
+    if not isinstance(bars_1s_path, str):
+        raise ValueError("data.files.bars_1s_path must be a string")
+    return DataFilesConfig(
+        bars_15m_path=bars_15m_path.strip(),
+        bars_1m_path=bars_1m_path.strip(),
+        bars_1s_path=bars_1s_path.strip(),
     )
 
 

@@ -1,4 +1,5 @@
 from pump_end_v2.execution.metrics import (
+    build_execution_monthly_report,
     build_execution_metrics,
     build_execution_symbol_report,
     build_execution_window_report,
@@ -11,5 +12,6 @@ __all__ = [
     "build_execution_metrics",
     "build_execution_window_report",
     "build_execution_symbol_report",
+    "build_execution_monthly_report",
 ]
 

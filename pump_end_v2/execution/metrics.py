@@ -114,6 +114,32 @@ def build_execution_symbol_report(executed_signals_df: pd.DataFrame) -> pd.DataF
     return pd.DataFrame(rows).sort_values("symbol", kind="mergesort").reset_index(drop=True)
 
 
+def build_execution_monthly_report(executed_signals_df: pd.DataFrame) -> pd.DataFrame:
+    _require_columns(executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df")
+    columns = ["month", "signals", "tp", "sl", "timeout", "ambiguous", "pnl_sum", "expectancy_all"]
+    frame = _prepare_frame(executed_signals_df)
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    month_series = frame["entry_bar_open_time"].dt.strftime("%Y-%m")
+    grouped = frame.assign(month=month_series).groupby("month", sort=True, dropna=False)
+    rows: list[dict[str, float | str]] = []
+    for month, grp in grouped:
+        rows.append(
+            {
+                "month": str(month),
+                "signals": float(len(grp)),
+                "tp": float((grp["trade_outcome"] == "tp").sum()),
+                "sl": float((grp["trade_outcome"] == "sl").sum()),
+                "timeout": float((grp["trade_outcome"] == "timeout").sum()),
+                "ambiguous": float((grp["trade_outcome"] == "ambiguous").sum()),
+                "pnl_sum": float(grp["trade_pnl_pct"].sum()),
+                "expectancy_all": float(grp["trade_pnl_pct"].mean()) if len(grp) > 0 else float("nan"),
+            }
+        )
+    out = pd.DataFrame(rows, columns=columns)
+    return out.sort_values("month", kind="mergesort").reset_index(drop=True)
+
+
 def _prepare_frame(df: pd.DataFrame) -> pd.DataFrame:
     frame = df.copy()
     if frame.empty:

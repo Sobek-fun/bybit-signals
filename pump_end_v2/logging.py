@@ -19,6 +19,8 @@ ALLOWED_COMPONENTS = {
     "POLICY",
     "GATE",
     "EXECUTION",
+    "IO",
+    "PIPELINE",
 }
 
 
