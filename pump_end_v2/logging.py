@@ -14,6 +14,8 @@ ALLOWED_COMPONENTS = {
     "METRICS",
     "LAYERS",
     "FEATURES",
+    "DETECTOR",
+    "CV",
 }
 
 
