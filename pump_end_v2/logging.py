@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
-ALLOWED_COMPONENTS = {"RUN", "CONFIG", "ARTIFACTS", "DRYRUN", "TEST"}
+ALLOWED_COMPONENTS = {
+    "RUN",
+    "CONFIG",
+    "ARTIFACTS",
+    "DRYRUN",
+    "TEST",
+    "EVENT",
+    "RESOLVER",
+    "ROWS",
+    "METRICS",
+}
 
 
 def _log(level: str, component: str, message: str) -> None:
