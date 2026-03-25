@@ -84,18 +84,30 @@ def _build_symbol_token_state(symbol: str, sdf: pd.DataFrame, cfg: EventOpenerCo
     losses = (-close_delta.clip(upper=0.0)).fillna(0.0)
     avg_gain = gains.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean()
     avg_loss = losses.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean()
-    rs = _safe_ratio(avg_gain, avg_loss.where(avg_loss > 0.0, np.nan))
-    frame["rsi_like_14"] = 100.0 - (100.0 / (1.0 + rs))
-    frame["rsi_like_14"] = frame["rsi_like_14"].fillna(50.0).clip(lower=0.0, upper=100.0)
+    rsi_regular_mask = (avg_gain > 0.0) & (avg_loss > 0.0)
+    rsi_gain_only_mask = (avg_loss == 0.0) & (avg_gain > 0.0)
+    rsi_loss_only_mask = (avg_gain == 0.0) & (avg_loss > 0.0)
+    rsi = pd.Series(50.0, index=frame.index, dtype=float)
+    rs = _safe_ratio(avg_gain, avg_loss)
+    rsi.loc[rsi_regular_mask] = 100.0 - (100.0 / (1.0 + rs.loc[rsi_regular_mask]))
+    rsi.loc[rsi_gain_only_mask] = 100.0
+    rsi.loc[rsi_loss_only_mask] = 0.0
+    frame["rsi_like_14"] = rsi.fillna(50.0).clip(lower=0.0, upper=100.0)
     typical_price = (frame["high"] + frame["low"] + frame["close"]) / 3.0
     raw_money_flow = typical_price * frame["volume"]
     pos_flow = raw_money_flow.where(close_delta > 0.0, 0.0)
     neg_flow = raw_money_flow.where(close_delta < 0.0, 0.0).abs()
     pos_flow_sum = pos_flow.rolling(window=14, min_periods=1).sum()
     neg_flow_sum = neg_flow.rolling(window=14, min_periods=1).sum()
-    money_flow_ratio = _safe_ratio(pos_flow_sum, neg_flow_sum.where(neg_flow_sum > 0.0, np.nan))
-    frame["mfi_like_14"] = 100.0 - (100.0 / (1.0 + money_flow_ratio))
-    frame["mfi_like_14"] = frame["mfi_like_14"].fillna(50.0).clip(lower=0.0, upper=100.0)
+    mfi_regular_mask = (pos_flow_sum > 0.0) & (neg_flow_sum > 0.0)
+    mfi_pos_only_mask = (neg_flow_sum == 0.0) & (pos_flow_sum > 0.0)
+    mfi_neg_only_mask = (pos_flow_sum == 0.0) & (neg_flow_sum > 0.0)
+    mfi = pd.Series(50.0, index=frame.index, dtype=float)
+    money_flow_ratio = _safe_ratio(pos_flow_sum, neg_flow_sum)
+    mfi.loc[mfi_regular_mask] = 100.0 - (100.0 / (1.0 + money_flow_ratio.loc[mfi_regular_mask]))
+    mfi.loc[mfi_pos_only_mask] = 100.0
+    mfi.loc[mfi_neg_only_mask] = 0.0
+    frame["mfi_like_14"] = mfi.fillna(50.0).clip(lower=0.0, upper=100.0)
     ema12 = frame["close"].ewm(span=12, adjust=False, min_periods=1).mean()
     ema26 = frame["close"].ewm(span=26, adjust=False, min_periods=1).mean()
     frame["macd_line"] = ema12 - ema26

@@ -296,7 +296,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_model_and_log(gate_model_test, gate_dir / "model_train_oof.cbm")
 
     _save_df_and_log(val_gate_decisions_df, eval_val_dir / "candidate_signals.parquet")
-    _save_df_and_log(val_execution_decisions_df, eval_val_dir / "gate_decisions.parquet")
+    _save_df_and_log(val_execution_decisions_df, eval_val_dir / "execution_decisions.parquet")
     _save_df_and_log(val_executed_signals_df, eval_val_dir / "executed_signals.csv")
     _save_json_and_log(val_metrics, eval_val_dir / "metrics.json")
     _save_json_and_log(val_decision_summary, eval_val_dir / "decision_summary.json")
@@ -307,7 +307,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
 
     _save_df_and_log(test_gate_decisions_df, eval_test_dir / "candidate_signals.parquet")
     holdout_signals_path = _save_df_and_log(test_executed_signals_df, eval_test_dir / "test_signals_holdout.csv")
-    _save_df_and_log(test_execution_decisions_df, eval_test_dir / "gate_decisions.parquet")
+    _save_df_and_log(test_execution_decisions_df, eval_test_dir / "execution_decisions.parquet")
     _save_json_and_log(test_metrics, eval_test_dir / "metrics_holdout.json")
     _save_json_and_log(test_decision_summary, eval_test_dir / "decision_summary.json")
     _save_df_and_log(test_window_6h, eval_test_dir / "window_report_6h.csv")
