@@ -218,8 +218,12 @@ def build_gate_decile_report(scored_signals_df: pd.DataFrame, deciles: int = 10)
                 "avg_future_net_edge_pct": float(gdf["future_net_edge_pct"].mean() * 100.0)
                 if len(gdf) > 0
                 else float("nan"),
-                "mean_pullback_pct": float(gdf["future_pullback_pct"].mean()) if len(gdf) > 0 else float("nan"),
-                "mean_squeeze_pct": float(gdf["future_prepullback_squeeze_pct"].mean()) if len(gdf) > 0 else float("nan"),
+                "mean_pullback_pct": float(gdf["future_pullback_pct"].mean() * 100.0)
+                if len(gdf) > 0
+                else float("nan"),
+                "mean_squeeze_pct": float(gdf["future_prepullback_squeeze_pct"].mean() * 100.0)
+                if len(gdf) > 0
+                else float("nan"),
             }
         )
     return pd.DataFrame(rows).sort_values("decile", kind="mergesort").reset_index(drop=True)

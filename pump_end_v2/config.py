@@ -248,9 +248,6 @@ def _validate_compute(compute_section: dict[str, Any]) -> None:
     runs_root = compute_section.get("runs_root")
     if not isinstance(runs_root, str) or not runs_root:
         raise ValueError("compute.runs_root must be a non-empty path")
-    max_workers = int(compute_section.get("max_workers", 1))
-    if max_workers < 1:
-        raise ValueError("compute.max_workers must be >= 1")
 
 
 def _require_positive_int(value: Any, field_name: str) -> int:

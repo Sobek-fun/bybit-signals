@@ -1,6 +1,5 @@
 [data]
 source_root = "."
-timeframe = "15m"
 
 [data.files]
 bars_15m_path = "inputs/bars_15m.parquet"
@@ -69,4 +68,3 @@ entry_shift_bars = 0
 
 [compute]
 runs_root = "artifacts/pump_end_v2"
-max_workers = 4
