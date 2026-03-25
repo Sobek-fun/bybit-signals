@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+import heapq
 
 import pandas as pd
 
+from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.logging import log_info
 
 GATE_IDENTITY_COLUMNS: tuple[str, ...] = (
@@ -55,9 +57,15 @@ GATE_FEATURE_COLUMNS: tuple[str, ...] = (
     "signal_flow_recent_signals_24h",
     "signal_flow_recent_same_symbol_signals_24h",
     "signal_flow_recent_mean_detector_p_good_24h",
+    "recent_resolved_tp_rate_24h",
+    "recent_resolved_sl_rate_24h",
+    "recent_pnl_sum_24h",
+    "recent_pnl_sum_last_n",
+    "recent_losing_streak",
+    "active_symbol_sessions_now",
 )
 
-_CANDIDATE_REQUIRED_COLUMNS: tuple[str, ...] = (
+_CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
     "signal_id",
     "episode_id",
     "symbol",
@@ -69,31 +77,16 @@ _CANDIDATE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "p_good_drop_from_peak",
     "episode_age_bars",
     "distance_from_episode_high_pct",
-    "score_source",
-    "fold_id",
-    "target_good_short_now",
-    "target_reason",
-    "future_outcome_class",
-    "future_prepullback_squeeze_pct",
-    "future_pullback_pct",
-    "future_net_edge_pct",
-    "bars_to_pullback",
-    "bars_to_peak_after_row",
-    "bars_to_resolution",
-    "entry_quality_score",
-    "ideal_entry_row_id",
-    "ideal_entry_bar_open_time",
-    "is_ideal_entry",
 )
-
 
 def build_gate_feature_view(
     candidate_signals_df: pd.DataFrame,
     token_state_df: pd.DataFrame,
     reference_state_df: pd.DataFrame,
     breadth_state_df: pd.DataFrame,
+    execution_contract: ExecutionContract | None = None,
 ) -> pd.DataFrame:
-    _require_columns(candidate_signals_df, _CANDIDATE_REQUIRED_COLUMNS, "candidate_signals_df")
+    _require_columns(candidate_signals_df, _CANDIDATE_PROD_REQUIRED_COLUMNS, "candidate_signals_df")
     _require_columns(
         token_state_df,
         (
@@ -149,6 +142,10 @@ def build_gate_feature_view(
     frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
     frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
     frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
+    if "score_source" not in frame.columns:
+        frame["score_source"] = "unknown"
+    if "fold_id" not in frame.columns:
+        frame["fold_id"] = pd.NA
     token_part = token_state_df[
         [
             "symbol",
@@ -205,6 +202,7 @@ def build_gate_feature_view(
         merged["distance_from_episode_high_pct"], errors="coerce"
     )
     merged = _append_signal_flow_features(merged)
+    merged = _append_strategy_state_features(merged, execution_contract)
     out = merged.loc[:, [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS]].copy()
     log_info(
         "GATE",
@@ -253,6 +251,124 @@ def _append_signal_flow_features(df: pd.DataFrame) -> pd.DataFrame:
     frame["signal_flow_recent_signals_24h"] = recent_counts
     frame["signal_flow_recent_same_symbol_signals_24h"] = same_symbol_counts
     frame["signal_flow_recent_mean_detector_p_good_24h"] = recent_mean_scores
+    return frame.drop(columns=["_stream_group_key"], errors="ignore")
+
+
+def _append_strategy_state_features(
+    df: pd.DataFrame,
+    execution_contract: ExecutionContract | None,
+) -> pd.DataFrame:
+    frame = df.copy()
+    frame["_stream_group_key"] = frame.apply(_stream_group_key, axis=1)
+    frame = frame.sort_values(
+        ["_stream_group_key", "context_bar_open_time", "decision_time", "signal_id"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    tp_rate_24h = [0.0] * len(frame)
+    sl_rate_24h = [0.0] * len(frame)
+    pnl_sum_24h = [0.0] * len(frame)
+    pnl_sum_last_n = [0.0] * len(frame)
+    losing_streak = [0.0] * len(frame)
+    active_symbol_sessions = [0.0] * len(frame)
+    window = pd.Timedelta(hours=24)
+    last_n = 10
+    tp_pct = float(execution_contract.tp_pct) * 100.0 if execution_contract is not None else 4.5
+    sl_pct = float(execution_contract.sl_pct) * 100.0 if execution_contract is not None else 3.0
+    max_hold_bars = int(execution_contract.max_hold_bars) if execution_contract is not None else 96
+    has_hindsight_columns = all(column in frame.columns for column in ("signal_quality_h32", "bars_to_resolution"))
+    for _, idx in frame.groupby("_stream_group_key", sort=False, dropna=False).groups.items():
+        event_seq = 0
+        start_heap: list[tuple[int, int, str, int, int, float]] = []
+        end_heap: list[tuple[int, int, str]] = []
+        resolve_heap: list[tuple[int, int, float, int, int]] = []
+        history_24h: deque[tuple[pd.Timestamp, float, int, int]] = deque()
+        pnl_history_last_n: deque[float] = deque()
+        running_pnl_24h = 0.0
+        running_tp_24h = 0
+        running_sl_24h = 0
+        symbol_counts: dict[str, int] = {}
+        streak = 0
+        for row_idx in idx:
+            row = frame.iloc[row_idx]
+            now = pd.Timestamp(row["context_bar_open_time"])
+            now_ns = int(now.value)
+            while start_heap and start_heap[0][0] <= now_ns:
+                _, _, start_symbol, close_ns, close_seq, close_pnl = heapq.heappop(start_heap)
+                symbol_counts[start_symbol] = symbol_counts.get(start_symbol, 0) + 1
+                heapq.heappush(end_heap, (close_ns, close_seq, start_symbol))
+                if close_pnl != 0.0:
+                    tp_event = 1 if close_pnl > 0 else 0
+                    sl_event = 1 if close_pnl < 0 else 0
+                    heapq.heappush(resolve_heap, (close_ns, close_seq, close_pnl, tp_event, sl_event))
+            while end_heap and end_heap[0][0] <= now_ns:
+                _, _, end_symbol = heapq.heappop(end_heap)
+                count = symbol_counts.get(end_symbol, 0)
+                if count <= 1:
+                    symbol_counts.pop(end_symbol, None)
+                else:
+                    symbol_counts[end_symbol] = count - 1
+            while resolve_heap and resolve_heap[0][0] <= now_ns:
+                close_ns, _, close_pnl, tp_event, sl_event = heapq.heappop(resolve_heap)
+                close_time = pd.Timestamp(close_ns, tz="UTC")
+                history_24h.append((close_time, close_pnl, tp_event, sl_event))
+                running_pnl_24h += close_pnl
+                running_tp_24h += tp_event
+                running_sl_24h += sl_event
+                pnl_history_last_n.append(close_pnl)
+                while len(pnl_history_last_n) > last_n:
+                    pnl_history_last_n.popleft()
+                if close_pnl < 0:
+                    streak += 1
+                else:
+                    streak = 0
+            while history_24h and history_24h[0][0] < now - window:
+                _, old_pnl, old_tp, old_sl = history_24h.popleft()
+                running_pnl_24h -= old_pnl
+                running_tp_24h -= old_tp
+                running_sl_24h -= old_sl
+            resolved_total = running_tp_24h + running_sl_24h
+            tp_rate_24h[row_idx] = float(running_tp_24h / resolved_total) if resolved_total > 0 else 0.0
+            sl_rate_24h[row_idx] = float(running_sl_24h / resolved_total) if resolved_total > 0 else 0.0
+            pnl_sum_24h[row_idx] = float(running_pnl_24h)
+            pnl_sum_last_n[row_idx] = float(sum(pnl_history_last_n))
+            losing_streak[row_idx] = float(streak)
+            active_symbol_sessions[row_idx] = float(len(symbol_counts))
+            if not has_hindsight_columns:
+                continue
+            quality = str(row["signal_quality_h32"])
+            bars_to_resolution = pd.to_numeric(row["bars_to_resolution"], errors="coerce")
+            quality_valid = quality not in {"", "nan", "<NA>"}
+            bars_valid = pd.notna(bars_to_resolution) and float(bars_to_resolution) >= 1.0
+            if not (quality_valid and bars_valid):
+                continue
+            is_bad = quality in {
+                "dirty_retrace_h32",
+                "clean_no_pullback_h32",
+                "dirty_no_pullback_h32",
+                "pullback_before_squeeze_h32",
+            }
+            close_pnl = tp_pct if quality == "clean_retrace_h32" else (-sl_pct if is_bad else 0.0)
+            entry_time = pd.Timestamp(row["entry_bar_open_time"])
+            hold_bars = min(max_hold_bars, max(1, int(float(bars_to_resolution))))
+            close_time = entry_time + pd.Timedelta(minutes=15 * hold_bars)
+            event_seq += 1
+            heapq.heappush(
+                start_heap,
+                (
+                    int(entry_time.value),
+                    event_seq,
+                    str(row["symbol"]),
+                    int(close_time.value),
+                    event_seq,
+                    float(close_pnl),
+                ),
+            )
+    frame["recent_resolved_tp_rate_24h"] = tp_rate_24h
+    frame["recent_resolved_sl_rate_24h"] = sl_rate_24h
+    frame["recent_pnl_sum_24h"] = pnl_sum_24h
+    frame["recent_pnl_sum_last_n"] = pnl_sum_last_n
+    frame["recent_losing_streak"] = losing_streak
+    frame["active_symbol_sessions_now"] = active_symbol_sessions
     return frame.drop(columns=["_stream_group_key"], errors="ignore")
 
 
