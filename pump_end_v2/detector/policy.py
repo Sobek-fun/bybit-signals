@@ -5,6 +5,7 @@ from typing import Any
 import pandas as pd
 
 from pump_end_v2.config import DetectorPolicyConfig
+from pump_end_v2.contracts import CandidateSignalRef
 from pump_end_v2.logging import log_info
 
 INPUT_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -19,9 +20,13 @@ INPUT_REQUIRED_COLUMNS: tuple[str, ...] = (
     "policy_context_only",
     "episode_age_bars",
     "distance_from_episode_high_pct",
+)
+
+_OPTIONAL_HINDSIGHT_COLUMNS: tuple[str, ...] = (
     "target_good_short_now",
     "target_reason",
     "future_outcome_class",
+    "signal_quality_h32",
     "future_prepullback_squeeze_pct",
     "future_pullback_pct",
     "future_net_edge_pct",
@@ -55,6 +60,7 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "target_good_short_now",
     "target_reason",
     "future_outcome_class",
+    "signal_quality_h32",
     "future_prepullback_squeeze_pct",
     "future_pullback_pct",
     "future_net_edge_pct",
@@ -82,6 +88,7 @@ EPISODE_POLICY_SUMMARY_COLUMNS: tuple[str, ...] = (
     "fire_target_good_short_now",
     "fire_target_reason",
     "fire_future_outcome_class",
+    "fire_signal_quality_h32",
     "fire_future_net_edge_pct",
     "bars_fire_to_ideal",
 )
@@ -97,7 +104,10 @@ def apply_episode_aware_detector_policy(
     frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
     frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
     frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
-    frame["ideal_entry_bar_open_time"] = pd.to_datetime(frame["ideal_entry_bar_open_time"], utc=True, errors="coerce")
+    if "ideal_entry_bar_open_time" in frame.columns:
+        frame["ideal_entry_bar_open_time"] = pd.to_datetime(
+            frame["ideal_entry_bar_open_time"], utc=True, errors="coerce"
+        )
     frame["policy_context_only"] = frame["policy_context_only"].astype(bool)
     frame["p_good"] = frame["p_good"].astype(float)
     if not has_fold_id:
@@ -121,7 +131,7 @@ def apply_episode_aware_detector_policy(
         active_rows_total = int(len(active_rows))
         if active_rows_total == 0:
             continue
-        good_episode_flag = bool((pd.to_numeric(active_rows["target_good_short_now"], errors="coerce") == 1).any())
+        good_episode_flag = _compute_good_episode_flag(active_rows)
         armed_flag = False
         had_arm = False
         fired = False
@@ -151,9 +161,18 @@ def apply_episode_aware_detector_policy(
                     expired = True
                     continue
                 signal_id = f"{episode_id}|{pd.Timestamp(row.context_bar_open_time).strftime('%Y%m%d_%H%M%S')}"
+                _ = CandidateSignalRef(
+                    signal_id=signal_id,
+                    episode_id=episode_id,
+                    symbol=symbol,
+                    fire_decision_time=pd.Timestamp(row.decision_time).to_pydatetime(),
+                    entry_bar_open_time=pd.Timestamp(row.entry_bar_open_time).to_pydatetime(),
+                )
+                ideal_entry_value = _row_value(row, "ideal_entry_bar_open_time")
+                ideal_entry_time = pd.Timestamp(ideal_entry_value) if pd.notna(ideal_entry_value) else None
                 bars_fire_to_ideal = _compute_bars_fire_to_ideal(
                     pd.Timestamp(row.entry_bar_open_time),
-                    pd.Timestamp(row.ideal_entry_bar_open_time) if pd.notna(row.ideal_entry_bar_open_time) else None,
+                    ideal_entry_time,
                 )
                 fire_signal_row = {
                     "signal_id": signal_id,
@@ -173,21 +192,10 @@ def apply_episode_aware_detector_policy(
                     "policy_arm_score_min": detector_policy_config.arm_score_min,
                     "policy_fire_score_floor": detector_policy_config.fire_score_floor,
                     "policy_turn_down_delta": detector_policy_config.turn_down_delta,
-                    "target_good_short_now": row.target_good_short_now,
-                    "target_reason": row.target_reason,
-                    "future_outcome_class": row.future_outcome_class,
-                    "future_prepullback_squeeze_pct": row.future_prepullback_squeeze_pct,
-                    "future_pullback_pct": row.future_pullback_pct,
-                    "future_net_edge_pct": row.future_net_edge_pct,
-                    "bars_to_pullback": row.bars_to_pullback,
-                    "bars_to_peak_after_row": row.bars_to_peak_after_row,
-                    "bars_to_resolution": row.bars_to_resolution,
-                    "entry_quality_score": row.entry_quality_score,
-                    "ideal_entry_row_id": row.ideal_entry_row_id,
-                    "ideal_entry_bar_open_time": row.ideal_entry_bar_open_time,
-                    "is_ideal_entry": row.is_ideal_entry,
                     "bars_fire_to_ideal": bars_fire_to_ideal,
                 }
+                for column in _OPTIONAL_HINDSIGHT_COLUMNS:
+                    fire_signal_row[column] = _row_value(row, column)
                 candidate_rows.append(fire_signal_row)
                 fired = True
                 continue
@@ -210,6 +218,7 @@ def apply_episode_aware_detector_policy(
                 "fire_target_good_short_now": fire_signal_row["target_good_short_now"] if fire_signal_row else pd.NA,
                 "fire_target_reason": fire_signal_row["target_reason"] if fire_signal_row else pd.NA,
                 "fire_future_outcome_class": fire_signal_row["future_outcome_class"] if fire_signal_row else pd.NA,
+                "fire_signal_quality_h32": fire_signal_row["signal_quality_h32"] if fire_signal_row else pd.NA,
                 "fire_future_net_edge_pct": fire_signal_row["future_net_edge_pct"] if fire_signal_row else pd.NA,
                 "bars_fire_to_ideal": fire_signal_row["bars_fire_to_ideal"] if fire_signal_row else pd.NA,
             }
@@ -267,7 +276,8 @@ def build_detector_policy_metrics(
         episodes_total,
     )
     arm_to_fire_conversion = _safe_ratio(episodes_fired, episodes_armed)
-    selection_score = good_episode_capture_rate + fired_good_rate - bad_episode_fire_rate
+    density_sanity_penalty = _compute_detector_density_sanity_penalty(fires_per_30d)
+    selection_score = good_episode_capture_rate + fired_good_rate - bad_episode_fire_rate - 0.15 * density_sanity_penalty
     return {
         "episodes_total": float(episodes_total),
         "episodes_with_good_zone": float(episodes_with_good_zone),
@@ -281,6 +291,7 @@ def build_detector_policy_metrics(
         "median_future_net_edge_pct_at_fire": float(median_future_net_edge_pct_at_fire),
         "reset_without_fire_share": float(reset_without_fire_share),
         "arm_to_fire_conversion": float(arm_to_fire_conversion),
+        "density_sanity_penalty": float(density_sanity_penalty),
         "selection_score": float(selection_score),
     }
 
@@ -309,6 +320,28 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
     if denominator <= 0:
         return 0.0
     return float(numerator / denominator)
+
+
+def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
+    value = float(fires_per_30d)
+    if 15.0 <= value <= 180.0:
+        return 0.0
+    if value < 15.0:
+        return float((15.0 - value) / 15.0)
+    return float((value - 180.0) / 180.0)
+
+
+def _compute_good_episode_flag(active_rows: pd.DataFrame) -> bool:
+    if "signal_quality_h32" in active_rows.columns:
+        quality = active_rows["signal_quality_h32"].astype(str)
+        return bool((quality == "clean_retrace_h32").any())
+    if "target_good_short_now" in active_rows.columns:
+        return bool((pd.to_numeric(active_rows["target_good_short_now"], errors="coerce") == 1).any())
+    return False
+
+
+def _row_value(row: Any, column: str) -> Any:
+    return getattr(row, column) if hasattr(row, column) else pd.NA
 
 
 def _require_columns(df: pd.DataFrame, columns: tuple[str, ...]) -> None:

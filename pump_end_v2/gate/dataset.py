@@ -8,6 +8,7 @@ from pump_end_v2.logging import log_info
 GATE_TARGET_META_COLUMNS: tuple[str, ...] = (
     "target_block_signal",
     "block_reason",
+    "signal_quality_h32",
     "target_good_short_now",
     "target_reason",
     "future_outcome_class",
@@ -25,6 +26,7 @@ GATE_TARGET_META_COLUMNS: tuple[str, ...] = (
 
 _CANDIDATE_TARGET_COLUMNS: tuple[str, ...] = (
     "signal_id",
+    "signal_quality_h32",
     "target_good_short_now",
     "target_reason",
     "future_outcome_class",
@@ -50,10 +52,15 @@ def build_gate_dataset(gate_feature_view_df: pd.DataFrame, candidate_signals_df:
     target_part = candidate_signals_df.loc[:, list(_CANDIDATE_TARGET_COLUMNS)].copy()
     merged = gate_feature_view_df.merge(target_part, on="signal_id", how="inner", validate="one_to_one")
     merged["target_good_short_now"] = pd.to_numeric(merged["target_good_short_now"], errors="coerce").fillna(0).astype(int)
-    merged["target_block_signal"] = (merged["target_good_short_now"] == 0).astype(int)
+    merged["signal_quality_h32"] = merged["signal_quality_h32"].astype(str)
+    merged["target_block_signal"] = (merged["signal_quality_h32"] != "clean_retrace_h32").astype(int)
     merged["target_reason"] = merged["target_reason"].astype(str)
     merged["future_outcome_class"] = merged["future_outcome_class"].astype(str)
-    merged["gate_trainable_signal"] = merged["target_reason"] != "invalid_context"
+    merged["gate_trainable_signal"] = (
+        merged["signal_quality_h32"].ne("")
+        & merged["signal_quality_h32"].ne("nan")
+        & merged["signal_quality_h32"].ne("<NA>")
+    )
     merged["block_reason"] = merged.apply(_resolve_block_reason, axis=1)
     ordered = merged.loc[:, [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS, *GATE_TARGET_META_COLUMNS, "gate_trainable_signal"]]
     trainable_rows = int(ordered["gate_trainable_signal"].sum())
@@ -69,17 +76,18 @@ def build_gate_dataset(gate_feature_view_df: pd.DataFrame, candidate_signals_df:
 
 
 def _resolve_block_reason(row: pd.Series) -> str:
-    if int(row["target_good_short_now"]) == 1:
-        return "keep_good"
-    if str(row["future_outcome_class"]) == "continuation":
-        return "continuation"
-    if str(row["future_outcome_class"]) == "flat":
-        return "flat"
-    if str(row["target_reason"]) == "too_early":
-        return "too_early"
-    if str(row["target_reason"]) == "too_late":
-        return "too_late"
-    return "bad_signal"
+    quality = str(row["signal_quality_h32"])
+    if quality == "clean_retrace_h32":
+        return "keep_clean_retrace_h32"
+    if quality == "dirty_retrace_h32":
+        return "block_dirty_retrace_h32"
+    if quality == "clean_no_pullback_h32":
+        return "block_clean_no_pullback_h32"
+    if quality == "dirty_no_pullback_h32":
+        return "block_dirty_no_pullback_h32"
+    if quality == "pullback_before_squeeze_h32":
+        return "block_pullback_before_squeeze_h32"
+    return "block_unknown_quality"
 
 
 def _validate_no_leakage_columns() -> None:

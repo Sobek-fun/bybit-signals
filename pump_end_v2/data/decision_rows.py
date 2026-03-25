@@ -4,7 +4,7 @@ import time
 
 import pandas as pd
 
-from pump_end_v2.contracts import ExecutionContract
+from pump_end_v2.contracts import DecisionRowRef, ExecutionContract
 from pump_end_v2.logging import log_info, stage_done, stage_start
 from pump_end_v2.time_utils import context_to_decision_time, decision_to_entry_bar_open_time
 
@@ -59,9 +59,18 @@ def build_decision_rows(
             entry_bar_open_time = decision_to_entry_bar_open_time(
                 decision_time, entry_shift_bars=execution.entry_shift_bars
             )
+            decision_row_id = f"{episode.episode_id}|{row.open_time:%Y%m%d_%H%M%S}"
+            _ = DecisionRowRef(
+                decision_row_id=decision_row_id,
+                episode_id=str(episode.episode_id),
+                symbol=str(episode.symbol),
+                context_bar_open_time=pd.Timestamp(row.open_time).to_pydatetime(),
+                decision_time=pd.Timestamp(decision_time).to_pydatetime(),
+                entry_bar_open_time=pd.Timestamp(entry_bar_open_time).to_pydatetime(),
+            )
             rows.append(
                 {
-                    "decision_row_id": f"{episode.episode_id}|{row.open_time:%Y%m%d_%H%M%S}",
+                    "decision_row_id": decision_row_id,
                     "episode_id": episode.episode_id,
                     "symbol": episode.symbol,
                     "context_bar_open_time": row.open_time,

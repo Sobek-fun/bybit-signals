@@ -38,6 +38,7 @@ class ResolverConfig:
     success_pullback_pct: float
     max_prepullback_squeeze_pct: float
     flat_max_abs_move_pct: float
+    max_wait_bars_for_success: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +142,6 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         sl_pct=float(config["execution"]["sl_pct"]),
         max_hold_bars=int(config["execution"]["max_hold_bars"]),
         entry_shift_bars=int(config["execution"]["entry_shift_bars"]),
-        replay_resolution=str(config["execution"]["replay_resolution"]),
     )
     return V2Config(
         raw=copy.deepcopy(config),
@@ -254,28 +254,40 @@ def _validate_compute(compute_section: dict[str, Any]) -> None:
 
 
 def _require_positive_int(value: Any, field_name: str) -> int:
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be positive") from exc
     if parsed <= 0:
         raise ValueError(f"{field_name} must be positive")
     return parsed
 
 
 def _require_non_negative_int(value: Any, field_name: str) -> int:
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be non-negative") from exc
     if parsed < 0:
         raise ValueError(f"{field_name} must be non-negative")
     return parsed
 
 
 def _require_positive_float(value: Any, field_name: str) -> float:
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be positive") from exc
     if parsed <= 0:
         raise ValueError(f"{field_name} must be positive")
     return parsed
 
 
 def _require_non_negative_float(value: Any, field_name: str) -> float:
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be non-negative") from exc
     if parsed < 0:
         raise ValueError(f"{field_name} must be non-negative")
     return parsed
@@ -316,8 +328,15 @@ def _build_event_opener(section: dict[str, Any]) -> EventOpenerConfig:
 
 
 def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
+    horizon_bars = _require_positive_int(section.get("horizon_bars"), "data.resolver.horizon_bars")
+    max_wait_bars_for_success = _require_positive_int(
+        section.get("max_wait_bars_for_success"),
+        "data.resolver.max_wait_bars_for_success",
+    )
+    if max_wait_bars_for_success > horizon_bars:
+        raise ValueError("data.resolver.max_wait_bars_for_success must be <= data.resolver.horizon_bars")
     return ResolverConfig(
-        horizon_bars=_require_positive_int(section.get("horizon_bars"), "data.resolver.horizon_bars"),
+        horizon_bars=horizon_bars,
         success_pullback_pct=_require_positive_float(
             section.get("success_pullback_pct"), "data.resolver.success_pullback_pct"
         ),
@@ -327,6 +346,7 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
         flat_max_abs_move_pct=_require_positive_float(
             section.get("flat_max_abs_move_pct"), "data.resolver.flat_max_abs_move_pct"
         ),
+        max_wait_bars_for_success=max_wait_bars_for_success,
     )
 
 

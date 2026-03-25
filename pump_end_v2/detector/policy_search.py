@@ -35,6 +35,7 @@ POLICY_ROW_COLUMNS: tuple[str, ...] = (
     "target_good_short_now",
     "target_reason",
     "future_outcome_class",
+    "signal_quality_h32",
     "future_prepullback_squeeze_pct",
     "future_pullback_pct",
     "future_net_edge_pct",
@@ -62,6 +63,7 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "median_future_net_edge_pct_at_fire",
     "reset_without_fire_share",
     "arm_to_fire_conversion",
+    "density_sanity_penalty",
     "selection_score",
 )
 
@@ -77,18 +79,6 @@ POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "episode_age_bars",
     "distance_from_episode_high_pct",
     "target_good_short_now",
-    "target_reason",
-    "future_outcome_class",
-    "future_prepullback_squeeze_pct",
-    "future_pullback_pct",
-    "future_net_edge_pct",
-    "bars_to_pullback",
-    "bars_to_peak_after_row",
-    "bars_to_resolution",
-    "entry_quality_score",
-    "ideal_entry_row_id",
-    "ideal_entry_bar_open_time",
-    "is_ideal_entry",
     *DETECTOR_FEATURE_COLUMNS,
 )
 
@@ -367,6 +357,7 @@ def sweep_detector_policy(
                 "median_future_net_edge_pct_at_fire": metrics["median_future_net_edge_pct_at_fire"],
                 "reset_without_fire_share": metrics["reset_without_fire_share"],
                 "arm_to_fire_conversion": metrics["arm_to_fire_conversion"],
+                "density_sanity_penalty": _compute_detector_density_sanity_penalty(metrics["fires_per_30d"]),
                 "selection_score": metrics["selection_score"],
             }
         )
@@ -503,7 +494,8 @@ def _prepare_dataset_frame(dataset_df: pd.DataFrame) -> pd.DataFrame:
     frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
     frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
     frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
-    frame["ideal_entry_bar_open_time"] = pd.to_datetime(frame["ideal_entry_bar_open_time"], utc=True, errors="coerce")
+    if "ideal_entry_bar_open_time" in frame.columns:
+        frame["ideal_entry_bar_open_time"] = pd.to_datetime(frame["ideal_entry_bar_open_time"], utc=True, errors="coerce")
     return frame
 
 
@@ -518,25 +510,7 @@ def _score_policy_window(
     score_frame = predict_detector_scores(model, rows_to_score, DETECTOR_FEATURE_COLUMNS)
     merged = score_frame.merge(
         rows_to_score[
-            [
-                "decision_row_id",
-                "policy_context_only",
-                "episode_age_bars",
-                "distance_from_episode_high_pct",
-                "target_good_short_now",
-                "target_reason",
-                "future_outcome_class",
-                "future_prepullback_squeeze_pct",
-                "future_pullback_pct",
-                "future_net_edge_pct",
-                "bars_to_pullback",
-                "bars_to_peak_after_row",
-                "bars_to_resolution",
-                "entry_quality_score",
-                "ideal_entry_row_id",
-                "ideal_entry_bar_open_time",
-                "is_ideal_entry",
-            ]
+            _available_rows_to_score_columns(rows_to_score)
         ],
         on="decision_row_id",
         how="left",
@@ -571,3 +545,36 @@ def _require_columns(df: pd.DataFrame, columns: tuple[str, ...]) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
         raise ValueError(f"dataset missing required columns: {missing}")
+
+
+def _available_rows_to_score_columns(rows_to_score: pd.DataFrame) -> list[str]:
+    ordered = [
+        "decision_row_id",
+        "policy_context_only",
+        "episode_age_bars",
+        "distance_from_episode_high_pct",
+        "target_good_short_now",
+        "target_reason",
+        "future_outcome_class",
+        "signal_quality_h32",
+        "future_prepullback_squeeze_pct",
+        "future_pullback_pct",
+        "future_net_edge_pct",
+        "bars_to_pullback",
+        "bars_to_peak_after_row",
+        "bars_to_resolution",
+        "entry_quality_score",
+        "ideal_entry_row_id",
+        "ideal_entry_bar_open_time",
+        "is_ideal_entry",
+    ]
+    return [column for column in ordered if column in rows_to_score.columns]
+
+
+def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
+    value = float(fires_per_30d)
+    if 15.0 <= value <= 180.0:
+        return 0.0
+    if value < 15.0:
+        return float((15.0 - value) / 15.0)
+    return float((value - 180.0) / 180.0)

@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from pump_end_v2.contracts import ExecutionContract
+from pump_end_v2.contracts import ExecutedSignalRef, ExecutionContract, TradeOutcome
 from pump_end_v2.logging import log_info
 
 _BARS_REQUIRED_COLUMNS: tuple[str, ...] = ("symbol", "open_time", "open", "high", "low", "close")
@@ -136,6 +136,13 @@ def replay_short_signals_with_symbol_lock(
         decisions.at[idx, "mfe_pct"] = outcome_data["mfe_pct"]
         decisions.at[idx, "mae_pct"] = outcome_data["mae_pct"]
         decisions.at[idx, "holding_bars"] = int(outcome_data["holding_bars"])
+        _ = ExecutedSignalRef(
+            signal_id=str(row["signal_id"]),
+            symbol=symbol,
+            entry_bar_open_time=entry_time.to_pydatetime(),
+            exit_time=pd.Timestamp(outcome_data["exit_time"]).to_pydatetime(),
+            trade_outcome=TradeOutcome(str(outcome_data["trade_outcome"])),
+        )
         lock_until_by_symbol[symbol] = pd.Timestamp(outcome_data["exit_time"])
     decisions = decisions.sort_values("_row_order", kind="mergesort").drop(columns=["_row_order"])
     executed_signals_df = decisions[decisions["execution_status"] == "executed"].copy().reset_index(drop=True)

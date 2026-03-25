@@ -13,6 +13,14 @@ class OutcomeClass(StrEnum):
     FLAT = "flat"
 
 
+class SignalQualityClass(StrEnum):
+    CLEAN_RETRACE_H32 = "clean_retrace_h32"
+    DIRTY_RETRACE_H32 = "dirty_retrace_h32"
+    CLEAN_NO_PULLBACK_H32 = "clean_no_pullback_h32"
+    DIRTY_NO_PULLBACK_H32 = "dirty_no_pullback_h32"
+    PULLBACK_BEFORE_SQUEEZE_H32 = "pullback_before_squeeze_h32"
+
+
 class TargetReason(StrEnum):
     GOOD = "good"
     TOO_EARLY = "too_early"
@@ -120,7 +128,6 @@ class ExecutionContract:
     sl_pct: float
     max_hold_bars: int
     entry_shift_bars: int
-    replay_resolution: str
 
     def __post_init__(self) -> None:
         if self.tp_pct <= 0:
@@ -131,5 +138,3 @@ class ExecutionContract:
             raise ValueError("max_hold_bars must be positive")
         if self.entry_shift_bars < 0:
             raise ValueError("entry_shift_bars must be non-negative")
-        if self.replay_resolution not in {"1m", "1s"}:
-            raise ValueError("replay_resolution must be one of: 1m, 1s")

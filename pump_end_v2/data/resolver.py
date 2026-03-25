@@ -6,7 +6,7 @@ import time
 import pandas as pd
 
 from pump_end_v2.config import ResolverConfig
-from pump_end_v2.contracts import OutcomeClass, TargetReason
+from pump_end_v2.contracts import OutcomeClass, SignalQualityClass, TargetReason
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
@@ -28,6 +28,7 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
     resolved["bars_to_peak_after_row"] = pd.NA
     resolved["bars_to_resolution"] = pd.NA
     resolved["future_outcome_class"] = pd.NA
+    resolved["signal_quality_h32"] = pd.NA
     resolved["target_good_short_now"] = 0
     resolved["target_reason"] = TargetReason.INVALID_CONTEXT.value
     resolved["entry_quality_score"] = math.nan
@@ -72,10 +73,31 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
         )
         future_pullback_pct = max_pullback_pct_total
         future_net_edge_pct = future_pullback_pct - future_prepullback_squeeze_pct
-        is_reversal = (
-            future_pullback_pct >= config.success_pullback_pct
-            and future_prepullback_squeeze_pct <= config.max_prepullback_squeeze_pct
+        first_squeeze_breach_index = _first_true_index(
+            squeeze_series > float(config.max_prepullback_squeeze_pct),
+            int(horizon_df.index[0]),
         )
+        has_success_pullback = first_success_pullback_index is not None
+        wait_ok = (
+            has_success_pullback and int(first_success_pullback_index) <= int(config.max_wait_bars_for_success)
+        )
+        squeeze_ok = future_prepullback_squeeze_pct <= float(config.max_prepullback_squeeze_pct)
+        pullback_before_squeeze = (
+            has_success_pullback
+            and first_squeeze_breach_index is not None
+            and int(first_success_pullback_index) < int(first_squeeze_breach_index)
+        )
+        is_reversal = has_success_pullback and squeeze_ok and wait_ok
+        if is_reversal:
+            signal_quality = SignalQualityClass.CLEAN_RETRACE_H32.value
+        elif has_success_pullback and pullback_before_squeeze:
+            signal_quality = SignalQualityClass.PULLBACK_BEFORE_SQUEEZE_H32.value
+        elif has_success_pullback:
+            signal_quality = SignalQualityClass.DIRTY_RETRACE_H32.value
+        elif max_squeeze_pct_total <= config.flat_max_abs_move_pct:
+            signal_quality = SignalQualityClass.CLEAN_NO_PULLBACK_H32.value
+        else:
+            signal_quality = SignalQualityClass.DIRTY_NO_PULLBACK_H32.value
         if is_reversal:
             outcome = OutcomeClass.REVERSAL.value
         elif max_squeeze_pct_total > config.flat_max_abs_move_pct:
@@ -91,6 +113,7 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
         resolved.at[idx, "bars_to_peak_after_row"] = first_peak_index
         resolved.at[idx, "bars_to_resolution"] = bars_to_resolution
         resolved.at[idx, "future_outcome_class"] = outcome
+        resolved.at[idx, "signal_quality_h32"] = signal_quality
         resolved.at[idx, "target_good_short_now"] = 1 if outcome == OutcomeClass.REVERSAL.value else 0
         resolved.at[idx, "entry_quality_score"] = future_net_edge_pct - 0.001 * min(
             bars_to_resolution, config.horizon_bars
@@ -156,3 +179,10 @@ def _apply_target_reason(resolved: pd.DataFrame) -> pd.DataFrame:
         else:
             frame.at[idx, "target_reason"] = TargetReason.INVALID_CONTEXT.value
     return frame
+
+
+def _first_true_index(mask: pd.Series, base_index: int) -> int | None:
+    true_mask = mask[mask]
+    if true_mask.empty:
+        return None
+    return int(true_mask.index[0] - base_index)

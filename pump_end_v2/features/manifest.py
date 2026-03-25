@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from pump_end_v2.gate.feature_view import (
+    GATE_FEATURE_COLUMNS,
+    GATE_IDENTITY_COLUMNS,
+)
+
 DETECTOR_IDENTITY_COLUMNS: tuple[str, ...] = (
     "decision_row_id",
     "episode_id",
@@ -58,6 +63,7 @@ BLOCKED_COLUMNS: tuple[str, ...] = (
     "bars_to_peak_after_row",
     "bars_to_resolution",
     "future_outcome_class",
+    "signal_quality_h32",
     "target_good_short_now",
     "target_reason",
     "entry_quality_score",
@@ -73,4 +79,12 @@ def build_detector_feature_manifest() -> dict[str, object]:
         "feature_count": len(DETECTOR_FEATURE_COLUMNS),
         "identity_columns": list(DETECTOR_IDENTITY_COLUMNS),
         "blocked_columns": list(BLOCKED_COLUMNS),
+    }
+
+
+def build_gate_feature_manifest() -> dict[str, object]:
+    return {
+        "feature_columns": list(GATE_FEATURE_COLUMNS),
+        "feature_count": len(GATE_FEATURE_COLUMNS),
+        "identity_columns": list(GATE_IDENTITY_COLUMNS),
     }

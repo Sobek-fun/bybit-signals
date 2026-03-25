@@ -10,6 +10,7 @@ from pump_end_v2.logging import log_info, stage_done, stage_start
 TARGET_META_COLUMNS: tuple[str, ...] = (
     "is_resolved",
     "future_outcome_class",
+    "signal_quality_h32",
     "target_good_short_now",
     "target_reason",
     "future_prepullback_squeeze_pct",
@@ -48,11 +49,13 @@ def build_detector_dataset(detector_feature_view_df: pd.DataFrame, resolved_rows
     merged["trainable_row"] = merged["is_resolved"].astype(bool) & (
         merged["target_reason"].astype(str) != "invalid_context"
     )
+    merged["detector_trainable_row"] = merged["trainable_row"].astype(int)
     ordered_columns = [
         *DETECTOR_IDENTITY_COLUMNS,
         *DETECTOR_FEATURE_COLUMNS,
         *TARGET_META_COLUMNS,
         "trainable_row",
+        "detector_trainable_row",
     ]
     dataset = merged.loc[:, ordered_columns].copy()
     resolved_rows = int(dataset["is_resolved"].astype(bool).sum())
