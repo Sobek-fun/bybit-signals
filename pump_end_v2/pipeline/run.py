@@ -34,15 +34,20 @@ from pump_end_v2.execution import (
 )
 from pump_end_v2.features import (
     build_breadth_state_layer,
+    build_detector_feature_manifest,
     build_detector_feature_view,
     build_episode_state_layer,
+    build_gate_feature_manifest,
     build_reference_state_layer,
     build_token_state_layer,
 )
 from pump_end_v2.gate import (
     apply_gate_block_threshold,
+    build_gate_decile_report,
+    build_gate_execution_decision_summary,
     build_gate_test_scored_signals,
-    build_gate_val_scored_signals_and_threshold,
+    build_gate_val_scored_signals_and_datasets,
+    select_gate_block_threshold_execution_aware,
 )
 from pump_end_v2.logging import log_info, stage_done, stage_start
 from pump_end_v2.pipeline.io import (
@@ -162,25 +167,40 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     stage_done("PIPELINE", "DETECTOR_TEST")
 
     stage_start("PIPELINE", "GATE_VAL")
-    _, val_scored_signals_df, selected_gate_threshold, gate_threshold_sweep_df = build_gate_val_scored_signals_and_threshold(
+    (
+        _,
+        val_scored_signals_df,
+        gate_threshold_sweep_diagnostic_df,
+        gate_dataset_train_oof_df,
+        gate_dataset_val_df,
+    ) = build_gate_val_scored_signals_and_datasets(
         train_oof_candidate_signals_df,
         val_candidate_signals_df,
         token_state,
         reference_state,
         breadth_state,
+        config.execution,
         config.gate_model,
         config.gate_config.block_threshold,
+    )
+    selected_gate_threshold, gate_threshold_sweep_execution_df = select_gate_block_threshold_execution_aware(
+        scored_signals_df=val_scored_signals_df,
+        base_block_threshold=config.gate_config.block_threshold,
+        bars_1m_df=bars_1m,
+        execution_contract=config.execution,
+        bars_1s_df=bars_1s,
     )
     val_gate_decisions_df, _ = apply_gate_block_threshold(val_scored_signals_df, selected_gate_threshold)
     stage_done("PIPELINE", "GATE_VAL")
 
     stage_start("PIPELINE", "GATE_TEST")
-    gate_model_test, test_scored_signals_df = build_gate_test_scored_signals(
+    gate_model_test, test_scored_signals_df, gate_dataset_test_df = build_gate_test_scored_signals(
         train_oof_candidate_signals_df,
         test_candidate_signals_df,
         token_state,
         reference_state,
         breadth_state,
+        config.execution,
         config.gate_model,
     )
     test_gate_decisions_df, _ = apply_gate_block_threshold(test_scored_signals_df, selected_gate_threshold)
@@ -199,6 +219,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         config.execution,
         bars_1s,
     )
+    val_decision_summary = build_gate_execution_decision_summary(val_execution_decisions_df)
+    test_decision_summary = build_gate_execution_decision_summary(test_execution_decisions_df)
     stage_done("PIPELINE", "EXECUTION_REPLAY")
 
     stage_start("PIPELINE", "EXECUTION_REPORTS")
@@ -212,6 +234,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     test_window_24h = build_execution_window_report(test_executed_signals_df, 24)
     test_symbol_report = build_execution_symbol_report(test_executed_signals_df)
     test_monthly_report = build_execution_monthly_report(test_executed_signals_df)
+    gate_deciles_val = build_gate_decile_report(val_scored_signals_df)
+    gate_deciles_test = build_gate_decile_report(test_scored_signals_df)
     stage_done("PIPELINE", "EXECUTION_REPORTS")
 
     stage_start("PIPELINE", "ARTIFACTS_SAVE")
@@ -232,6 +256,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_json_and_log(event_quality_report, prepared_dir / "event_quality_report.json")
 
     _save_df_and_log(detector_dataset, detector_dir / "dataset.parquet")
+    _save_json_and_log(build_detector_feature_manifest(), detector_dir / "feature_manifest.json")
     _save_df_and_log(detector_policy_sweep_df, detector_dir / "policy_sweep_val.csv")
     _save_json_and_log(_policy_to_dict(selected_detector_policy), detector_dir / "selected_policy.json")
     _save_df_and_log(train_oof_candidate_signals_df, detector_dir / "train_oof_candidate_signals.parquet")
@@ -251,14 +276,22 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_model_and_log(detector_model_test, detector_dir / "model_train_only.cbm")
 
     _save_df_and_log(val_scored_signals_df, gate_dir / "val_scored_signals.parquet")
-    _save_df_and_log(gate_threshold_sweep_df, gate_dir / "threshold_sweep_val.csv")
+    _save_json_and_log(build_gate_feature_manifest(), gate_dir / "feature_manifest.json")
+    _save_df_and_log(gate_dataset_train_oof_df, gate_dir / "dataset_train_oof.parquet")
+    _save_df_and_log(gate_dataset_val_df, gate_dir / "dataset_val.parquet")
+    _save_df_and_log(gate_dataset_test_df, gate_dir / "dataset_test.parquet")
+    _save_df_and_log(gate_threshold_sweep_diagnostic_df, gate_dir / "threshold_sweep_val_diagnostic.csv")
+    _save_df_and_log(gate_threshold_sweep_execution_df, gate_dir / "threshold_sweep_val_execution.csv")
     _save_json_and_log(float(selected_gate_threshold), gate_dir / "selected_threshold.json")
+    _save_df_and_log(gate_deciles_val, gate_dir / "gate_deciles.csv")
+    _save_df_and_log(gate_deciles_test, gate_dir / "gate_deciles_test.csv")
     _save_df_and_log(test_scored_signals_df, gate_dir / "test_scored_signals.parquet")
     _save_model_and_log(gate_model_test, gate_dir / "model_train_oof.cbm")
 
     _save_df_and_log(val_execution_decisions_df, eval_val_dir / "gate_decisions.parquet")
     _save_df_and_log(val_executed_signals_df, eval_val_dir / "executed_signals.csv")
     _save_json_and_log(val_metrics, eval_val_dir / "metrics.json")
+    _save_json_and_log(val_decision_summary, eval_val_dir / "decision_summary.json")
     _save_df_and_log(val_window_6h, eval_val_dir / "window_report_6h.csv")
     _save_df_and_log(val_window_24h, eval_val_dir / "window_report_24h.csv")
     _save_df_and_log(val_symbol_report, eval_val_dir / "symbol_report.csv")
@@ -267,6 +300,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     holdout_signals_path = _save_df_and_log(test_executed_signals_df, eval_test_dir / "test_signals_holdout.csv")
     _save_df_and_log(test_execution_decisions_df, eval_test_dir / "gate_decisions.parquet")
     _save_json_and_log(test_metrics, eval_test_dir / "metrics_holdout.json")
+    _save_json_and_log(test_decision_summary, eval_test_dir / "decision_summary.json")
     _save_df_and_log(test_window_6h, eval_test_dir / "window_report_6h.csv")
     _save_df_and_log(test_window_24h, eval_test_dir / "window_report_24h.csv")
     _save_df_and_log(test_symbol_report, eval_test_dir / "symbol_report.csv")
@@ -282,6 +316,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         "detector_val_policy_metrics": detector_val_policy_metrics,
         "detector_train_oof_policy_metrics": detector_train_oof_policy_metrics,
         "detector_test_policy_metrics": detector_test_policy_metrics,
+        "val_decision_summary": val_decision_summary,
+        "test_decision_summary": test_decision_summary,
         "val_execution_metrics": val_metrics,
         "test_execution_metrics": test_metrics,
     }
