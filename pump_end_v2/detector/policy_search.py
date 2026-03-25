@@ -119,18 +119,29 @@ def build_detector_val_policy_rows(
         scored = pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
         log_info("POLICY", "policy val scoring rows build done rows_total=0 context_rows=0 active_rows=0")
         return model, scored
-    val_start = val_rows["context_bar_open_time"].min()
-    warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
-    warmup_start = val_start - warmup_timedelta
-    score_window = frame[
-        (frame["context_bar_open_time"] >= warmup_start)
-        & (frame["context_bar_open_time"] <= pd.Timestamp(split_bounds.val_end))
-        & (
-            (frame["dataset_split"] == "val")
-            | (frame["context_bar_open_time"] < val_start)
+    active_window_end = pd.Timestamp(split_bounds.val_end)
+    val_active = val_rows[
+        _build_active_eligibility_mask(
+            val_rows,
+            resolver_config=resolver_config,
+            active_window_end=active_window_end,
         )
     ].copy()
-    score_window["policy_context_only"] = score_window["context_bar_open_time"] < val_start
+    if val_active.empty:
+        scored = pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
+        log_info("POLICY", "policy val scoring rows build done rows_total=0 context_rows=0 active_rows=0")
+        return model, scored
+    active_start = val_active["context_bar_open_time"].min()
+    warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
+    warmup_start = active_start - warmup_timedelta
+    warmup_rows = frame[
+        (frame["context_bar_open_time"] >= warmup_start)
+        & (frame["context_bar_open_time"] < active_start)
+    ].copy()
+    warmup_rows["policy_context_only"] = True
+    val_active["policy_context_only"] = False
+    score_window = pd.concat([warmup_rows, val_active], ignore_index=True)
+    score_window = score_window.drop_duplicates(subset=["decision_row_id"], keep="last").reset_index(drop=True)
     scored = _score_policy_window(
         model=model,
         rows_to_score=score_window,
@@ -173,14 +184,31 @@ def build_detector_train_oof_policy_rows(
         val_start = pd.Timestamp(fold.val_start)
         val_end = pd.Timestamp(fold.val_end)
         warmup_start = val_start - warmup_timedelta
-        fold_score_rows = frame[
+        fold_active_rows = frame[
             (frame["dataset_split"] == "train")
-            & (frame["context_bar_open_time"] >= warmup_start)
+            & (frame["context_bar_open_time"] >= val_start)
             & (frame["context_bar_open_time"] <= val_end)
         ].copy()
-        if fold_score_rows.empty:
+        if fold_active_rows.empty:
             continue
-        fold_score_rows["policy_context_only"] = fold_score_rows["context_bar_open_time"] < val_start
+        fold_active_rows = fold_active_rows[
+            _build_active_eligibility_mask(
+                fold_active_rows,
+                resolver_config=resolver_config,
+                active_window_end=val_end,
+            )
+        ].copy()
+        if fold_active_rows.empty:
+            continue
+        fold_warmup_rows = frame[
+            (frame["dataset_split"] == "train")
+            & (frame["context_bar_open_time"] >= warmup_start)
+            & (frame["context_bar_open_time"] < val_start)
+        ].copy()
+        fold_warmup_rows["policy_context_only"] = True
+        fold_active_rows["policy_context_only"] = False
+        fold_score_rows = pd.concat([fold_warmup_rows, fold_active_rows], ignore_index=True)
+        fold_score_rows = fold_score_rows.drop_duplicates(subset=["decision_row_id"], keep="last").reset_index(drop=True)
         scored_fold = _score_policy_window(
             model=model,
             rows_to_score=fold_score_rows,
@@ -420,6 +448,18 @@ def _score_policy_window(
     merged["score_source"] = score_source
     merged["fold_id"] = fold_id
     return merged.loc[:, list(POLICY_ROW_COLUMNS)].copy()
+
+
+def _build_active_eligibility_mask(
+    rows_df: pd.DataFrame,
+    resolver_config: ResolverConfig,
+    active_window_end: pd.Timestamp,
+) -> pd.Series:
+    if rows_df.empty:
+        return pd.Series(dtype=bool)
+    horizon_delta = pd.Timedelta(minutes=15 * max(int(resolver_config.horizon_bars) - 1, 0))
+    horizon_end = pd.to_datetime(rows_df["entry_bar_open_time"], utc=True, errors="raise") + horizon_delta
+    return horizon_end <= pd.Timestamp(active_window_end)
 
 
 def _clip(value: float, lower: float, upper: float) -> float:
