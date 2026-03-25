@@ -57,6 +57,13 @@ class DetectorCVConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DetectorPolicyConfig:
+    arm_score_min: float
+    fire_score_floor: float
+    turn_down_delta: float
+
+
+@dataclass(frozen=True, slots=True)
 class ReferenceSymbolsConfig:
     btc_symbol: str
     eth_symbol: str
@@ -71,6 +78,7 @@ class V2Config:
     resolver: ResolverConfig
     detector_model: DetectorModelConfig
     detector_cv: DetectorCVConfig
+    detector_policy: DetectorPolicyConfig
     execution: ExecutionContract
 
 
@@ -100,6 +108,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     resolver = _build_resolver(config["data"]["resolver"])
     detector_model = _build_detector_model(config["detector"])
     detector_cv = _build_detector_cv(config["detector"])
+    detector_policy = _build_detector_policy(config["detector"])
     execution = ExecutionContract(
         tp_pct=float(config["execution"]["tp_pct"]),
         sl_pct=float(config["execution"]["sl_pct"]),
@@ -115,6 +124,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         resolver=resolver,
         detector_model=detector_model,
         detector_cv=detector_cv,
+        detector_policy=detector_policy,
         execution=execution,
     )
 
@@ -174,6 +184,7 @@ def _validate_detector(detector_section: dict[str, Any]) -> None:
     _validate_non_negative(detector_section, "detector")
     _build_detector_model(detector_section)
     _build_detector_cv(detector_section)
+    _build_detector_policy(detector_section)
 
 
 def _validate_non_negative(section: dict[str, Any], section_name: str) -> None:
@@ -320,6 +331,23 @@ def _build_detector_cv(section: dict[str, Any]) -> DetectorCVConfig:
         min_train_days=_require_positive_int(cv_section.get("min_train_days"), "detector.cv.min_train_days"),
         fold_span_days=_require_positive_int(cv_section.get("fold_span_days"), "detector.cv.fold_span_days"),
         max_folds=_require_positive_int(cv_section.get("max_folds"), "detector.cv.max_folds"),
+    )
+
+
+def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
+    arm_score_min = float(section.get("arm_score_min"))
+    fire_score_floor = float(section.get("fire_score_floor"))
+    turn_down_delta = float(section.get("turn_down_delta"))
+    if not (0.0 < arm_score_min <= 1.0):
+        raise ValueError("detector.arm_score_min must satisfy 0 < x <= 1")
+    if not (0.0 <= fire_score_floor <= arm_score_min):
+        raise ValueError("detector.fire_score_floor must satisfy 0 <= x <= detector.arm_score_min")
+    if not (0.0 < turn_down_delta <= 1.0):
+        raise ValueError("detector.turn_down_delta must satisfy 0 < x <= 1")
+    return DetectorPolicyConfig(
+        arm_score_min=arm_score_min,
+        fire_score_floor=fire_score_floor,
+        turn_down_delta=turn_down_delta,
     )
 
 
