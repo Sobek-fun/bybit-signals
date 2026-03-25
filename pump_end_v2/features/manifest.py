@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+DETECTOR_IDENTITY_COLUMNS: tuple[str, ...] = (
+    "decision_row_id",
+    "episode_id",
+    "symbol",
+    "context_bar_open_time",
+    "decision_time",
+    "entry_bar_open_time",
+)
+
+DETECTOR_FEATURE_COLUMNS: tuple[str, ...] = (
+    "close_ret_1",
+    "close_ret_4",
+    "close_ret_12",
+    "intrabar_range_pct",
+    "candle_body_pct",
+    "upper_wick_pct",
+    "lower_wick_pct",
+    "rolling_volatility_4",
+    "rolling_volatility_12",
+    "runup_pct_at_context",
+    "volume_ratio_at_context",
+    "pump_context_flag",
+    "distance_from_episode_high_pct",
+    "episode_age_bars",
+    "episode_runup_from_open_pct",
+    "btc_close_ret_1",
+    "btc_close_ret_4",
+    "btc_close_ret_12",
+    "btc_intrabar_range_pct",
+    "btc_volume_ratio",
+    "btc_pump_context_flag",
+    "eth_close_ret_1",
+    "eth_close_ret_4",
+    "eth_close_ret_12",
+    "eth_intrabar_range_pct",
+    "eth_volume_ratio",
+    "eth_pump_context_flag",
+    "breadth_universe_size",
+    "breadth_advancers_share",
+    "breadth_mean_close_ret_1",
+    "breadth_median_close_ret_1",
+    "breadth_std_close_ret_1",
+    "breadth_near_high_share",
+    "breadth_pump_context_share",
+    "breadth_volume_spike_share",
+)
+
+BLOCKED_COLUMNS: tuple[str, ...] = (
+    "episode_close_time",
+    "duration_bars",
+    "expiry_reason",
+    "future_prepullback_squeeze_pct",
+    "future_pullback_pct",
+    "future_net_edge_pct",
+    "bars_to_pullback",
+    "bars_to_peak_after_row",
+    "bars_to_resolution",
+    "future_outcome_class",
+    "target_good_short_now",
+    "target_reason",
+    "entry_quality_score",
+    "ideal_entry_row_id",
+    "ideal_entry_bar_open_time",
+    "is_ideal_entry",
+)
+
+
+def build_detector_feature_manifest() -> dict[str, object]:
+    return {
+        "feature_columns": list(DETECTOR_FEATURE_COLUMNS),
+        "feature_count": len(DETECTOR_FEATURE_COLUMNS),
+        "identity_columns": list(DETECTOR_IDENTITY_COLUMNS),
+        "blocked_columns": list(BLOCKED_COLUMNS),
+    }
