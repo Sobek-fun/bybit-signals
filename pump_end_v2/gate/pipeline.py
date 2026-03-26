@@ -77,9 +77,10 @@ def build_gate_val_scored_signals_and_datasets(
     breadth_state_df: pd.DataFrame,
     gate_model_config: GateModelConfig,
     base_block_threshold: float,
+    bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
-    bars_1s_df: pd.DataFrame | None = None,
+    bars_1s_fetcher: object | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -93,15 +94,17 @@ def build_gate_val_scored_signals_and_datasets(
 ]:
     train_oof_with_execution_df = _enrich_with_counterfactual(
         train_oof_candidate_signals_df,
+        bars_15m_df,
         bars_1m_df,
         execution_contract,
-        bars_1s_df,
+        bars_1s_fetcher,
     )
     val_with_execution_df = _enrich_with_counterfactual(
         val_candidate_signals_df,
+        bars_15m_df,
         bars_1m_df,
         execution_contract,
-        bars_1s_df,
+        bars_1s_fetcher,
     )
     val_history_df = _slice_history_window(
         train_oof_candidate_signals_df, val_candidate_signals_df, hours=24
@@ -117,9 +120,10 @@ def build_gate_val_scored_signals_and_datasets(
         candidate_signals_df=val_with_execution_df,
         history_candidate_signals_df=_enrich_with_counterfactual(
             val_history_df,
+            bars_15m_df,
             bars_1m_df,
             execution_contract,
-            bars_1s_df,
+            bars_1s_fetcher,
         ),
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
@@ -226,9 +230,10 @@ def build_gate_test_scored_signals(
     reference_state_df: pd.DataFrame,
     breadth_state_df: pd.DataFrame,
     gate_model_config: GateModelConfig,
+    bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
-    bars_1s_df: pd.DataFrame | None = None,
+    bars_1s_fetcher: object | None = None,
     force_disabled_no_data: bool = False,
 ) -> tuple[CatBoostClassifier | None, pd.DataFrame, pd.DataFrame, str]:
     if force_disabled_no_data:
@@ -250,15 +255,17 @@ def build_gate_test_scored_signals(
         )
     train_oof_with_execution_df = _enrich_with_counterfactual(
         train_oof_candidate_signals_df,
+        bars_15m_df,
         bars_1m_df,
         execution_contract,
-        bars_1s_df,
+        bars_1s_fetcher,
     )
     test_with_execution_df = _enrich_with_counterfactual(
         test_candidate_signals_df,
+        bars_15m_df,
         bars_1m_df,
         execution_contract,
-        bars_1s_df,
+        bars_1s_fetcher,
     )
     test_history_df = _slice_history_window(
         history_candidate_signals_df, test_candidate_signals_df, hours=24
@@ -274,9 +281,10 @@ def build_gate_test_scored_signals(
         candidate_signals_df=test_with_execution_df,
         history_candidate_signals_df=_enrich_with_counterfactual(
             test_history_df,
+            bars_15m_df,
             bars_1m_df,
             execution_contract,
-            bars_1s_df,
+            bars_1s_fetcher,
         ),
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
@@ -405,9 +413,10 @@ def _slice_history_window(
 
 def _enrich_with_counterfactual(
     candidate_signals_df: pd.DataFrame | None,
+    bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
-    bars_1s_df: pd.DataFrame | None,
+    bars_1s_fetcher: object | None,
 ) -> pd.DataFrame | None:
     if candidate_signals_df is None:
         return None
@@ -415,9 +424,10 @@ def _enrich_with_counterfactual(
         return candidate_signals_df.copy()
     counterfactual_df = attach_counterfactual_execution_outcomes(
         candidate_signals_df,
+        bars_15m_df,
         bars_1m_df,
         execution_contract,
-        bars_1s_df,
+        bars_1s_fetcher,
     )
     return candidate_signals_df.merge(
         counterfactual_df,

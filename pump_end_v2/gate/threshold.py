@@ -319,18 +319,20 @@ def build_gate_decile_report(
 def select_gate_block_threshold_execution_aware(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
-    bars_1s_df: pd.DataFrame | None = None,
+    bars_1s_fetcher: object | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> tuple[float, pd.DataFrame]:
     counterfactual_outcomes_df = attach_counterfactual_execution_outcomes(
         scored_signals_df,
+        bars_15m_df,
         bars_1m_df,
         execution_contract,
-        bars_1s_df,
+        bars_1s_fetcher,
     )
     rows: list[dict[str, float]] = []
     for threshold in build_gate_threshold_grid(base_block_threshold):
@@ -338,9 +340,10 @@ def select_gate_block_threshold_execution_aware(
         execution_decisions_df, executed_signals_df = (
             replay_short_signals_with_symbol_lock(
                 gate_decisions_df,
+                bars_15m_df,
                 bars_1m_df,
                 execution_contract,
-                bars_1s_df,
+                bars_1s_fetcher,
             )
         )
         execution_decisions_df = execution_decisions_df.merge(
@@ -546,9 +549,10 @@ def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], name: str) -> N
 
 def attach_counterfactual_execution_outcomes(
     decision_df: pd.DataFrame,
+    bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
-    bars_1s_df: pd.DataFrame | None = None,
+    bars_1s_fetcher: object | None = None,
 ) -> pd.DataFrame:
     _require_columns(
         decision_df,
@@ -589,9 +593,10 @@ def attach_counterfactual_execution_outcomes(
         )
         one_decision_df, _ = replay_short_signals_with_symbol_lock(
             one_signal,
+            bars_15m_df,
             bars_1m_df,
             execution_contract,
-            bars_1s_df,
+            bars_1s_fetcher,
         )
         one = one_decision_df.iloc[0]
         rows.append(

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Protocol
 
 import pandas as pd
 
@@ -47,9 +47,13 @@ _EXECUTION_OUTPUT_COLUMNS: tuple[str, ...] = (
 )
 
 
+class OneSecondBarsFetcher(Protocol):
+    def fetch(self, symbol: str, minute_start: pd.Timestamp) -> pd.DataFrame: ...
+
+
 def prepare_intraday_bars_frame(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
-    if timeframe_label not in {"1m", "1s"}:
-        raise ValueError("timeframe_label must be one of: 1m, 1s")
+    if timeframe_label not in {"1m", "1s", "15m"}:
+        raise ValueError("timeframe_label must be one of: 15m, 1m, 1s")
     _require_columns(df, _BARS_REQUIRED_COLUMNS, f"bars_{timeframe_label}_df")
     frame = df.copy()
     frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="raise")
@@ -79,9 +83,10 @@ def prepare_intraday_bars_frame(df: pd.DataFrame, timeframe_label: str) -> pd.Da
 
 def replay_short_signals_with_symbol_lock(
     decision_df: pd.DataFrame,
+    bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
-    bars_1s_df: pd.DataFrame | None = None,
+    bars_1s_fetcher: OneSecondBarsFetcher | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     _require_columns(decision_df, _DECISION_REQUIRED_COLUMNS, "decision_df")
     decisions = (
@@ -104,12 +109,8 @@ def replay_short_signals_with_symbol_lock(
         decisions["entry_bar_open_time"], utc=True, errors="raise"
     )
     decisions["gate_decision"] = decisions["gate_decision"].astype(str).str.lower()
+    bars_15m = prepare_intraday_bars_frame(bars_15m_df, "15m")
     bars_1m = prepare_intraday_bars_frame(bars_1m_df, "1m")
-    bars_1s = (
-        prepare_intraday_bars_frame(bars_1s_df, "1s")
-        if bars_1s_df is not None
-        else None
-    )
     for column in _EXECUTION_OUTPUT_COLUMNS:
         decisions[column] = pd.NA
     decisions["execution_status"] = "pending"
@@ -121,18 +122,14 @@ def replay_short_signals_with_symbol_lock(
     kept_ordered = decisions.loc[kept_indices].sort_values(
         ["entry_bar_open_time", "signal_id"], kind="mergesort"
     )
+    bars_15m_by_symbol = {
+        symbol: grp.reset_index(drop=True)
+        for symbol, grp in bars_15m.groupby("symbol", sort=False)
+    }
     bars_1m_by_symbol = {
         symbol: grp.reset_index(drop=True)
         for symbol, grp in bars_1m.groupby("symbol", sort=False)
     }
-    bars_1s_by_symbol = (
-        {
-            symbol: grp.reset_index(drop=True)
-            for symbol, grp in bars_1s.groupby("symbol", sort=False)
-        }
-        if bars_1s is not None
-        else {}
-    )
     hold_window_delta = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15)
     for idx, row in kept_ordered.iterrows():
         symbol = str(row["symbol"])
@@ -143,11 +140,11 @@ def replay_short_signals_with_symbol_lock(
         ):
             decisions.at[idx, "execution_status"] = "blocked_symbol_lock"
             continue
-        symbol_1m = bars_1m_by_symbol.get(symbol)
-        if symbol_1m is None:
+        symbol_15m = bars_15m_by_symbol.get(symbol)
+        if symbol_15m is None:
             decisions.at[idx, "execution_status"] = "missing_entry_bar"
             continue
-        entry_match = symbol_1m[symbol_1m["open_time"] == entry_time]
+        entry_match = symbol_15m[symbol_15m["open_time"] == entry_time]
         if entry_match.empty:
             decisions.at[idx, "execution_status"] = "missing_entry_bar"
             continue
@@ -156,17 +153,18 @@ def replay_short_signals_with_symbol_lock(
         tp_price = entry_price * (1.0 - float(execution_contract.tp_pct))
         sl_price = entry_price * (1.0 + float(execution_contract.sl_pct))
         horizon_end = entry_time + hold_window_delta
-        path_bars = symbol_1m[
-            (symbol_1m["open_time"] >= entry_time)
-            & (symbol_1m["open_time"] < horizon_end)
+        path_bars = symbol_15m[
+            (symbol_15m["open_time"] >= entry_time)
+            & (symbol_15m["open_time"] < horizon_end)
         ].copy()
         if path_bars.empty:
             decisions.at[idx, "execution_status"] = "missing_entry_bar"
             continue
         outcome_data = _replay_single_short_path(
             symbol=symbol,
-            path_1m=path_bars,
-            bars_1s=bars_1s_by_symbol.get(symbol),
+            path_15m=path_bars,
+            symbol_1m=bars_1m_by_symbol.get(symbol),
+            bars_1s_fetcher=bars_1s_fetcher,
             tp_price=tp_price,
             sl_price=sl_price,
             entry_price=entry_price,
@@ -242,70 +240,67 @@ def replay_short_signals_with_symbol_lock(
 
 def _replay_single_short_path(
     symbol: str,
-    path_1m: pd.DataFrame,
-    bars_1s: pd.DataFrame | None,
+    path_15m: pd.DataFrame,
+    symbol_1m: pd.DataFrame | None,
+    bars_1s_fetcher: OneSecondBarsFetcher | None,
     tp_price: float,
     sl_price: float,
     entry_price: float,
 ) -> dict[str, Any]:
     trade_outcome = "timeout"
-    exit_time = pd.Timestamp(path_1m["open_time"].iloc[-1])
-    exit_price = float(path_1m["close"].iloc[-1])
-    holding_bars = int(len(path_1m))
-    processed: list[pd.Series] = []
-    for bar in path_1m.itertuples(index=False):
+    exit_time = pd.Timestamp(path_15m["open_time"].iloc[-1])
+    exit_price = float(path_15m["close"].iloc[-1])
+    holding_bars = int(len(path_15m))
+    path_lows: list[float] = []
+    path_highs: list[float] = []
+    for bar in path_15m.itertuples(index=False):
         bar_time = pd.Timestamp(bar.open_time)
         bar_low = float(bar.low)
         bar_high = float(bar.high)
         bar_close = float(bar.close)
-        processed.append(pd.Series({"low": bar_low, "high": bar_high}))
+        path_lows.append(bar_low)
+        path_highs.append(bar_high)
         hit_tp = bar_low <= tp_price
         hit_sl = bar_high >= sl_price
         if hit_tp and hit_sl:
-            if bars_1s is None:
-                trade_outcome = "ambiguous"
-                exit_time = bar_time
-                exit_price = bar_close
-                holding_bars = len(processed)
-                break
-            second_outcome = _resolve_intraminute_touch(
-                minute_start=bar_time,
-                bars_1s=bars_1s,
+            resolution = _resolve_intra_15m_touch(
+                symbol=symbol,
+                bar_15m_start=bar_time,
+                symbol_1m=symbol_1m,
+                bars_1s_fetcher=bars_1s_fetcher,
                 tp_price=tp_price,
                 sl_price=sl_price,
             )
-            if second_outcome["trade_outcome"] is None:
+            if resolution["path_lows"]:
+                path_lows[-1] = min(resolution["path_lows"])
+                path_highs[-1] = max(resolution["path_highs"])
+            if resolution["trade_outcome"] is None:
                 trade_outcome = "ambiguous"
                 exit_time = bar_time
                 exit_price = bar_close
             else:
-                trade_outcome = str(second_outcome["trade_outcome"])
-                exit_time = pd.Timestamp(second_outcome["exit_time"])
-                exit_price = float(second_outcome["exit_price"])
-            holding_bars = len(processed)
+                trade_outcome = str(resolution["trade_outcome"])
+                exit_time = pd.Timestamp(resolution["exit_time"])
+                exit_price = float(resolution["exit_price"])
+            holding_bars = len(path_lows)
             break
         if hit_tp:
             trade_outcome = "tp"
             exit_time = bar_time
             exit_price = tp_price
-            holding_bars = len(processed)
+            holding_bars = len(path_lows)
             break
         if hit_sl:
             trade_outcome = "sl"
             exit_time = bar_time
             exit_price = sl_price
-            holding_bars = len(processed)
+            holding_bars = len(path_lows)
             break
-    processed_df = pd.DataFrame(processed)
     mfe_pct = 0.0
     mae_pct = 0.0
-    if not processed_df.empty:
-        mfe_pct = float(
-            ((entry_price - processed_df["low"]) / entry_price).max() * 100.0
-        )
-        mae_pct = float(
-            ((processed_df["high"] - entry_price) / entry_price).max() * 100.0
-        )
+    if path_lows and path_highs:
+        mfe_pct = float(((entry_price - min(path_lows)) / entry_price) * 100.0)
+        mae_pct = float(((max(path_highs) - entry_price) / entry_price) * 100.0)
     return {
         "symbol": symbol,
         "trade_outcome": trade_outcome,
@@ -317,21 +312,131 @@ def _replay_single_short_path(
     }
 
 
-def _resolve_intraminute_touch(
-    minute_start: pd.Timestamp,
-    bars_1s: pd.DataFrame,
+def _resolve_intra_15m_touch(
+    symbol: str,
+    bar_15m_start: pd.Timestamp,
+    symbol_1m: pd.DataFrame | None,
+    bars_1s_fetcher: OneSecondBarsFetcher | None,
     tp_price: float,
     sl_price: float,
 ) -> dict[str, Any]:
-    minute_end = minute_start + pd.Timedelta(minutes=1)
-    minute_bars = bars_1s[
-        (bars_1s["open_time"] >= minute_start) & (bars_1s["open_time"] < minute_end)
+    if symbol_1m is None:
+        return {
+            "trade_outcome": None,
+            "exit_time": None,
+            "exit_price": None,
+            "path_lows": [],
+            "path_highs": [],
+        }
+    bar_15m_end = bar_15m_start + pd.Timedelta(minutes=15)
+    minute_bars = symbol_1m[
+        (symbol_1m["open_time"] >= bar_15m_start) & (symbol_1m["open_time"] < bar_15m_end)
     ]
     if minute_bars.empty:
-        return {"trade_outcome": None, "exit_time": None, "exit_price": None}
+        return {
+            "trade_outcome": None,
+            "exit_time": None,
+            "exit_price": None,
+            "path_lows": [],
+            "path_highs": [],
+        }
+    lows: list[float] = []
+    highs: list[float] = []
+    for row in minute_bars.itertuples(index=False):
+        minute_start = pd.Timestamp(row.open_time)
+        minute_low = float(row.low)
+        minute_high = float(row.high)
+        minute_close = float(row.close)
+        lows.append(minute_low)
+        highs.append(minute_high)
+        hit_tp = minute_low <= tp_price
+        hit_sl = minute_high >= sl_price
+        if hit_tp and hit_sl:
+            second_outcome = _resolve_intraminute_touch(
+                symbol=symbol,
+                minute_start=minute_start,
+                bars_1s_fetcher=bars_1s_fetcher,
+                tp_price=tp_price,
+                sl_price=sl_price,
+            )
+            if second_outcome["path_lows"]:
+                lows[-1] = min(second_outcome["path_lows"])
+                highs[-1] = max(second_outcome["path_highs"])
+            if second_outcome["trade_outcome"] is None:
+                return {
+                    "trade_outcome": "ambiguous",
+                    "exit_time": minute_start,
+                    "exit_price": minute_close,
+                    "path_lows": lows,
+                    "path_highs": highs,
+                }
+            return {
+                "trade_outcome": second_outcome["trade_outcome"],
+                "exit_time": second_outcome["exit_time"],
+                "exit_price": second_outcome["exit_price"],
+                "path_lows": lows,
+                "path_highs": highs,
+            }
+        if hit_tp:
+            return {
+                "trade_outcome": "tp",
+                "exit_time": minute_start,
+                "exit_price": tp_price,
+                "path_lows": lows,
+                "path_highs": highs,
+            }
+        if hit_sl:
+            return {
+                "trade_outcome": "sl",
+                "exit_time": minute_start,
+                "exit_price": sl_price,
+                "path_lows": lows,
+                "path_highs": highs,
+            }
+    return {
+        "trade_outcome": None,
+        "exit_time": None,
+        "exit_price": None,
+        "path_lows": lows,
+        "path_highs": highs,
+    }
+
+
+def _resolve_intraminute_touch(
+    symbol: str,
+    minute_start: pd.Timestamp,
+    bars_1s_fetcher: OneSecondBarsFetcher | None,
+    tp_price: float,
+    sl_price: float,
+) -> dict[str, Any]:
+    if bars_1s_fetcher is None:
+        return {
+            "trade_outcome": None,
+            "exit_time": None,
+            "exit_price": None,
+            "path_lows": [],
+            "path_highs": [],
+        }
+    minute_end = minute_start + pd.Timedelta(minutes=1)
+    minute_bars = bars_1s_fetcher.fetch(symbol=symbol, minute_start=minute_start)
+    minute_bars = minute_bars[
+        (minute_bars["open_time"] >= minute_start) & (minute_bars["open_time"] < minute_end)
+    ]
+    if minute_bars.empty:
+        return {
+            "trade_outcome": None,
+            "exit_time": None,
+            "exit_price": None,
+            "path_lows": [],
+            "path_highs": [],
+        }
+    lows: list[float] = []
+    highs: list[float] = []
     for row in minute_bars.itertuples(index=False):
         sec_low = float(row.low)
         sec_high = float(row.high)
+        lows.append(sec_low)
+        highs.append(sec_high)
         hit_tp = sec_low <= tp_price
         hit_sl = sec_high >= sl_price
         if hit_tp and hit_sl:
@@ -339,20 +444,32 @@ def _resolve_intraminute_touch(
                 "trade_outcome": "ambiguous",
                 "exit_time": pd.Timestamp(row.open_time),
                 "exit_price": float(row.close),
+                "path_lows": lows,
+                "path_highs": highs,
             }
         if hit_tp:
             return {
                 "trade_outcome": "tp",
                 "exit_time": pd.Timestamp(row.open_time),
                 "exit_price": tp_price,
+                "path_lows": lows,
+                "path_highs": highs,
             }
         if hit_sl:
             return {
                 "trade_outcome": "sl",
                 "exit_time": pd.Timestamp(row.open_time),
                 "exit_price": sl_price,
+                "path_lows": lows,
+                "path_highs": highs,
             }
-    return {"trade_outcome": None, "exit_time": None, "exit_price": None}
+    return {
+        "trade_outcome": None,
+        "exit_time": None,
+        "exit_price": None,
+        "path_lows": lows,
+        "path_highs": highs,
+    }
 
 
 def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], name: str) -> None:
