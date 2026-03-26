@@ -21,7 +21,7 @@ from scripts.runpod_jobs.utils import ensure_dir, read_json, write_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ALLOWED_DIRS = ("pump_end_threshold", "pump_end_prod", "scripts")
+ALLOWED_DIRS = ("pump_end_threshold", "pump_end_prod", "pump_end_v2", "scripts")
 
 
 def _log(stage: str, message: str) -> None:
