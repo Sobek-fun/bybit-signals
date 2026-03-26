@@ -55,6 +55,11 @@ GATE_FEATURE_COLUMNS: tuple[str, ...] = (
     "signal_flow_recent_signals_24h",
     "signal_flow_recent_same_symbol_signals_24h",
     "signal_flow_recent_mean_detector_p_good_24h",
+    "strategy_recent_resolved_pnl_sum_24h",
+    "strategy_recent_sl_rate_24h",
+    "strategy_recent_tp_rate_24h",
+    "strategy_prev_closed_losing_streak",
+    "strategy_open_trades_now",
 )
 
 _CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -73,6 +78,7 @@ _CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
 
 def build_gate_feature_view(
     candidate_signals_df: pd.DataFrame,
+    history_candidate_signals_df: pd.DataFrame | None,
     token_state_df: pd.DataFrame,
     reference_state_df: pd.DataFrame,
     breadth_state_df: pd.DataFrame,
@@ -129,14 +135,12 @@ def build_gate_feature_view(
         ),
         "breadth_state_df",
     )
-    frame = candidate_signals_df.copy()
-    frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
-    frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
-    frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
-    if "score_source" not in frame.columns:
-        frame["score_source"] = "unknown"
-    if "fold_id" not in frame.columns:
-        frame["fold_id"] = pd.NA
+    frame = _prepare_candidate_frame(candidate_signals_df, history_context_only=False)
+    if history_candidate_signals_df is not None and not history_candidate_signals_df.empty:
+        history = _prepare_candidate_frame(history_candidate_signals_df, history_context_only=True)
+        history = _normalize_history_stream_context(history, frame)
+        frame = pd.concat([history, frame], ignore_index=True)
+        frame = frame.drop_duplicates(subset=["signal_id"], keep="last").reset_index(drop=True)
     token_part = token_state_df[
         [
             "symbol",
@@ -193,7 +197,8 @@ def build_gate_feature_view(
         merged["distance_from_episode_high_pct"], errors="coerce"
     )
     merged = _append_signal_flow_features(merged)
-    out = merged.loc[:, [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS]].copy()
+    merged = _append_strategy_state_features(merged)
+    out = merged.loc[~merged["_history_context_only"].astype(bool), [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS]].copy()
     log_info(
         "GATE",
         f"gate feature view build done rows_total={len(out)} feature_cols_total={len(GATE_FEATURE_COLUMNS)}",
@@ -216,9 +221,12 @@ def _append_signal_flow_features(df: pd.DataFrame) -> pd.DataFrame:
         history: deque[tuple[pd.Timestamp, str, float]] = deque()
         score_sum = 0.0
         symbol_counts: dict[str, int] = {}
-        for row_idx in idx:
-            row = frame.iloc[row_idx]
-            now = pd.Timestamp(row["context_bar_open_time"])
+        group_frame = frame.loc[list(idx), ["context_bar_open_time", "decision_time"]]
+        for _, bucket_idx in group_frame.groupby(
+            ["context_bar_open_time", "decision_time"], sort=False, dropna=False
+        ).groups.items():
+            bucket_indices = list(bucket_idx)
+            now = pd.Timestamp(frame.iloc[bucket_indices[0]]["context_bar_open_time"])
             while history and history[0][0] < now - window:
                 old_time, old_symbol, old_score = history.popleft()
                 score_sum -= old_score
@@ -228,19 +236,110 @@ def _append_signal_flow_features(df: pd.DataFrame) -> pd.DataFrame:
                 else:
                     symbol_counts[old_symbol] = current_count - 1
             total_prev = len(history)
-            recent_counts[row_idx] = total_prev
-            current_symbol = str(row["symbol"])
-            same_symbol_counts[row_idx] = symbol_counts.get(current_symbol, 0)
-            recent_mean_scores[row_idx] = float(score_sum / total_prev) if total_prev > 0 else 0.0
-            p_good_value = float(pd.to_numeric(row["detector_p_good"], errors="coerce"))
-            if pd.isna(p_good_value):
-                p_good_value = 0.0
-            history.append((now, current_symbol, p_good_value))
-            score_sum += p_good_value
-            symbol_counts[current_symbol] = symbol_counts.get(current_symbol, 0) + 1
+            additions: list[tuple[pd.Timestamp, str, float]] = []
+            for row_idx in bucket_indices:
+                row = frame.iloc[row_idx]
+                current_symbol = str(row["symbol"])
+                recent_counts[row_idx] = total_prev
+                same_symbol_counts[row_idx] = symbol_counts.get(current_symbol, 0)
+                recent_mean_scores[row_idx] = float(score_sum / total_prev) if total_prev > 0 else 0.0
+                p_good_value = float(pd.to_numeric(row["detector_p_good"], errors="coerce"))
+                if pd.isna(p_good_value):
+                    p_good_value = 0.0
+                additions.append((now, current_symbol, p_good_value))
+            for add_time, add_symbol, add_score in additions:
+                history.append((add_time, add_symbol, add_score))
+                score_sum += add_score
+                symbol_counts[add_symbol] = symbol_counts.get(add_symbol, 0) + 1
     frame["signal_flow_recent_signals_24h"] = recent_counts
     frame["signal_flow_recent_same_symbol_signals_24h"] = same_symbol_counts
     frame["signal_flow_recent_mean_detector_p_good_24h"] = recent_mean_scores
+    return frame.drop(columns=["_stream_group_key"], errors="ignore")
+
+
+def _append_strategy_state_features(df: pd.DataFrame) -> pd.DataFrame:
+    frame = df.copy()
+    frame["_stream_group_key"] = frame.apply(_stream_group_key, axis=1)
+    frame = frame.sort_values(
+        ["_stream_group_key", "context_bar_open_time", "decision_time", "signal_id"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    required = {
+        "counterfactual_trade_outcome",
+        "counterfactual_trade_pnl_pct",
+        "counterfactual_exit_time",
+    }
+    for column in required:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    frame["counterfactual_trade_outcome"] = frame["counterfactual_trade_outcome"].astype(str).str.lower()
+    frame["counterfactual_trade_pnl_pct"] = pd.to_numeric(frame["counterfactual_trade_pnl_pct"], errors="coerce")
+    frame["counterfactual_exit_time"] = pd.to_datetime(frame["counterfactual_exit_time"], utc=True, errors="coerce")
+    pnl_sum_24h = [0.0] * len(frame)
+    sl_rate_24h = [0.0] * len(frame)
+    tp_rate_24h = [0.0] * len(frame)
+    losing_streak_prev = [0.0] * len(frame)
+    open_trades_now = [0.0] * len(frame)
+    window = pd.Timedelta(hours=24)
+    for _, idx in frame.groupby("_stream_group_key", sort=False, dropna=False).groups.items():
+        resolved_history: list[tuple[pd.Timestamp, float, str]] = []
+        all_resolved: list[tuple[pd.Timestamp, str]] = []
+        active_positions: list[tuple[pd.Timestamp | None, float, str]] = []
+        group_frame = frame.loc[list(idx), ["context_bar_open_time", "decision_time"]]
+        for _, bucket_idx in group_frame.groupby(
+            ["context_bar_open_time", "decision_time"], sort=False, dropna=False
+        ).groups.items():
+            bucket_indices = list(bucket_idx)
+            now = pd.Timestamp(frame.iloc[bucket_indices[0]]["context_bar_open_time"])
+            resolved_history = [item for item in resolved_history if item[0] >= now - window]
+            still_active: list[tuple[pd.Timestamp | None, float, str]] = []
+            for exit_time_item, pnl_item, outcome_item in active_positions:
+                if exit_time_item is not None and exit_time_item < now:
+                    resolved_history.append((exit_time_item, pnl_item, outcome_item))
+                    all_resolved.append((exit_time_item, outcome_item))
+                else:
+                    still_active.append((exit_time_item, pnl_item, outcome_item))
+            active_positions = still_active
+            recent_total = len(resolved_history)
+            if recent_total > 0:
+                recent_pnl_sum = float(sum(item[1] for item in resolved_history))
+                tp_count = int(sum(1 for item in resolved_history if item[2] == "tp"))
+                sl_count = int(sum(1 for item in resolved_history if item[2] == "sl"))
+                recent_tp_rate = float(tp_count / recent_total)
+                recent_sl_rate = float(sl_count / recent_total)
+            else:
+                recent_pnl_sum = 0.0
+                recent_tp_rate = 0.0
+                recent_sl_rate = 0.0
+            streak = 0
+            sorted_resolved = sorted(all_resolved, key=lambda item: item[0])
+            for _, outcome_flag in reversed(sorted_resolved):
+                if outcome_flag == "sl":
+                    streak += 1
+                else:
+                    break
+            for row_idx in bucket_indices:
+                pnl_sum_24h[row_idx] = recent_pnl_sum
+                tp_rate_24h[row_idx] = recent_tp_rate
+                sl_rate_24h[row_idx] = recent_sl_rate
+                losing_streak_prev[row_idx] = float(streak)
+                open_trades_now[row_idx] = float(len(active_positions))
+            for row_idx in bucket_indices:
+                row = frame.iloc[row_idx]
+                exit_time = pd.Timestamp(row["counterfactual_exit_time"]) if pd.notna(row["counterfactual_exit_time"]) else None
+                outcome = str(row["counterfactual_trade_outcome"])
+                pnl_value = float(row["counterfactual_trade_pnl_pct"]) if pd.notna(row["counterfactual_trade_pnl_pct"]) else 0.0
+                is_resolved = outcome in {"tp", "sl", "timeout", "ambiguous"} and exit_time is not None
+                if is_resolved and exit_time < now:
+                    resolved_history.append((exit_time, pnl_value, outcome))
+                    all_resolved.append((exit_time, outcome))
+                else:
+                    active_positions.append((exit_time, pnl_value, outcome))
+    frame["strategy_recent_resolved_pnl_sum_24h"] = pnl_sum_24h
+    frame["strategy_recent_sl_rate_24h"] = sl_rate_24h
+    frame["strategy_recent_tp_rate_24h"] = tp_rate_24h
+    frame["strategy_prev_closed_losing_streak"] = losing_streak_prev
+    frame["strategy_open_trades_now"] = open_trades_now
     return frame.drop(columns=["_stream_group_key"], errors="ignore")
 
 
@@ -275,3 +374,26 @@ def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], name: str) -> N
     missing = [column for column in columns if column not in df.columns]
     if missing:
         raise ValueError(f"{name} missing required columns: {missing}")
+
+
+def _prepare_candidate_frame(candidate_signals_df: pd.DataFrame, history_context_only: bool) -> pd.DataFrame:
+    frame = candidate_signals_df.copy()
+    frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
+    frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
+    frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
+    if "score_source" not in frame.columns:
+        frame["score_source"] = "unknown"
+    if "fold_id" not in frame.columns:
+        frame["fold_id"] = pd.NA
+    frame["_history_context_only"] = bool(history_context_only)
+    return frame
+
+
+def _normalize_history_stream_context(history_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty or current_df.empty:
+        return history_df
+    current_score_source = current_df["score_source"].dropna().astype(str).mode()
+    if not current_score_source.empty:
+        history_df["score_source"] = str(current_score_source.iloc[0])
+    history_df["fold_id"] = pd.NA
+    return history_df

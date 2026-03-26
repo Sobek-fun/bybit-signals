@@ -10,6 +10,7 @@ from pump_end_v2.gate.pipeline import (
     build_gate_val_scored_signals_and_datasets,
 )
 from pump_end_v2.gate.threshold import (
+    attach_counterfactual_execution_outcomes,
     apply_gate_block_threshold,
     build_gate_decile_report,
     build_gate_execution_decision_summary,
@@ -30,6 +31,7 @@ __all__ = [
     "fit_gate_model",
     "predict_gate_scores",
     "build_gate_threshold_grid",
+    "attach_counterfactual_execution_outcomes",
     "apply_gate_block_threshold",
     "build_gate_threshold_metrics",
     "sweep_gate_block_threshold",
