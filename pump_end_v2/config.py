@@ -83,10 +83,21 @@ class ReferenceSymbolsConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class DataFilesConfig:
-    bars_15m_path: str
-    bars_1m_path: str
-    bars_1s_path: str
+class DataWindowConfig:
+    start: datetime
+    end: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class DataUniverseConfig:
+    symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DataClickHouseConfig:
+    candles_table: str
+    transactions_table: str
+    timezone: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +105,9 @@ class V2Config:
     raw: dict[str, Any]
     splits: SplitBounds
     references: ReferenceSymbolsConfig
-    data_files: DataFilesConfig
+    data_window: DataWindowConfig
+    data_universe: DataUniverseConfig
+    data_clickhouse: DataClickHouseConfig
     event_opener: EventOpenerConfig
     resolver: ResolverConfig
     detector_model: DetectorModelConfig
@@ -126,7 +139,9 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _validate_compute(config["compute"])
     splits = _build_splits(config["splits"])
     references = _build_references(config["data"]["references"])
-    data_files = _build_data_files(config["data"]["files"])
+    data_window = _build_data_window(config["data"]["window"])
+    data_universe = _build_data_universe(config["data"]["universe"])
+    data_clickhouse = _build_data_clickhouse(config["data"]["clickhouse"])
     event_opener = _build_event_opener(config["data"]["event_opener"])
     resolver = _build_resolver(config["data"]["resolver"])
     detector_model = _build_detector_model(config["detector"])
@@ -144,7 +159,9 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         raw=copy.deepcopy(config),
         splits=splits,
         references=references,
-        data_files=data_files,
+        data_window=data_window,
+        data_universe=data_universe,
+        data_clickhouse=data_clickhouse,
         event_opener=event_opener,
         resolver=resolver,
         detector_model=detector_model,
@@ -171,6 +188,15 @@ def _parse_date(value: Any, name: str) -> datetime:
     return day_start + timedelta(days=1) - timedelta(microseconds=1)
 
 
+def _parse_date_start(value: Any, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be YYYY-MM-DD string")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be YYYY-MM-DD string") from exc
+
+
 def _build_splits(splits_section: dict[str, Any]) -> SplitBounds:
     return SplitBounds(
         train_end=_parse_date(splits_section.get("train_end"), "splits.train_end"),
@@ -186,13 +212,6 @@ def _validate_splits(splits_section: dict[str, Any]) -> None:
 
 
 def _validate_data(data_section: dict[str, Any]) -> None:
-    required_paths = ["source_root"]
-    for key in required_paths:
-        path_value = data_section.get(key)
-        if not isinstance(path_value, str) or not path_value:
-            raise ValueError(f"data.{key} must be a non-empty path")
-        if not Path(path_value).exists():
-            raise ValueError(f"data.{key} path does not exist: {path_value}")
     event_opener_section = data_section.get("event_opener")
     if not isinstance(event_opener_section, dict):
         raise ValueError("missing required section: data.event_opener")
@@ -202,13 +221,21 @@ def _validate_data(data_section: dict[str, Any]) -> None:
     references_section = data_section.get("references")
     if not isinstance(references_section, dict):
         raise ValueError("missing required section: data.references")
-    files_section = data_section.get("files")
-    if not isinstance(files_section, dict):
-        raise ValueError("missing required section: data.files")
+    window_section = data_section.get("window")
+    if not isinstance(window_section, dict):
+        raise ValueError("missing required section: data.window")
+    universe_section = data_section.get("universe")
+    if not isinstance(universe_section, dict):
+        raise ValueError("missing required section: data.universe")
+    clickhouse_section = data_section.get("clickhouse")
+    if not isinstance(clickhouse_section, dict):
+        raise ValueError("missing required section: data.clickhouse")
     _validate_event_opener(event_opener_section)
     _validate_resolver(resolver_section)
     _validate_references(references_section)
-    _validate_data_files(files_section)
+    _validate_data_window(window_section)
+    _validate_data_universe(universe_section)
+    _validate_data_clickhouse(clickhouse_section)
 
 
 def _validate_detector(detector_section: dict[str, Any]) -> None:
@@ -373,29 +400,68 @@ def _build_references(section: dict[str, Any]) -> ReferenceSymbolsConfig:
             "data.references.btc_symbol must differ from data.references.eth_symbol"
         )
     return ReferenceSymbolsConfig(
-        btc_symbol=btc_symbol.strip(),
-        eth_symbol=eth_symbol.strip(),
+        btc_symbol=btc_symbol.strip().upper(),
+        eth_symbol=eth_symbol.strip().upper(),
     )
 
 
-def _validate_data_files(section: dict[str, Any]) -> None:
-    _build_data_files(section)
+def _validate_data_window(section: dict[str, Any]) -> None:
+    _build_data_window(section)
 
 
-def _build_data_files(section: dict[str, Any]) -> DataFilesConfig:
-    bars_15m_path = section.get("bars_15m_path")
-    if not isinstance(bars_15m_path, str) or not bars_15m_path.strip():
-        raise ValueError("data.files.bars_15m_path must be a non-empty string")
-    bars_1m_path = section.get("bars_1m_path")
-    if not isinstance(bars_1m_path, str) or not bars_1m_path.strip():
-        raise ValueError("data.files.bars_1m_path must be a non-empty string")
-    bars_1s_path = section.get("bars_1s_path")
-    if not isinstance(bars_1s_path, str):
-        raise ValueError("data.files.bars_1s_path must be a string")
-    return DataFilesConfig(
-        bars_15m_path=bars_15m_path.strip(),
-        bars_1m_path=bars_1m_path.strip(),
-        bars_1s_path=bars_1s_path.strip(),
+def _build_data_window(section: dict[str, Any]) -> DataWindowConfig:
+    start = _parse_date_start(section.get("start"), "data.window.start")
+    end_raw = section.get("end")
+    end = None
+    if end_raw is not None:
+        end = _parse_date(end_raw, "data.window.end")
+        if end <= start:
+            raise ValueError("data.window.end must be greater than data.window.start")
+    return DataWindowConfig(start=start, end=end)
+
+
+def _validate_data_universe(section: dict[str, Any]) -> None:
+    _build_data_universe(section)
+
+
+def _build_data_universe(section: dict[str, Any]) -> DataUniverseConfig:
+    raw_symbols = section.get("symbols")
+    if not isinstance(raw_symbols, list) or not raw_symbols:
+        raise ValueError("data.universe.symbols must be a non-empty list")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in raw_symbols:
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise ValueError("data.universe.symbols must contain non-empty strings")
+        symbol = raw_symbol.strip().upper()
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+        if symbol not in seen:
+            seen.add(symbol)
+            normalized.append(symbol)
+    if not normalized:
+        raise ValueError("data.universe.symbols must contain at least one symbol")
+    return DataUniverseConfig(symbols=tuple(normalized))
+
+
+def _validate_data_clickhouse(section: dict[str, Any]) -> None:
+    _build_data_clickhouse(section)
+
+
+def _build_data_clickhouse(section: dict[str, Any]) -> DataClickHouseConfig:
+    candles_table = section.get("candles_table")
+    if not isinstance(candles_table, str) or not candles_table.strip():
+        raise ValueError("data.clickhouse.candles_table must be a non-empty string")
+    transactions_table = section.get("transactions_table")
+    if not isinstance(transactions_table, str) or not transactions_table.strip():
+        raise ValueError("data.clickhouse.transactions_table must be a non-empty string")
+    timezone = section.get("timezone")
+    if not isinstance(timezone, str) or not timezone.strip():
+        raise ValueError("data.clickhouse.timezone must be a non-empty string")
+    return DataClickHouseConfig(
+        candles_table=candles_table.strip(),
+        transactions_table=transactions_table.strip(),
+        timezone=timezone.strip(),
     )
 
 

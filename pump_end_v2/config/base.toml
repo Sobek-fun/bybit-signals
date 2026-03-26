@@ -1,10 +1,16 @@
 [data]
-source_root = "."
 
-[data.files]
-bars_15m_path = "inputs/bars_15m.parquet"
-bars_1m_path = "inputs/bars_1m.parquet"
-bars_1s_path = ""
+[data.window]
+start = "2024-01-01"
+end = "2025-12-31"
+
+[data.universe]
+symbols = ["SOLUSDT", "LDOUSDT", "AAVEUSDT"]
+
+[data.clickhouse]
+candles_table = "bybit.candles"
+transactions_table = "bybit.transactions"
+timezone = "UTC"
 
 [data.references]
 btc_symbol = "BTCUSDT"

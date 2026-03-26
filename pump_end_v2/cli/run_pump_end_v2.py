@@ -13,6 +13,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="pump_end_v2 foundation dry-run")
     parser.add_argument("--config", required=True, help="Path to TOML config")
     parser.add_argument("--dry-run", action="store_true", help="Run foundation dry-run")
+    parser.add_argument(
+        "--clickhouse-dsn",
+        default=None,
+        help="ClickHouse DSN for full-run mode",
+    )
     return parser
 
 
@@ -48,7 +53,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.dry_run:
         return run_dry_run(args.config)
-    run_pump_end_v2_pipeline(args.config)
+    if not args.clickhouse_dsn:
+        parser.error("--clickhouse-dsn is required for full-run mode")
+    run_pump_end_v2_pipeline(args.config, clickhouse_dsn=args.clickhouse_dsn)
     return 0
 
 
