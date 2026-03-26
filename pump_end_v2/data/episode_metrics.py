@@ -20,6 +20,7 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "episode_open_time",
                 "episode_close_time",
                 "duration_bars",
+                "runup_pct_at_open",
                 "total_rows",
                 "resolved_rows",
                 "good_row_count",
@@ -30,6 +31,7 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "ideal_prepullback_squeeze_pct",
                 "ideal_net_edge_pct",
                 "bars_open_to_ideal_entry",
+                "extension_open_to_ideal_entry_pct",
                 "episode_outcome_class",
             ]
         )
@@ -51,6 +53,7 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
             ideal_prepullback_squeeze_pct = math.nan
             ideal_net_edge_pct = math.nan
             bars_open_to_ideal_entry = math.nan
+            extension_open_to_ideal_entry_pct = math.nan
         else:
             ideal = ideal_row.iloc[0]
             ideal_entry_row_id = ideal["decision_row_id"]
@@ -61,6 +64,15 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
             bars_open_to_ideal_entry = int(
                 (ideal_entry_bar_open_time - gdf["episode_open_time"].iloc[0]).total_seconds() // (15 * 60)
             )
+            episode_open_close = pd.to_numeric(gdf["episode_open_close"].iloc[0], errors="coerce")
+            ideal_entry_price = pd.to_numeric(ideal["entry_price"], errors="coerce")
+            if pd.notna(episode_open_close) and float(episode_open_close) > 0.0 and pd.notna(ideal_entry_price):
+                extension_open_to_ideal_entry_pct = float(
+                    (float(ideal_entry_price) - float(episode_open_close)) / float(episode_open_close)
+                )
+            else:
+                extension_open_to_ideal_entry_pct = math.nan
+        runup_pct_at_open = float(pd.to_numeric(gdf["runup_pct_at_context"].iloc[0], errors="coerce"))
         if good_row_count > 0:
             episode_outcome_class = OutcomeClass.REVERSAL.value
         elif (gdf["future_outcome_class"] == OutcomeClass.CONTINUATION.value).any():
@@ -74,6 +86,7 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "episode_open_time": gdf["episode_open_time"].iloc[0],
                 "episode_close_time": gdf["context_bar_open_time"].max(),
                 "duration_bars": int(gdf["episode_age_bars"].max()),
+                "runup_pct_at_open": runup_pct_at_open,
                 "total_rows": total_rows,
                 "resolved_rows": resolved_count,
                 "good_row_count": good_row_count,
@@ -84,6 +97,7 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "ideal_prepullback_squeeze_pct": ideal_prepullback_squeeze_pct,
                 "ideal_net_edge_pct": ideal_net_edge_pct,
                 "bars_open_to_ideal_entry": bars_open_to_ideal_entry,
+                "extension_open_to_ideal_entry_pct": extension_open_to_ideal_entry_pct,
                 "episode_outcome_class": episode_outcome_class,
             }
         )
@@ -112,6 +126,8 @@ def build_event_quality_report(summary_df: pd.DataFrame) -> dict[str, float]:
             "median_bars_open_to_ideal_entry": math.nan,
             "median_ideal_pullback_pct": math.nan,
             "median_ideal_remaining_squeeze_pct": math.nan,
+            "median_runup_pct_at_open": math.nan,
+            "median_extension_open_to_ideal_entry_pct": math.nan,
             "good_episode_share": 0.0,
             "mean_good_zone_width_bars": 0.0,
         }
@@ -134,6 +150,8 @@ def build_event_quality_report(summary_df: pd.DataFrame) -> dict[str, float]:
         "median_bars_open_to_ideal_entry": float(summary_df["bars_open_to_ideal_entry"].median()),
         "median_ideal_pullback_pct": float(summary_df["ideal_pullback_pct"].median()),
         "median_ideal_remaining_squeeze_pct": float(summary_df["ideal_prepullback_squeeze_pct"].median()),
+        "median_runup_pct_at_open": float(summary_df["runup_pct_at_open"].median()),
+        "median_extension_open_to_ideal_entry_pct": float(summary_df["extension_open_to_ideal_entry_pct"].median()),
         "good_episode_share": reversal_share,
         "mean_good_zone_width_bars": float(summary_df["good_zone_width_bars"].mean()),
     }
