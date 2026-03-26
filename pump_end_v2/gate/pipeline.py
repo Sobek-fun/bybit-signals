@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier, CatBoostError
 
 from pump_end_v2.config import GateModelConfig
 from pump_end_v2.contracts import ExecutionContract
@@ -34,6 +34,30 @@ _SCORED_OUTPUT_COLUMNS: tuple[str, ...] = (
 )
 _GATE_STATUS_ENABLED = "enabled"
 _GATE_STATUS_DISABLED_NO_DATA = "disabled_no_data"
+
+
+def _is_informative_gate_feature(series: pd.Series) -> bool:
+    non_na = series.dropna()
+    if non_na.empty:
+        return False
+    return bool(non_na.nunique(dropna=True) > 1)
+
+
+def _is_gate_trainable(train_fit_df: pd.DataFrame) -> bool:
+    if train_fit_df.empty:
+        return False
+    if "target_block_signal" not in train_fit_df.columns:
+        return False
+    target_unique = pd.to_numeric(train_fit_df["target_block_signal"], errors="coerce").dropna().nunique()
+    if int(target_unique) < 2:
+        return False
+    informative_features = 0
+    for column in GATE_FEATURE_COLUMNS:
+        if column not in train_fit_df.columns:
+            continue
+        if _is_informative_gate_feature(train_fit_df[column]):
+            informative_features += 1
+    return informative_features > 0
 
 
 def build_gate_val_scored_signals_and_datasets(
@@ -90,7 +114,7 @@ def build_gate_val_scored_signals_and_datasets(
         & train_gate_dataset_df["gate_trainable_signal"].astype(bool)
     ].copy()
     val_score_df = val_gate_dataset_df[val_gate_dataset_df["score_source"] == "val_forward"].copy()
-    if train_fit_df.empty or val_score_df.empty:
+    if (not _is_gate_trainable(train_fit_df)) or val_score_df.empty:
         val_scored_signals_df = _build_disabled_scored_signals(val_candidate_signals_df, "val_forward")
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
@@ -116,7 +140,33 @@ def build_gate_val_scored_signals_and_datasets(
             _GATE_STATUS_DISABLED_NO_DATA,
         )
     model = build_gate_model(gate_model_config)
-    fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
+    try:
+        fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
+    except CatBoostError:
+        val_scored_signals_df = _build_disabled_scored_signals(val_candidate_signals_df, "val_forward")
+        threshold_sweep_df = sweep_gate_block_threshold(
+            scored_signals_df=val_scored_signals_df,
+            base_block_threshold=base_block_threshold,
+            window_start=window_start,
+            window_end=window_end,
+            window_days=window_days,
+        )
+        log_info(
+            "GATE",
+            (
+                "gate val wrapper fallback "
+                f"status={_GATE_STATUS_DISABLED_NO_DATA} train_rows={len(train_fit_df)} val_rows={len(val_score_df)} "
+                f"scored_rows={len(val_scored_signals_df)}"
+            ),
+        )
+        return (
+            None,
+            val_scored_signals_df,
+            threshold_sweep_df,
+            train_gate_dataset_df,
+            val_gate_dataset_df,
+            _GATE_STATUS_DISABLED_NO_DATA,
+        )
     val_scored_signals_df = _score_gate_dataset_rows(model, val_score_df)
     threshold_sweep_df = sweep_gate_block_threshold(
         scored_signals_df=val_scored_signals_df,
@@ -197,7 +247,7 @@ def build_gate_test_scored_signals(
         & train_gate_dataset_df["gate_trainable_signal"].astype(bool)
     ].copy()
     test_score_df = test_gate_dataset_df[test_gate_dataset_df["score_source"] == "test_forward"].copy()
-    if train_fit_df.empty or test_score_df.empty:
+    if (not _is_gate_trainable(train_fit_df)) or test_score_df.empty:
         test_scored_signals_df = _build_disabled_scored_signals(test_candidate_signals_df, "test_forward")
         log_info(
             "GATE",
@@ -209,7 +259,19 @@ def build_gate_test_scored_signals(
         )
         return None, test_scored_signals_df, test_gate_dataset_df, _GATE_STATUS_DISABLED_NO_DATA
     model = build_gate_model(gate_model_config)
-    fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
+    try:
+        fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
+    except CatBoostError:
+        test_scored_signals_df = _build_disabled_scored_signals(test_candidate_signals_df, "test_forward")
+        log_info(
+            "GATE",
+            (
+                "gate test wrapper fallback "
+                f"status={_GATE_STATUS_DISABLED_NO_DATA} train_rows={len(train_fit_df)} test_rows={len(test_score_df)} "
+                f"scored_rows={len(test_scored_signals_df)}"
+            ),
+        )
+        return None, test_scored_signals_df, test_gate_dataset_df, _GATE_STATUS_DISABLED_NO_DATA
     test_scored_signals_df = _score_gate_dataset_rows(model, test_score_df)
     log_info(
         "GATE",

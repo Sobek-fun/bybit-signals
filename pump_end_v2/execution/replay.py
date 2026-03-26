@@ -132,12 +132,20 @@ def replay_short_signals_with_symbol_lock(
             sl_price=sl_price,
             entry_price=entry_price,
         )
+        trade_outcome = str(outcome_data["trade_outcome"])
+        exit_time = outcome_data["exit_time"]
+        if trade_outcome == "ambiguous":
+            exit_price = float(entry_price)
+            trade_pnl_pct = 0.0
+        else:
+            exit_price = float(outcome_data["exit_price"])
+            trade_pnl_pct = ((entry_price - exit_price) / entry_price) * 100.0
         decisions.at[idx, "execution_status"] = "executed"
         decisions.at[idx, "entry_price"] = entry_price
-        decisions.at[idx, "exit_time"] = outcome_data["exit_time"]
-        decisions.at[idx, "exit_price"] = outcome_data["exit_price"]
-        decisions.at[idx, "trade_outcome"] = outcome_data["trade_outcome"]
-        decisions.at[idx, "trade_pnl_pct"] = ((entry_price - float(outcome_data["exit_price"])) / entry_price) * 100.0
+        decisions.at[idx, "exit_time"] = exit_time
+        decisions.at[idx, "exit_price"] = exit_price
+        decisions.at[idx, "trade_outcome"] = trade_outcome
+        decisions.at[idx, "trade_pnl_pct"] = trade_pnl_pct
         decisions.at[idx, "mfe_pct"] = outcome_data["mfe_pct"]
         decisions.at[idx, "mae_pct"] = outcome_data["mae_pct"]
         decisions.at[idx, "holding_bars"] = int(outcome_data["holding_bars"])
@@ -145,10 +153,10 @@ def replay_short_signals_with_symbol_lock(
             signal_id=str(row["signal_id"]),
             symbol=symbol,
             entry_bar_open_time=entry_time.to_pydatetime(),
-            exit_time=pd.Timestamp(outcome_data["exit_time"]).to_pydatetime(),
-            trade_outcome=TradeOutcome(str(outcome_data["trade_outcome"])),
+            exit_time=pd.Timestamp(exit_time).to_pydatetime(),
+            trade_outcome=TradeOutcome(trade_outcome),
         )
-        lock_until_by_symbol[symbol] = pd.Timestamp(outcome_data["exit_time"])
+        lock_until_by_symbol[symbol] = pd.Timestamp(exit_time)
     decisions = decisions.sort_values("_row_order", kind="mergesort").drop(columns=["_row_order"])
     decisions = decisions[
         [

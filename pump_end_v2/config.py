@@ -120,7 +120,6 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     for section in REQUIRED_SECTIONS:
         if section not in config:
             raise ValueError(f"missing required section: {section}")
-    _reject_feature_flags(config)
     _validate_splits(config["splits"])
     _validate_data(config["data"])
     _validate_detector(config["detector"])
@@ -446,15 +445,3 @@ def _build_gate_model(section: dict[str, Any]) -> GateModelConfig:
         l2_leaf_reg=_require_positive_float(model_section.get("l2_leaf_reg"), "gate.model.l2_leaf_reg"),
         random_seed=_require_non_negative_int(model_section.get("random_seed"), "gate.model.random_seed"),
     )
-
-
-def _reject_feature_flags(value: Any, path: str = "config") -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            lowered = str(key).lower()
-            if lowered in {"feature_flags", "feature_flag", "flags"}:
-                raise ValueError(f"feature flags are forbidden: {path}.{key}")
-            _reject_feature_flags(nested, f"{path}.{key}")
-    elif isinstance(value, list):
-        for idx, nested in enumerate(value):
-            _reject_feature_flags(nested, f"{path}[{idx}]")

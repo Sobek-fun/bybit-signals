@@ -52,6 +52,14 @@ _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
     "selection_score",
 )
 
+_COUNTERFACTUAL_COLUMNS: tuple[str, ...] = (
+    "signal_id",
+    "counterfactual_execution_status",
+    "counterfactual_trade_outcome",
+    "counterfactual_trade_pnl_pct",
+    "counterfactual_exit_time",
+)
+
 
 def build_gate_threshold_grid(base_block_threshold: float) -> list[float]:
     base = float(base_block_threshold)
@@ -479,6 +487,8 @@ def attach_counterfactual_execution_outcomes(
         ),
         "decision_df",
     )
+    if decision_df.empty:
+        return pd.DataFrame(columns=list(_COUNTERFACTUAL_COLUMNS))
     identity_columns = [
         "signal_id",
         "episode_id",
@@ -518,9 +528,9 @@ def attach_counterfactual_execution_outcomes(
                 "counterfactual_exit_time": one.get("exit_time", pd.NaT),
             }
         )
+    out = pd.DataFrame(rows, columns=list(_COUNTERFACTUAL_COLUMNS))
     if not decision_df["signal_id"].is_unique:
         raise ValueError("decision_df must have unique signal_id for counterfactual enrichment")
-    out = pd.DataFrame(rows)
     if not out["signal_id"].is_unique:
         raise ValueError("counterfactual outcomes produced duplicate signal_id")
     return out
