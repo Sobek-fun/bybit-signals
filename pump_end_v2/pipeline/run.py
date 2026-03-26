@@ -27,6 +27,7 @@ from pump_end_v2.detector import (
     select_detector_policy,
 )
 from pump_end_v2.execution import (
+    build_execution_market_view,
     build_execution_metrics,
     build_execution_monthly_report,
     build_execution_symbol_report,
@@ -320,6 +321,7 @@ def run_pump_end_v2_pipeline(
     val_1m_load_started = time.perf_counter()
     raw_1m_val = market_loader.load_1m_ohlcv_intervals(val_intervals)
     bars_1m_val = prepare_intraday_bars_frame(raw_1m_val, "1m")
+    execution_market_view_val = build_execution_market_view(bars_15m, bars_1m_val)
     val_1m_load_elapsed = time.perf_counter() - val_1m_load_started
     log_info(
         "PIPELINE",
@@ -348,6 +350,7 @@ def run_pump_end_v2_pipeline(
         bars_1m_val,
         config.execution,
         bars_1s_fetcher,
+        execution_market_view=execution_market_view_val,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
@@ -387,6 +390,7 @@ def run_pump_end_v2_pipeline(
                 bars_1m_df=bars_1m_val,
                 execution_contract=config.execution,
                 bars_1s_fetcher=bars_1s_fetcher,
+                execution_market_view=execution_market_view_val,
                 window_start=config.splits.train_end,
                 window_end=config.splits.val_end,
             )
@@ -428,6 +432,7 @@ def run_pump_end_v2_pipeline(
     test_1m_load_started = time.perf_counter()
     raw_1m_test = market_loader.load_1m_ohlcv_intervals(test_intervals)
     bars_1m_test = prepare_intraday_bars_frame(raw_1m_test, "1m")
+    execution_market_view_test = build_execution_market_view(bars_15m, bars_1m_test)
     test_1m_load_elapsed = time.perf_counter() - test_1m_load_started
     log_info(
         "PIPELINE",
@@ -451,6 +456,7 @@ def run_pump_end_v2_pipeline(
             config.execution,
             bars_1s_fetcher,
             force_disabled_no_data=(gate_status_val != "enabled"),
+            execution_market_view=execution_market_view_test,
         )
     )
     test_gate_decisions_df, _ = apply_gate_block_threshold(
@@ -503,6 +509,7 @@ def run_pump_end_v2_pipeline(
             config.execution,
             bars_1s_fetcher,
             emit_summary_log=False,
+            market_view=execution_market_view_val,
         )
     )
     val_replay_elapsed = time.perf_counter() - val_replay_started
@@ -535,6 +542,7 @@ def run_pump_end_v2_pipeline(
             config.execution,
             bars_1s_fetcher,
             emit_summary_log=False,
+            market_view=execution_market_view_test,
         )
     )
     test_replay_elapsed = time.perf_counter() - test_replay_started
@@ -606,22 +614,24 @@ def run_pump_end_v2_pipeline(
 
     execution_reports_started = time.perf_counter()
     stage_start("PIPELINE", "EXECUTION_REPORTS")
+    val_window_6h = build_execution_window_report(val_executed_signals_df, 6)
+    val_window_24h = build_execution_window_report(val_executed_signals_df, 24)
     val_metrics = build_execution_metrics(
         val_executed_signals_df,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
+        precomputed_window_reports={6: val_window_6h, 24: val_window_24h},
     )
-    val_window_6h = build_execution_window_report(val_executed_signals_df, 6)
-    val_window_24h = build_execution_window_report(val_executed_signals_df, 24)
     val_symbol_report = build_execution_symbol_report(val_executed_signals_df)
     val_monthly_report = build_execution_monthly_report(val_executed_signals_df)
+    test_window_6h = build_execution_window_report(test_executed_signals_df, 6)
+    test_window_24h = build_execution_window_report(test_executed_signals_df, 24)
     test_metrics = build_execution_metrics(
         test_executed_signals_df,
         window_start=config.splits.val_end,
         window_end=config.splits.test_end,
+        precomputed_window_reports={6: test_window_6h, 24: test_window_24h},
     )
-    test_window_6h = build_execution_window_report(test_executed_signals_df, 6)
-    test_window_24h = build_execution_window_report(test_executed_signals_df, 24)
     test_symbol_report = build_execution_symbol_report(test_executed_signals_df)
     test_monthly_report = build_execution_monthly_report(test_executed_signals_df)
     gate_deciles_val = build_gate_decile_report(val_scored_signals_df)

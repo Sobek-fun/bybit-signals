@@ -15,6 +15,7 @@ def build_execution_metrics(
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
+    precomputed_window_reports: dict[int, pd.DataFrame] | None = None,
 ) -> dict[str, float]:
     _require_columns(
         executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df"
@@ -57,8 +58,13 @@ def build_execution_metrics(
         window_start=window_start, window_end=window_end, window_days=window_days
     )
     signals_per_30d = float(_compute_signals_per_30d(len(frame), eval_window_days))
-    report_6h = build_execution_window_report(frame, 6)
-    report_24h = build_execution_window_report(frame, 24)
+    window_reports = precomputed_window_reports or {}
+    report_6h = window_reports.get(6)
+    if report_6h is None:
+        report_6h = build_execution_window_report(frame, 6)
+    report_24h = window_reports.get(24)
+    if report_24h is None:
+        report_24h = build_execution_window_report(frame, 24)
     worst_6h_pnl = (
         float(report_6h["pnl_sum"].min()) if not report_6h.empty else float("nan")
     )
@@ -103,20 +109,19 @@ def build_execution_window_report(
     if frame.empty:
         return pd.DataFrame(columns=["window_end_time", "trades", "pnl_sum"])
     window = pd.Timedelta(hours=int(window_hours))
-    rows: list[dict[str, object]] = []
     times = frame["entry_bar_open_time"].tolist()
     pnl = frame["trade_pnl_pct"].tolist()
+    rows: list[dict[str, object]] = []
     for idx, current_time in enumerate(times):
         left = 0
         window_start = current_time - window
         while left <= idx and times[left] < window_start:
             left += 1
-        pnl_sum = float(sum(pnl[left : idx + 1]))
         rows.append(
             {
                 "window_end_time": current_time,
                 "trades": int(idx - left + 1),
-                "pnl_sum": pnl_sum,
+                "pnl_sum": float(sum(pnl[left : idx + 1])),
             }
         )
     out = (
