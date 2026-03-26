@@ -7,6 +7,8 @@ import pandas as pd
 from pump_end_v2.config import EventOpenerConfig
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
+_CONTEXT_DECAY_BARS = 3
+
 
 def open_causal_pump_episodes(token_state_df: pd.DataFrame, config: EventOpenerConfig) -> pd.DataFrame:
     started = time.perf_counter()
@@ -52,6 +54,8 @@ def _open_symbol_episodes(symbol: str, sdf: pd.DataFrame, config: EventOpenerCon
                     "max_high_during_episode": float(row["high"]),
                     "max_runup_pct_during_episode": float(row["runup_pct"]),
                     "duration_bars": 1,
+                    "pump_context_false_streak": 0,
+                    "near_high_runup_decay_streak": 0,
                 }
                 expiry_reason = _resolve_expiry_reason(active, row, config)
                 if expiry_reason is not None:
@@ -74,12 +78,28 @@ def _open_symbol_episodes(symbol: str, sdf: pd.DataFrame, config: EventOpenerCon
 
 
 def _resolve_expiry_reason(active: dict[str, object], row: pd.Series, config: EventOpenerConfig) -> str | None:
+    pump_context_flag = bool(row.get("pump_context_flag", False))
+    near_high_flag = bool(row.get("near_high_flag", False))
+    runup_pct = float(row.get("runup_pct", 0.0))
+    if pump_context_flag:
+        active["pump_context_false_streak"] = 0
+    else:
+        active["pump_context_false_streak"] = int(active.get("pump_context_false_streak", 0)) + 1
+    if near_high_flag or runup_pct >= float(config.min_runup_pct):
+        active["near_high_runup_decay_streak"] = 0
+    else:
+        active["near_high_runup_decay_streak"] = int(active.get("near_high_runup_decay_streak", 0)) + 1
     episode_high_so_far = max(float(active["max_high_during_episode"]), float(row["high"]))
     drawdown_pct = (episode_high_so_far - float(row["close"])) / episode_high_so_far
     if int(active["duration_bars"]) >= config.max_episode_bars:
         return "max_age"
     if drawdown_pct >= config.expiry_drawdown_pct:
         return "drawdown"
+    if (
+        int(active.get("pump_context_false_streak", 0)) >= _CONTEXT_DECAY_BARS
+        or int(active.get("near_high_runup_decay_streak", 0)) >= _CONTEXT_DECAY_BARS
+    ):
+        return "context_decay"
     return None
 
 

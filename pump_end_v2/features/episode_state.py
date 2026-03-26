@@ -40,11 +40,9 @@ def build_episode_state_layer(
     market = token_state_df[["symbol", "open_time", "close"]].rename(
         columns={"open_time": "context_bar_open_time", "close": "context_close"}
     )
-    merged = decision_rows_df.merge(
-        episodes_df[["episode_id", "episode_open_close"]],
-        on="episode_id",
-        how="left",
-    )
+    if "episode_open_close" not in decision_rows_df.columns:
+        raise ValueError("decision_rows_df missing required column: episode_open_close")
+    merged = decision_rows_df.copy()
     merged = merged.merge(
         market,
         on=["symbol", "context_bar_open_time"],
