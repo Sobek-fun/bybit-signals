@@ -343,6 +343,7 @@ def select_gate_block_threshold_execution_aware(
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None = None,
+    execution_market_view: object | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -373,6 +374,7 @@ def select_gate_block_threshold_execution_aware(
         bars_1m_df=bars_1m_df,
         execution_contract=execution_contract,
         bars_1s_fetcher=bars_1s_fetcher,
+        market_view=execution_market_view,
     )
     thresholds = build_gate_threshold_grid(base_block_threshold)
     log_info(
@@ -400,14 +402,15 @@ def select_gate_block_threshold_execution_aware(
                 how="left",
                 validate="one_to_one",
             )
+        window_6h = build_execution_window_report(executed_signals_df, 6)
+        window_24h = build_execution_window_report(executed_signals_df, 24)
         execution_metrics = build_execution_metrics(
             executed_signals_df,
             window_start=window_start,
             window_end=window_end,
             window_days=window_days,
+            precomputed_window_reports={6: window_6h, 24: window_24h},
         )
-        window_6h = build_execution_window_report(executed_signals_df, 6)
-        window_24h = build_execution_window_report(executed_signals_df, 24)
         summary = build_gate_execution_decision_summary(execution_decisions_df)
         signals_per_30d = float(execution_metrics.get("signals_per_30d", 0.0))
         pnl_sum = float(execution_metrics.get("pnl_sum", 0.0))
@@ -625,6 +628,7 @@ def attach_counterfactual_execution_outcomes(
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None = None,
     split_label: str = "unknown",
+    execution_market_view: object | None = None,
 ) -> pd.DataFrame:
     _require_columns(
         decision_df,
@@ -655,6 +659,7 @@ def attach_counterfactual_execution_outcomes(
         bars_1m_df=bars_1m_df,
         execution_contract=execution_contract,
         bars_1s_fetcher=bars_1s_fetcher,
+        market_view=execution_market_view,
     )
     for _ in progress_iter:
         pass

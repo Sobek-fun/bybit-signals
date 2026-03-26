@@ -1,4 +1,7 @@
+from dataclasses import dataclass
 from typing import Any, Protocol
+
+import numpy as np
 
 import pandas as pd
 
@@ -48,8 +51,87 @@ _EXECUTION_OUTPUT_COLUMNS: tuple[str, ...] = (
 _INDEPENDENT_OUTCOME_COLUMNS: tuple[str, ...] = ("signal_id", *_EXECUTION_OUTPUT_COLUMNS)
 
 
+@dataclass(frozen=True)
+class _SymbolMarketBars:
+    open_time: np.ndarray
+    open_time_ns: np.ndarray
+    open: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    close: np.ndarray
+    time_to_pos: dict[pd.Timestamp, int]
+    minute_start_by_15m_pos: np.ndarray | None = None
+    minute_end_by_15m_pos: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionMarketView:
+    bars_15m_by_symbol: dict[str, _SymbolMarketBars]
+    bars_1m_by_symbol: dict[str, _SymbolMarketBars]
+
+
 class OneSecondBarsFetcher(Protocol):
     def fetch(self, symbol: str, minute_start: pd.Timestamp) -> pd.DataFrame: ...
+
+
+def build_execution_market_view(
+    bars_15m_df: pd.DataFrame,
+    bars_1m_df: pd.DataFrame,
+) -> ExecutionMarketView:
+    bars_15m = prepare_intraday_bars_frame(bars_15m_df, "15m")
+    bars_1m = prepare_intraday_bars_frame(bars_1m_df, "1m")
+    bars_1m_by_symbol: dict[str, _SymbolMarketBars] = {}
+    for symbol, grp in bars_1m.groupby("symbol", sort=False):
+        times = grp["open_time"].to_numpy(copy=True)
+        times_ns = grp["open_time"].astype("int64").to_numpy(copy=True)
+        bars_1m_by_symbol[str(symbol)] = _SymbolMarketBars(
+            open_time=times,
+            open_time_ns=times_ns,
+            open=grp["open"].to_numpy(dtype=float, copy=True),
+            high=grp["high"].to_numpy(dtype=float, copy=True),
+            low=grp["low"].to_numpy(dtype=float, copy=True),
+            close=grp["close"].to_numpy(dtype=float, copy=True),
+            time_to_pos={
+                pd.Timestamp(ts): int(i) for i, ts in enumerate(times.tolist())
+            },
+            minute_start_by_15m_pos=None,
+            minute_end_by_15m_pos=None,
+        )
+    bars_15m_by_symbol: dict[str, _SymbolMarketBars] = {}
+    fifteen_min_ns = int(pd.Timedelta(minutes=15).value)
+    for symbol, grp in bars_15m.groupby("symbol", sort=False):
+        symbol_str = str(symbol)
+        times = grp["open_time"].to_numpy(copy=True)
+        times_ns = grp["open_time"].astype("int64").to_numpy(copy=True)
+        minute_view = bars_1m_by_symbol.get(symbol_str)
+        minute_start: np.ndarray | None
+        minute_end: np.ndarray | None
+        if minute_view is None:
+            minute_start = None
+            minute_end = None
+        else:
+            minute_start = np.searchsorted(
+                minute_view.open_time_ns, times_ns, side="left"
+            ).astype(np.int64, copy=False)
+            minute_end = np.searchsorted(
+                minute_view.open_time_ns, times_ns + fifteen_min_ns, side="left"
+            ).astype(np.int64, copy=False)
+        bars_15m_by_symbol[symbol_str] = _SymbolMarketBars(
+            open_time=times,
+            open_time_ns=times_ns,
+            open=grp["open"].to_numpy(dtype=float, copy=True),
+            high=grp["high"].to_numpy(dtype=float, copy=True),
+            low=grp["low"].to_numpy(dtype=float, copy=True),
+            close=grp["close"].to_numpy(dtype=float, copy=True),
+            time_to_pos={
+                pd.Timestamp(ts): int(i) for i, ts in enumerate(times.tolist())
+            },
+            minute_start_by_15m_pos=minute_start,
+            minute_end_by_15m_pos=minute_end,
+        )
+    return ExecutionMarketView(
+        bars_15m_by_symbol=bars_15m_by_symbol, bars_1m_by_symbol=bars_1m_by_symbol
+    )
 
 
 def replay_independent_short_signals(
@@ -58,6 +140,7 @@ def replay_independent_short_signals(
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_fetcher: OneSecondBarsFetcher | None = None,
+    market_view: ExecutionMarketView | None = None,
 ) -> pd.DataFrame:
     _require_columns(
         decision_df,
@@ -85,50 +168,50 @@ def replay_independent_short_signals(
     decisions["entry_bar_open_time"] = pd.to_datetime(
         decisions["entry_bar_open_time"], utc=True, errors="raise"
     )
-    bars_15m = prepare_intraday_bars_frame(bars_15m_df, "15m")
-    bars_1m = prepare_intraday_bars_frame(bars_1m_df, "1m")
+    resolved_market_view = market_view or build_execution_market_view(
+        bars_15m_df=bars_15m_df,
+        bars_1m_df=bars_1m_df,
+    )
     for column in _EXECUTION_OUTPUT_COLUMNS:
         decisions[column] = pd.NA
-    decisions["execution_status"] = "pending"
-    bars_15m_by_symbol = {
-        symbol: grp.reset_index(drop=True)
-        for symbol, grp in bars_15m.groupby("symbol", sort=False)
-    }
-    bars_1m_by_symbol = {
-        symbol: grp.reset_index(drop=True)
-        for symbol, grp in bars_1m.groupby("symbol", sort=False)
-    }
-    hold_window_delta = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15)
+    execution_status = np.full(len(decisions), "missing_entry_bar", dtype=object)
+    entry_price_out = np.full(len(decisions), np.nan, dtype=float)
+    exit_time_out = np.array([pd.NaT] * len(decisions), dtype=object)
+    exit_price_out = np.full(len(decisions), np.nan, dtype=float)
+    trade_outcome_out = np.array([pd.NA] * len(decisions), dtype=object)
+    trade_pnl_pct_out = np.full(len(decisions), np.nan, dtype=float)
+    mfe_pct_out = np.full(len(decisions), np.nan, dtype=float)
+    mae_pct_out = np.full(len(decisions), np.nan, dtype=float)
+    holding_bars_out = np.array([pd.NA] * len(decisions), dtype=object)
+    hold_window_ns = int(pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15).value)
     ordered = decisions.sort_values(
         ["entry_bar_open_time", "signal_id"], kind="mergesort"
     )
-    for idx, row in ordered.iterrows():
-        symbol = str(row["symbol"])
-        entry_time = pd.Timestamp(row["entry_bar_open_time"])
-        symbol_15m = bars_15m_by_symbol.get(symbol)
+    for row in ordered.itertuples(index=True):
+        idx = int(row.Index)
+        symbol = str(row.symbol)
+        entry_time = pd.Timestamp(row.entry_bar_open_time)
+        symbol_15m = resolved_market_view.bars_15m_by_symbol.get(symbol)
         if symbol_15m is None:
-            decisions.at[idx, "execution_status"] = "missing_entry_bar"
             continue
-        entry_match = symbol_15m[symbol_15m["open_time"] == entry_time]
-        if entry_match.empty:
-            decisions.at[idx, "execution_status"] = "missing_entry_bar"
+        entry_pos = symbol_15m.time_to_pos.get(entry_time)
+        if entry_pos is None:
             continue
-        entry_bar = entry_match.iloc[0]
-        entry_price = float(entry_bar["open"])
+        entry_price = float(symbol_15m.open[entry_pos])
         tp_price = entry_price * (1.0 - float(execution_contract.tp_pct))
         sl_price = entry_price * (1.0 + float(execution_contract.sl_pct))
-        horizon_end = entry_time + hold_window_delta
-        path_bars = symbol_15m[
-            (symbol_15m["open_time"] >= entry_time)
-            & (symbol_15m["open_time"] < horizon_end)
-        ].copy()
-        if path_bars.empty:
-            decisions.at[idx, "execution_status"] = "missing_entry_bar"
+        horizon_end_ns = int(entry_time.value) + hold_window_ns
+        horizon_pos = int(
+            np.searchsorted(symbol_15m.open_time_ns, horizon_end_ns, side="left")
+        )
+        if horizon_pos <= entry_pos:
             continue
         outcome_data = _replay_single_short_path(
             symbol=symbol,
-            path_15m=path_bars,
-            symbol_1m=bars_1m_by_symbol.get(symbol),
+            symbol_15m=symbol_15m,
+            entry_pos_15m=entry_pos,
+            end_pos_15m=horizon_pos,
+            symbol_1m=resolved_market_view.bars_1m_by_symbol.get(symbol),
             bars_1s_fetcher=bars_1s_fetcher,
             tp_price=tp_price,
             sl_price=sl_price,
@@ -142,16 +225,28 @@ def replay_independent_short_signals(
         else:
             exit_price = float(outcome_data["exit_price"])
             trade_pnl_pct = ((entry_price - exit_price) / entry_price) * 100.0
-        decisions.at[idx, "execution_status"] = "executed"
-        decisions.at[idx, "entry_price"] = entry_price
-        decisions.at[idx, "exit_time"] = exit_time
-        decisions.at[idx, "exit_price"] = exit_price
-        decisions.at[idx, "trade_outcome"] = trade_outcome
-        decisions.at[idx, "trade_pnl_pct"] = trade_pnl_pct
-        decisions.at[idx, "mfe_pct"] = outcome_data["mfe_pct"]
-        decisions.at[idx, "mae_pct"] = outcome_data["mae_pct"]
-        decisions.at[idx, "holding_bars"] = int(outcome_data["holding_bars"])
+        execution_status[idx] = "executed"
+        entry_price_out[idx] = entry_price
+        exit_time_out[idx] = exit_time
+        exit_price_out[idx] = exit_price
+        trade_outcome_out[idx] = trade_outcome
+        trade_pnl_pct_out[idx] = trade_pnl_pct
+        mfe_pct_out[idx] = float(outcome_data["mfe_pct"])
+        mae_pct_out[idx] = float(outcome_data["mae_pct"])
+        holding_bars_out[idx] = int(outcome_data["holding_bars"])
+    decisions["execution_status"] = execution_status
+    decisions["entry_price"] = entry_price_out
+    decisions["exit_time"] = exit_time_out
+    decisions["exit_price"] = exit_price_out
+    decisions["trade_outcome"] = trade_outcome_out
+    decisions["trade_pnl_pct"] = trade_pnl_pct_out
+    decisions["mfe_pct"] = mfe_pct_out
+    decisions["mae_pct"] = mae_pct_out
+    decisions["holding_bars"] = holding_bars_out
     out = decisions.sort_values("_row_order", kind="mergesort")
+    out["exit_time"] = pd.to_datetime(out["exit_time"], utc=True, errors="coerce").astype(
+        "datetime64[us, UTC]"
+    )
     return out.loc[:, list(_INDEPENDENT_OUTCOME_COLUMNS)].reset_index(drop=True)
 
 
@@ -201,25 +296,35 @@ def replay_short_signals_with_symbol_lock_precomputed(
     kept_ordered = merged.loc[merged["gate_decision"] == "keep"].sort_values(
         ["entry_bar_open_time", "signal_id"], kind="mergesort"
     )
-    for idx, row in kept_ordered.iterrows():
-        if str(row["execution_status"]) != "executed":
+    execution_status_arr = merged["execution_status"].to_numpy(dtype=object, copy=True)
+    symbol_arr = merged["symbol"].astype(str).to_numpy(dtype=object, copy=False)
+    entry_arr = merged["entry_bar_open_time"].to_numpy(copy=False)
+    exit_arr = merged["exit_time"].to_numpy(copy=False)
+    output_cols = list(_EXECUTION_OUTPUT_COLUMNS)
+    for row in kept_ordered.itertuples(index=True):
+        idx = int(row.Index)
+        if str(execution_status_arr[idx]) != "executed":
             continue
-        symbol = str(row["symbol"])
-        entry_time = pd.Timestamp(row["entry_bar_open_time"])
+        symbol = str(symbol_arr[idx])
+        entry_time = pd.Timestamp(entry_arr[idx])
         if (
             symbol in lock_until_by_symbol
             and entry_time <= lock_until_by_symbol[symbol]
         ):
-            merged.at[idx, "execution_status"] = "blocked_symbol_lock"
-            for column in _EXECUTION_OUTPUT_COLUMNS:
-                merged.at[idx, column] = pd.NA
+            execution_status_arr[idx] = "blocked_symbol_lock"
+            for column in output_cols:
+                merged.iat[idx, merged.columns.get_loc(column)] = pd.NA
             continue
-        exit_time = row["exit_time"]
+        exit_time = exit_arr[idx]
         if pd.notna(exit_time):
             lock_until_by_symbol[symbol] = pd.Timestamp(exit_time)
+    merged["execution_status"] = execution_status_arr
     decisions_out = merged.sort_values("_row_order", kind="mergesort").drop(
         columns=["_row_order"]
     )
+    decisions_out["exit_time"] = pd.to_datetime(
+        decisions_out["exit_time"], utc=True, errors="coerce"
+    ).astype("datetime64[us, UTC]")
     decisions_out = decisions_out[
         [
             *[
@@ -299,13 +404,19 @@ def replay_short_signals_with_symbol_lock(
     execution_contract: ExecutionContract,
     bars_1s_fetcher: OneSecondBarsFetcher | None = None,
     emit_summary_log: bool = True,
+    market_view: ExecutionMarketView | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    resolved_market_view = market_view or build_execution_market_view(
+        bars_15m_df=bars_15m_df,
+        bars_1m_df=bars_1m_df,
+    )
     independent_outcomes_df = replay_independent_short_signals(
         decision_df=decision_df,
         bars_15m_df=bars_15m_df,
         bars_1m_df=bars_1m_df,
         execution_contract=execution_contract,
         bars_1s_fetcher=bars_1s_fetcher,
+        market_view=resolved_market_view,
     )
     decisions, executed_signals_df = replay_short_signals_with_symbol_lock_precomputed(
         decision_df=decision_df,
@@ -339,24 +450,27 @@ def replay_short_signals_with_symbol_lock(
 
 def _replay_single_short_path(
     symbol: str,
-    path_15m: pd.DataFrame,
-    symbol_1m: pd.DataFrame | None,
+    symbol_15m: _SymbolMarketBars,
+    entry_pos_15m: int,
+    end_pos_15m: int,
+    symbol_1m: _SymbolMarketBars | None,
     bars_1s_fetcher: OneSecondBarsFetcher | None,
     tp_price: float,
     sl_price: float,
     entry_price: float,
 ) -> dict[str, Any]:
     trade_outcome = "timeout"
-    exit_time = pd.Timestamp(path_15m["open_time"].iloc[-1])
-    exit_price = float(path_15m["close"].iloc[-1])
-    holding_bars = int(len(path_15m))
+    last_pos = end_pos_15m - 1
+    exit_time = pd.Timestamp(symbol_15m.open_time[last_pos])
+    exit_price = float(symbol_15m.close[last_pos])
+    holding_bars = int(end_pos_15m - entry_pos_15m)
     path_lows: list[float] = []
     path_highs: list[float] = []
-    for bar in path_15m.itertuples(index=False):
-        bar_time = pd.Timestamp(bar.open_time)
-        bar_low = float(bar.low)
-        bar_high = float(bar.high)
-        bar_close = float(bar.close)
+    for pos in range(entry_pos_15m, end_pos_15m):
+        bar_time = pd.Timestamp(symbol_15m.open_time[pos])
+        bar_low = float(symbol_15m.low[pos])
+        bar_high = float(symbol_15m.high[pos])
+        bar_close = float(symbol_15m.close[pos])
         path_lows.append(bar_low)
         path_highs.append(bar_high)
         hit_tp = bar_low <= tp_price
@@ -364,7 +478,8 @@ def _replay_single_short_path(
         if hit_tp and hit_sl:
             resolution = _resolve_intra_15m_touch(
                 symbol=symbol,
-                bar_15m_start=bar_time,
+                symbol_15m=symbol_15m,
+                bar_pos_15m=pos,
                 symbol_1m=symbol_1m,
                 bars_1s_fetcher=bars_1s_fetcher,
                 tp_price=tp_price,
@@ -413,8 +528,9 @@ def _replay_single_short_path(
 
 def _resolve_intra_15m_touch(
     symbol: str,
-    bar_15m_start: pd.Timestamp,
-    symbol_1m: pd.DataFrame | None,
+    symbol_15m: _SymbolMarketBars,
+    bar_pos_15m: int,
+    symbol_1m: _SymbolMarketBars | None,
     bars_1s_fetcher: OneSecondBarsFetcher | None,
     tp_price: float,
     sl_price: float,
@@ -427,11 +543,19 @@ def _resolve_intra_15m_touch(
             "path_lows": [],
             "path_highs": [],
         }
-    bar_15m_end = bar_15m_start + pd.Timedelta(minutes=15)
-    minute_bars = symbol_1m[
-        (symbol_1m["open_time"] >= bar_15m_start) & (symbol_1m["open_time"] < bar_15m_end)
-    ]
-    if minute_bars.empty:
+    minute_start_by_15m_pos = symbol_15m.minute_start_by_15m_pos
+    minute_end_by_15m_pos = symbol_15m.minute_end_by_15m_pos
+    if minute_start_by_15m_pos is None or minute_end_by_15m_pos is None:
+        return {
+            "trade_outcome": None,
+            "exit_time": None,
+            "exit_price": None,
+            "path_lows": [],
+            "path_highs": [],
+        }
+    minute_start_idx = int(minute_start_by_15m_pos[bar_pos_15m])
+    minute_end_idx = int(minute_end_by_15m_pos[bar_pos_15m])
+    if minute_end_idx <= minute_start_idx:
         return {
             "trade_outcome": None,
             "exit_time": None,
@@ -441,11 +565,11 @@ def _resolve_intra_15m_touch(
         }
     lows: list[float] = []
     highs: list[float] = []
-    for row in minute_bars.itertuples(index=False):
-        minute_start = pd.Timestamp(row.open_time)
-        minute_low = float(row.low)
-        minute_high = float(row.high)
-        minute_close = float(row.close)
+    for minute_pos in range(minute_start_idx, minute_end_idx):
+        minute_start = pd.Timestamp(symbol_1m.open_time[minute_pos])
+        minute_low = float(symbol_1m.low[minute_pos])
+        minute_high = float(symbol_1m.high[minute_pos])
+        minute_close = float(symbol_1m.close[minute_pos])
         lows.append(minute_low)
         highs.append(minute_high)
         hit_tp = minute_low <= tp_price
