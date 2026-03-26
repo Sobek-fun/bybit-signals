@@ -109,7 +109,7 @@ def build_gate_val_scored_signals_and_datasets(
         split_label="val",
     )
     val_history_df = _slice_history_window(
-        train_oof_candidate_signals_df, val_candidate_signals_df, hours=24
+        train_oof_with_execution_df, val_candidate_signals_df, hours=24
     )
     train_feature_view_df = build_gate_feature_view(
         candidate_signals_df=train_oof_with_execution_df,
@@ -120,14 +120,7 @@ def build_gate_val_scored_signals_and_datasets(
     )
     val_feature_view_df = build_gate_feature_view(
         candidate_signals_df=val_with_execution_df,
-        history_candidate_signals_df=_enrich_with_counterfactual(
-            val_history_df,
-            bars_15m_df,
-            bars_1m_df,
-            execution_contract,
-            bars_1s_fetcher,
-            split_label="val_history",
-        ),
+        history_candidate_signals_df=val_history_df,
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
@@ -146,6 +139,9 @@ def build_gate_val_scored_signals_and_datasets(
     if (not _is_gate_trainable(train_fit_df)) or val_score_df.empty:
         val_scored_signals_df = _build_disabled_scored_signals(
             val_candidate_signals_df, "val_forward"
+        )
+        val_scored_signals_df = _attach_counterfactual_columns(
+            val_scored_signals_df, val_with_execution_df
         )
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
@@ -201,6 +197,9 @@ def build_gate_val_scored_signals_and_datasets(
             _GATE_STATUS_DISABLED_NO_DATA,
         )
     val_scored_signals_df = _score_gate_dataset_rows(model, val_score_df)
+    val_scored_signals_df = _attach_counterfactual_columns(
+        val_scored_signals_df, val_with_execution_df
+    )
     threshold_sweep_df = sweep_gate_block_threshold(
         scored_signals_df=val_scored_signals_df,
         base_block_threshold=base_block_threshold,
@@ -243,6 +242,17 @@ def build_gate_test_scored_signals(
         test_scored_signals_df = _build_disabled_scored_signals(
             test_candidate_signals_df, "test_forward"
         )
+        test_with_execution_df = _enrich_with_counterfactual(
+            test_candidate_signals_df,
+            bars_15m_df,
+            bars_1m_df,
+            execution_contract,
+            bars_1s_fetcher,
+            split_label="test",
+        )
+        test_scored_signals_df = _attach_counterfactual_columns(
+            test_scored_signals_df, test_with_execution_df
+        )
         log_info(
             "GATE",
             (
@@ -272,8 +282,16 @@ def build_gate_test_scored_signals(
         bars_1s_fetcher,
         split_label="test",
     )
+    history_with_execution_df = _enrich_with_counterfactual(
+        history_candidate_signals_df,
+        bars_15m_df,
+        bars_1m_df,
+        execution_contract,
+        bars_1s_fetcher,
+        split_label="test_history",
+    )
     test_history_df = _slice_history_window(
-        history_candidate_signals_df, test_candidate_signals_df, hours=24
+        history_with_execution_df, test_candidate_signals_df, hours=24
     )
     train_feature_view_df = build_gate_feature_view(
         candidate_signals_df=train_oof_with_execution_df,
@@ -284,14 +302,7 @@ def build_gate_test_scored_signals(
     )
     test_feature_view_df = build_gate_feature_view(
         candidate_signals_df=test_with_execution_df,
-        history_candidate_signals_df=_enrich_with_counterfactual(
-            test_history_df,
-            bars_15m_df,
-            bars_1m_df,
-            execution_contract,
-            bars_1s_fetcher,
-            split_label="test_history",
-        ),
+        history_candidate_signals_df=test_history_df,
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
@@ -312,6 +323,9 @@ def build_gate_test_scored_signals(
     if (not _is_gate_trainable(train_fit_df)) or test_score_df.empty:
         test_scored_signals_df = _build_disabled_scored_signals(
             test_candidate_signals_df, "test_forward"
+        )
+        test_scored_signals_df = _attach_counterfactual_columns(
+            test_scored_signals_df, test_with_execution_df
         )
         log_info(
             "GATE",
@@ -349,6 +363,9 @@ def build_gate_test_scored_signals(
             _GATE_STATUS_DISABLED_NO_DATA,
         )
     test_scored_signals_df = _score_gate_dataset_rows(model, test_score_df)
+    test_scored_signals_df = _attach_counterfactual_columns(
+        test_scored_signals_df, test_with_execution_df
+    )
     log_info(
         "GATE",
         (
@@ -467,3 +484,28 @@ def _build_disabled_scored_signals(
         if column not in out.columns:
             out[column] = pd.NA
     return out.loc[:, list(_SCORED_OUTPUT_COLUMNS)].reset_index(drop=True)
+
+
+def _attach_counterfactual_columns(
+    scored_signals_df: pd.DataFrame, enriched_candidate_signals_df: pd.DataFrame | None
+) -> pd.DataFrame:
+    if enriched_candidate_signals_df is None or enriched_candidate_signals_df.empty:
+        out = scored_signals_df.copy()
+        out["counterfactual_execution_status"] = pd.NA
+        out["counterfactual_trade_outcome"] = pd.NA
+        out["counterfactual_trade_pnl_pct"] = pd.NA
+        out["counterfactual_exit_time"] = pd.NaT
+        return out
+    counterfactual_df = enriched_candidate_signals_df.loc[
+        :,
+        [
+            "signal_id",
+            "counterfactual_execution_status",
+            "counterfactual_trade_outcome",
+            "counterfactual_trade_pnl_pct",
+            "counterfactual_exit_time",
+        ],
+    ].copy()
+    return scored_signals_df.merge(
+        counterfactual_df, on="signal_id", how="left", validate="one_to_one"
+    )

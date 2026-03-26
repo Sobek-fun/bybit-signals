@@ -7,7 +7,10 @@ from pump_end_v2.execution.metrics import (
     build_execution_metrics,
     build_execution_window_report,
 )
-from pump_end_v2.execution.replay import replay_short_signals_with_symbol_lock
+from pump_end_v2.execution.replay import (
+    replay_independent_short_signals,
+    replay_short_signals_with_symbol_lock_precomputed,
+)
 from pump_end_v2.logging import log_info
 
 try:
@@ -92,10 +95,6 @@ def _tqdm_kwargs() -> dict[str, object]:
         "dynamic_ncols": True,
         "mininterval": 0.5,
     }
-
-
-def _is_tty_progress() -> bool:
-    return sys.stderr.isatty()
 
 
 def apply_gate_block_threshold(
@@ -349,13 +348,31 @@ def select_gate_block_threshold_execution_aware(
     window_days: float | None = None,
 ) -> tuple[float, pd.DataFrame]:
     sweep_started = time.perf_counter()
-    counterfactual_outcomes_df = attach_counterfactual_execution_outcomes(
-        scored_signals_df,
-        bars_15m_df,
-        bars_1m_df,
-        execution_contract,
-        bars_1s_fetcher,
-        split_label="val",
+    counterfactual_columns = {
+        "counterfactual_execution_status",
+        "counterfactual_trade_outcome",
+        "counterfactual_trade_pnl_pct",
+        "counterfactual_exit_time",
+    }
+    if counterfactual_columns.issubset(scored_signals_df.columns):
+        counterfactual_outcomes_df = scored_signals_df.loc[
+            :, ["signal_id", *sorted(counterfactual_columns)]
+        ].copy()
+    else:
+        counterfactual_outcomes_df = attach_counterfactual_execution_outcomes(
+            scored_signals_df,
+            bars_15m_df,
+            bars_1m_df,
+            execution_contract,
+            bars_1s_fetcher,
+            split_label="val",
+        )
+    independent_outcomes_df = replay_independent_short_signals(
+        decision_df=scored_signals_df,
+        bars_15m_df=bars_15m_df,
+        bars_1m_df=bars_1m_df,
+        execution_contract=execution_contract,
+        bars_1s_fetcher=bars_1s_fetcher,
     )
     thresholds = build_gate_threshold_grid(base_block_threshold)
     log_info(
@@ -367,21 +384,22 @@ def select_gate_block_threshold_execution_aware(
     for idx, threshold in enumerate(thresholds, start=1):
         gate_decisions_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
         execution_decisions_df, executed_signals_df = (
-            replay_short_signals_with_symbol_lock(
-                gate_decisions_df,
-                bars_15m_df,
-                bars_1m_df,
-                execution_contract,
-                bars_1s_fetcher,
+            replay_short_signals_with_symbol_lock_precomputed(
+                decision_df=gate_decisions_df,
+                independent_outcomes_df=independent_outcomes_df,
                 emit_summary_log=False,
             )
         )
-        execution_decisions_df = execution_decisions_df.merge(
-            counterfactual_outcomes_df,
-            on="signal_id",
-            how="left",
-            validate="one_to_one",
-        )
+        if not {
+            "counterfactual_trade_outcome",
+            "counterfactual_trade_pnl_pct",
+        }.issubset(execution_decisions_df.columns):
+            execution_decisions_df = execution_decisions_df.merge(
+                counterfactual_outcomes_df,
+                on="signal_id",
+                how="left",
+                validate="one_to_one",
+            )
         execution_metrics = build_execution_metrics(
             executed_signals_df,
             window_start=window_start,
@@ -622,85 +640,36 @@ def attach_counterfactual_execution_outcomes(
     )
     if decision_df.empty:
         return pd.DataFrame(columns=list(_COUNTERFACTUAL_COLUMNS))
-    identity_columns = [
-        "signal_id",
-        "episode_id",
-        "symbol",
-        "context_bar_open_time",
-        "decision_time",
-        "entry_bar_open_time",
-    ]
-    rows: list[dict[str, object]] = []
     total_signals = len(decision_df)
-    progress_step = max(1, total_signals // 12 if total_signals > 0 else 1)
     started = time.perf_counter()
-    emit_periodic_log = not _is_tty_progress()
+    progress_iter = tqdm(
+        [0],
+        total=1,
+        desc=f"counterfactual {split_label}",
+        unit="batch",
+        **_tqdm_kwargs(),
+    )
+    independent_outcomes_df = replay_independent_short_signals(
+        decision_df=decision_df,
+        bars_15m_df=bars_15m_df,
+        bars_1m_df=bars_1m_df,
+        execution_contract=execution_contract,
+        bars_1s_fetcher=bars_1s_fetcher,
+    )
+    for _ in progress_iter:
+        pass
+    outcome_counts = (
+        independent_outcomes_df["trade_outcome"]
+        .astype(str)
+        .str.lower()
+        .value_counts(dropna=False)
+    )
     status_counts: dict[str, int] = {
-        "tp": 0,
-        "sl": 0,
-        "timeout": 0,
-        "ambiguous": 0,
+        "tp": int(outcome_counts.get("tp", 0)),
+        "sl": int(outcome_counts.get("sl", 0)),
+        "timeout": int(outcome_counts.get("timeout", 0)),
+        "ambiguous": int(outcome_counts.get("ambiguous", 0)),
     }
-    for processed, row in enumerate(
-        tqdm(
-            decision_df.loc[:, identity_columns].itertuples(index=False),
-            total=total_signals,
-            desc=f"counterfactual {split_label}",
-            unit="signal",
-            **_tqdm_kwargs(),
-        ),
-        start=1,
-    ):
-        one_signal = pd.DataFrame(
-            [
-                {
-                    "signal_id": row.signal_id,
-                    "episode_id": row.episode_id,
-                    "symbol": row.symbol,
-                    "context_bar_open_time": row.context_bar_open_time,
-                    "decision_time": row.decision_time,
-                    "entry_bar_open_time": row.entry_bar_open_time,
-                    "gate_decision": "keep",
-                }
-            ]
-        )
-        one_decision_df, _ = replay_short_signals_with_symbol_lock(
-            one_signal,
-            bars_15m_df,
-            bars_1m_df,
-            execution_contract,
-            bars_1s_fetcher,
-            emit_summary_log=False,
-        )
-        one = one_decision_df.iloc[0]
-        outcome = str(one.get("trade_outcome", "")).lower()
-        if outcome in status_counts:
-            status_counts[outcome] += 1
-        rows.append(
-            {
-                "signal_id": row.signal_id,
-                "counterfactual_execution_status": one.get("execution_status", pd.NA),
-                "counterfactual_trade_outcome": one.get("trade_outcome", pd.NA),
-                "counterfactual_trade_pnl_pct": one.get("trade_pnl_pct", pd.NA),
-                "counterfactual_exit_time": one.get("exit_time", pd.NaT),
-            }
-        )
-        if emit_periodic_log and (processed % progress_step == 0 or processed == total_signals):
-            elapsed = time.perf_counter() - started
-            rate = processed / elapsed if elapsed > 0 else 0.0
-            eta = (total_signals - processed) / rate if rate > 0 else 0.0
-            pct = (processed / total_signals * 100.0) if total_signals > 0 else 0.0
-            avg_sec_per_signal = elapsed / processed if processed > 0 else 0.0
-            log_info(
-                "EXECUTION",
-                (
-                    f"counterfactual progress split={split_label} processed={processed}/{total_signals} "
-                    f"pct={pct:.1f} elapsed_sec={elapsed:.3f} rate_per_sec={rate:.3f} "
-                    f"avg_sec_per_signal={avg_sec_per_signal:.3f} eta_sec={eta:.3f} "
-                    f"tp_so_far={status_counts['tp']} sl_so_far={status_counts['sl']} "
-                    f"timeout_so_far={status_counts['timeout']} ambiguous_so_far={status_counts['ambiguous']}"
-                ),
-            )
     elapsed_total = time.perf_counter() - started
     avg_sec_per_signal = elapsed_total / total_signals if total_signals > 0 else 0.0
     log_info(
@@ -712,7 +681,14 @@ def attach_counterfactual_execution_outcomes(
             f"timeout_total={status_counts['timeout']} ambiguous_total={status_counts['ambiguous']}"
         ),
     )
-    out = pd.DataFrame(rows, columns=list(_COUNTERFACTUAL_COLUMNS))
+    out = independent_outcomes_df.rename(
+        columns={
+            "execution_status": "counterfactual_execution_status",
+            "trade_outcome": "counterfactual_trade_outcome",
+            "trade_pnl_pct": "counterfactual_trade_pnl_pct",
+            "exit_time": "counterfactual_exit_time",
+        }
+    ).loc[:, list(_COUNTERFACTUAL_COLUMNS)]
     if not decision_df["signal_id"].is_unique:
         raise ValueError(
             "decision_df must have unique signal_id for counterfactual enrichment"
