@@ -242,6 +242,32 @@ class ClickHouseMarketDataLoader:
             frame[column] = pd.to_numeric(frame[column], errors="raise")
         return frame
 
+    def load_1m_ohlcv_intervals(
+        self,
+        symbol_intervals: dict[
+            str, list[tuple[datetime | pd.Timestamp, datetime | pd.Timestamp]]
+        ],
+    ) -> pd.DataFrame:
+        chunks: list[pd.DataFrame] = []
+        for symbol, intervals in symbol_intervals.items():
+            normalized_symbol = _normalize_symbol(symbol)
+            for start_time, end_time in intervals:
+                chunk = self.load_1m_ohlcv(
+                    symbols=(normalized_symbol,),
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                if not chunk.empty:
+                    chunks.append(chunk)
+        if not chunks:
+            return _empty_ohlcv()
+        merged = pd.concat(chunks, ignore_index=True)
+        merged = merged.drop_duplicates(subset=["symbol", "open_time"], keep="first")
+        merged = merged.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(
+            drop=True
+        )
+        return merged
+
     def build_1s_fetcher(self) -> MinuteOneSecondFetcher:
         return MinuteOneSecondFetcher(
             client=self._client,

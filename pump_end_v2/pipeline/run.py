@@ -45,7 +45,6 @@ from pump_end_v2.features import (
 )
 from pump_end_v2.gate import (
     apply_gate_block_threshold,
-    attach_counterfactual_execution_outcomes,
     build_gate_decile_report,
     build_gate_execution_decision_summary,
     build_gate_test_scored_signals,
@@ -306,9 +305,10 @@ def run_pump_end_v2_pipeline(
 
     gate_val_started = time.perf_counter()
     stage_start("PIPELINE", "GATE_VAL")
-    val_symbols, val_start, val_end = _derive_1m_stage_window(
+    val_intervals = _derive_1m_stage_intervals(
         [train_oof_candidate_signals_df, val_candidate_signals_df], config.execution
     )
+    val_symbols, val_start, val_end = _summarize_1m_intervals(val_intervals)
     log_info(
         "PIPELINE",
         (
@@ -318,7 +318,7 @@ def run_pump_end_v2_pipeline(
         ),
     )
     val_1m_load_started = time.perf_counter()
-    raw_1m_val = market_loader.load_1m_ohlcv(val_symbols, val_start, val_end)
+    raw_1m_val = market_loader.load_1m_ohlcv_intervals(val_intervals)
     bars_1m_val = prepare_intraday_bars_frame(raw_1m_val, "1m")
     val_1m_load_elapsed = time.perf_counter() - val_1m_load_started
     log_info(
@@ -411,10 +411,11 @@ def run_pump_end_v2_pipeline(
 
     gate_test_started = time.perf_counter()
     stage_start("PIPELINE", "GATE_TEST")
-    test_symbols, test_start, test_end = _derive_1m_stage_window(
+    test_intervals = _derive_1m_stage_intervals(
         [train_oof_candidate_signals_df, val_candidate_signals_df, test_candidate_signals_df],
         config.execution,
     )
+    test_symbols, test_start, test_end = _summarize_1m_intervals(test_intervals)
     history_rows_for_context = len(train_oof_candidate_signals_df) + len(val_candidate_signals_df)
     log_info(
         "PIPELINE",
@@ -425,7 +426,7 @@ def run_pump_end_v2_pipeline(
         ),
     )
     test_1m_load_started = time.perf_counter()
-    raw_1m_test = market_loader.load_1m_ohlcv(test_symbols, test_start, test_end)
+    raw_1m_test = market_loader.load_1m_ohlcv_intervals(test_intervals)
     bars_1m_test = prepare_intraday_bars_frame(raw_1m_test, "1m")
     test_1m_load_elapsed = time.perf_counter() - test_1m_load_started
     log_info(
@@ -481,13 +482,22 @@ def run_pump_end_v2_pipeline(
     execution_replay_started = time.perf_counter()
     stage_start("PIPELINE", "EXECUTION_REPLAY")
     val_replay_started = time.perf_counter()
+    counterfactual_cols = [
+        "counterfactual_execution_status",
+        "counterfactual_trade_outcome",
+        "counterfactual_trade_pnl_pct",
+        "counterfactual_exit_time",
+    ]
+    val_replay_input_df = val_gate_decisions_df.drop(
+        columns=[c for c in counterfactual_cols if c in val_gate_decisions_df.columns]
+    )
     log_info(
         "PIPELINE",
-        f"split=val execution replay start decisions_total={len(val_gate_decisions_df)} symbols_total={val_gate_decisions_df['symbol'].nunique() if not val_gate_decisions_df.empty else 0}",
+        f"split=val execution replay start decisions_total={len(val_replay_input_df)} symbols_total={val_replay_input_df['symbol'].nunique() if not val_replay_input_df.empty else 0}",
     )
     val_execution_decisions_df, val_executed_signals_df = (
         replay_short_signals_with_symbol_lock(
-            val_gate_decisions_df,
+            val_replay_input_df,
             bars_15m,
             bars_1m_val,
             config.execution,
@@ -497,7 +507,7 @@ def run_pump_end_v2_pipeline(
     )
     val_replay_elapsed = time.perf_counter() - val_replay_started
     val_rate = (
-        len(val_gate_decisions_df) / val_replay_elapsed if val_replay_elapsed > 0 else 0.0
+        len(val_replay_input_df) / val_replay_elapsed if val_replay_elapsed > 0 else 0.0
     )
     log_info(
         "PIPELINE",
@@ -510,13 +520,16 @@ def run_pump_end_v2_pipeline(
         ),
     )
     test_replay_started = time.perf_counter()
+    test_replay_input_df = test_gate_decisions_df.drop(
+        columns=[c for c in counterfactual_cols if c in test_gate_decisions_df.columns]
+    )
     log_info(
         "PIPELINE",
-        f"split=test execution replay start decisions_total={len(test_gate_decisions_df)} symbols_total={test_gate_decisions_df['symbol'].nunique() if not test_gate_decisions_df.empty else 0}",
+        f"split=test execution replay start decisions_total={len(test_replay_input_df)} symbols_total={test_replay_input_df['symbol'].nunique() if not test_replay_input_df.empty else 0}",
     )
     test_execution_decisions_df, test_executed_signals_df = (
         replay_short_signals_with_symbol_lock(
-            test_gate_decisions_df,
+            test_replay_input_df,
             bars_15m,
             bars_1m_test,
             config.execution,
@@ -526,7 +539,7 @@ def run_pump_end_v2_pipeline(
     )
     test_replay_elapsed = time.perf_counter() - test_replay_started
     test_rate = (
-        len(test_gate_decisions_df) / test_replay_elapsed if test_replay_elapsed > 0 else 0.0
+        len(test_replay_input_df) / test_replay_elapsed if test_replay_elapsed > 0 else 0.0
     )
     log_info(
         "PIPELINE",
@@ -538,34 +551,50 @@ def run_pump_end_v2_pipeline(
             f"elapsed_sec={test_replay_elapsed:.3f} decisions_per_sec={test_rate:.3f}"
         ),
     )
-    val_counterfactual_df = attach_counterfactual_execution_outcomes(
-        val_execution_decisions_df,
-        bars_15m,
-        bars_1m_val,
-        config.execution,
-        bars_1s_fetcher,
-        split_label="val",
-    )
-    test_counterfactual_df = attach_counterfactual_execution_outcomes(
-        test_execution_decisions_df,
-        bars_15m,
-        bars_1m_test,
-        config.execution,
-        bars_1s_fetcher,
-        split_label="test",
-    )
-    val_execution_decisions_enriched_df = val_execution_decisions_df.merge(
-        val_counterfactual_df,
-        on="signal_id",
-        how="left",
-        validate="one_to_one",
-    )
-    test_execution_decisions_enriched_df = test_execution_decisions_df.merge(
-        test_counterfactual_df,
-        on="signal_id",
-        how="left",
-        validate="one_to_one",
-    )
+    val_counterfactual_df = val_gate_decisions_df.loc[
+        :,
+        [
+            "signal_id",
+            "counterfactual_execution_status",
+            "counterfactual_trade_outcome",
+            "counterfactual_trade_pnl_pct",
+            "counterfactual_exit_time",
+        ],
+    ].copy()
+    test_counterfactual_df = test_gate_decisions_df.loc[
+        :,
+        [
+            "signal_id",
+            "counterfactual_execution_status",
+            "counterfactual_trade_outcome",
+            "counterfactual_trade_pnl_pct",
+            "counterfactual_exit_time",
+        ],
+    ].copy()
+    if {
+        "counterfactual_trade_outcome",
+        "counterfactual_trade_pnl_pct",
+    }.issubset(val_execution_decisions_df.columns):
+        val_execution_decisions_enriched_df = val_execution_decisions_df.copy()
+    else:
+        val_execution_decisions_enriched_df = val_execution_decisions_df.merge(
+            val_counterfactual_df,
+            on="signal_id",
+            how="left",
+            validate="one_to_one",
+        )
+    if {
+        "counterfactual_trade_outcome",
+        "counterfactual_trade_pnl_pct",
+    }.issubset(test_execution_decisions_df.columns):
+        test_execution_decisions_enriched_df = test_execution_decisions_df.copy()
+    else:
+        test_execution_decisions_enriched_df = test_execution_decisions_df.merge(
+            test_counterfactual_df,
+            on="signal_id",
+            how="left",
+            validate="one_to_one",
+        )
     val_decision_summary = build_gate_execution_decision_summary(
         val_execution_decisions_enriched_df
     )
@@ -876,12 +905,11 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
     }
 
 
-def _derive_1m_stage_window(
+def _derive_1m_stage_intervals(
     candidate_frames: list, execution_contract
-) -> tuple[tuple[str, ...], pd.Timestamp, pd.Timestamp]:
-    symbols: set[str] = set()
-    min_entry: pd.Timestamp | None = None
-    max_entry: pd.Timestamp | None = None
+) -> dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]]:
+    by_symbol: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+    horizon = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15 + 15)
     for frame in candidate_frames:
         if frame is None or frame.empty:
             continue
@@ -895,16 +923,44 @@ def _derive_1m_stage_window(
         local = local.dropna(subset=["entry_bar_open_time"])
         if local.empty:
             continue
-        local_symbols = (
-            local["symbol"].astype(str).str.strip().str.upper().replace("", pd.NA).dropna()
+        local["symbol"] = (
+            local["symbol"].astype(str).str.strip().str.upper().replace("", pd.NA)
         )
-        symbols.update(local_symbols.tolist())
-        local_min = pd.Timestamp(local["entry_bar_open_time"].min())
-        local_max = pd.Timestamp(local["entry_bar_open_time"].max())
-        min_entry = local_min if min_entry is None else min(min_entry, local_min)
-        max_entry = local_max if max_entry is None else max(max_entry, local_max)
-    if min_entry is None or max_entry is None or not symbols:
+        local = local.dropna(subset=["symbol"]).reset_index(drop=True)
+        for row in local.itertuples(index=False):
+            symbol = str(row.symbol)
+            start = pd.Timestamp(row.entry_bar_open_time)
+            end = start + horizon
+            by_symbol.setdefault(symbol, []).append((start, end))
+    merged: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+    for symbol, intervals in by_symbol.items():
+        if not intervals:
+            continue
+        ordered = sorted(intervals, key=lambda item: item[0])
+        merged_symbol: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        cur_start, cur_end = ordered[0]
+        for start, end in ordered[1:]:
+            if start <= cur_end:
+                cur_end = max(cur_end, end)
+                continue
+            merged_symbol.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+        merged_symbol.append((cur_start, cur_end))
+        merged[symbol] = merged_symbol
+    return dict(sorted(merged.items()))
+
+
+def _summarize_1m_intervals(
+    symbol_intervals: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]],
+) -> tuple[tuple[str, ...], pd.Timestamp, pd.Timestamp]:
+    if not symbol_intervals:
         now_utc = pd.Timestamp.utcnow()
         return tuple(), now_utc, now_utc + pd.Timedelta(minutes=1)
-    horizon = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15 + 15)
-    return tuple(sorted(symbols)), min_entry, max_entry + horizon
+    symbols = tuple(sorted(symbol_intervals.keys()))
+    starts: list[pd.Timestamp] = []
+    ends: list[pd.Timestamp] = []
+    for intervals in symbol_intervals.values():
+        for start, end in intervals:
+            starts.append(pd.Timestamp(start))
+            ends.append(pd.Timestamp(end))
+    return symbols, min(starts), max(ends)
