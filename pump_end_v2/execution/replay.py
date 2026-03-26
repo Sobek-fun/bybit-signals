@@ -104,7 +104,7 @@ def replay_short_signals_with_symbol_lock(
     for idx, row in kept_ordered.iterrows():
         symbol = str(row["symbol"])
         entry_time = pd.Timestamp(row["entry_bar_open_time"])
-        if symbol in lock_until_by_symbol and entry_time < lock_until_by_symbol[symbol]:
+        if symbol in lock_until_by_symbol and entry_time <= lock_until_by_symbol[symbol]:
             decisions.at[idx, "execution_status"] = "blocked_symbol_lock"
             continue
         symbol_1m = bars_1m_by_symbol.get(symbol)
