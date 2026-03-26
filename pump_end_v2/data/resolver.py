@@ -1,13 +1,10 @@
-from __future__ import annotations
-
 import math
 import time
 
 import pandas as pd
 
 from pump_end_v2.config import ResolverConfig
-from pump_end_v2.contracts import (OutcomeClass, SignalQualityClass,
-                                   TargetReason)
+from pump_end_v2.contracts import OutcomeClass, SignalQualityClass, TargetReason
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 

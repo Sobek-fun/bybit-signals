@@ -1,20 +1,29 @@
-from __future__ import annotations
-
 from itertools import product
 
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from pump_end_v2.config import (DetectorCVConfig, DetectorModelConfig,
-                                DetectorPolicyConfig, EventOpenerConfig,
-                                ResolverConfig, SplitBounds)
-from pump_end_v2.detector.model import (build_detector_model,
-                                        fit_detector_model,
-                                        predict_detector_scores)
-from pump_end_v2.detector.policy import (apply_episode_aware_detector_policy,
-                                         build_detector_policy_metrics)
-from pump_end_v2.detector.splits import (filter_fold_rows,
-                                         generate_detector_walkforward_folds)
+from pump_end_v2.config import (
+    DetectorCVConfig,
+    DetectorModelConfig,
+    DetectorPolicyConfig,
+    EventOpenerConfig,
+    ResolverConfig,
+    SplitBounds,
+)
+from pump_end_v2.detector.model import (
+    build_detector_model,
+    fit_detector_model,
+    predict_detector_scores,
+)
+from pump_end_v2.detector.policy import (
+    apply_episode_aware_detector_policy,
+    build_detector_policy_metrics,
+)
+from pump_end_v2.detector.splits import (
+    filter_fold_rows,
+    generate_detector_walkforward_folds,
+)
 from pump_end_v2.features.manifest import DETECTOR_FEATURE_COLUMNS
 from pump_end_v2.logging import log_info
 

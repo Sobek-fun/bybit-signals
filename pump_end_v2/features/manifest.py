@@ -1,7 +1,4 @@
-from __future__ import annotations
-
-from pump_end_v2.gate.feature_view import (GATE_FEATURE_COLUMNS,
-                                           GATE_IDENTITY_COLUMNS)
+from pump_end_v2.gate.feature_view import GATE_FEATURE_COLUMNS, GATE_IDENTITY_COLUMNS
 
 DETECTOR_IDENTITY_COLUMNS: tuple[str, ...] = (
     "decision_row_id",

@@ -1,13 +1,13 @@
-from __future__ import annotations
-
 import time
 
 import pandas as pd
 
 from pump_end_v2.contracts import DecisionRowRef, ExecutionContract
 from pump_end_v2.logging import log_info, stage_done, stage_start
-from pump_end_v2.time_utils import (context_to_decision_time,
-                                    decision_to_entry_bar_open_time)
+from pump_end_v2.time_utils import (
+    context_to_decision_time,
+    decision_to_entry_bar_open_time,
+)
 
 DECISION_ROW_COLUMNS: tuple[str, ...] = (
     "decision_row_id",

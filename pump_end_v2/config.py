@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import copy
 import tomllib
 from dataclasses import dataclass

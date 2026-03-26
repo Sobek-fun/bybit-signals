@@ -1,48 +1,60 @@
-from __future__ import annotations
-
 import time
 from pathlib import Path
 from typing import Any
 
 from pump_end_v2.artifacts import ArtifactManager
 from pump_end_v2.config import load_and_validate_config
-from pump_end_v2.data import (build_decision_rows, build_episode_summary,
-                              build_event_quality_report,
-                              open_causal_pump_episodes,
-                              prepare_ohlcv_15m_frame, resolve_decision_rows)
-from pump_end_v2.detector import (apply_episode_aware_detector_policy,
-                                  assign_detector_dataset_splits,
-                                  build_detector_dataset,
-                                  build_detector_policy_metrics,
-                                  build_detector_target_metrics,
-                                  build_detector_test_policy_rows,
-                                  build_detector_train_oof_policy_rows,
-                                  build_detector_val_policy_rows,
-                                  select_detector_policy)
-from pump_end_v2.execution import (build_execution_metrics,
-                                   build_execution_monthly_report,
-                                   build_execution_symbol_report,
-                                   build_execution_window_report,
-                                   prepare_intraday_bars_frame,
-                                   replay_short_signals_with_symbol_lock)
-from pump_end_v2.features import (build_breadth_state_layer,
-                                  build_detector_feature_manifest,
-                                  build_detector_feature_view,
-                                  build_episode_state_layer,
-                                  build_gate_feature_manifest,
-                                  build_reference_state_layer,
-                                  build_token_state_layer)
-from pump_end_v2.gate import (apply_gate_block_threshold,
-                              attach_counterfactual_execution_outcomes,
-                              build_gate_decile_report,
-                              build_gate_execution_decision_summary,
-                              build_gate_test_scored_signals,
-                              build_gate_val_scored_signals_and_datasets,
-                              select_gate_block_threshold_execution_aware)
+from pump_end_v2.data import (
+    build_decision_rows,
+    build_episode_summary,
+    build_event_quality_report,
+    open_causal_pump_episodes,
+    prepare_ohlcv_15m_frame,
+    resolve_decision_rows,
+)
+from pump_end_v2.detector import (
+    apply_episode_aware_detector_policy,
+    assign_detector_dataset_splits,
+    build_detector_dataset,
+    build_detector_policy_metrics,
+    build_detector_target_metrics,
+    build_detector_test_policy_rows,
+    build_detector_train_oof_policy_rows,
+    build_detector_val_policy_rows,
+    select_detector_policy,
+)
+from pump_end_v2.execution import (
+    build_execution_metrics,
+    build_execution_monthly_report,
+    build_execution_symbol_report,
+    build_execution_window_report,
+    prepare_intraday_bars_frame,
+    replay_short_signals_with_symbol_lock,
+)
+from pump_end_v2.features import (
+    build_breadth_state_layer,
+    build_detector_feature_manifest,
+    build_detector_feature_view,
+    build_episode_state_layer,
+    build_gate_feature_manifest,
+    build_reference_state_layer,
+    build_token_state_layer,
+)
+from pump_end_v2.gate import (
+    apply_gate_block_threshold,
+    attach_counterfactual_execution_outcomes,
+    build_gate_decile_report,
+    build_gate_execution_decision_summary,
+    build_gate_test_scored_signals,
+    build_gate_val_scored_signals_and_datasets,
+    select_gate_block_threshold_execution_aware,
+)
 from pump_end_v2.logging import log_info, stage_done, stage_start
-from pump_end_v2.pipeline.io import (load_market_inputs,
-                                     save_dataframe_artifact,
-                                     save_json_artifact)
+from pump_end_v2.pipeline.io import (
+    load_market_inputs,
+    save_dataframe_artifact,
+    save_json_artifact,
+)
 from pump_end_v2.run_context import create_run_context
 
 

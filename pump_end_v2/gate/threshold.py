@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 import pandas as pd
 
 from pump_end_v2.contracts import ExecutionContract
-from pump_end_v2.execution.metrics import (build_execution_metrics,
-                                           build_execution_window_report)
+from pump_end_v2.execution.metrics import (
+    build_execution_metrics,
+    build_execution_window_report,
+)
 from pump_end_v2.execution.replay import replay_short_signals_with_symbol_lock
 from pump_end_v2.logging import log_info
 

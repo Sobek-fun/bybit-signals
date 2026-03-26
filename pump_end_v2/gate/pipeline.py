@@ -1,19 +1,19 @@
-from __future__ import annotations
-
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostError
 
 from pump_end_v2.config import GateModelConfig
 from pump_end_v2.contracts import ExecutionContract
-from pump_end_v2.gate.dataset import (GATE_TARGET_META_COLUMNS,
-                                      build_gate_dataset)
-from pump_end_v2.gate.feature_view import (GATE_FEATURE_COLUMNS,
-                                           GATE_IDENTITY_COLUMNS,
-                                           build_gate_feature_view)
-from pump_end_v2.gate.model import (build_gate_model, fit_gate_model,
-                                    predict_gate_scores)
+from pump_end_v2.gate.dataset import GATE_TARGET_META_COLUMNS, build_gate_dataset
+from pump_end_v2.gate.feature_view import (
+    GATE_FEATURE_COLUMNS,
+    GATE_IDENTITY_COLUMNS,
+    build_gate_feature_view,
+)
+from pump_end_v2.gate.model import build_gate_model, fit_gate_model, predict_gate_scores
 from pump_end_v2.gate.threshold import (
-    attach_counterfactual_execution_outcomes, sweep_gate_block_threshold)
+    attach_counterfactual_execution_outcomes,
+    sweep_gate_block_threshold,
+)
 from pump_end_v2.logging import log_info
 
 _SCORED_OUTPUT_COLUMNS: tuple[str, ...] = (

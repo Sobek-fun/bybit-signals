@@ -1,9 +1,6 @@
-from __future__ import annotations
-
 import pandas as pd
 
-from pump_end_v2.gate.feature_view import (GATE_FEATURE_COLUMNS,
-                                           GATE_IDENTITY_COLUMNS)
+from pump_end_v2.gate.feature_view import GATE_FEATURE_COLUMNS, GATE_IDENTITY_COLUMNS
 from pump_end_v2.logging import log_info
 
 GATE_TARGET_META_COLUMNS: tuple[str, ...] = (

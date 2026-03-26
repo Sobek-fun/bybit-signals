@@ -1,11 +1,12 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from pump_end_v2.time_utils import (decision_to_entry_bar_open_time,
-                                    is_15m_grid, validate_causality)
+from pump_end_v2.time_utils import (
+    decision_to_entry_bar_open_time,
+    is_15m_grid,
+    validate_causality,
+)
 
 
 class OutcomeClass(StrEnum):
