@@ -2,9 +2,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from pump_end_v2.artifacts import ArtifactManager
 from pump_end_v2.config import load_and_validate_config
 from pump_end_v2.data import (
+    ClickHouseMarketDataLoader,
     build_decision_rows,
     build_episode_summary,
     build_event_quality_report,
@@ -51,14 +54,15 @@ from pump_end_v2.gate import (
 )
 from pump_end_v2.logging import log_info, stage_done, stage_start
 from pump_end_v2.pipeline.io import (
-    load_market_inputs,
     save_dataframe_artifact,
     save_json_artifact,
 )
 from pump_end_v2.run_context import create_run_context
 
 
-def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
+def run_pump_end_v2_pipeline(
+    config_path: str | Path, clickhouse_dsn: str
+) -> dict[str, object]:
     started = time.perf_counter()
     stage_start("PIPELINE", "FULL_RUN")
     config = load_and_validate_config(config_path)
@@ -80,12 +84,12 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     )
     _log_saved(config_snapshot_path)
     _log_saved(run_manifest_path)
+    market_loader = ClickHouseMarketDataLoader(clickhouse_dsn, config)
+    bars_1s_fetcher = market_loader.build_1s_fetcher()
 
     stage_start("PIPELINE", "INPUT_LOADING")
-    raw_15m, raw_1m, raw_1s = load_market_inputs(config)
+    raw_15m = market_loader.load_15m_ohlcv()
     bars_15m = prepare_ohlcv_15m_frame(raw_15m)
-    bars_1m = prepare_intraday_bars_frame(raw_1m, "1m")
-    bars_1s = prepare_intraday_bars_frame(raw_1s, "1s") if raw_1s is not None else None
     stage_done("PIPELINE", "INPUT_LOADING")
 
     stage_start("PIPELINE", "PREPARED_LAYERS")
@@ -194,6 +198,11 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     stage_done("PIPELINE", "DETECTOR_TEST")
 
     stage_start("PIPELINE", "GATE_VAL")
+    val_symbols, val_start, val_end = _derive_1m_stage_window(
+        [train_oof_candidate_signals_df, val_candidate_signals_df], config.execution
+    )
+    raw_1m_val = market_loader.load_1m_ohlcv(val_symbols, val_start, val_end)
+    bars_1m_val = prepare_intraday_bars_frame(raw_1m_val, "1m")
     (
         _,
         val_scored_signals_df,
@@ -209,9 +218,10 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         breadth_state,
         config.gate_model,
         config.gate_config.block_threshold,
-        bars_1m,
+        bars_15m,
+        bars_1m_val,
         config.execution,
-        bars_1s,
+        bars_1s_fetcher,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
@@ -220,9 +230,10 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
             select_gate_block_threshold_execution_aware(
                 scored_signals_df=val_scored_signals_df,
                 base_block_threshold=config.gate_config.block_threshold,
-                bars_1m_df=bars_1m,
+                bars_15m_df=bars_15m,
+                bars_1m_df=bars_1m_val,
                 execution_contract=config.execution,
-                bars_1s_df=bars_1s,
+                bars_1s_fetcher=bars_1s_fetcher,
                 window_start=config.splits.train_end,
                 window_end=config.splits.val_end,
             )
@@ -236,6 +247,12 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     stage_done("PIPELINE", "GATE_VAL")
 
     stage_start("PIPELINE", "GATE_TEST")
+    test_symbols, test_start, test_end = _derive_1m_stage_window(
+        [train_oof_candidate_signals_df, val_candidate_signals_df, test_candidate_signals_df],
+        config.execution,
+    )
+    raw_1m_test = market_loader.load_1m_ohlcv(test_symbols, test_start, test_end)
+    bars_1m_test = prepare_intraday_bars_frame(raw_1m_test, "1m")
     gate_model_test, test_scored_signals_df, gate_dataset_test_df, gate_status_test = (
         build_gate_test_scored_signals(
             train_oof_candidate_signals_df,
@@ -245,9 +262,10 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
             reference_state,
             breadth_state,
             config.gate_model,
-            bars_1m,
+            bars_15m,
+            bars_1m_test,
             config.execution,
-            bars_1s,
+            bars_1s_fetcher,
             force_disabled_no_data=(gate_status_val != "enabled"),
         )
     )
@@ -260,30 +278,34 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     val_execution_decisions_df, val_executed_signals_df = (
         replay_short_signals_with_symbol_lock(
             val_gate_decisions_df,
-            bars_1m,
+            bars_15m,
+            bars_1m_val,
             config.execution,
-            bars_1s,
+            bars_1s_fetcher,
         )
     )
     test_execution_decisions_df, test_executed_signals_df = (
         replay_short_signals_with_symbol_lock(
             test_gate_decisions_df,
-            bars_1m,
+            bars_15m,
+            bars_1m_test,
             config.execution,
-            bars_1s,
+            bars_1s_fetcher,
         )
     )
     val_counterfactual_df = attach_counterfactual_execution_outcomes(
         val_execution_decisions_df,
-        bars_1m,
+        bars_15m,
+        bars_1m_val,
         config.execution,
-        bars_1s,
+        bars_1s_fetcher,
     )
     test_counterfactual_df = attach_counterfactual_execution_outcomes(
         test_execution_decisions_df,
-        bars_1m,
+        bars_15m,
+        bars_1m_test,
         config.execution,
-        bars_1s,
+        bars_1s_fetcher,
     )
     val_execution_decisions_enriched_df = val_execution_decisions_df.merge(
         val_counterfactual_df,
@@ -518,3 +540,37 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
 
 def _log_saved(path: Path) -> None:
     log_info("ARTIFACTS", f"saved path={path}")
+
+
+def _derive_1m_stage_window(
+    candidate_frames: list, execution_contract
+) -> tuple[tuple[str, ...], pd.Timestamp, pd.Timestamp]:
+    symbols: set[str] = set()
+    min_entry: pd.Timestamp | None = None
+    max_entry: pd.Timestamp | None = None
+    for frame in candidate_frames:
+        if frame is None or frame.empty:
+            continue
+        required = {"symbol", "entry_bar_open_time"}
+        if not required.issubset(frame.columns):
+            continue
+        local = frame.loc[:, ["symbol", "entry_bar_open_time"]].copy()
+        local["entry_bar_open_time"] = pd.to_datetime(
+            local["entry_bar_open_time"], utc=True, errors="coerce"
+        )
+        local = local.dropna(subset=["entry_bar_open_time"])
+        if local.empty:
+            continue
+        local_symbols = (
+            local["symbol"].astype(str).str.strip().str.upper().replace("", pd.NA).dropna()
+        )
+        symbols.update(local_symbols.tolist())
+        local_min = pd.Timestamp(local["entry_bar_open_time"].min())
+        local_max = pd.Timestamp(local["entry_bar_open_time"].max())
+        min_entry = local_min if min_entry is None else min(min_entry, local_min)
+        max_entry = local_max if max_entry is None else max(max_entry, local_max)
+    if min_entry is None or max_entry is None or not symbols:
+        now_utc = pd.Timestamp.utcnow()
+        return tuple(), now_utc, now_utc + pd.Timedelta(minutes=1)
+    horizon = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15 + 15)
+    return tuple(sorted(symbols)), min_entry, max_entry + horizon
