@@ -1,0 +1,219 @@
+# Тест: лучший strict-opener сценарий с расширенным поиском detector policy и честным gate-off кандидатом.
+
+[data]
+
+[data.window]
+start = "2025-01-01"
+end = "2026-03-15"
+
+[data.universe]
+symbols = [
+    "0GUSDT",
+    "10000QUBICUSDT",
+    "1000CATUSDT",
+    "1000LUNCUSDT",
+    "2ZUSDT",
+    "ACTUSDT",
+    "AERGOUSDT",
+    "AIXBTUSDT",
+    "AKEUSDT",
+    "ALCHUSDT",
+    "ALEOUSDT",
+    "ALICEUSDT",
+    "ALLOUSDT",
+    "ALPINEUSDT",
+    "ANIMEUSDT",
+    "APRUSDT",
+    "ATUSDT",
+    "ATHUSDT",
+    "AVAAIUSDT",
+    "AXLUSDT",
+    "BANANAUSDT",
+    "BANDUSDT",
+    "BICOUSDT",
+    "BLASTUSDT",
+    "BLUAIUSDT",
+    "BROCCOLIUSDT",
+    "BSUUSDT",
+    "BTRUSDT",
+    "CAMPUSDT",
+    "CCUSDT",
+    "CHILLGUYUSDT",
+    "COOKIEUSDT",
+    "CTCUSDT",
+    "CUDISUSDT",
+    "DUSKUSDT",
+    "DYMUSDT",
+    "EDENUSDT",
+    "ENSOUSDT",
+    "FUSDT",
+    "FIDAUSDT",
+    "FLOCKUSDT",
+    "FLOWUSDT",
+    "FLUIDUSDT",
+    "FWOGUSDT",
+    "GIGAUSDT",
+    "GIGGLEUSDT",
+    "GMTUSDT",
+    "GPSUSDT",
+    "GRASSUSDT",
+    "HANAUSDT",
+    "HEIUSDT",
+    "HFTUSDT",
+    "HIPPOUSDT",
+    "HMSTRUSDT",
+    "HOLOUSDT",
+    "HOOKUSDT",
+    "IDEXUSDT",
+    "INITUSDT",
+    "IRYSUSDT",
+    "JCTUSDT",
+    "JELLYJELLYUSDT",
+    "KSMUSDT",
+    "L3USDT",
+    "LSKUSDT",
+    "LYNUSDT",
+    "MAGICUSDT",
+    "MANTAUSDT",
+    "MAVIAUSDT",
+    "MELANIAUSDT",
+    "MERLUSDT",
+    "METUSDT",
+    "MIRAUSDT",
+    "MITOUSDT",
+    "MONUSDT",
+    "MOODENGUSDT",
+    "MOVEUSDT",
+    "MUBARAKUSDT",
+    "NILUSDT",
+    "NMRUSDT",
+    "NOTUSDT",
+    "NTRNUSDT",
+    "NXPCUSDT",
+    "OBTUSDT",
+    "OPENUSDT",
+    "ORDERUSDT",
+    "PARTIUSDT",
+    "PEAQUSDT",
+    "PIPPINUSDT",
+    "PNUTUSDT",
+    "PORTALUSDT",
+    "PUFFERUSDT",
+    "PUMPBTCUSDT",
+    "PYRUSDT",
+    "REDUSDT",
+    "REZUSDT",
+    "RLSUSDT",
+    "SAHARAUSDT",
+    "SHELLUSDT",
+    "SKLUSDT",
+    "SOLVUSDT",
+    "SOMIUSDT",
+    "SONICUSDT",
+    "SPELLUSDT",
+    "SPKUSDT",
+    "SQDUSDT",
+    "STABLEUSDT",
+    "STRKUSDT",
+    "SUPERUSDT",
+    "SWARMSUSDT",
+    "TACUSDT",
+    "TAIUSDT",
+    "TAIKOUSDT",
+    "TNSRUSDT",
+    "TURTLEUSDT",
+    "USTCUSDT",
+    "USUALUSDT",
+    "VANRYUSDT",
+    "VELOUSDT",
+    "WALUSDT",
+    "WAVESUSDT",
+    "WCTUSDT",
+    "XAIUSDT",
+    "XANUSDT",
+    "XCNUSDT",
+    "XIONUSDT",
+    "XNYUSDT",
+    "YALAUSDT",
+    "ZBCNUSDT",
+    "ZEREBROUSDT",
+    "ZKUSDT",
+    "ZKCUSDT",
+]
+
+[data.clickhouse]
+candles_table = "bybit.candles"
+transactions_table = "bybit.transactions"
+timezone = "UTC"
+
+[data.references]
+btc_symbol = "BTCUSDT"
+eth_symbol = "ETHUSDT"
+
+[data.event_opener]
+runup_lookback_bars = 12
+min_runup_pct = 0.10
+near_high_lookback_bars = 8
+near_high_tol_pct = 0.0075
+volume_ratio_lookback_bars = 20
+min_volume_ratio = 2.0
+max_episode_bars = 24
+expiry_drawdown_pct = 0.03
+cooldown_bars = 10
+
+[data.resolver]
+horizon_bars = 32
+success_pullback_pct = 0.03
+max_prepullback_squeeze_pct = 0.02
+flat_max_abs_move_pct = 0.01
+max_wait_bars_for_success = 12
+
+[splits]
+train_end = "2025-10-31"
+val_end = "2026-01-15"
+test_end = "2026-03-15"
+
+[detector]
+arm_score_min = 0.50
+fire_score_floor = 0.35
+turn_down_delta = 0.12
+
+[detector.model]
+iterations = 350
+depth = 6
+learning_rate = 0.05
+l2_leaf_reg = 3.0
+random_seed = 42
+
+[detector.cv]
+min_train_days = 120
+fold_span_days = 21
+max_folds = 4
+
+[gate]
+block_threshold = 0.80
+
+[gate.model]
+iterations = 250
+depth = 5
+learning_rate = 0.05
+l2_leaf_reg = 3.0
+random_seed = 42
+
+[search.detector_policy]
+arm_candidates = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
+fire_candidates = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55]
+turn_candidates = [0.015, 0.03, 0.06, 0.09, 0.12, 0.18, 0.24]
+
+[search.gate_threshold]
+threshold_candidates = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.975, 0.99]
+include_disabled_candidate = true
+
+[execution]
+tp_pct = 0.045
+sl_pct = 0.03
+max_hold_bars = 96
+entry_shift_bars = 0
+
+[compute]
+runs_root = "artifacts/pump_end_v2"
