@@ -243,6 +243,9 @@ def apply_episode_aware_detector_policy(
 def build_detector_policy_metrics(
     candidate_signals_df: pd.DataFrame,
     episode_policy_summary_df: pd.DataFrame,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
 ) -> dict[str, float]:
     _require_columns(episode_policy_summary_df, EPISODE_POLICY_SUMMARY_COLUMNS)
     episodes_total = int(len(episode_policy_summary_df))
@@ -260,7 +263,12 @@ def build_detector_policy_metrics(
         if len(candidate_signals_df) > 0
         else 0.0
     )
-    fires_per_30d = _compute_fires_per_30d(candidate_signals_df)
+    eval_window_days = _resolve_eval_window_days(
+        window_start=window_start,
+        window_end=window_end,
+        window_days=window_days,
+    )
+    fires_per_30d = _compute_fires_per_30d(len(candidate_signals_df), eval_window_days)
     median_bars_fire_to_ideal = (
         float(pd.to_numeric(candidate_signals_df.get("bars_fire_to_ideal"), errors="coerce").median())
         if len(candidate_signals_df) > 0
@@ -305,15 +313,30 @@ def _compute_bars_fire_to_ideal(
     return float((entry_bar_open_time - ideal_entry_bar_open_time) / pd.Timedelta(minutes=15))
 
 
-def _compute_fires_per_30d(candidate_signals_df: pd.DataFrame) -> float:
-    if "context_bar_open_time" not in candidate_signals_df.columns or len(candidate_signals_df) == 0:
+def _compute_fires_per_30d(fires_count: int, eval_window_days: float) -> float:
+    if fires_count <= 0:
         return 0.0
-    context_times = pd.to_datetime(candidate_signals_df["context_bar_open_time"], utc=True, errors="coerce").dropna()
-    if context_times.empty:
-        return 0.0
-    days_span = (context_times.max() - context_times.min()) / pd.Timedelta(days=1)
-    safe_days_span = max(float(days_span), 1.0)
-    return float(len(context_times) * 30.0 / safe_days_span)
+    safe_window_days = max(float(eval_window_days), 1e-9)
+    return float(float(fires_count) * 30.0 / safe_window_days)
+
+
+def _resolve_eval_window_days(
+    window_start: pd.Timestamp | None,
+    window_end: pd.Timestamp | None,
+    window_days: float | None,
+) -> float:
+    if window_days is not None:
+        resolved = float(window_days)
+        if resolved <= 0.0:
+            raise ValueError("window_days must be positive")
+        return resolved
+    if window_start is None or window_end is None:
+        return 1.0
+    start = pd.Timestamp(window_start)
+    end = pd.Timestamp(window_end)
+    if end <= start:
+        raise ValueError("window_end must be greater than window_start")
+    return float((end - start) / pd.Timedelta(days=1))
 
 
 def _safe_ratio(numerator: int, denominator: int) -> float:

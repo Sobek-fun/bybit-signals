@@ -21,7 +21,7 @@ from pump_end_v2.detector import (
     build_detector_policy_metrics,
     build_detector_target_metrics,
     build_detector_test_policy_rows,
-    build_detector_train_oof_candidate_signal_ledger,
+    build_detector_train_oof_policy_rows,
     build_detector_val_policy_rows,
     select_detector_policy,
 )
@@ -43,6 +43,7 @@ from pump_end_v2.features import (
     build_token_state_layer,
 )
 from pump_end_v2.gate import (
+    attach_counterfactual_execution_outcomes,
     apply_gate_block_threshold,
     build_gate_decile_report,
     build_gate_execution_decision_summary,
@@ -119,18 +120,13 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     stage_done("PIPELINE", "DETECTOR_DATASET")
 
     stage_start("PIPELINE", "DETECTOR_TRAIN_OOF")
-    (
-        train_oof_candidate_signals_df,
-        train_oof_episode_policy_summary_df,
-        detector_train_oof_policy_metrics,
-    ) = build_detector_train_oof_candidate_signal_ledger(
+    train_oof_policy_rows = build_detector_train_oof_policy_rows(
         dataset_df=detector_dataset,
         split_bounds=config.splits,
         resolver_config=config.resolver,
         event_opener_config=config.event_opener,
         detector_cv_config=config.detector_cv,
         detector_model_config=config.detector_model,
-        detector_policy_config=config.detector_policy,
     )
     stage_done("PIPELINE", "DETECTOR_TRAIN_OOF")
 
@@ -143,7 +139,17 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         detector_model_config=config.detector_model,
     )
     selected_detector_policy, detector_policy_sweep_df = select_detector_policy(
-        val_policy_rows, config.detector_policy
+        val_policy_rows,
+        config.detector_policy,
+        window_start=config.splits.train_end,
+        window_end=config.splits.val_end,
+    )
+    train_oof_candidate_signals_df, train_oof_episode_policy_summary_df = apply_episode_aware_detector_policy(
+        train_oof_policy_rows, selected_detector_policy
+    )
+    detector_train_oof_policy_metrics = build_detector_policy_metrics(
+        train_oof_candidate_signals_df,
+        train_oof_episode_policy_summary_df,
     )
     val_candidate_signals_df, val_episode_policy_summary_df = apply_episode_aware_detector_policy(
         val_policy_rows, selected_detector_policy
@@ -151,6 +157,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     detector_val_policy_metrics = build_detector_policy_metrics(
         val_candidate_signals_df,
         val_episode_policy_summary_df,
+        window_start=config.splits.train_end,
+        window_end=config.splits.val_end,
     )
     detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
     stage_done("PIPELINE", "DETECTOR_VAL_POLICY")
@@ -169,6 +177,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     detector_test_policy_metrics = build_detector_policy_metrics(
         test_candidate_signals_df,
         test_episode_policy_summary_df,
+        window_start=config.splits.val_end,
+        window_end=config.splits.test_end,
     )
     detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
     stage_done("PIPELINE", "DETECTOR_TEST")
@@ -180,6 +190,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         gate_threshold_sweep_diagnostic_df,
         gate_dataset_train_oof_df,
         gate_dataset_val_df,
+        gate_status_val,
     ) = build_gate_val_scored_signals_and_datasets(
         train_oof_candidate_signals_df,
         val_candidate_signals_df,
@@ -188,25 +199,41 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         breadth_state,
         config.gate_model,
         config.gate_config.block_threshold,
+        bars_1m,
+        config.execution,
+        bars_1s,
+        window_start=config.splits.train_end,
+        window_end=config.splits.val_end,
     )
-    selected_gate_threshold, gate_threshold_sweep_execution_df = select_gate_block_threshold_execution_aware(
-        scored_signals_df=val_scored_signals_df,
-        base_block_threshold=config.gate_config.block_threshold,
-        bars_1m_df=bars_1m,
-        execution_contract=config.execution,
-        bars_1s_df=bars_1s,
-    )
+    if gate_status_val == "enabled":
+        selected_gate_threshold, gate_threshold_sweep_execution_df = select_gate_block_threshold_execution_aware(
+            scored_signals_df=val_scored_signals_df,
+            base_block_threshold=config.gate_config.block_threshold,
+            bars_1m_df=bars_1m,
+            execution_contract=config.execution,
+            bars_1s_df=bars_1s,
+            window_start=config.splits.train_end,
+            window_end=config.splits.val_end,
+        )
+    else:
+        selected_gate_threshold = float(config.gate_config.block_threshold)
+        gate_threshold_sweep_execution_df = gate_threshold_sweep_diagnostic_df.copy()
     val_gate_decisions_df, _ = apply_gate_block_threshold(val_scored_signals_df, selected_gate_threshold)
     stage_done("PIPELINE", "GATE_VAL")
 
     stage_start("PIPELINE", "GATE_TEST")
-    gate_model_test, test_scored_signals_df, gate_dataset_test_df = build_gate_test_scored_signals(
+    gate_model_test, test_scored_signals_df, gate_dataset_test_df, gate_status_test = build_gate_test_scored_signals(
         train_oof_candidate_signals_df,
         test_candidate_signals_df,
+        val_candidate_signals_df,
         token_state_tradable,
         reference_state,
         breadth_state,
         config.gate_model,
+        bars_1m,
+        config.execution,
+        bars_1s,
+        force_disabled_no_data=(gate_status_val != "enabled"),
     )
     test_gate_decisions_df, _ = apply_gate_block_threshold(test_scored_signals_df, selected_gate_threshold)
     stage_done("PIPELINE", "GATE_TEST")
@@ -224,17 +251,49 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         config.execution,
         bars_1s,
     )
-    val_decision_summary = build_gate_execution_decision_summary(val_execution_decisions_df)
-    test_decision_summary = build_gate_execution_decision_summary(test_execution_decisions_df)
+    val_counterfactual_df = attach_counterfactual_execution_outcomes(
+        val_execution_decisions_df,
+        bars_1m,
+        config.execution,
+        bars_1s,
+    )
+    test_counterfactual_df = attach_counterfactual_execution_outcomes(
+        test_execution_decisions_df,
+        bars_1m,
+        config.execution,
+        bars_1s,
+    )
+    val_execution_decisions_enriched_df = val_execution_decisions_df.merge(
+        val_counterfactual_df,
+        on="signal_id",
+        how="left",
+        validate="one_to_one",
+    )
+    test_execution_decisions_enriched_df = test_execution_decisions_df.merge(
+        test_counterfactual_df,
+        on="signal_id",
+        how="left",
+        validate="one_to_one",
+    )
+    val_decision_summary = build_gate_execution_decision_summary(val_execution_decisions_enriched_df)
+    test_decision_summary = build_gate_execution_decision_summary(test_execution_decisions_enriched_df)
     stage_done("PIPELINE", "EXECUTION_REPLAY")
 
     stage_start("PIPELINE", "EXECUTION_REPORTS")
-    val_metrics = build_execution_metrics(val_executed_signals_df)
+    val_metrics = build_execution_metrics(
+        val_executed_signals_df,
+        window_start=config.splits.train_end,
+        window_end=config.splits.val_end,
+    )
     val_window_6h = build_execution_window_report(val_executed_signals_df, 6)
     val_window_24h = build_execution_window_report(val_executed_signals_df, 24)
     val_symbol_report = build_execution_symbol_report(val_executed_signals_df)
     val_monthly_report = build_execution_monthly_report(val_executed_signals_df)
-    test_metrics = build_execution_metrics(test_executed_signals_df)
+    test_metrics = build_execution_metrics(
+        test_executed_signals_df,
+        window_start=config.splits.val_end,
+        window_end=config.splits.test_end,
+    )
     test_window_6h = build_execution_window_report(test_executed_signals_df, 6)
     test_window_24h = build_execution_window_report(test_executed_signals_df, 24)
     test_symbol_report = build_execution_symbol_report(test_executed_signals_df)
@@ -264,6 +323,7 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_json_and_log(build_detector_feature_manifest(), detector_dir / "feature_manifest.json")
     _save_df_and_log(detector_policy_sweep_df, detector_dir / "policy_sweep_val.csv")
     _save_json_and_log(_policy_to_dict(selected_detector_policy), detector_dir / "selected_policy.json")
+    _save_df_and_log(train_oof_policy_rows, detector_dir / "train_oof_policy_rows.parquet")
     _save_df_and_log(train_oof_candidate_signals_df, detector_dir / "train_oof_candidate_signals.parquet")
     _save_df_and_log(
         train_oof_episode_policy_summary_df,
@@ -293,7 +353,8 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
     _save_df_and_log(gate_deciles_val, gate_dir / "gate_deciles.csv")
     _save_df_and_log(gate_deciles_test, gate_dir / "gate_deciles_test.csv")
     _save_df_and_log(test_scored_signals_df, gate_dir / "test_scored_signals.parquet")
-    _save_model_and_log(gate_model_test, gate_dir / "model_train_oof.cbm")
+    if gate_model_test is not None:
+        _save_model_and_log(gate_model_test, gate_dir / "model_train_oof.cbm")
 
     _save_df_and_log(val_gate_decisions_df, eval_val_dir / "candidate_signals.parquet")
     _save_df_and_log(val_execution_decisions_df, eval_val_dir / "execution_decisions.parquet")
@@ -321,6 +382,9 @@ def run_pump_end_v2_pipeline(config_path: str | Path) -> dict[str, object]:
         "config_path": str(Path(config_path).resolve()),
         "selected_detector_policy": _policy_to_dict(selected_detector_policy),
         "selected_gate_threshold": float(selected_gate_threshold),
+        "gate_status": "disabled_no_data" if (gate_status_val != "enabled" or gate_status_test != "enabled") else "enabled",
+        "gate_status_val": gate_status_val,
+        "gate_status_test": gate_status_test,
         "event_quality_report": event_quality_report,
         "detector_val_policy_metrics": detector_val_policy_metrics,
         "detector_train_oof_policy_metrics": detector_train_oof_policy_metrics,

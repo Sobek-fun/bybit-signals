@@ -12,7 +12,12 @@ _EXECUTED_REQUIRED_COLUMNS: tuple[str, ...] = (
 )
 
 
-def build_execution_metrics(executed_signals_df: pd.DataFrame) -> dict[str, float]:
+def build_execution_metrics(
+    executed_signals_df: pd.DataFrame,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
+) -> dict[str, float]:
     _require_columns(executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df")
     frame = _prepare_frame(executed_signals_df)
     signals = int(len(frame))
@@ -32,7 +37,8 @@ def build_execution_metrics(executed_signals_df: pd.DataFrame) -> dict[str, floa
     neg_sum_abs = float(abs(frame.loc[frame["trade_pnl_pct"] < 0, "trade_pnl_pct"].sum())) if signals > 0 else 0.0
     profit_factor = float(pos_sum / neg_sum_abs) if (pos_sum > 0.0 and neg_sum_abs > 0.0) else 0.0
     max_losing_streak = float(_compute_max_losing_streak(frame))
-    signals_per_30d = float(_compute_signals_per_30d(frame))
+    eval_window_days = _resolve_eval_window_days(window_start=window_start, window_end=window_end, window_days=window_days)
+    signals_per_30d = float(_compute_signals_per_30d(len(frame), eval_window_days))
     report_6h = build_execution_window_report(frame, 6)
     report_24h = build_execution_window_report(frame, 24)
     worst_6h_pnl = float(report_6h["pnl_sum"].min()) if not report_6h.empty else float("nan")
@@ -153,12 +159,30 @@ def _prepare_frame(df: pd.DataFrame) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
-def _compute_signals_per_30d(frame: pd.DataFrame) -> float:
-    if frame.empty:
+def _compute_signals_per_30d(signals_count: int, eval_window_days: float) -> float:
+    if signals_count <= 0:
         return 0.0
-    span_days = float((frame["entry_bar_open_time"].max() - frame["entry_bar_open_time"].min()) / pd.Timedelta(days=1))
-    safe_span_days = max(span_days, 1.0)
-    return float(len(frame) * 30.0 / safe_span_days)
+    safe_window_days = max(float(eval_window_days), 1e-9)
+    return float(float(signals_count) * 30.0 / safe_window_days)
+
+
+def _resolve_eval_window_days(
+    window_start: pd.Timestamp | None,
+    window_end: pd.Timestamp | None,
+    window_days: float | None,
+) -> float:
+    if window_days is not None:
+        resolved = float(window_days)
+        if resolved <= 0.0:
+            raise ValueError("window_days must be positive")
+        return resolved
+    if window_start is None or window_end is None:
+        return 1.0
+    start = pd.Timestamp(window_start)
+    end = pd.Timestamp(window_end)
+    if end <= start:
+        raise ValueError("window_end must be greater than window_start")
+    return float((end - start) / pd.Timedelta(days=1))
 
 
 def _compute_max_losing_streak(frame: pd.DataFrame) -> int:

@@ -336,11 +336,20 @@ def build_detector_policy_grid(
 def sweep_detector_policy(
     scored_rows_df: pd.DataFrame,
     base_policy_config: DetectorPolicyConfig,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for candidate in build_detector_policy_grid(base_policy_config):
         candidate_signals_df, episode_policy_summary_df = apply_episode_aware_detector_policy(scored_rows_df, candidate)
-        metrics = build_detector_policy_metrics(candidate_signals_df, episode_policy_summary_df)
+        metrics = build_detector_policy_metrics(
+            candidate_signals_df,
+            episode_policy_summary_df,
+            window_start=window_start,
+            window_end=window_end,
+            window_days=window_days,
+        )
         rows.append(
             {
                 "arm_score_min": candidate.arm_score_min,
@@ -369,11 +378,23 @@ def sweep_detector_policy(
 def select_detector_policy(
     scored_rows_df: pd.DataFrame,
     base_policy_config: DetectorPolicyConfig,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
 ) -> tuple[DetectorPolicyConfig, pd.DataFrame]:
-    sweep_df = sweep_detector_policy(scored_rows_df, base_policy_config)
+    sweep_df = sweep_detector_policy(
+        scored_rows_df,
+        base_policy_config,
+        window_start=window_start,
+        window_end=window_end,
+        window_days=window_days,
+    )
     if sweep_df.empty:
         raise ValueError("policy sweep returned no candidates")
     ranked = sweep_df.copy()
+    positive_fire_exists = bool((pd.to_numeric(ranked["episodes_fired"], errors="coerce").fillna(0.0) > 0.0).any())
+    if positive_fire_exists:
+        ranked = ranked[pd.to_numeric(ranked["episodes_fired"], errors="coerce").fillna(0.0) > 0.0].copy()
     ranked["_median_future_edge_sort"] = pd.to_numeric(
         ranked["median_future_net_edge_pct_at_fire"], errors="coerce"
     ).fillna(float("-inf"))
@@ -430,7 +451,12 @@ def build_detector_val_candidate_signal_ledger(
         scored_rows_df=scored_rows_df,
         detector_policy_config=detector_policy_config,
     )
-    metrics = build_detector_policy_metrics(candidate_signals_df, episode_policy_summary_df)
+    metrics = build_detector_policy_metrics(
+        candidate_signals_df,
+        episode_policy_summary_df,
+        window_start=pd.Timestamp(split_bounds.train_end),
+        window_end=pd.Timestamp(split_bounds.val_end),
+    )
     return model, candidate_signals_df, episode_policy_summary_df, metrics
 
 
@@ -453,7 +479,12 @@ def build_detector_test_candidate_signal_ledger(
         scored_rows_df=scored_rows_df,
         detector_policy_config=detector_policy_config,
     )
-    metrics = build_detector_policy_metrics(candidate_signals_df, episode_policy_summary_df)
+    metrics = build_detector_policy_metrics(
+        candidate_signals_df,
+        episode_policy_summary_df,
+        window_start=pd.Timestamp(split_bounds.val_end),
+        window_end=pd.Timestamp(split_bounds.test_end),
+    )
     log_info(
         "POLICY",
         (

@@ -23,17 +23,12 @@ _SWEEP_COLUMNS: tuple[str, ...] = (
 
 _APPLY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "signal_id",
-    "p_block",
+    "episode_id",
+    "symbol",
     "context_bar_open_time",
-    "target_block_signal",
-    "block_reason",
-    "signal_quality_h32",
-    "target_good_short_now",
-    "target_reason",
-    "future_outcome_class",
-    "future_prepullback_squeeze_pct",
-    "future_pullback_pct",
-    "future_net_edge_pct",
+    "decision_time",
+    "entry_bar_open_time",
+    "p_block",
 )
 
 _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
@@ -78,7 +73,12 @@ def apply_gate_block_threshold(
     return decision_df, kept_signals_df
 
 
-def build_gate_threshold_metrics(decision_df: pd.DataFrame) -> dict[str, float]:
+def build_gate_threshold_metrics(
+    decision_df: pd.DataFrame,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
+) -> dict[str, float]:
     _require_columns(decision_df, ("target_block_signal", "gate_decision", "context_bar_open_time"), "decision_df")
     eval_df = decision_df.copy()
     if "gate_trainable_signal" in eval_df.columns:
@@ -100,7 +100,8 @@ def build_gate_threshold_metrics(decision_df: pd.DataFrame) -> dict[str, float]:
     blocked_bad_precision = _safe_ratio(blocked_bad, total_blocked)
     good_block_tax = _safe_ratio(blocked_good, total_good)
     blocked_share = _safe_ratio(total_blocked, signals_before)
-    signals_per_30d_after = _compute_signals_per_30d_after(eval_df[kept_mask].copy())
+    eval_window_days = _resolve_eval_window_days(window_start=window_start, window_end=window_end, window_days=window_days)
+    signals_per_30d_after = _compute_signals_per_30d_after(total_kept, eval_window_days)
     density_penalty = _compute_density_penalty(signals_per_30d_after)
     selection_score = (
         bad_block_rate + good_keep_rate + blocked_bad_precision - good_block_tax - 0.25 * density_penalty
@@ -122,11 +123,19 @@ def build_gate_threshold_metrics(decision_df: pd.DataFrame) -> dict[str, float]:
 def sweep_gate_block_threshold(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for threshold in build_gate_threshold_grid(base_block_threshold):
         decision_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
-        metrics = build_gate_threshold_metrics(decision_df)
+        metrics = build_gate_threshold_metrics(
+            decision_df,
+            window_start=window_start,
+            window_end=window_end,
+            window_days=window_days,
+        )
         rows.append({"block_threshold": threshold, **metrics})
     out = pd.DataFrame(rows, columns=list(_SWEEP_COLUMNS))
     log_info("GATE", f"gate threshold sweep done candidates_total={len(out)}")
@@ -136,8 +145,17 @@ def sweep_gate_block_threshold(
 def select_gate_block_threshold(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
 ) -> tuple[float, pd.DataFrame]:
-    sweep_df = sweep_gate_block_threshold(scored_signals_df, base_block_threshold)
+    sweep_df = sweep_gate_block_threshold(
+        scored_signals_df,
+        base_block_threshold,
+        window_start=window_start,
+        window_end=window_end,
+        window_days=window_days,
+    )
     if sweep_df.empty:
         raise ValueError("gate threshold sweep returned no candidates")
     ranked = sweep_df.sort_values(
@@ -235,7 +253,16 @@ def select_gate_block_threshold_execution_aware(
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_df: pd.DataFrame | None = None,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
+    window_days: float | None = None,
 ) -> tuple[float, pd.DataFrame]:
+    counterfactual_outcomes_df = attach_counterfactual_execution_outcomes(
+        scored_signals_df,
+        bars_1m_df,
+        execution_contract,
+        bars_1s_df,
+    )
     rows: list[dict[str, float]] = []
     for threshold in build_gate_threshold_grid(base_block_threshold):
         gate_decisions_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
@@ -245,7 +272,18 @@ def select_gate_block_threshold_execution_aware(
             execution_contract,
             bars_1s_df,
         )
-        execution_metrics = build_execution_metrics(executed_signals_df)
+        execution_decisions_df = execution_decisions_df.merge(
+            counterfactual_outcomes_df,
+            on="signal_id",
+            how="left",
+            validate="one_to_one",
+        )
+        execution_metrics = build_execution_metrics(
+            executed_signals_df,
+            window_start=window_start,
+            window_end=window_end,
+            window_days=window_days,
+        )
         window_6h = build_execution_window_report(executed_signals_df, 6)
         window_24h = build_execution_window_report(executed_signals_df, 24)
         summary = build_gate_execution_decision_summary(execution_decisions_df)
@@ -320,9 +358,9 @@ def build_gate_execution_decision_summary(
         (
             "gate_decision",
             "execution_status",
-            "signal_quality_h32",
-            "future_net_edge_pct",
             "trade_pnl_pct",
+            "counterfactual_trade_outcome",
+            "counterfactual_trade_pnl_pct",
         ),
         "execution_decisions_df",
     )
@@ -334,18 +372,13 @@ def build_gate_execution_decision_summary(
     failed_execution_other_mask = gate_keep_mask & ~joined["execution_status"].astype(str).isin(
         {"executed", "blocked_symbol_lock"}
     )
-    quality = joined["signal_quality_h32"].astype(str)
-    tp_mask = quality == "clean_retrace_h32"
-    sl_mask = quality.isin(
-        {
-            "dirty_retrace_h32",
-            "clean_no_pullback_h32",
-            "dirty_no_pullback_h32",
-            "pullback_before_squeeze_h32",
-        }
-    )
-    tp_total = int(tp_mask.sum())
-    sl_total = int(sl_mask.sum())
+    counterfactual_outcome = joined["counterfactual_trade_outcome"].astype(str)
+    tp_mask = counterfactual_outcome == "tp"
+    sl_mask = counterfactual_outcome == "sl"
+    tp_total_all_candidates = int(tp_mask.sum())
+    sl_total_all_candidates = int(sl_mask.sum())
+    tp_total_kept = int((gate_keep_mask & tp_mask).sum())
+    sl_total_kept = int((gate_keep_mask & sl_mask).sum())
     tp_blocked_model = int((blocked_gate_mask & tp_mask).sum())
     sl_blocked_model = int((blocked_gate_mask & sl_mask).sum())
     tp_blocked_execution = int((blocked_symbol_lock_mask & tp_mask).sum())
@@ -361,11 +394,11 @@ def build_gate_execution_decision_summary(
         "sl_blocked_model": float(sl_blocked_model),
         "tp_blocked_execution": float(tp_blocked_execution),
         "sl_blocked_execution": float(sl_blocked_execution),
-        "tp_tax_model": float(_safe_ratio(tp_blocked_model, tp_total)),
-        "sl_capture_model": float(_safe_ratio(sl_blocked_model, sl_total)),
-        "tp_tax_execution": float(_safe_ratio(tp_blocked_execution, tp_total)),
-        "sl_capture_execution": float(_safe_ratio(sl_blocked_execution, sl_total)),
-        "pnl_before": float(pd.to_numeric(joined["future_net_edge_pct"], errors="coerce").fillna(0.0).sum() * 100.0),
+        "tp_tax_model": float(_safe_ratio(tp_blocked_model, tp_total_all_candidates)),
+        "sl_capture_model": float(_safe_ratio(sl_blocked_model, sl_total_all_candidates)),
+        "tp_tax_execution": float(_safe_ratio(tp_blocked_execution, tp_total_kept)),
+        "sl_capture_execution": float(_safe_ratio(sl_blocked_execution, sl_total_kept)),
+        "pnl_before": float(pd.to_numeric(joined["counterfactual_trade_pnl_pct"], errors="coerce").fillna(0.0).sum()),
         "pnl_after_execution": float(
             pd.to_numeric(joined.loc[executed_mask, "trade_pnl_pct"], errors="coerce").fillna(0.0).sum()
         ),
@@ -373,15 +406,11 @@ def build_gate_execution_decision_summary(
     return summary
 
 
-def _compute_signals_per_30d_after(kept_df: pd.DataFrame) -> float:
-    if kept_df.empty:
+def _compute_signals_per_30d_after(kept_signals_count: int, eval_window_days: float) -> float:
+    if kept_signals_count <= 0:
         return 0.0
-    context = pd.to_datetime(kept_df["context_bar_open_time"], utc=True, errors="coerce").dropna()
-    if context.empty:
-        return 0.0
-    days_span = (context.max() - context.min()) / pd.Timedelta(days=1)
-    safe_days_span = max(float(days_span), 1.0)
-    return float(len(context) * 30.0 / safe_days_span)
+    safe_window_days = max(float(eval_window_days), 1e-9)
+    return float(float(kept_signals_count) * 30.0 / safe_window_days)
 
 
 def _compute_density_penalty(signals_per_30d_after: float) -> float:
@@ -407,7 +436,91 @@ def _round6(value: float) -> float:
     return float(round(float(value), 6))
 
 
+def _resolve_eval_window_days(
+    window_start: pd.Timestamp | None,
+    window_end: pd.Timestamp | None,
+    window_days: float | None,
+) -> float:
+    if window_days is not None:
+        resolved = float(window_days)
+        if resolved <= 0.0:
+            raise ValueError("window_days must be positive")
+        return resolved
+    if window_start is None or window_end is None:
+        return 1.0
+    start = pd.Timestamp(window_start)
+    end = pd.Timestamp(window_end)
+    if end <= start:
+        raise ValueError("window_end must be greater than window_start")
+    return float((end - start) / pd.Timedelta(days=1))
+
+
 def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], name: str) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
         raise ValueError(f"{name} missing required columns: {missing}")
+
+
+def attach_counterfactual_execution_outcomes(
+    decision_df: pd.DataFrame,
+    bars_1m_df: pd.DataFrame,
+    execution_contract: ExecutionContract,
+    bars_1s_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    _require_columns(
+        decision_df,
+        (
+            "signal_id",
+            "episode_id",
+            "symbol",
+            "context_bar_open_time",
+            "decision_time",
+            "entry_bar_open_time",
+        ),
+        "decision_df",
+    )
+    identity_columns = [
+        "signal_id",
+        "episode_id",
+        "symbol",
+        "context_bar_open_time",
+        "decision_time",
+        "entry_bar_open_time",
+    ]
+    rows: list[dict[str, object]] = []
+    for row in decision_df.loc[:, identity_columns].itertuples(index=False):
+        one_signal = pd.DataFrame(
+            [
+                {
+                    "signal_id": row.signal_id,
+                    "episode_id": row.episode_id,
+                    "symbol": row.symbol,
+                    "context_bar_open_time": row.context_bar_open_time,
+                    "decision_time": row.decision_time,
+                    "entry_bar_open_time": row.entry_bar_open_time,
+                    "gate_decision": "keep",
+                }
+            ]
+        )
+        one_decision_df, _ = replay_short_signals_with_symbol_lock(
+            one_signal,
+            bars_1m_df,
+            execution_contract,
+            bars_1s_df,
+        )
+        one = one_decision_df.iloc[0]
+        rows.append(
+            {
+                "signal_id": row.signal_id,
+                "counterfactual_execution_status": one.get("execution_status", pd.NA),
+                "counterfactual_trade_outcome": one.get("trade_outcome", pd.NA),
+                "counterfactual_trade_pnl_pct": one.get("trade_pnl_pct", pd.NA),
+                "counterfactual_exit_time": one.get("exit_time", pd.NaT),
+            }
+        )
+    if not decision_df["signal_id"].is_unique:
+        raise ValueError("decision_df must have unique signal_id for counterfactual enrichment")
+    out = pd.DataFrame(rows)
+    if not out["signal_id"].is_unique:
+        raise ValueError("counterfactual outcomes produced duplicate signal_id")
+    return out
