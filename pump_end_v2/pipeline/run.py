@@ -82,8 +82,10 @@ def run_pump_end_v2_pipeline(
             "run_dir": str(run_context.run_dir),
         },
     )
-    _log_saved(config_snapshot_path)
-    _log_saved(run_manifest_path)
+    log_info(
+        "ARTIFACTS",
+        f"run artifacts initialized run_dir={run_context.run_dir}",
+    )
     market_loader = ClickHouseMarketDataLoader(clickhouse_dsn, config)
     bars_1s_fetcher = market_loader.build_1s_fetcher()
 
@@ -351,6 +353,7 @@ def run_pump_end_v2_pipeline(
     stage_done("PIPELINE", "EXECUTION_REPORTS")
 
     stage_start("PIPELINE", "ARTIFACTS_SAVE")
+    log_info("ARTIFACTS", "artifacts save started")
     prepared_dir = manager.stage_output_dir(run_context.run_dir, "prepared")
     detector_dir = manager.stage_output_dir(run_context.run_dir, "detector")
     gate_dir = manager.stage_output_dir(run_context.run_dir, "gate")
@@ -495,6 +498,7 @@ def run_pump_end_v2_pipeline(
         "test_execution_metrics": test_metrics,
     }
     summary_path = _save_json_and_log(run_summary, reports_dir / "run_summary.json")
+    log_info("ARTIFACTS", "artifacts save completed")
     stage_done("PIPELINE", "ARTIFACTS_SAVE")
     stage_done("PIPELINE", "FULL_RUN", elapsed_sec=time.perf_counter() - started)
     log_info(
@@ -511,13 +515,11 @@ def run_pump_end_v2_pipeline(
 
 def _save_df_and_log(df, path: Path) -> Path:
     saved_path = save_dataframe_artifact(df, path)
-    _log_saved(saved_path)
     return saved_path
 
 
 def _save_json_and_log(payload: Any, path: Path) -> Path:
     saved_path = save_json_artifact(payload, path)
-    _log_saved(saved_path)
     return saved_path
 
 
@@ -526,7 +528,6 @@ def _save_model_and_log(model: Any, path: Path) -> Path:
         raise TypeError(f"model object does not support save_model: {type(model)!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(str(path))
-    _log_saved(path)
     return path
 
 
@@ -536,10 +537,6 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
         "fire_score_floor": float(policy.fire_score_floor),
         "turn_down_delta": float(policy.turn_down_delta),
     }
-
-
-def _log_saved(path: Path) -> None:
-    log_info("ARTIFACTS", f"saved path={path}")
 
 
 def _derive_1m_stage_window(
