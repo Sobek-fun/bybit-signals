@@ -8,6 +8,7 @@ from pump_end_v2.config import (
     DetectorCVConfig,
     DetectorModelConfig,
     DetectorPolicyConfig,
+    DetectorPolicySearchConfig,
     EventOpenerConfig,
     ResolverConfig,
     SplitBounds,
@@ -403,7 +404,49 @@ def build_detector_train_oof_policy_rows(
 
 def build_detector_policy_grid(
     base_policy_config: DetectorPolicyConfig,
+    search_config: DetectorPolicySearchConfig | None = None,
 ) -> list[DetectorPolicyConfig]:
+    if (
+        search_config is not None
+        and len(search_config.arm_candidates) > 0
+        and len(search_config.fire_candidates) > 0
+        and len(search_config.turn_candidates) > 0
+    ):
+        grid: list[DetectorPolicyConfig] = []
+        for arm_score_min, fire_score_floor, turn_down_delta in product(
+            search_config.arm_candidates,
+            search_config.fire_candidates,
+            search_config.turn_candidates,
+        ):
+            if not (0.0 < float(arm_score_min) <= 1.0):
+                continue
+            if not (0.0 <= float(fire_score_floor) <= float(arm_score_min)):
+                continue
+            if not (0.0 < float(turn_down_delta) <= 1.0):
+                continue
+            grid.append(
+                DetectorPolicyConfig(
+                    arm_score_min=_round6(float(arm_score_min)),
+                    fire_score_floor=_round6(float(fire_score_floor)),
+                    turn_down_delta=_round6(float(turn_down_delta)),
+                )
+            )
+        unique: dict[tuple[float, float, float], DetectorPolicyConfig] = {}
+        for candidate in grid:
+            key = (
+                candidate.arm_score_min,
+                candidate.fire_score_floor,
+                candidate.turn_down_delta,
+            )
+            unique[key] = candidate
+        return sorted(
+            unique.values(),
+            key=lambda item: (
+                item.arm_score_min,
+                item.fire_score_floor,
+                item.turn_down_delta,
+            ),
+        )
     arm_candidates = sorted(
         {
             _round6(_clip(base_policy_config.arm_score_min + delta, 0.30, 0.95))
@@ -454,12 +497,13 @@ def build_detector_policy_grid(
 def sweep_detector_policy(
     scored_rows_df: pd.DataFrame,
     base_policy_config: DetectorPolicyConfig,
+    search_config: DetectorPolicySearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> pd.DataFrame:
     started = time.perf_counter()
-    candidates = build_detector_policy_grid(base_policy_config)
+    candidates = build_detector_policy_grid(base_policy_config, search_config)
     log_info(
         "POLICY",
         (
@@ -536,6 +580,7 @@ def sweep_detector_policy(
 def select_detector_policy(
     scored_rows_df: pd.DataFrame,
     base_policy_config: DetectorPolicyConfig,
+    search_config: DetectorPolicySearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -543,6 +588,7 @@ def select_detector_policy(
     sweep_df = sweep_detector_policy(
         scored_rows_df,
         base_policy_config,
+        search_config=search_config,
         window_start=window_start,
         window_end=window_end,
         window_days=window_days,

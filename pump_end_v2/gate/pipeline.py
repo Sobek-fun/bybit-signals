@@ -1,7 +1,7 @@
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostError
 
-from pump_end_v2.config import GateModelConfig
+from pump_end_v2.config import GateModelConfig, GateThresholdSearchConfig
 from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.gate.dataset import GATE_TARGET_META_COLUMNS, build_gate_dataset
 from pump_end_v2.gate.feature_view import (
@@ -82,6 +82,7 @@ def build_gate_val_scored_signals_and_datasets(
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None = None,
     execution_market_view: object | None = None,
+    search_threshold_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -149,6 +150,7 @@ def build_gate_val_scored_signals_and_datasets(
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
             base_block_threshold=base_block_threshold,
+            search_config=search_threshold_config,
             window_start=window_start,
             window_end=window_end,
             window_days=window_days,
@@ -179,6 +181,7 @@ def build_gate_val_scored_signals_and_datasets(
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
             base_block_threshold=base_block_threshold,
+            search_config=search_threshold_config,
             window_start=window_start,
             window_end=window_end,
             window_days=window_days,
@@ -206,6 +209,7 @@ def build_gate_val_scored_signals_and_datasets(
     threshold_sweep_df = sweep_gate_block_threshold(
         scored_signals_df=val_scored_signals_df,
         base_block_threshold=base_block_threshold,
+        search_config=search_threshold_config,
         window_start=window_start,
         window_end=window_end,
         window_days=window_days,

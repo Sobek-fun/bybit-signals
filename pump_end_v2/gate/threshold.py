@@ -2,6 +2,7 @@ import pandas as pd
 import sys
 import time
 
+from pump_end_v2.config import GateThresholdSearchConfig
 from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.execution.metrics import (
     build_execution_metrics,
@@ -44,6 +45,7 @@ _APPLY_REQUIRED_COLUMNS: tuple[str, ...] = (
 )
 
 _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
+    "gate_mode",
     "block_threshold",
     "signals_before",
     "signals_after_model",
@@ -73,7 +75,16 @@ _COUNTERFACTUAL_COLUMNS: tuple[str, ...] = (
 )
 
 
-def build_gate_threshold_grid(base_block_threshold: float) -> list[float]:
+def build_gate_threshold_grid(
+    base_block_threshold: float,
+    search_config: GateThresholdSearchConfig | None = None,
+) -> list[float]:
+    if search_config is not None and len(search_config.threshold_candidates) > 0:
+        explicit = [
+            _round6(_clip(float(value), 0.0, 1.0))
+            for value in search_config.threshold_candidates
+        ]
+        return sorted(set(explicit))
     base = float(base_block_threshold)
     raw = [
         base - 0.20,
@@ -180,12 +191,13 @@ def build_gate_threshold_metrics(
 def sweep_gate_block_threshold(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    search_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
-    for threshold in build_gate_threshold_grid(base_block_threshold):
+    for threshold in build_gate_threshold_grid(base_block_threshold, search_config):
         decision_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
         metrics = build_gate_threshold_metrics(
             decision_df,
@@ -202,6 +214,7 @@ def sweep_gate_block_threshold(
 def select_gate_block_threshold(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    search_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -209,6 +222,7 @@ def select_gate_block_threshold(
     sweep_df = sweep_gate_block_threshold(
         scored_signals_df,
         base_block_threshold,
+        search_config=search_config,
         window_start=window_start,
         window_end=window_end,
         window_days=window_days,
@@ -344,10 +358,11 @@ def select_gate_block_threshold_execution_aware(
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None = None,
     execution_market_view: object | None = None,
+    search_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
-) -> tuple[float, pd.DataFrame]:
+) -> tuple[float | None, pd.DataFrame]:
     sweep_started = time.perf_counter()
     counterfactual_columns = {
         "counterfactual_execution_status",
@@ -376,15 +391,28 @@ def select_gate_block_threshold_execution_aware(
         bars_1s_fetcher=bars_1s_fetcher,
         market_view=execution_market_view,
     )
-    thresholds = build_gate_threshold_grid(base_block_threshold)
+    thresholds = build_gate_threshold_grid(base_block_threshold, search_config)
+    candidates: list[tuple[str, float | None]] = [("threshold", threshold) for threshold in thresholds]
+    if (
+        search_config is not None
+        and bool(search_config.include_disabled_candidate)
+    ):
+        candidates.append(("disabled", None))
     log_info(
         "GATE",
-        f"threshold execution sweep start candidates_total={len(thresholds)}",
+        f"threshold execution sweep start candidates_total={len(candidates)}",
     )
     rows: list[dict[str, float]] = []
     best_selection_score = float("-inf")
-    for idx, threshold in enumerate(thresholds, start=1):
-        gate_decisions_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
+    for idx, (gate_mode, threshold) in enumerate(candidates, start=1):
+        if gate_mode == "disabled":
+            gate_decisions_df = scored_signals_df.copy()
+            gate_decisions_df["gate_decision"] = "keep"
+            gate_decisions_df["gate_block_threshold"] = pd.NA
+        else:
+            gate_decisions_df, _ = apply_gate_block_threshold(
+                scored_signals_df, float(threshold)
+            )
         execution_decisions_df, executed_signals_df = (
             replay_short_signals_with_symbol_lock_precomputed(
                 decision_df=gate_decisions_df,
@@ -430,12 +458,16 @@ def select_gate_block_threshold_execution_aware(
         best_selection_score = max(best_selection_score, float(selection_score))
         elapsed = time.perf_counter() - sweep_started
         rate = idx / elapsed if elapsed > 0 else 0.0
-        eta = (len(thresholds) - idx) / rate if rate > 0 else 0.0
+        eta = (len(candidates) - idx) / rate if rate > 0 else 0.0
+        threshold_repr = (
+            f"{float(threshold):.6f}" if threshold is not None else "nan"
+        )
         log_info(
             "GATE",
             (
-                f"threshold execution progress idx={idx}/{len(thresholds)} "
-                f"block_threshold={float(threshold):.6f} "
+                f"threshold execution progress idx={idx}/{len(candidates)} "
+                f"gate_mode={gate_mode} "
+                f"block_threshold={threshold_repr} "
                 f"signals_after_model={int(summary['after_model'])} "
                 f"signals_after_execution={int(summary['after_execution'])} "
                 f"pnl_after_execution={pnl_sum:.6f} "
@@ -448,7 +480,10 @@ def select_gate_block_threshold_execution_aware(
         )
         rows.append(
             {
-                "block_threshold": float(threshold),
+                "gate_mode": gate_mode,
+                "block_threshold": (
+                    float(threshold) if threshold is not None else float("nan")
+                ),
                 "signals_before": float(summary["candidate_signals_before"]),
                 "signals_after_model": float(summary["after_model"]),
                 "signals_after_execution": float(summary["after_execution"]),
@@ -482,7 +517,10 @@ def select_gate_block_threshold_execution_aware(
         ascending=[False, False, False, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
-    best_threshold = float(ranked.iloc[0]["block_threshold"])
+    best_mode = str(ranked.iloc[0]["gate_mode"])
+    best_threshold = (
+        None if best_mode == "disabled" else float(ranked.iloc[0]["block_threshold"])
+    )
     log_info(
         "GATE",
         f"threshold execution sweep done candidates_total={len(sweep_df)} elapsed_sec={time.perf_counter() - sweep_started:.3f}",
@@ -491,7 +529,8 @@ def select_gate_block_threshold_execution_aware(
         "GATE",
         (
             "gate threshold execution-aware select done "
-            f"best_threshold={best_threshold:.6f} "
+            f"best_mode={best_mode} "
+            f"best_threshold={(f'{best_threshold:.6f}' if best_threshold is not None else 'None')} "
             f"best_selection_score={float(ranked.iloc[0]['selection_score']):.6f}"
         ),
     )

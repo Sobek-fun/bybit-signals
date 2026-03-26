@@ -241,6 +241,7 @@ def run_pump_end_v2_pipeline(
     selected_detector_policy, detector_policy_sweep_df = select_detector_policy(
         val_policy_rows,
         config.detector_policy,
+        search_config=config.search_detector_policy,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
@@ -351,6 +352,7 @@ def run_pump_end_v2_pipeline(
         config.execution,
         bars_1s_fetcher,
         execution_market_view=execution_market_view_val,
+        search_threshold_config=config.search_gate_threshold,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
@@ -391,22 +393,39 @@ def run_pump_end_v2_pipeline(
                 execution_contract=config.execution,
                 bars_1s_fetcher=bars_1s_fetcher,
                 execution_market_view=execution_market_view_val,
+                search_config=config.search_gate_threshold,
                 window_start=config.splits.train_end,
                 window_end=config.splits.val_end,
             )
         )
+        if selected_gate_threshold is None:
+            selected_gate_mode = "disabled_by_selection"
+            val_gate_decisions_df = val_scored_signals_df.copy()
+            val_gate_decisions_df["gate_decision"] = "keep"
+            val_gate_decisions_df["gate_block_threshold"] = pd.NA
+        else:
+            selected_gate_mode = "threshold"
+            val_gate_decisions_df, _ = apply_gate_block_threshold(
+                val_scored_signals_df, selected_gate_threshold
+            )
     else:
         selected_gate_threshold = float(config.gate_config.block_threshold)
         gate_threshold_sweep_execution_df = gate_threshold_sweep_diagnostic_df.copy()
-    val_gate_decisions_df, _ = apply_gate_block_threshold(
-        val_scored_signals_df, selected_gate_threshold
-    )
+        selected_gate_mode = "disabled_no_data"
+        val_gate_decisions_df, _ = apply_gate_block_threshold(
+            val_scored_signals_df, selected_gate_threshold
+        )
     gate_val_elapsed = time.perf_counter() - gate_val_started
+    selected_gate_threshold_log = (
+        f"{float(selected_gate_threshold):.6f}"
+        if selected_gate_threshold is not None
+        else "None"
+    )
     log_info(
         "PIPELINE",
         (
             f"GATE_VAL summary elapsed_sec_total={gate_val_elapsed:.3f} gate_status={gate_status_val} "
-            f"selected_gate_threshold={float(selected_gate_threshold):.6f} "
+            f"selected_gate_mode={selected_gate_mode} selected_gate_threshold={selected_gate_threshold_log} "
             f"candidate_signals_val={len(val_scored_signals_df)} "
             f"candidate_signals_after_gate={int((val_gate_decisions_df['gate_decision'] == 'keep').sum())}"
         ),
@@ -459,9 +478,14 @@ def run_pump_end_v2_pipeline(
             execution_market_view=execution_market_view_test,
         )
     )
-    test_gate_decisions_df, _ = apply_gate_block_threshold(
-        test_scored_signals_df, selected_gate_threshold
-    )
+    if selected_gate_threshold is None:
+        test_gate_decisions_df = test_scored_signals_df.copy()
+        test_gate_decisions_df["gate_decision"] = "keep"
+        test_gate_decisions_df["gate_block_threshold"] = pd.NA
+    else:
+        test_gate_decisions_df, _ = apply_gate_block_threshold(
+            test_scored_signals_df, selected_gate_threshold
+        )
     test_rows = int(
         (gate_dataset_test_df["score_source"] == "test_forward").sum()
     ) if not gate_dataset_test_df.empty else 0
@@ -772,9 +796,7 @@ def run_pump_end_v2_pipeline(
         gate_threshold_sweep_execution_df,
         gate_dir / "threshold_sweep_val_execution.csv",
     )
-    _save_json_and_log(
-        float(selected_gate_threshold), gate_dir / "selected_threshold.json"
-    )
+    _save_json_and_log(selected_gate_threshold, gate_dir / "selected_threshold.json")
     log_info(
         "ARTIFACTS",
         f"key artifact saved path={gate_dir / 'dataset_train_oof.parquet'} rows={len(gate_dataset_train_oof_df)}",
@@ -834,7 +856,12 @@ def run_pump_end_v2_pipeline(
         "run_dir": str(run_context.run_dir),
         "config_path": str(Path(config_path).resolve()),
         "selected_detector_policy": _policy_to_dict(selected_detector_policy),
-        "selected_gate_threshold": float(selected_gate_threshold),
+        "selected_gate_mode": selected_gate_mode,
+        "selected_gate_threshold": (
+            float(selected_gate_threshold)
+            if selected_gate_threshold is not None
+            else None
+        ),
         "gate_status": (
             "disabled_no_data"
             if (gate_status_val != "enabled" or gate_status_test != "enabled")

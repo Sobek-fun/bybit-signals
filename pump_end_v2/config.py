@@ -63,8 +63,21 @@ class DetectorPolicyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DetectorPolicySearchConfig:
+    arm_candidates: tuple[float, ...]
+    fire_candidates: tuple[float, ...]
+    turn_candidates: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GateConfig:
     block_threshold: float
+
+
+@dataclass(frozen=True, slots=True)
+class GateThresholdSearchConfig:
+    threshold_candidates: tuple[float, ...]
+    include_disabled_candidate: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +126,9 @@ class V2Config:
     detector_model: DetectorModelConfig
     detector_cv: DetectorCVConfig
     detector_policy: DetectorPolicyConfig
+    search_detector_policy: DetectorPolicySearchConfig | None
     gate_config: GateConfig
+    search_gate_threshold: GateThresholdSearchConfig | None
     gate_model: GateModelConfig
     execution: ExecutionContract
 
@@ -147,7 +162,9 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     detector_model = _build_detector_model(config["detector"])
     detector_cv = _build_detector_cv(config["detector"])
     detector_policy = _build_detector_policy(config["detector"])
+    search_detector_policy = _build_detector_policy_search(config.get("search"))
     gate_config = _build_gate_config(config["gate"])
+    search_gate_threshold = _build_gate_threshold_search(config.get("search"))
     gate_model = _build_gate_model(config["gate"])
     execution = ExecutionContract(
         tp_pct=float(config["execution"]["tp_pct"]),
@@ -167,7 +184,9 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         detector_model=detector_model,
         detector_cv=detector_cv,
         detector_policy=detector_policy,
+        search_detector_policy=search_detector_policy,
         gate_config=gate_config,
+        search_gate_threshold=search_gate_threshold,
         gate_model=gate_model,
         execution=execution,
     )
@@ -522,11 +541,83 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
     )
 
 
+def _parse_float_candidates(
+    value: Any, field_name: str, *, allow_empty: bool = True
+) -> tuple[float, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    out: list[float] = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must contain numeric values") from exc
+    if not allow_empty and not out:
+        raise ValueError(f"{field_name} must be non-empty")
+    return tuple(out)
+
+
+def _build_detector_policy_search(
+    search_section: Any,
+) -> DetectorPolicySearchConfig | None:
+    if search_section is None:
+        return None
+    if not isinstance(search_section, dict):
+        raise ValueError("search section must be a table")
+    detector_policy_section = search_section.get("detector_policy")
+    if detector_policy_section is None:
+        return None
+    if not isinstance(detector_policy_section, dict):
+        raise ValueError("search.detector_policy must be a table")
+    arm_candidates = _parse_float_candidates(
+        detector_policy_section.get("arm_candidates", []),
+        "search.detector_policy.arm_candidates",
+    )
+    fire_candidates = _parse_float_candidates(
+        detector_policy_section.get("fire_candidates", []),
+        "search.detector_policy.fire_candidates",
+    )
+    turn_candidates = _parse_float_candidates(
+        detector_policy_section.get("turn_candidates", []),
+        "search.detector_policy.turn_candidates",
+    )
+    return DetectorPolicySearchConfig(
+        arm_candidates=arm_candidates,
+        fire_candidates=fire_candidates,
+        turn_candidates=turn_candidates,
+    )
+
+
 def _build_gate_config(section: dict[str, Any]) -> GateConfig:
     block_threshold = float(section.get("block_threshold"))
     if not (0.0 < block_threshold <= 1.0):
         raise ValueError("gate.block_threshold must satisfy 0 < x <= 1")
     return GateConfig(block_threshold=block_threshold)
+
+
+def _build_gate_threshold_search(
+    search_section: Any,
+) -> GateThresholdSearchConfig | None:
+    if search_section is None:
+        return None
+    if not isinstance(search_section, dict):
+        raise ValueError("search section must be a table")
+    gate_threshold_section = search_section.get("gate_threshold")
+    if gate_threshold_section is None:
+        return None
+    if not isinstance(gate_threshold_section, dict):
+        raise ValueError("search.gate_threshold must be a table")
+    threshold_candidates = _parse_float_candidates(
+        gate_threshold_section.get("threshold_candidates", []),
+        "search.gate_threshold.threshold_candidates",
+    )
+    include_disabled_candidate = bool(
+        gate_threshold_section.get("include_disabled_candidate", False)
+    )
+    return GateThresholdSearchConfig(
+        threshold_candidates=threshold_candidates,
+        include_disabled_candidate=include_disabled_candidate,
+    )
 
 
 def _build_gate_model(section: dict[str, Any]) -> GateModelConfig:
