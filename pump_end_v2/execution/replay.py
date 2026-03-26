@@ -244,9 +244,7 @@ def replay_independent_short_signals(
     decisions["mae_pct"] = mae_pct_out
     decisions["holding_bars"] = holding_bars_out
     out = decisions.sort_values("_row_order", kind="mergesort")
-    out["exit_time"] = pd.to_datetime(out["exit_time"], utc=True, errors="coerce").astype(
-        "datetime64[us, UTC]"
-    )
+    out["exit_time"] = pd.to_datetime(out["exit_time"], utc=True, errors="coerce")
     return out.loc[:, list(_INDEPENDENT_OUTCOME_COLUMNS)].reset_index(drop=True)
 
 
@@ -324,7 +322,7 @@ def replay_short_signals_with_symbol_lock_precomputed(
     )
     decisions_out["exit_time"] = pd.to_datetime(
         decisions_out["exit_time"], utc=True, errors="coerce"
-    ).astype("datetime64[us, UTC]")
+    )
     decisions_out = decisions_out[
         [
             *[
