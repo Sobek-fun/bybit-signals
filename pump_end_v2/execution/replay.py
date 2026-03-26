@@ -45,61 +45,37 @@ _EXECUTION_OUTPUT_COLUMNS: tuple[str, ...] = (
     "mae_pct",
     "holding_bars",
 )
+_INDEPENDENT_OUTCOME_COLUMNS: tuple[str, ...] = ("signal_id", *_EXECUTION_OUTPUT_COLUMNS)
 
 
 class OneSecondBarsFetcher(Protocol):
     def fetch(self, symbol: str, minute_start: pd.Timestamp) -> pd.DataFrame: ...
 
 
-def prepare_intraday_bars_frame(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
-    if timeframe_label not in {"1m", "1s", "15m"}:
-        raise ValueError("timeframe_label must be one of: 15m, 1m, 1s")
-    _require_columns(df, _BARS_REQUIRED_COLUMNS, f"bars_{timeframe_label}_df")
-    frame = df.copy()
-    frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="raise")
-    for col in ("open", "high", "low", "close"):
-        frame[col] = pd.to_numeric(frame[col], errors="raise")
-    frame = frame.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(
-        drop=True
-    )
-    dup_mask = frame.duplicated(subset=["symbol", "open_time"], keep=False)
-    if dup_mask.any():
-        sample = frame.loc[dup_mask, ["symbol", "open_time"]].head(3).to_dict("records")
-        raise ValueError(
-            f"duplicate open_time within symbol for {timeframe_label}: sample={sample}"
-        )
-    valid_price_mask = (
-        (frame["open"] <= frame["high"])
-        & (frame["low"] <= frame["high"])
-        & (frame["low"] <= frame["close"])
-        & (frame["close"] <= frame["high"])
-        & (frame["low"] <= frame["open"])
-        & (frame["open"] <= frame["high"])
-    )
-    if not bool(valid_price_mask.all()):
-        raise ValueError(f"invalid OHLC bounds in {timeframe_label} bars")
-    return frame
-
-
-def replay_short_signals_with_symbol_lock(
+def replay_independent_short_signals(
     decision_df: pd.DataFrame,
     bars_15m_df: pd.DataFrame,
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_fetcher: OneSecondBarsFetcher | None = None,
-    emit_summary_log: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    _require_columns(decision_df, _DECISION_REQUIRED_COLUMNS, "decision_df")
+) -> pd.DataFrame:
+    _require_columns(
+        decision_df,
+        (
+            "signal_id",
+            "episode_id",
+            "symbol",
+            "context_bar_open_time",
+            "decision_time",
+            "entry_bar_open_time",
+        ),
+        "decision_df",
+    )
     decisions = (
         decision_df.copy()
         .reset_index(drop=False)
         .rename(columns={"index": "_row_order"})
     )
-    optional_passthrough_columns = [
-        column
-        for column in _DECISION_OPTIONAL_PASSTHROUGH_COLUMNS
-        if column in decisions.columns
-    ]
     decisions["context_bar_open_time"] = pd.to_datetime(
         decisions["context_bar_open_time"], utc=True, errors="raise"
     )
@@ -109,20 +85,11 @@ def replay_short_signals_with_symbol_lock(
     decisions["entry_bar_open_time"] = pd.to_datetime(
         decisions["entry_bar_open_time"], utc=True, errors="raise"
     )
-    decisions["gate_decision"] = decisions["gate_decision"].astype(str).str.lower()
     bars_15m = prepare_intraday_bars_frame(bars_15m_df, "15m")
     bars_1m = prepare_intraday_bars_frame(bars_1m_df, "1m")
     for column in _EXECUTION_OUTPUT_COLUMNS:
         decisions[column] = pd.NA
     decisions["execution_status"] = "pending"
-    blocked_gate_mask = decisions["gate_decision"] == "block"
-    decisions.loc[blocked_gate_mask, "execution_status"] = "blocked_gate"
-    decisions.loc[blocked_gate_mask, "trade_outcome"] = pd.NA
-    lock_until_by_symbol: dict[str, pd.Timestamp] = {}
-    kept_indices = decisions.index[decisions["gate_decision"] == "keep"].tolist()
-    kept_ordered = decisions.loc[kept_indices].sort_values(
-        ["entry_bar_open_time", "signal_id"], kind="mergesort"
-    )
     bars_15m_by_symbol = {
         symbol: grp.reset_index(drop=True)
         for symbol, grp in bars_15m.groupby("symbol", sort=False)
@@ -132,15 +99,12 @@ def replay_short_signals_with_symbol_lock(
         for symbol, grp in bars_1m.groupby("symbol", sort=False)
     }
     hold_window_delta = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15)
-    for idx, row in kept_ordered.iterrows():
+    ordered = decisions.sort_values(
+        ["entry_bar_open_time", "signal_id"], kind="mergesort"
+    )
+    for idx, row in ordered.iterrows():
         symbol = str(row["symbol"])
         entry_time = pd.Timestamp(row["entry_bar_open_time"])
-        if (
-            symbol in lock_until_by_symbol
-            and entry_time <= lock_until_by_symbol[symbol]
-        ):
-            decisions.at[idx, "execution_status"] = "blocked_symbol_lock"
-            continue
         symbol_15m = bars_15m_by_symbol.get(symbol)
         if symbol_15m is None:
             decisions.at[idx, "execution_status"] = "missing_entry_bar"
@@ -187,28 +151,86 @@ def replay_short_signals_with_symbol_lock(
         decisions.at[idx, "mfe_pct"] = outcome_data["mfe_pct"]
         decisions.at[idx, "mae_pct"] = outcome_data["mae_pct"]
         decisions.at[idx, "holding_bars"] = int(outcome_data["holding_bars"])
-        _ = ExecutedSignalRef(
-            signal_id=str(row["signal_id"]),
-            symbol=symbol,
-            entry_bar_open_time=entry_time.to_pydatetime(),
-            exit_time=pd.Timestamp(exit_time).to_pydatetime(),
-            trade_outcome=TradeOutcome(trade_outcome),
-        )
-        lock_until_by_symbol[symbol] = pd.Timestamp(exit_time)
-    decisions = decisions.sort_values("_row_order", kind="mergesort").drop(
+    out = decisions.sort_values("_row_order", kind="mergesort")
+    return out.loc[:, list(_INDEPENDENT_OUTCOME_COLUMNS)].reset_index(drop=True)
+
+
+def replay_short_signals_with_symbol_lock_precomputed(
+    decision_df: pd.DataFrame,
+    independent_outcomes_df: pd.DataFrame,
+    emit_summary_log: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    _require_columns(decision_df, _DECISION_REQUIRED_COLUMNS, "decision_df")
+    _require_columns(
+        independent_outcomes_df, _INDEPENDENT_OUTCOME_COLUMNS, "independent_outcomes_df"
+    )
+    decisions = (
+        decision_df.copy()
+        .reset_index(drop=False)
+        .rename(columns={"index": "_row_order"})
+    )
+    optional_passthrough_columns = [
+        column
+        for column in _DECISION_OPTIONAL_PASSTHROUGH_COLUMNS
+        if column in decisions.columns
+    ]
+    decisions["context_bar_open_time"] = pd.to_datetime(
+        decisions["context_bar_open_time"], utc=True, errors="raise"
+    )
+    decisions["decision_time"] = pd.to_datetime(
+        decisions["decision_time"], utc=True, errors="raise"
+    )
+    decisions["entry_bar_open_time"] = pd.to_datetime(
+        decisions["entry_bar_open_time"], utc=True, errors="raise"
+    )
+    decisions["gate_decision"] = decisions["gate_decision"].astype(str).str.lower()
+    merged = decisions.merge(
+        independent_outcomes_df.loc[:, list(_INDEPENDENT_OUTCOME_COLUMNS)],
+        on="signal_id",
+        how="left",
+        validate="one_to_one",
+    )
+    for column in _EXECUTION_OUTPUT_COLUMNS:
+        merged[column] = merged[column]
+    merged["execution_status"] = merged["execution_status"].fillna("missing_entry_bar")
+    blocked_gate_mask = merged["gate_decision"] == "block"
+    for column in _EXECUTION_OUTPUT_COLUMNS:
+        merged.loc[blocked_gate_mask, column] = pd.NA
+    merged.loc[blocked_gate_mask, "execution_status"] = "blocked_gate"
+    lock_until_by_symbol: dict[str, pd.Timestamp] = {}
+    kept_ordered = merged.loc[merged["gate_decision"] == "keep"].sort_values(
+        ["entry_bar_open_time", "signal_id"], kind="mergesort"
+    )
+    for idx, row in kept_ordered.iterrows():
+        if str(row["execution_status"]) != "executed":
+            continue
+        symbol = str(row["symbol"])
+        entry_time = pd.Timestamp(row["entry_bar_open_time"])
+        if (
+            symbol in lock_until_by_symbol
+            and entry_time <= lock_until_by_symbol[symbol]
+        ):
+            merged.at[idx, "execution_status"] = "blocked_symbol_lock"
+            for column in _EXECUTION_OUTPUT_COLUMNS:
+                merged.at[idx, column] = pd.NA
+            continue
+        exit_time = row["exit_time"]
+        if pd.notna(exit_time):
+            lock_until_by_symbol[symbol] = pd.Timestamp(exit_time)
+    decisions_out = merged.sort_values("_row_order", kind="mergesort").drop(
         columns=["_row_order"]
     )
-    decisions = decisions[
+    decisions_out = decisions_out[
         [
             *[
                 column
                 for column in _DECISION_REQUIRED_COLUMNS
-                if column in decisions.columns
+                if column in decisions_out.columns
             ],
             *optional_passthrough_columns,
             *[
                 column
-                for column in decisions.columns
+                for column in decisions_out.columns
                 if column
                 not in {
                     *_DECISION_REQUIRED_COLUMNS,
@@ -220,15 +242,90 @@ def replay_short_signals_with_symbol_lock(
         ]
     ]
     executed_signals_df = (
-        decisions[decisions["execution_status"] == "executed"]
+        decisions_out[decisions_out["execution_status"] == "executed"]
         .copy()
         .reset_index(drop=True)
     )
-    blocked_gate = int((decisions["execution_status"] == "blocked_gate").sum())
+    blocked_gate = int((decisions_out["execution_status"] == "blocked_gate").sum())
     blocked_symbol_lock = int(
-        (decisions["execution_status"] == "blocked_symbol_lock").sum()
+        (decisions_out["execution_status"] == "blocked_symbol_lock").sum()
     )
     if emit_summary_log:
+        log_info(
+            "EXECUTION",
+            (
+                "execution replay done "
+                f"decisions_total={len(decisions_out)} executed_total={len(executed_signals_df)} "
+                f"blocked_gate={blocked_gate} blocked_symbol_lock={blocked_symbol_lock}"
+            ),
+        )
+    return decisions_out.reset_index(drop=True), executed_signals_df
+
+
+def prepare_intraday_bars_frame(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
+    if timeframe_label not in {"1m", "1s", "15m"}:
+        raise ValueError("timeframe_label must be one of: 15m, 1m, 1s")
+    _require_columns(df, _BARS_REQUIRED_COLUMNS, f"bars_{timeframe_label}_df")
+    frame = df.copy()
+    frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="raise")
+    for col in ("open", "high", "low", "close"):
+        frame[col] = pd.to_numeric(frame[col], errors="raise")
+    frame = frame.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(
+        drop=True
+    )
+    dup_mask = frame.duplicated(subset=["symbol", "open_time"], keep=False)
+    if dup_mask.any():
+        sample = frame.loc[dup_mask, ["symbol", "open_time"]].head(3).to_dict("records")
+        raise ValueError(
+            f"duplicate open_time within symbol for {timeframe_label}: sample={sample}"
+        )
+    valid_price_mask = (
+        (frame["open"] <= frame["high"])
+        & (frame["low"] <= frame["high"])
+        & (frame["low"] <= frame["close"])
+        & (frame["close"] <= frame["high"])
+        & (frame["low"] <= frame["open"])
+        & (frame["open"] <= frame["high"])
+    )
+    if not bool(valid_price_mask.all()):
+        raise ValueError(f"invalid OHLC bounds in {timeframe_label} bars")
+    return frame
+
+
+def replay_short_signals_with_symbol_lock(
+    decision_df: pd.DataFrame,
+    bars_15m_df: pd.DataFrame,
+    bars_1m_df: pd.DataFrame,
+    execution_contract: ExecutionContract,
+    bars_1s_fetcher: OneSecondBarsFetcher | None = None,
+    emit_summary_log: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    independent_outcomes_df = replay_independent_short_signals(
+        decision_df=decision_df,
+        bars_15m_df=bars_15m_df,
+        bars_1m_df=bars_1m_df,
+        execution_contract=execution_contract,
+        bars_1s_fetcher=bars_1s_fetcher,
+    )
+    decisions, executed_signals_df = replay_short_signals_with_symbol_lock_precomputed(
+        decision_df=decision_df,
+        independent_outcomes_df=independent_outcomes_df,
+        emit_summary_log=False,
+    )
+    if not executed_signals_df.empty:
+        for row in executed_signals_df.itertuples(index=False):
+            _ = ExecutedSignalRef(
+                signal_id=str(row.signal_id),
+                symbol=str(row.symbol),
+                entry_bar_open_time=pd.Timestamp(row.entry_bar_open_time).to_pydatetime(),
+                exit_time=pd.Timestamp(row.exit_time).to_pydatetime(),
+                trade_outcome=TradeOutcome(str(row.trade_outcome)),
+            )
+    if emit_summary_log:
+        blocked_gate = int((decisions["execution_status"] == "blocked_gate").sum())
+        blocked_symbol_lock = int(
+            (decisions["execution_status"] == "blocked_symbol_lock").sum()
+        )
         log_info(
             "EXECUTION",
             (
@@ -237,7 +334,7 @@ def replay_short_signals_with_symbol_lock(
                 f"blocked_gate={blocked_gate} blocked_symbol_lock={blocked_symbol_lock}"
             ),
         )
-    return decisions.reset_index(drop=True), executed_signals_df
+    return decisions, executed_signals_df
 
 
 def _replay_single_short_path(
