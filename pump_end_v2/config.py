@@ -302,42 +302,55 @@ def _build_event_opener(section: dict[str, Any]) -> EventOpenerConfig:
         runup_lookback_bars=_require_positive_int(
             section.get("runup_lookback_bars"), "data.event_opener.runup_lookback_bars"
         ),
-        min_runup_pct=_require_positive_float(section.get("min_runup_pct"), "data.event_opener.min_runup_pct"),
+        min_runup_pct=_require_positive_float(
+            section.get("min_runup_pct"), "data.event_opener.min_runup_pct"
+        ),
         near_high_lookback_bars=_require_positive_int(
-            section.get("near_high_lookback_bars"), "data.event_opener.near_high_lookback_bars"
+            section.get("near_high_lookback_bars"),
+            "data.event_opener.near_high_lookback_bars",
         ),
         near_high_tol_pct=_require_non_negative_float(
             section.get("near_high_tol_pct"), "data.event_opener.near_high_tol_pct"
         ),
         volume_ratio_lookback_bars=_require_positive_int(
-            section.get("volume_ratio_lookback_bars"), "data.event_opener.volume_ratio_lookback_bars"
+            section.get("volume_ratio_lookback_bars"),
+            "data.event_opener.volume_ratio_lookback_bars",
         ),
         min_volume_ratio=_require_positive_float(
             section.get("min_volume_ratio"), "data.event_opener.min_volume_ratio"
         ),
-        max_episode_bars=_require_positive_int(section.get("max_episode_bars"), "data.event_opener.max_episode_bars"),
+        max_episode_bars=_require_positive_int(
+            section.get("max_episode_bars"), "data.event_opener.max_episode_bars"
+        ),
         expiry_drawdown_pct=_require_positive_float(
             section.get("expiry_drawdown_pct"), "data.event_opener.expiry_drawdown_pct"
         ),
-        cooldown_bars=_require_non_negative_int(section.get("cooldown_bars"), "data.event_opener.cooldown_bars"),
+        cooldown_bars=_require_non_negative_int(
+            section.get("cooldown_bars"), "data.event_opener.cooldown_bars"
+        ),
     )
 
 
 def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
-    horizon_bars = _require_positive_int(section.get("horizon_bars"), "data.resolver.horizon_bars")
+    horizon_bars = _require_positive_int(
+        section.get("horizon_bars"), "data.resolver.horizon_bars"
+    )
     max_wait_bars_for_success = _require_positive_int(
         section.get("max_wait_bars_for_success"),
         "data.resolver.max_wait_bars_for_success",
     )
     if max_wait_bars_for_success > horizon_bars:
-        raise ValueError("data.resolver.max_wait_bars_for_success must be <= data.resolver.horizon_bars")
+        raise ValueError(
+            "data.resolver.max_wait_bars_for_success must be <= data.resolver.horizon_bars"
+        )
     return ResolverConfig(
         horizon_bars=horizon_bars,
         success_pullback_pct=_require_positive_float(
             section.get("success_pullback_pct"), "data.resolver.success_pullback_pct"
         ),
         max_prepullback_squeeze_pct=_require_positive_float(
-            section.get("max_prepullback_squeeze_pct"), "data.resolver.max_prepullback_squeeze_pct"
+            section.get("max_prepullback_squeeze_pct"),
+            "data.resolver.max_prepullback_squeeze_pct",
         ),
         flat_max_abs_move_pct=_require_positive_float(
             section.get("flat_max_abs_move_pct"), "data.resolver.flat_max_abs_move_pct"
@@ -358,7 +371,9 @@ def _build_references(section: dict[str, Any]) -> ReferenceSymbolsConfig:
     if not isinstance(eth_symbol, str) or not eth_symbol.strip():
         raise ValueError("data.references.eth_symbol must be a non-empty string")
     if btc_symbol.strip() == eth_symbol.strip():
-        raise ValueError("data.references.btc_symbol must differ from data.references.eth_symbol")
+        raise ValueError(
+            "data.references.btc_symbol must differ from data.references.eth_symbol"
+        )
     return ReferenceSymbolsConfig(
         btc_symbol=btc_symbol.strip(),
         eth_symbol=eth_symbol.strip(),
@@ -391,11 +406,19 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
     if not isinstance(model_section, dict):
         raise ValueError("missing required section: detector.model")
     return DetectorModelConfig(
-        iterations=_require_positive_int(model_section.get("iterations"), "detector.model.iterations"),
+        iterations=_require_positive_int(
+            model_section.get("iterations"), "detector.model.iterations"
+        ),
         depth=_require_positive_int(model_section.get("depth"), "detector.model.depth"),
-        learning_rate=_require_positive_float(model_section.get("learning_rate"), "detector.model.learning_rate"),
-        l2_leaf_reg=_require_positive_float(model_section.get("l2_leaf_reg"), "detector.model.l2_leaf_reg"),
-        random_seed=_require_non_negative_int(model_section.get("random_seed"), "detector.model.random_seed"),
+        learning_rate=_require_positive_float(
+            model_section.get("learning_rate"), "detector.model.learning_rate"
+        ),
+        l2_leaf_reg=_require_positive_float(
+            model_section.get("l2_leaf_reg"), "detector.model.l2_leaf_reg"
+        ),
+        random_seed=_require_non_negative_int(
+            model_section.get("random_seed"), "detector.model.random_seed"
+        ),
     )
 
 
@@ -404,9 +427,15 @@ def _build_detector_cv(section: dict[str, Any]) -> DetectorCVConfig:
     if not isinstance(cv_section, dict):
         raise ValueError("missing required section: detector.cv")
     return DetectorCVConfig(
-        min_train_days=_require_positive_int(cv_section.get("min_train_days"), "detector.cv.min_train_days"),
-        fold_span_days=_require_positive_int(cv_section.get("fold_span_days"), "detector.cv.fold_span_days"),
-        max_folds=_require_positive_int(cv_section.get("max_folds"), "detector.cv.max_folds"),
+        min_train_days=_require_positive_int(
+            cv_section.get("min_train_days"), "detector.cv.min_train_days"
+        ),
+        fold_span_days=_require_positive_int(
+            cv_section.get("fold_span_days"), "detector.cv.fold_span_days"
+        ),
+        max_folds=_require_positive_int(
+            cv_section.get("max_folds"), "detector.cv.max_folds"
+        ),
     )
 
 
@@ -417,7 +446,9 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
     if not (0.0 < arm_score_min <= 1.0):
         raise ValueError("detector.arm_score_min must satisfy 0 < x <= 1")
     if not (0.0 <= fire_score_floor <= arm_score_min):
-        raise ValueError("detector.fire_score_floor must satisfy 0 <= x <= detector.arm_score_min")
+        raise ValueError(
+            "detector.fire_score_floor must satisfy 0 <= x <= detector.arm_score_min"
+        )
     if not (0.0 < turn_down_delta <= 1.0):
         raise ValueError("detector.turn_down_delta must satisfy 0 < x <= 1")
     return DetectorPolicyConfig(
@@ -439,9 +470,17 @@ def _build_gate_model(section: dict[str, Any]) -> GateModelConfig:
     if not isinstance(model_section, dict):
         raise ValueError("missing required section: gate.model")
     return GateModelConfig(
-        iterations=_require_positive_int(model_section.get("iterations"), "gate.model.iterations"),
+        iterations=_require_positive_int(
+            model_section.get("iterations"), "gate.model.iterations"
+        ),
         depth=_require_positive_int(model_section.get("depth"), "gate.model.depth"),
-        learning_rate=_require_positive_float(model_section.get("learning_rate"), "gate.model.learning_rate"),
-        l2_leaf_reg=_require_positive_float(model_section.get("l2_leaf_reg"), "gate.model.l2_leaf_reg"),
-        random_seed=_require_non_negative_int(model_section.get("random_seed"), "gate.model.random_seed"),
+        learning_rate=_require_positive_float(
+            model_section.get("learning_rate"), "gate.model.learning_rate"
+        ),
+        l2_leaf_reg=_require_positive_float(
+            model_section.get("l2_leaf_reg"), "gate.model.l2_leaf_reg"
+        ),
+        random_seed=_require_non_negative_int(
+            model_section.get("random_seed"), "gate.model.random_seed"
+        ),
     )

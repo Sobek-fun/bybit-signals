@@ -28,7 +28,9 @@ EPISODE_STATE_COLUMNS: tuple[str, ...] = (
 
 
 def build_episode_state_layer(
-    token_state_df: pd.DataFrame, episodes_df: pd.DataFrame, decision_rows_df: pd.DataFrame
+    token_state_df: pd.DataFrame,
+    episodes_df: pd.DataFrame,
+    decision_rows_df: pd.DataFrame,
 ) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("LAYERS", "EPISODE_STATE")
@@ -51,21 +53,41 @@ def build_episode_state_layer(
     open_close = pd.to_numeric(merged["episode_open_close"], errors="coerce")
     context_close = pd.to_numeric(merged["context_close"], errors="coerce")
     denom = open_close.where(open_close > 0.0)
-    merged["episode_runup_from_open_pct"] = (context_close / denom - 1.0).replace([np.inf, -np.inf], np.nan)
+    merged["episode_runup_from_open_pct"] = (context_close / denom - 1.0).replace(
+        [np.inf, -np.inf], np.nan
+    )
     merged["episode_extension_from_open_pct"] = (
         pd.to_numeric(merged["episode_high_so_far"], errors="coerce") / denom - 1.0
     ).replace([np.inf, -np.inf], np.nan)
     merged["drawdown_from_episode_high_so_far"] = pd.to_numeric(
         merged["distance_from_episode_high_pct"], errors="coerce"
     )
-    merged = merged.sort_values(["episode_id", "context_bar_open_time"], kind="mergesort").reset_index(drop=True)
+    merged = merged.sort_values(
+        ["episode_id", "context_bar_open_time"], kind="mergesort"
+    ).reset_index(drop=True)
     near_high_now = merged["drawdown_from_episode_high_so_far"].fillna(1.0) <= 0.005
-    merged["_is_episode_high_now"] = merged["drawdown_from_episode_high_so_far"].fillna(1.0) <= 1e-12
+    merged["_is_episode_high_now"] = (
+        merged["drawdown_from_episode_high_so_far"].fillna(1.0) <= 1e-12
+    )
     merged["_bar_idx_in_episode"] = merged.groupby("episode_id", sort=False).cumcount()
-    merged["_last_high_idx"] = merged["_bar_idx_in_episode"].where(merged["_is_episode_high_now"])
-    merged["_last_high_idx"] = merged.groupby("episode_id", sort=False)["_last_high_idx"].ffill().fillna(0).astype(int)
-    merged["bars_since_episode_high"] = merged["_bar_idx_in_episode"] - merged["_last_high_idx"]
-    merged["high_retest_count"] = near_high_now.astype(int).groupby(merged["episode_id"], sort=False).cumsum().astype(int)
+    merged["_last_high_idx"] = merged["_bar_idx_in_episode"].where(
+        merged["_is_episode_high_now"]
+    )
+    merged["_last_high_idx"] = (
+        merged.groupby("episode_id", sort=False)["_last_high_idx"]
+        .ffill()
+        .fillna(0)
+        .astype(int)
+    )
+    merged["bars_since_episode_high"] = (
+        merged["_bar_idx_in_episode"] - merged["_last_high_idx"]
+    )
+    merged["high_retest_count"] = (
+        near_high_now.astype(int)
+        .groupby(merged["episode_id"], sort=False)
+        .cumsum()
+        .astype(int)
+    )
     merged["high_persistence_4"] = (
         near_high_now.astype(float)
         .groupby(merged["episode_id"], sort=False)
@@ -75,11 +97,16 @@ def build_episode_state_layer(
     )
     pump_flag = merged["pump_context_flag"].fillna(False).astype(bool)
     streak_source = pump_flag.groupby(merged["episode_id"], sort=False).cumsum()
-    streak_reset = streak_source.where(~pump_flag, 0).groupby(merged["episode_id"], sort=False).cummax()
+    streak_reset = (
+        streak_source.where(~pump_flag, 0)
+        .groupby(merged["episode_id"], sort=False)
+        .cummax()
+    )
     merged["episode_pump_context_streak"] = (streak_source - streak_reset).astype(int)
     merged["bars_since_episode_open"] = merged["episode_age_bars"]
     merged = merged.drop(
-        columns=["_is_episode_high_now", "_bar_idx_in_episode", "_last_high_idx"], errors="ignore"
+        columns=["_is_episode_high_now", "_bar_idx_in_episode", "_last_high_idx"],
+        errors="ignore",
     )
     episode_state = merged.loc[:, list(EPISODE_STATE_COLUMNS)].copy()
     log_info(

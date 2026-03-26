@@ -4,7 +4,8 @@ import time
 
 import pandas as pd
 
-from pump_end_v2.features.manifest import DETECTOR_FEATURE_COLUMNS, DETECTOR_IDENTITY_COLUMNS
+from pump_end_v2.features.manifest import (DETECTOR_FEATURE_COLUMNS,
+                                           DETECTOR_IDENTITY_COLUMNS)
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
@@ -71,7 +72,9 @@ def build_detector_feature_view(
         on="decision_row_id",
         how="left",
     )
-    ordered = frame.loc[:, [*DETECTOR_IDENTITY_COLUMNS, *DETECTOR_FEATURE_COLUMNS]].copy()
+    ordered = frame.loc[
+        :, [*DETECTOR_IDENTITY_COLUMNS, *DETECTOR_FEATURE_COLUMNS]
+    ].copy()
     log_info(
         "FEATURES",
         f"detector_view summary rows_total={len(ordered)} feature_cols_total={len(DETECTOR_FEATURE_COLUMNS)}",

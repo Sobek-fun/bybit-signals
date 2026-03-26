@@ -4,7 +4,9 @@ import time
 
 import pandas as pd
 
-from pump_end_v2.features.manifest import BLOCKED_COLUMNS, DETECTOR_FEATURE_COLUMNS, DETECTOR_IDENTITY_COLUMNS
+from pump_end_v2.features.manifest import (BLOCKED_COLUMNS,
+                                           DETECTOR_FEATURE_COLUMNS,
+                                           DETECTOR_IDENTITY_COLUMNS)
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 TARGET_META_COLUMNS: tuple[str, ...] = (
@@ -26,7 +28,9 @@ TARGET_META_COLUMNS: tuple[str, ...] = (
 )
 
 
-def build_detector_dataset(detector_feature_view_df: pd.DataFrame, resolved_rows_df: pd.DataFrame) -> pd.DataFrame:
+def build_detector_dataset(
+    detector_feature_view_df: pd.DataFrame, resolved_rows_df: pd.DataFrame
+) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("DETECTOR", "DATASET_BUILD")
     _validate_unique_ids(detector_feature_view_df, "detector_feature_view_df")
@@ -41,7 +45,10 @@ def build_detector_dataset(detector_feature_view_df: pd.DataFrame, resolved_rows
         validate="one_to_one",
     )
     if len(merged) != len(detector_feature_view_df):
-        missing = sorted(set(detector_feature_view_df["decision_row_id"]) - set(merged["decision_row_id"]))
+        missing = sorted(
+            set(detector_feature_view_df["decision_row_id"])
+            - set(merged["decision_row_id"])
+        )
         preview = missing[:5]
         raise ValueError(
             f"missing resolver rows for decision_row_id count={len(missing)} sample={preview}"
@@ -61,7 +68,11 @@ def build_detector_dataset(detector_feature_view_df: pd.DataFrame, resolved_rows
     resolved_rows = int(dataset["is_resolved"].astype(bool).sum())
     trainable_rows = int(dataset["trainable_row"].sum())
     positive_rate = (
-        float(dataset.loc[dataset["trainable_row"], "target_good_short_now"].astype(float).mean())
+        float(
+            dataset.loc[dataset["trainable_row"], "target_good_short_now"]
+            .astype(float)
+            .mean()
+        )
         if trainable_rows > 0
         else 0.0
     )

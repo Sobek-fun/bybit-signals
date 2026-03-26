@@ -6,6 +6,7 @@ from catboost import CatBoostClassifier
 from pump_end_v2.config import GateModelConfig
 from pump_end_v2.gate.feature_view import GATE_IDENTITY_COLUMNS
 
+
 def build_gate_model(model_config: GateModelConfig) -> CatBoostClassifier:
     return CatBoostClassifier(
         loss_function="Logloss",

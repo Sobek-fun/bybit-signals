@@ -23,7 +23,9 @@ REFERENCE_STATE_COLUMNS: tuple[str, ...] = (
 )
 
 
-def build_reference_state_layer(token_state_df: pd.DataFrame, btc_symbol: str, eth_symbol: str) -> pd.DataFrame:
+def build_reference_state_layer(
+    token_state_df: pd.DataFrame, btc_symbol: str, eth_symbol: str
+) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("LAYERS", "REFERENCE_STATE")
     _require_symbol(token_state_df, btc_symbol, "btc_symbol")
@@ -36,7 +38,9 @@ def build_reference_state_layer(token_state_df: pd.DataFrame, btc_symbol: str, e
     )
     btc = _select_symbol(token_state_df, btc_symbol, "btc")
     eth = _select_symbol(token_state_df, eth_symbol, "eth")
-    reference = base_times.merge(btc, on="open_time", how="left").merge(eth, on="open_time", how="left")
+    reference = base_times.merge(btc, on="open_time", how="left").merge(
+        eth, on="open_time", how="left"
+    )
     reference = reference.loc[:, list(REFERENCE_STATE_COLUMNS)].copy()
     log_info(
         "LAYERS",
@@ -53,7 +57,9 @@ def _require_symbol(token_state_df: pd.DataFrame, symbol: str, field_name: str) 
         raise ValueError(f"reference symbol not found in token_state_df: {symbol}")
 
 
-def _select_symbol(token_state_df: pd.DataFrame, symbol: str, prefix: str) -> pd.DataFrame:
+def _select_symbol(
+    token_state_df: pd.DataFrame, symbol: str, prefix: str
+) -> pd.DataFrame:
     cols = {
         "close_ret_1": f"{prefix}_close_ret_1",
         "close_ret_4": f"{prefix}_close_ret_4",
@@ -62,5 +68,7 @@ def _select_symbol(token_state_df: pd.DataFrame, symbol: str, prefix: str) -> pd
         "volume_ratio": f"{prefix}_volume_ratio",
         "pump_context_flag": f"{prefix}_pump_context_flag",
     }
-    selected = token_state_df[token_state_df["symbol"] == symbol][["open_time", *cols.keys()]].copy()
+    selected = token_state_df[token_state_df["symbol"] == symbol][
+        ["open_time", *cols.keys()]
+    ].copy()
     return selected.rename(columns=cols)

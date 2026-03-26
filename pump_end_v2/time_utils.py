@@ -37,7 +37,9 @@ def ceil_to_15m(ts: datetime | str) -> datetime:
     return datetime.fromtimestamp(ceiled, tz=UTC)
 
 
-def decision_to_entry_bar_open_time(decision_time: datetime | str, entry_shift_bars: int = 0) -> datetime:
+def decision_to_entry_bar_open_time(
+    decision_time: datetime | str, entry_shift_bars: int = 0
+) -> datetime:
     if entry_shift_bars < 0:
         raise ValueError("entry_shift_bars must be non-negative")
     decision = normalize_timestamp(decision_time)
@@ -61,7 +63,9 @@ def validate_causality(
     if decision < min_decision:
         raise ValueError("decision_time must be after context bar close")
     if entry < ceil_to_15m(decision):
-        raise ValueError("entry_bar_open_time must not be earlier than allowed entry grid")
+        raise ValueError(
+            "entry_bar_open_time must not be earlier than allowed entry grid"
+        )
 
 
 def is_valid_ideal_entry(entry_bar_open_time: datetime | str) -> bool:

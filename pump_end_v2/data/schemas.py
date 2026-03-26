@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import pandas as pd
 
-REQUIRED_OHLCV_COLUMNS = ("symbol", "open_time", "open", "high", "low", "close", "volume")
+REQUIRED_OHLCV_COLUMNS = (
+    "symbol",
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+)
 
 
 def prepare_ohlcv_15m_frame(df: pd.DataFrame) -> pd.DataFrame:
     prepared = df.copy(deep=True)
     _require_columns(prepared)
-    prepared["open_time"] = pd.to_datetime(prepared["open_time"], utc=True, errors="raise")
-    prepared = prepared.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(drop=True)
+    prepared["open_time"] = pd.to_datetime(
+        prepared["open_time"], utc=True, errors="raise"
+    )
+    prepared = prepared.sort_values(
+        ["symbol", "open_time"], kind="mergesort"
+    ).reset_index(drop=True)
     validate_ohlcv_15m_frame(prepared)
     return prepared
 
@@ -22,7 +34,9 @@ def validate_ohlcv_15m_frame(df: pd.DataFrame) -> None:
         raise ValueError("open_time must be timezone-aware datetime")
     if str(df["open_time"].dt.tz) != "UTC":
         raise ValueError("open_time timezone must be UTC")
-    sorted_df = df.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(drop=True)
+    sorted_df = df.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(
+        drop=True
+    )
     if not df.reset_index(drop=True).equals(sorted_df):
         raise ValueError("frame must be sorted by symbol, open_time")
     duplicates = df.duplicated(subset=["symbol", "open_time"], keep=False)

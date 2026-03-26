@@ -18,7 +18,9 @@ def build_execution_metrics(
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> dict[str, float]:
-    _require_columns(executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df")
+    _require_columns(
+        executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df"
+    )
     frame = _prepare_frame(executed_signals_df)
     signals = int(len(frame))
     symbols = int(frame["symbol"].nunique()) if signals > 0 else 0
@@ -30,19 +32,41 @@ def build_execution_metrics(
     tp_rate_resolved = _safe_ratio(tp, resolved)
     sl_rate_resolved = _safe_ratio(sl, resolved)
     pnl_sum = float(frame["trade_pnl_pct"].sum()) if signals > 0 else 0.0
-    expectancy_all = float(frame["trade_pnl_pct"].mean()) if signals > 0 else float("nan")
+    expectancy_all = (
+        float(frame["trade_pnl_pct"].mean()) if signals > 0 else float("nan")
+    )
     resolved_mask = frame["trade_outcome"].isin(["tp", "sl"])
-    expectancy_resolved = float(frame.loc[resolved_mask, "trade_pnl_pct"].mean()) if resolved > 0 else float("nan")
-    pos_sum = float(frame.loc[frame["trade_pnl_pct"] > 0, "trade_pnl_pct"].sum()) if signals > 0 else 0.0
-    neg_sum_abs = float(abs(frame.loc[frame["trade_pnl_pct"] < 0, "trade_pnl_pct"].sum())) if signals > 0 else 0.0
-    profit_factor = float(pos_sum / neg_sum_abs) if (pos_sum > 0.0 and neg_sum_abs > 0.0) else 0.0
+    expectancy_resolved = (
+        float(frame.loc[resolved_mask, "trade_pnl_pct"].mean())
+        if resolved > 0
+        else float("nan")
+    )
+    pos_sum = (
+        float(frame.loc[frame["trade_pnl_pct"] > 0, "trade_pnl_pct"].sum())
+        if signals > 0
+        else 0.0
+    )
+    neg_sum_abs = (
+        float(abs(frame.loc[frame["trade_pnl_pct"] < 0, "trade_pnl_pct"].sum()))
+        if signals > 0
+        else 0.0
+    )
+    profit_factor = (
+        float(pos_sum / neg_sum_abs) if (pos_sum > 0.0 and neg_sum_abs > 0.0) else 0.0
+    )
     max_losing_streak = float(_compute_max_losing_streak(frame))
-    eval_window_days = _resolve_eval_window_days(window_start=window_start, window_end=window_end, window_days=window_days)
+    eval_window_days = _resolve_eval_window_days(
+        window_start=window_start, window_end=window_end, window_days=window_days
+    )
     signals_per_30d = float(_compute_signals_per_30d(len(frame), eval_window_days))
     report_6h = build_execution_window_report(frame, 6)
     report_24h = build_execution_window_report(frame, 24)
-    worst_6h_pnl = float(report_6h["pnl_sum"].min()) if not report_6h.empty else float("nan")
-    worst_24h_pnl = float(report_24h["pnl_sum"].min()) if not report_24h.empty else float("nan")
+    worst_6h_pnl = (
+        float(report_6h["pnl_sum"].min()) if not report_6h.empty else float("nan")
+    )
+    worst_24h_pnl = (
+        float(report_24h["pnl_sum"].min()) if not report_24h.empty else float("nan")
+    )
     metrics = {
         "signals": float(signals),
         "symbols": float(symbols),
@@ -71,8 +95,12 @@ def build_execution_metrics(
     return metrics
 
 
-def build_execution_window_report(executed_signals_df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
-    _require_columns(executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df")
+def build_execution_window_report(
+    executed_signals_df: pd.DataFrame, window_hours: int
+) -> pd.DataFrame:
+    _require_columns(
+        executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df"
+    )
     frame = _prepare_frame(executed_signals_df)
     if frame.empty:
         return pd.DataFrame(columns=["window_end_time", "trades", "pnl_sum"])
@@ -93,15 +121,32 @@ def build_execution_window_report(executed_signals_df: pd.DataFrame, window_hour
                 "pnl_sum": pnl_sum,
             }
         )
-    out = pd.DataFrame(rows).sort_values("window_end_time", kind="mergesort").reset_index(drop=True)
+    out = (
+        pd.DataFrame(rows)
+        .sort_values("window_end_time", kind="mergesort")
+        .reset_index(drop=True)
+    )
     return out
 
 
 def build_execution_symbol_report(executed_signals_df: pd.DataFrame) -> pd.DataFrame:
-    _require_columns(executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df")
+    _require_columns(
+        executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df"
+    )
     frame = _prepare_frame(executed_signals_df)
     if frame.empty:
-        return pd.DataFrame(columns=["symbol", "signals", "tp", "sl", "timeout", "ambiguous", "pnl_sum", "expectancy_all"])
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "signals",
+                "tp",
+                "sl",
+                "timeout",
+                "ambiguous",
+                "pnl_sum",
+                "expectancy_all",
+            ]
+        )
     groups = frame.groupby("symbol", sort=True, dropna=False)
     rows: list[dict[str, float | str]] = []
     for symbol, grp in groups:
@@ -114,15 +159,32 @@ def build_execution_symbol_report(executed_signals_df: pd.DataFrame) -> pd.DataF
                 "timeout": float((grp["trade_outcome"] == "timeout").sum()),
                 "ambiguous": float((grp["trade_outcome"] == "ambiguous").sum()),
                 "pnl_sum": float(grp["trade_pnl_pct"].sum()),
-                "expectancy_all": float(grp["trade_pnl_pct"].mean()) if len(grp) > 0 else float("nan"),
+                "expectancy_all": (
+                    float(grp["trade_pnl_pct"].mean()) if len(grp) > 0 else float("nan")
+                ),
             }
         )
-    return pd.DataFrame(rows).sort_values("symbol", kind="mergesort").reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values("symbol", kind="mergesort")
+        .reset_index(drop=True)
+    )
 
 
 def build_execution_monthly_report(executed_signals_df: pd.DataFrame) -> pd.DataFrame:
-    _require_columns(executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df")
-    columns = ["month", "signals", "tp", "sl", "timeout", "ambiguous", "pnl_sum", "expectancy_all"]
+    _require_columns(
+        executed_signals_df, _EXECUTED_REQUIRED_COLUMNS, "executed_signals_df"
+    )
+    columns = [
+        "month",
+        "signals",
+        "tp",
+        "sl",
+        "timeout",
+        "ambiguous",
+        "pnl_sum",
+        "expectancy_all",
+    ]
     frame = _prepare_frame(executed_signals_df)
     if frame.empty:
         return pd.DataFrame(columns=columns)
@@ -139,7 +201,9 @@ def build_execution_monthly_report(executed_signals_df: pd.DataFrame) -> pd.Data
                 "timeout": float((grp["trade_outcome"] == "timeout").sum()),
                 "ambiguous": float((grp["trade_outcome"] == "ambiguous").sum()),
                 "pnl_sum": float(grp["trade_pnl_pct"].sum()),
-                "expectancy_all": float(grp["trade_pnl_pct"].mean()) if len(grp) > 0 else float("nan"),
+                "expectancy_all": (
+                    float(grp["trade_pnl_pct"].mean()) if len(grp) > 0 else float("nan")
+                ),
             }
         )
     out = pd.DataFrame(rows, columns=columns)
@@ -150,7 +214,9 @@ def _prepare_frame(df: pd.DataFrame) -> pd.DataFrame:
     frame = df.copy()
     if frame.empty:
         return frame
-    frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="coerce")
+    frame["entry_bar_open_time"] = pd.to_datetime(
+        frame["entry_bar_open_time"], utc=True, errors="coerce"
+    )
     frame["trade_pnl_pct"] = pd.to_numeric(frame["trade_pnl_pct"], errors="coerce")
     frame["trade_outcome"] = frame["trade_outcome"].astype(str).str.lower()
     frame = frame.dropna(subset=["entry_bar_open_time", "trade_pnl_pct"]).sort_values(

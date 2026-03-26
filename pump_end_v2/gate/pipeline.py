@@ -5,10 +5,15 @@ from catboost import CatBoostClassifier, CatBoostError
 
 from pump_end_v2.config import GateModelConfig
 from pump_end_v2.contracts import ExecutionContract
-from pump_end_v2.gate.dataset import GATE_TARGET_META_COLUMNS, build_gate_dataset
-from pump_end_v2.gate.feature_view import GATE_FEATURE_COLUMNS, GATE_IDENTITY_COLUMNS, build_gate_feature_view
-from pump_end_v2.gate.model import build_gate_model, fit_gate_model, predict_gate_scores
-from pump_end_v2.gate.threshold import attach_counterfactual_execution_outcomes, sweep_gate_block_threshold
+from pump_end_v2.gate.dataset import (GATE_TARGET_META_COLUMNS,
+                                      build_gate_dataset)
+from pump_end_v2.gate.feature_view import (GATE_FEATURE_COLUMNS,
+                                           GATE_IDENTITY_COLUMNS,
+                                           build_gate_feature_view)
+from pump_end_v2.gate.model import (build_gate_model, fit_gate_model,
+                                    predict_gate_scores)
+from pump_end_v2.gate.threshold import (
+    attach_counterfactual_execution_outcomes, sweep_gate_block_threshold)
 from pump_end_v2.logging import log_info
 
 _SCORED_OUTPUT_COLUMNS: tuple[str, ...] = (
@@ -48,7 +53,11 @@ def _is_gate_trainable(train_fit_df: pd.DataFrame) -> bool:
         return False
     if "target_block_signal" not in train_fit_df.columns:
         return False
-    target_unique = pd.to_numeric(train_fit_df["target_block_signal"], errors="coerce").dropna().nunique()
+    target_unique = (
+        pd.to_numeric(train_fit_df["target_block_signal"], errors="coerce")
+        .dropna()
+        .nunique()
+    )
     if int(target_unique) < 2:
         return False
     informative_features = 0
@@ -74,7 +83,14 @@ def build_gate_val_scored_signals_and_datasets(
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
-) -> tuple[CatBoostClassifier | None, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+) -> tuple[
+    CatBoostClassifier | None,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    str,
+]:
     train_oof_with_execution_df = _enrich_with_counterfactual(
         train_oof_candidate_signals_df,
         bars_1m_df,
@@ -87,7 +103,9 @@ def build_gate_val_scored_signals_and_datasets(
         execution_contract,
         bars_1s_df,
     )
-    val_history_df = _slice_history_window(train_oof_candidate_signals_df, val_candidate_signals_df, hours=24)
+    val_history_df = _slice_history_window(
+        train_oof_candidate_signals_df, val_candidate_signals_df, hours=24
+    )
     train_feature_view_df = build_gate_feature_view(
         candidate_signals_df=train_oof_with_execution_df,
         history_candidate_signals_df=None,
@@ -107,15 +125,21 @@ def build_gate_val_scored_signals_and_datasets(
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
     )
-    train_gate_dataset_df = build_gate_dataset(train_feature_view_df, train_oof_with_execution_df)
+    train_gate_dataset_df = build_gate_dataset(
+        train_feature_view_df, train_oof_with_execution_df
+    )
     val_gate_dataset_df = build_gate_dataset(val_feature_view_df, val_with_execution_df)
     train_fit_df = train_gate_dataset_df[
         (train_gate_dataset_df["score_source"] == "train_oof")
         & train_gate_dataset_df["gate_trainable_signal"].astype(bool)
     ].copy()
-    val_score_df = val_gate_dataset_df[val_gate_dataset_df["score_source"] == "val_forward"].copy()
+    val_score_df = val_gate_dataset_df[
+        val_gate_dataset_df["score_source"] == "val_forward"
+    ].copy()
     if (not _is_gate_trainable(train_fit_df)) or val_score_df.empty:
-        val_scored_signals_df = _build_disabled_scored_signals(val_candidate_signals_df, "val_forward")
+        val_scored_signals_df = _build_disabled_scored_signals(
+            val_candidate_signals_df, "val_forward"
+        )
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
             base_block_threshold=base_block_threshold,
@@ -143,7 +167,9 @@ def build_gate_val_scored_signals_and_datasets(
     try:
         fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
     except CatBoostError:
-        val_scored_signals_df = _build_disabled_scored_signals(val_candidate_signals_df, "val_forward")
+        val_scored_signals_df = _build_disabled_scored_signals(
+            val_candidate_signals_df, "val_forward"
+        )
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
             base_block_threshold=base_block_threshold,
@@ -182,7 +208,14 @@ def build_gate_val_scored_signals_and_datasets(
             f"train_rows={len(train_fit_df)} val_rows={len(val_score_df)} scored_rows={len(val_scored_signals_df)}"
         ),
     )
-    return model, val_scored_signals_df, threshold_sweep_df, train_gate_dataset_df, val_gate_dataset_df, _GATE_STATUS_ENABLED
+    return (
+        model,
+        val_scored_signals_df,
+        threshold_sweep_df,
+        train_gate_dataset_df,
+        val_gate_dataset_df,
+        _GATE_STATUS_ENABLED,
+    )
 
 
 def build_gate_test_scored_signals(
@@ -199,7 +232,9 @@ def build_gate_test_scored_signals(
     force_disabled_no_data: bool = False,
 ) -> tuple[CatBoostClassifier | None, pd.DataFrame, pd.DataFrame, str]:
     if force_disabled_no_data:
-        test_scored_signals_df = _build_disabled_scored_signals(test_candidate_signals_df, "test_forward")
+        test_scored_signals_df = _build_disabled_scored_signals(
+            test_candidate_signals_df, "test_forward"
+        )
         log_info(
             "GATE",
             (
@@ -207,7 +242,12 @@ def build_gate_test_scored_signals(
                 f"status={_GATE_STATUS_DISABLED_NO_DATA} forced=1 scored_rows={len(test_scored_signals_df)}"
             ),
         )
-        return None, test_scored_signals_df, pd.DataFrame(), _GATE_STATUS_DISABLED_NO_DATA
+        return (
+            None,
+            test_scored_signals_df,
+            pd.DataFrame(),
+            _GATE_STATUS_DISABLED_NO_DATA,
+        )
     train_oof_with_execution_df = _enrich_with_counterfactual(
         train_oof_candidate_signals_df,
         bars_1m_df,
@@ -220,7 +260,9 @@ def build_gate_test_scored_signals(
         execution_contract,
         bars_1s_df,
     )
-    test_history_df = _slice_history_window(history_candidate_signals_df, test_candidate_signals_df, hours=24)
+    test_history_df = _slice_history_window(
+        history_candidate_signals_df, test_candidate_signals_df, hours=24
+    )
     train_feature_view_df = build_gate_feature_view(
         candidate_signals_df=train_oof_with_execution_df,
         history_candidate_signals_df=None,
@@ -240,15 +282,23 @@ def build_gate_test_scored_signals(
         reference_state_df=reference_state_df,
         breadth_state_df=breadth_state_df,
     )
-    train_gate_dataset_df = build_gate_dataset(train_feature_view_df, train_oof_with_execution_df)
-    test_gate_dataset_df = build_gate_dataset(test_feature_view_df, test_with_execution_df)
+    train_gate_dataset_df = build_gate_dataset(
+        train_feature_view_df, train_oof_with_execution_df
+    )
+    test_gate_dataset_df = build_gate_dataset(
+        test_feature_view_df, test_with_execution_df
+    )
     train_fit_df = train_gate_dataset_df[
         (train_gate_dataset_df["score_source"] == "train_oof")
         & train_gate_dataset_df["gate_trainable_signal"].astype(bool)
     ].copy()
-    test_score_df = test_gate_dataset_df[test_gate_dataset_df["score_source"] == "test_forward"].copy()
+    test_score_df = test_gate_dataset_df[
+        test_gate_dataset_df["score_source"] == "test_forward"
+    ].copy()
     if (not _is_gate_trainable(train_fit_df)) or test_score_df.empty:
-        test_scored_signals_df = _build_disabled_scored_signals(test_candidate_signals_df, "test_forward")
+        test_scored_signals_df = _build_disabled_scored_signals(
+            test_candidate_signals_df, "test_forward"
+        )
         log_info(
             "GATE",
             (
@@ -257,12 +307,19 @@ def build_gate_test_scored_signals(
                 f"scored_rows={len(test_scored_signals_df)}"
             ),
         )
-        return None, test_scored_signals_df, test_gate_dataset_df, _GATE_STATUS_DISABLED_NO_DATA
+        return (
+            None,
+            test_scored_signals_df,
+            test_gate_dataset_df,
+            _GATE_STATUS_DISABLED_NO_DATA,
+        )
     model = build_gate_model(gate_model_config)
     try:
         fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
     except CatBoostError:
-        test_scored_signals_df = _build_disabled_scored_signals(test_candidate_signals_df, "test_forward")
+        test_scored_signals_df = _build_disabled_scored_signals(
+            test_candidate_signals_df, "test_forward"
+        )
         log_info(
             "GATE",
             (
@@ -271,7 +328,12 @@ def build_gate_test_scored_signals(
                 f"scored_rows={len(test_scored_signals_df)}"
             ),
         )
-        return None, test_scored_signals_df, test_gate_dataset_df, _GATE_STATUS_DISABLED_NO_DATA
+        return (
+            None,
+            test_scored_signals_df,
+            test_gate_dataset_df,
+            _GATE_STATUS_DISABLED_NO_DATA,
+        )
     test_scored_signals_df = _score_gate_dataset_rows(model, test_score_df)
     log_info(
         "GATE",
@@ -283,12 +345,24 @@ def build_gate_test_scored_signals(
     return model, test_scored_signals_df, test_gate_dataset_df, _GATE_STATUS_ENABLED
 
 
-def _score_gate_dataset_rows(model: CatBoostClassifier, rows_df: pd.DataFrame) -> pd.DataFrame:
+def _score_gate_dataset_rows(
+    model: CatBoostClassifier, rows_df: pd.DataFrame
+) -> pd.DataFrame:
     if rows_df.empty:
         return pd.DataFrame(columns=list(_SCORED_OUTPUT_COLUMNS))
     score_df = predict_gate_scores(model, rows_df, GATE_FEATURE_COLUMNS)
-    merged = rows_df.merge(score_df[["signal_id", "p_block"]], on="signal_id", how="left", validate="one_to_one")
-    required_cols = [*GATE_IDENTITY_COLUMNS, *GATE_TARGET_META_COLUMNS, "target_block_signal", "gate_trainable_signal"]
+    merged = rows_df.merge(
+        score_df[["signal_id", "p_block"]],
+        on="signal_id",
+        how="left",
+        validate="one_to_one",
+    )
+    required_cols = [
+        *GATE_IDENTITY_COLUMNS,
+        *GATE_TARGET_META_COLUMNS,
+        "target_block_signal",
+        "gate_trainable_signal",
+    ]
     _require_columns(merged, required_cols, "scored_rows")
     return merged.loc[:, list(_SCORED_OUTPUT_COLUMNS)].reset_index(drop=True)
 
@@ -304,16 +378,25 @@ def _slice_history_window(
     current_candidate_signals_df: pd.DataFrame,
     hours: int,
 ) -> pd.DataFrame | None:
-    if history_candidate_signals_df is None or history_candidate_signals_df.empty or current_candidate_signals_df.empty:
+    if (
+        history_candidate_signals_df is None
+        or history_candidate_signals_df.empty
+        or current_candidate_signals_df.empty
+    ):
         return None
     history = history_candidate_signals_df.copy()
     current = current_candidate_signals_df.copy()
-    history["context_bar_open_time"] = pd.to_datetime(history["context_bar_open_time"], utc=True, errors="raise")
-    current["context_bar_open_time"] = pd.to_datetime(current["context_bar_open_time"], utc=True, errors="raise")
+    history["context_bar_open_time"] = pd.to_datetime(
+        history["context_bar_open_time"], utc=True, errors="raise"
+    )
+    current["context_bar_open_time"] = pd.to_datetime(
+        current["context_bar_open_time"], utc=True, errors="raise"
+    )
     current_start = pd.Timestamp(current["context_bar_open_time"].min())
     window_start = current_start - pd.Timedelta(hours=int(hours))
     out = history[
-        (history["context_bar_open_time"] >= window_start) & (history["context_bar_open_time"] < current_start)
+        (history["context_bar_open_time"] >= window_start)
+        & (history["context_bar_open_time"] < current_start)
     ].copy()
     if out.empty:
         return None
@@ -344,15 +427,23 @@ def _enrich_with_counterfactual(
     )
 
 
-def _build_disabled_scored_signals(candidate_signals_df: pd.DataFrame, score_source: str) -> pd.DataFrame:
+def _build_disabled_scored_signals(
+    candidate_signals_df: pd.DataFrame, score_source: str
+) -> pd.DataFrame:
     if candidate_signals_df.empty:
         return pd.DataFrame(columns=list(_SCORED_OUTPUT_COLUMNS))
     out = candidate_signals_df.copy()
     out["score_source"] = score_source
     out["p_block"] = 0.0
-    target_good = pd.to_numeric(out.get("target_good_short_now"), errors="coerce").fillna(0).astype(int)
+    target_good = (
+        pd.to_numeric(out.get("target_good_short_now"), errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
     out["target_block_signal"] = (1 - target_good).clip(lower=0, upper=1)
-    out["block_reason"] = out.get("future_outcome_class", pd.Series("unknown", index=out.index)).astype(str)
+    out["block_reason"] = out.get(
+        "future_outcome_class", pd.Series("unknown", index=out.index)
+    ).astype(str)
     out["gate_trainable_signal"] = False
     for column in _SCORED_OUTPUT_COLUMNS:
         if column not in out.columns:

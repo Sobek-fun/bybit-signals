@@ -4,10 +4,18 @@ from typing import Any
 
 import pandas as pd
 
-from pump_end_v2.contracts import ExecutedSignalRef, ExecutionContract, TradeOutcome
+from pump_end_v2.contracts import (ExecutedSignalRef, ExecutionContract,
+                                   TradeOutcome)
 from pump_end_v2.logging import log_info
 
-_BARS_REQUIRED_COLUMNS: tuple[str, ...] = ("symbol", "open_time", "open", "high", "low", "close")
+_BARS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "symbol",
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+)
 _DECISION_REQUIRED_COLUMNS: tuple[str, ...] = (
     "signal_id",
     "episode_id",
@@ -50,11 +58,15 @@ def prepare_intraday_bars_frame(df: pd.DataFrame, timeframe_label: str) -> pd.Da
     frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="raise")
     for col in ("open", "high", "low", "close"):
         frame[col] = pd.to_numeric(frame[col], errors="raise")
-    frame = frame.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(drop=True)
+    frame = frame.sort_values(["symbol", "open_time"], kind="mergesort").reset_index(
+        drop=True
+    )
     dup_mask = frame.duplicated(subset=["symbol", "open_time"], keep=False)
     if dup_mask.any():
         sample = frame.loc[dup_mask, ["symbol", "open_time"]].head(3).to_dict("records")
-        raise ValueError(f"duplicate open_time within symbol for {timeframe_label}: sample={sample}")
+        raise ValueError(
+            f"duplicate open_time within symbol for {timeframe_label}: sample={sample}"
+        )
     valid_price_mask = (
         (frame["open"] <= frame["high"])
         & (frame["low"] <= frame["high"])
@@ -75,16 +87,32 @@ def replay_short_signals_with_symbol_lock(
     bars_1s_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     _require_columns(decision_df, _DECISION_REQUIRED_COLUMNS, "decision_df")
-    decisions = decision_df.copy().reset_index(drop=False).rename(columns={"index": "_row_order"})
+    decisions = (
+        decision_df.copy()
+        .reset_index(drop=False)
+        .rename(columns={"index": "_row_order"})
+    )
     optional_passthrough_columns = [
-        column for column in _DECISION_OPTIONAL_PASSTHROUGH_COLUMNS if column in decisions.columns
+        column
+        for column in _DECISION_OPTIONAL_PASSTHROUGH_COLUMNS
+        if column in decisions.columns
     ]
-    decisions["context_bar_open_time"] = pd.to_datetime(decisions["context_bar_open_time"], utc=True, errors="raise")
-    decisions["decision_time"] = pd.to_datetime(decisions["decision_time"], utc=True, errors="raise")
-    decisions["entry_bar_open_time"] = pd.to_datetime(decisions["entry_bar_open_time"], utc=True, errors="raise")
+    decisions["context_bar_open_time"] = pd.to_datetime(
+        decisions["context_bar_open_time"], utc=True, errors="raise"
+    )
+    decisions["decision_time"] = pd.to_datetime(
+        decisions["decision_time"], utc=True, errors="raise"
+    )
+    decisions["entry_bar_open_time"] = pd.to_datetime(
+        decisions["entry_bar_open_time"], utc=True, errors="raise"
+    )
     decisions["gate_decision"] = decisions["gate_decision"].astype(str).str.lower()
     bars_1m = prepare_intraday_bars_frame(bars_1m_df, "1m")
-    bars_1s = prepare_intraday_bars_frame(bars_1s_df, "1s") if bars_1s_df is not None else None
+    bars_1s = (
+        prepare_intraday_bars_frame(bars_1s_df, "1s")
+        if bars_1s_df is not None
+        else None
+    )
     for column in _EXECUTION_OUTPUT_COLUMNS:
         decisions[column] = pd.NA
     decisions["execution_status"] = "pending"
@@ -93,10 +121,18 @@ def replay_short_signals_with_symbol_lock(
     decisions.loc[blocked_gate_mask, "trade_outcome"] = pd.NA
     lock_until_by_symbol: dict[str, pd.Timestamp] = {}
     kept_indices = decisions.index[decisions["gate_decision"] == "keep"].tolist()
-    kept_ordered = decisions.loc[kept_indices].sort_values(["entry_bar_open_time", "signal_id"], kind="mergesort")
-    bars_1m_by_symbol = {symbol: grp.reset_index(drop=True) for symbol, grp in bars_1m.groupby("symbol", sort=False)}
+    kept_ordered = decisions.loc[kept_indices].sort_values(
+        ["entry_bar_open_time", "signal_id"], kind="mergesort"
+    )
+    bars_1m_by_symbol = {
+        symbol: grp.reset_index(drop=True)
+        for symbol, grp in bars_1m.groupby("symbol", sort=False)
+    }
     bars_1s_by_symbol = (
-        {symbol: grp.reset_index(drop=True) for symbol, grp in bars_1s.groupby("symbol", sort=False)}
+        {
+            symbol: grp.reset_index(drop=True)
+            for symbol, grp in bars_1s.groupby("symbol", sort=False)
+        }
         if bars_1s is not None
         else {}
     )
@@ -104,7 +140,10 @@ def replay_short_signals_with_symbol_lock(
     for idx, row in kept_ordered.iterrows():
         symbol = str(row["symbol"])
         entry_time = pd.Timestamp(row["entry_bar_open_time"])
-        if symbol in lock_until_by_symbol and entry_time <= lock_until_by_symbol[symbol]:
+        if (
+            symbol in lock_until_by_symbol
+            and entry_time <= lock_until_by_symbol[symbol]
+        ):
             decisions.at[idx, "execution_status"] = "blocked_symbol_lock"
             continue
         symbol_1m = bars_1m_by_symbol.get(symbol)
@@ -120,7 +159,10 @@ def replay_short_signals_with_symbol_lock(
         tp_price = entry_price * (1.0 - float(execution_contract.tp_pct))
         sl_price = entry_price * (1.0 + float(execution_contract.sl_pct))
         horizon_end = entry_time + hold_window_delta
-        path_bars = symbol_1m[(symbol_1m["open_time"] >= entry_time) & (symbol_1m["open_time"] < horizon_end)].copy()
+        path_bars = symbol_1m[
+            (symbol_1m["open_time"] >= entry_time)
+            & (symbol_1m["open_time"] < horizon_end)
+        ].copy()
         if path_bars.empty:
             decisions.at[idx, "execution_status"] = "missing_entry_bar"
             continue
@@ -157,10 +199,16 @@ def replay_short_signals_with_symbol_lock(
             trade_outcome=TradeOutcome(trade_outcome),
         )
         lock_until_by_symbol[symbol] = pd.Timestamp(exit_time)
-    decisions = decisions.sort_values("_row_order", kind="mergesort").drop(columns=["_row_order"])
+    decisions = decisions.sort_values("_row_order", kind="mergesort").drop(
+        columns=["_row_order"]
+    )
     decisions = decisions[
         [
-            *[column for column in _DECISION_REQUIRED_COLUMNS if column in decisions.columns],
+            *[
+                column
+                for column in _DECISION_REQUIRED_COLUMNS
+                if column in decisions.columns
+            ],
             *optional_passthrough_columns,
             *[
                 column
@@ -175,9 +223,15 @@ def replay_short_signals_with_symbol_lock(
             *_EXECUTION_OUTPUT_COLUMNS,
         ]
     ]
-    executed_signals_df = decisions[decisions["execution_status"] == "executed"].copy().reset_index(drop=True)
+    executed_signals_df = (
+        decisions[decisions["execution_status"] == "executed"]
+        .copy()
+        .reset_index(drop=True)
+    )
     blocked_gate = int((decisions["execution_status"] == "blocked_gate").sum())
-    blocked_symbol_lock = int((decisions["execution_status"] == "blocked_symbol_lock").sum())
+    blocked_symbol_lock = int(
+        (decisions["execution_status"] == "blocked_symbol_lock").sum()
+    )
     log_info(
         "EXECUTION",
         (
@@ -249,8 +303,12 @@ def _replay_single_short_path(
     mfe_pct = 0.0
     mae_pct = 0.0
     if not processed_df.empty:
-        mfe_pct = float(((entry_price - processed_df["low"]) / entry_price).max() * 100.0)
-        mae_pct = float(((processed_df["high"] - entry_price) / entry_price).max() * 100.0)
+        mfe_pct = float(
+            ((entry_price - processed_df["low"]) / entry_price).max() * 100.0
+        )
+        mae_pct = float(
+            ((processed_df["high"] - entry_price) / entry_price).max() * 100.0
+        )
     return {
         "symbol": symbol,
         "trade_outcome": trade_outcome,
@@ -269,7 +327,9 @@ def _resolve_intraminute_touch(
     sl_price: float,
 ) -> dict[str, Any]:
     minute_end = minute_start + pd.Timedelta(minutes=1)
-    minute_bars = bars_1s[(bars_1s["open_time"] >= minute_start) & (bars_1s["open_time"] < minute_end)]
+    minute_bars = bars_1s[
+        (bars_1s["open_time"] >= minute_start) & (bars_1s["open_time"] < minute_end)
+    ]
     if minute_bars.empty:
         return {"trade_outcome": None, "exit_time": None, "exit_price": None}
     for row in minute_bars.itertuples(index=False):
@@ -278,11 +338,23 @@ def _resolve_intraminute_touch(
         hit_tp = sec_low <= tp_price
         hit_sl = sec_high >= sl_price
         if hit_tp and hit_sl:
-            return {"trade_outcome": "ambiguous", "exit_time": pd.Timestamp(row.open_time), "exit_price": float(row.close)}
+            return {
+                "trade_outcome": "ambiguous",
+                "exit_time": pd.Timestamp(row.open_time),
+                "exit_price": float(row.close),
+            }
         if hit_tp:
-            return {"trade_outcome": "tp", "exit_time": pd.Timestamp(row.open_time), "exit_price": tp_price}
+            return {
+                "trade_outcome": "tp",
+                "exit_time": pd.Timestamp(row.open_time),
+                "exit_price": tp_price,
+            }
         if hit_sl:
-            return {"trade_outcome": "sl", "exit_time": pd.Timestamp(row.open_time), "exit_price": sl_price}
+            return {
+                "trade_outcome": "sl",
+                "exit_time": pd.Timestamp(row.open_time),
+                "exit_price": sl_price,
+            }
     return {"trade_outcome": None, "exit_time": None, "exit_price": None}
 
 

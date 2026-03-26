@@ -101,9 +101,15 @@ def apply_episode_aware_detector_policy(
     _require_columns(scored_rows_df, INPUT_REQUIRED_COLUMNS)
     has_fold_id = "fold_id" in scored_rows_df.columns
     frame = scored_rows_df.copy()
-    frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
-    frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
-    frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
+    frame["context_bar_open_time"] = pd.to_datetime(
+        frame["context_bar_open_time"], utc=True, errors="raise"
+    )
+    frame["decision_time"] = pd.to_datetime(
+        frame["decision_time"], utc=True, errors="raise"
+    )
+    frame["entry_bar_open_time"] = pd.to_datetime(
+        frame["entry_bar_open_time"], utc=True, errors="raise"
+    )
     if "ideal_entry_bar_open_time" in frame.columns:
         frame["ideal_entry_bar_open_time"] = pd.to_datetime(
             frame["ideal_entry_bar_open_time"], utc=True, errors="coerce"
@@ -114,7 +120,12 @@ def apply_episode_aware_detector_policy(
         frame["fold_id"] = pd.NA
     sort_columns = ["score_source", "episode_id", "context_bar_open_time"]
     if has_fold_id:
-        sort_columns = ["score_source", "fold_id", "episode_id", "context_bar_open_time"]
+        sort_columns = [
+            "score_source",
+            "fold_id",
+            "episode_id",
+            "context_bar_open_time",
+        ]
     frame = frame.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
     group_columns = ["score_source", "episode_id"]
     if has_fold_id:
@@ -166,10 +177,16 @@ def apply_episode_aware_detector_policy(
                     episode_id=episode_id,
                     symbol=symbol,
                     fire_decision_time=pd.Timestamp(row.decision_time).to_pydatetime(),
-                    entry_bar_open_time=pd.Timestamp(row.entry_bar_open_time).to_pydatetime(),
+                    entry_bar_open_time=pd.Timestamp(
+                        row.entry_bar_open_time
+                    ).to_pydatetime(),
                 )
                 ideal_entry_value = _row_value(row, "ideal_entry_bar_open_time")
-                ideal_entry_time = pd.Timestamp(ideal_entry_value) if pd.notna(ideal_entry_value) else None
+                ideal_entry_time = (
+                    pd.Timestamp(ideal_entry_value)
+                    if pd.notna(ideal_entry_value)
+                    else None
+                )
                 bars_fire_to_ideal = _compute_bars_fire_to_ideal(
                     pd.Timestamp(row.entry_bar_open_time),
                     ideal_entry_time,
@@ -214,25 +231,49 @@ def apply_episode_aware_detector_policy(
                 "armed": had_arm,
                 "fired": fired,
                 "reset_count": reset_count,
-                "fire_signal_id": fire_signal_row["signal_id"] if fire_signal_row else pd.NA,
-                "fire_target_good_short_now": fire_signal_row["target_good_short_now"] if fire_signal_row else pd.NA,
-                "fire_target_reason": fire_signal_row["target_reason"] if fire_signal_row else pd.NA,
-                "fire_future_outcome_class": fire_signal_row["future_outcome_class"] if fire_signal_row else pd.NA,
-                "fire_signal_quality_h32": fire_signal_row["signal_quality_h32"] if fire_signal_row else pd.NA,
-                "fire_future_net_edge_pct": fire_signal_row["future_net_edge_pct"] if fire_signal_row else pd.NA,
-                "bars_fire_to_ideal": fire_signal_row["bars_fire_to_ideal"] if fire_signal_row else pd.NA,
+                "fire_signal_id": (
+                    fire_signal_row["signal_id"] if fire_signal_row else pd.NA
+                ),
+                "fire_target_good_short_now": (
+                    fire_signal_row["target_good_short_now"]
+                    if fire_signal_row
+                    else pd.NA
+                ),
+                "fire_target_reason": (
+                    fire_signal_row["target_reason"] if fire_signal_row else pd.NA
+                ),
+                "fire_future_outcome_class": (
+                    fire_signal_row["future_outcome_class"]
+                    if fire_signal_row
+                    else pd.NA
+                ),
+                "fire_signal_quality_h32": (
+                    fire_signal_row["signal_quality_h32"] if fire_signal_row else pd.NA
+                ),
+                "fire_future_net_edge_pct": (
+                    fire_signal_row["future_net_edge_pct"] if fire_signal_row else pd.NA
+                ),
+                "bars_fire_to_ideal": (
+                    fire_signal_row["bars_fire_to_ideal"] if fire_signal_row else pd.NA
+                ),
             }
         )
     candidate_signals_df = pd.DataFrame(candidate_rows)
     if candidate_signals_df.empty:
         candidate_signals_df = pd.DataFrame(columns=list(CANDIDATE_LEDGER_COLUMNS))
     else:
-        candidate_signals_df = candidate_signals_df.loc[:, list(CANDIDATE_LEDGER_COLUMNS)].copy()
+        candidate_signals_df = candidate_signals_df.loc[
+            :, list(CANDIDATE_LEDGER_COLUMNS)
+        ].copy()
     episode_policy_summary_df = pd.DataFrame(summary_rows)
     if episode_policy_summary_df.empty:
-        episode_policy_summary_df = pd.DataFrame(columns=list(EPISODE_POLICY_SUMMARY_COLUMNS))
+        episode_policy_summary_df = pd.DataFrame(
+            columns=list(EPISODE_POLICY_SUMMARY_COLUMNS)
+        )
     else:
-        episode_policy_summary_df = episode_policy_summary_df.loc[:, list(EPISODE_POLICY_SUMMARY_COLUMNS)].copy()
+        episode_policy_summary_df = episode_policy_summary_df.loc[
+            :, list(EPISODE_POLICY_SUMMARY_COLUMNS)
+        ].copy()
     log_info(
         "POLICY",
         f"policy apply done episodes_total={len(episode_policy_summary_df)} signals_total={len(candidate_signals_df)}",
@@ -255,11 +296,19 @@ def build_detector_policy_metrics(
     episodes_with_good_zone = int(good_mask.sum())
     episodes_armed = int(armed_mask.sum())
     episodes_fired = int(fired_mask.sum())
-    good_episode_capture_rate = _safe_ratio(int((good_mask & fired_mask).sum()), episodes_with_good_zone)
+    good_episode_capture_rate = _safe_ratio(
+        int((good_mask & fired_mask).sum()), episodes_with_good_zone
+    )
     bad_mask = ~good_mask
-    bad_episode_fire_rate = _safe_ratio(int((bad_mask & fired_mask).sum()), int(bad_mask.sum()))
+    bad_episode_fire_rate = _safe_ratio(
+        int((bad_mask & fired_mask).sum()), int(bad_mask.sum())
+    )
     fired_good_rate = (
-        float(pd.to_numeric(candidate_signals_df.get("target_good_short_now"), errors="coerce").mean())
+        float(
+            pd.to_numeric(
+                candidate_signals_df.get("target_good_short_now"), errors="coerce"
+            ).mean()
+        )
         if len(candidate_signals_df) > 0
         else 0.0
     )
@@ -270,22 +319,40 @@ def build_detector_policy_metrics(
     )
     fires_per_30d = _compute_fires_per_30d(len(candidate_signals_df), eval_window_days)
     median_bars_fire_to_ideal = (
-        float(pd.to_numeric(candidate_signals_df.get("bars_fire_to_ideal"), errors="coerce").median())
+        float(
+            pd.to_numeric(
+                candidate_signals_df.get("bars_fire_to_ideal"), errors="coerce"
+            ).median()
+        )
         if len(candidate_signals_df) > 0
         else float("nan")
     )
     median_future_net_edge_pct_at_fire = (
-        float(pd.to_numeric(candidate_signals_df.get("future_net_edge_pct"), errors="coerce").median())
+        float(
+            pd.to_numeric(
+                candidate_signals_df.get("future_net_edge_pct"), errors="coerce"
+            ).median()
+        )
         if len(candidate_signals_df) > 0
         else float("nan")
     )
     reset_without_fire_share = _safe_ratio(
-        int(((episode_policy_summary_df["reset_count"].fillna(0).astype(int) > 0) & ~fired_mask).sum()),
+        int(
+            (
+                (episode_policy_summary_df["reset_count"].fillna(0).astype(int) > 0)
+                & ~fired_mask
+            ).sum()
+        ),
         episodes_total,
     )
     arm_to_fire_conversion = _safe_ratio(episodes_fired, episodes_armed)
     density_sanity_penalty = _compute_detector_density_sanity_penalty(fires_per_30d)
-    selection_score = good_episode_capture_rate + fired_good_rate - bad_episode_fire_rate - 0.15 * density_sanity_penalty
+    selection_score = (
+        good_episode_capture_rate
+        + fired_good_rate
+        - bad_episode_fire_rate
+        - 0.15 * density_sanity_penalty
+    )
     return {
         "episodes_total": float(episodes_total),
         "episodes_with_good_zone": float(episodes_with_good_zone),
@@ -310,7 +377,9 @@ def _compute_bars_fire_to_ideal(
 ) -> float:
     if ideal_entry_bar_open_time is None or pd.isna(ideal_entry_bar_open_time):
         return float("nan")
-    return float((entry_bar_open_time - ideal_entry_bar_open_time) / pd.Timedelta(minutes=15))
+    return float(
+        (entry_bar_open_time - ideal_entry_bar_open_time) / pd.Timedelta(minutes=15)
+    )
 
 
 def _compute_fires_per_30d(fires_count: int, eval_window_days: float) -> float:
@@ -359,7 +428,12 @@ def _compute_good_episode_flag(active_rows: pd.DataFrame) -> bool:
         quality = active_rows["signal_quality_h32"].astype(str)
         return bool((quality == "clean_retrace_h32").any())
     if "target_good_short_now" in active_rows.columns:
-        return bool((pd.to_numeric(active_rows["target_good_short_now"], errors="coerce") == 1).any())
+        return bool(
+            (
+                pd.to_numeric(active_rows["target_good_short_now"], errors="coerce")
+                == 1
+            ).any()
+        )
     return False
 
 

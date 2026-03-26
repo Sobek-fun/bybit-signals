@@ -30,7 +30,9 @@ def load_tabular_frame(path: str | Path) -> pd.DataFrame:
     raise ValueError(f"unsupported tabular extension: {suffix or '<none>'}")
 
 
-def load_market_inputs(config: V2Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+def load_market_inputs(
+    config: V2Config,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     source_root = config.raw["data"]["source_root"]
     bars_15m_path = resolve_source_path(source_root, config.data_files.bars_15m_path)
     bars_1m_path = resolve_source_path(source_root, config.data_files.bars_1m_path)
@@ -44,10 +46,15 @@ def load_market_inputs(config: V2Config) -> tuple[pd.DataFrame, pd.DataFrame, pd
     if config.data_files.bars_1s_path != "":
         bars_1s_path = resolve_source_path(source_root, config.data_files.bars_1s_path)
         if not bars_1s_path.exists():
-            raise FileNotFoundError(f"optional input file was configured but is missing: {bars_1s_path}")
+            raise FileNotFoundError(
+                f"optional input file was configured but is missing: {bars_1s_path}"
+            )
         raw_1s = load_tabular_frame(bars_1s_path)
     rows_1s = len(raw_1s) if raw_1s is not None else 0
-    log_info("IO", f"input load done rows_15m={len(raw_15m)} rows_1m={len(raw_1m)} rows_1s={rows_1s}")
+    log_info(
+        "IO",
+        f"input load done rows_15m={len(raw_15m)} rows_1m={len(raw_1m)} rows_1s={rows_1s}",
+    )
     return raw_15m, raw_1m, raw_1s
 
 
@@ -67,5 +74,7 @@ def save_dataframe_artifact(df: pd.DataFrame, path: str | Path) -> Path:
 def save_json_artifact(payload: Any, path: str | Path) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
     return output_path

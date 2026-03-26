@@ -76,6 +76,7 @@ _CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
     "distance_from_episode_high_pct",
 )
 
+
 def build_gate_feature_view(
     candidate_signals_df: pd.DataFrame,
     history_candidate_signals_df: pd.DataFrame | None,
@@ -83,7 +84,9 @@ def build_gate_feature_view(
     reference_state_df: pd.DataFrame,
     breadth_state_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    _require_columns(candidate_signals_df, _CANDIDATE_PROD_REQUIRED_COLUMNS, "candidate_signals_df")
+    _require_columns(
+        candidate_signals_df, _CANDIDATE_PROD_REQUIRED_COLUMNS, "candidate_signals_df"
+    )
     _require_columns(
         token_state_df,
         (
@@ -136,11 +139,18 @@ def build_gate_feature_view(
         "breadth_state_df",
     )
     frame = _prepare_candidate_frame(candidate_signals_df, history_context_only=False)
-    if history_candidate_signals_df is not None and not history_candidate_signals_df.empty:
-        history = _prepare_candidate_frame(history_candidate_signals_df, history_context_only=True)
+    if (
+        history_candidate_signals_df is not None
+        and not history_candidate_signals_df.empty
+    ):
+        history = _prepare_candidate_frame(
+            history_candidate_signals_df, history_context_only=True
+        )
         history = _normalize_history_stream_context(history, frame)
         frame = pd.concat([history, frame], ignore_index=True)
-        frame = frame.drop_duplicates(subset=["signal_id"], keep="last").reset_index(drop=True)
+        frame = frame.drop_duplicates(subset=["signal_id"], keep="last").reset_index(
+            drop=True
+        )
     token_part = token_state_df[
         [
             "symbol",
@@ -182,7 +192,9 @@ def build_gate_feature_view(
         on=["context_bar_open_time"],
         source_name="reference_state_df",
     )
-    breadth_part = breadth_state_df.rename(columns={"open_time": "context_bar_open_time"})
+    breadth_part = breadth_state_df.rename(
+        columns={"open_time": "context_bar_open_time"}
+    )
     merged = _merge_required_rows(
         left_df=merged,
         right_df=breadth_part,
@@ -190,15 +202,24 @@ def build_gate_feature_view(
         source_name="breadth_state_df",
     )
     merged["detector_p_good"] = pd.to_numeric(merged["p_good"], errors="coerce")
-    merged["detector_peak_p_good_before_fire"] = pd.to_numeric(merged["peak_p_good_before_fire"], errors="coerce")
-    merged["detector_p_good_drop_from_peak"] = pd.to_numeric(merged["p_good_drop_from_peak"], errors="coerce")
-    merged["detector_episode_age_bars"] = pd.to_numeric(merged["episode_age_bars"], errors="coerce")
+    merged["detector_peak_p_good_before_fire"] = pd.to_numeric(
+        merged["peak_p_good_before_fire"], errors="coerce"
+    )
+    merged["detector_p_good_drop_from_peak"] = pd.to_numeric(
+        merged["p_good_drop_from_peak"], errors="coerce"
+    )
+    merged["detector_episode_age_bars"] = pd.to_numeric(
+        merged["episode_age_bars"], errors="coerce"
+    )
     merged["detector_distance_from_episode_high_pct"] = pd.to_numeric(
         merged["distance_from_episode_high_pct"], errors="coerce"
     )
     merged = _append_signal_flow_features(merged)
     merged = _append_strategy_state_features(merged)
-    out = merged.loc[~merged["_history_context_only"].astype(bool), [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS]].copy()
+    out = merged.loc[
+        ~merged["_history_context_only"].astype(bool),
+        [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS],
+    ].copy()
     log_info(
         "GATE",
         f"gate feature view build done rows_total={len(out)} feature_cols_total={len(GATE_FEATURE_COLUMNS)}",
@@ -217,7 +238,9 @@ def _append_signal_flow_features(df: pd.DataFrame) -> pd.DataFrame:
     same_symbol_counts = [0] * len(frame)
     recent_mean_scores = [0.0] * len(frame)
     window = pd.Timedelta(hours=24)
-    for _, idx in frame.groupby("_stream_group_key", sort=False, dropna=False).groups.items():
+    for _, idx in frame.groupby(
+        "_stream_group_key", sort=False, dropna=False
+    ).groups.items():
         history: deque[tuple[pd.Timestamp, str, float]] = deque()
         score_sum = 0.0
         symbol_counts: dict[str, int] = {}
@@ -242,8 +265,12 @@ def _append_signal_flow_features(df: pd.DataFrame) -> pd.DataFrame:
                 current_symbol = str(row["symbol"])
                 recent_counts[row_idx] = total_prev
                 same_symbol_counts[row_idx] = symbol_counts.get(current_symbol, 0)
-                recent_mean_scores[row_idx] = float(score_sum / total_prev) if total_prev > 0 else 0.0
-                p_good_value = float(pd.to_numeric(row["detector_p_good"], errors="coerce"))
+                recent_mean_scores[row_idx] = (
+                    float(score_sum / total_prev) if total_prev > 0 else 0.0
+                )
+                p_good_value = float(
+                    pd.to_numeric(row["detector_p_good"], errors="coerce")
+                )
                 if pd.isna(p_good_value):
                     p_good_value = 0.0
                 additions.append((now, current_symbol, p_good_value))
@@ -272,16 +299,24 @@ def _append_strategy_state_features(df: pd.DataFrame) -> pd.DataFrame:
     for column in required:
         if column not in frame.columns:
             frame[column] = pd.NA
-    frame["counterfactual_trade_outcome"] = frame["counterfactual_trade_outcome"].astype(str).str.lower()
-    frame["counterfactual_trade_pnl_pct"] = pd.to_numeric(frame["counterfactual_trade_pnl_pct"], errors="coerce")
-    frame["counterfactual_exit_time"] = pd.to_datetime(frame["counterfactual_exit_time"], utc=True, errors="coerce")
+    frame["counterfactual_trade_outcome"] = (
+        frame["counterfactual_trade_outcome"].astype(str).str.lower()
+    )
+    frame["counterfactual_trade_pnl_pct"] = pd.to_numeric(
+        frame["counterfactual_trade_pnl_pct"], errors="coerce"
+    )
+    frame["counterfactual_exit_time"] = pd.to_datetime(
+        frame["counterfactual_exit_time"], utc=True, errors="coerce"
+    )
     pnl_sum_24h = [0.0] * len(frame)
     sl_rate_24h = [0.0] * len(frame)
     tp_rate_24h = [0.0] * len(frame)
     losing_streak_prev = [0.0] * len(frame)
     open_trades_now = [0.0] * len(frame)
     window = pd.Timedelta(hours=24)
-    for _, idx in frame.groupby("_stream_group_key", sort=False, dropna=False).groups.items():
+    for _, idx in frame.groupby(
+        "_stream_group_key", sort=False, dropna=False
+    ).groups.items():
         resolved_history: list[tuple[pd.Timestamp, float, str]] = []
         all_resolved: list[tuple[pd.Timestamp, str]] = []
         active_positions: list[tuple[pd.Timestamp | None, float, str]] = []
@@ -291,7 +326,9 @@ def _append_strategy_state_features(df: pd.DataFrame) -> pd.DataFrame:
         ).groups.items():
             bucket_indices = list(bucket_idx)
             now = pd.Timestamp(frame.iloc[bucket_indices[0]]["context_bar_open_time"])
-            resolved_history = [item for item in resolved_history if item[0] >= now - window]
+            resolved_history = [
+                item for item in resolved_history if item[0] >= now - window
+            ]
             still_active: list[tuple[pd.Timestamp | None, float, str]] = []
             for exit_time_item, pnl_item, outcome_item in active_positions:
                 if exit_time_item is not None and exit_time_item < now:
@@ -326,10 +363,21 @@ def _append_strategy_state_features(df: pd.DataFrame) -> pd.DataFrame:
                 open_trades_now[row_idx] = float(len(active_positions))
             for row_idx in bucket_indices:
                 row = frame.iloc[row_idx]
-                exit_time = pd.Timestamp(row["counterfactual_exit_time"]) if pd.notna(row["counterfactual_exit_time"]) else None
+                exit_time = (
+                    pd.Timestamp(row["counterfactual_exit_time"])
+                    if pd.notna(row["counterfactual_exit_time"])
+                    else None
+                )
                 outcome = str(row["counterfactual_trade_outcome"])
-                pnl_value = float(row["counterfactual_trade_pnl_pct"]) if pd.notna(row["counterfactual_trade_pnl_pct"]) else 0.0
-                is_resolved = outcome in {"tp", "sl", "timeout", "ambiguous"} and exit_time is not None
+                pnl_value = (
+                    float(row["counterfactual_trade_pnl_pct"])
+                    if pd.notna(row["counterfactual_trade_pnl_pct"])
+                    else 0.0
+                )
+                is_resolved = (
+                    outcome in {"tp", "sl", "timeout", "ambiguous"}
+                    and exit_time is not None
+                )
                 if is_resolved and exit_time < now:
                     resolved_history.append((exit_time, pnl_value, outcome))
                     all_resolved.append((exit_time, outcome))
@@ -366,7 +414,9 @@ def _merge_required_rows(
     )
     missing_total = int((merged["_join_status"] == "left_only").sum())
     if missing_total > 0:
-        raise ValueError(f"missing rows after join with {source_name}: missing_rows={missing_total}")
+        raise ValueError(
+            f"missing rows after join with {source_name}: missing_rows={missing_total}"
+        )
     return merged.drop(columns=["_join_status"], errors="ignore")
 
 
@@ -376,11 +426,19 @@ def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], name: str) -> N
         raise ValueError(f"{name} missing required columns: {missing}")
 
 
-def _prepare_candidate_frame(candidate_signals_df: pd.DataFrame, history_context_only: bool) -> pd.DataFrame:
+def _prepare_candidate_frame(
+    candidate_signals_df: pd.DataFrame, history_context_only: bool
+) -> pd.DataFrame:
     frame = candidate_signals_df.copy()
-    frame["context_bar_open_time"] = pd.to_datetime(frame["context_bar_open_time"], utc=True, errors="raise")
-    frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="raise")
-    frame["entry_bar_open_time"] = pd.to_datetime(frame["entry_bar_open_time"], utc=True, errors="raise")
+    frame["context_bar_open_time"] = pd.to_datetime(
+        frame["context_bar_open_time"], utc=True, errors="raise"
+    )
+    frame["decision_time"] = pd.to_datetime(
+        frame["decision_time"], utc=True, errors="raise"
+    )
+    frame["entry_bar_open_time"] = pd.to_datetime(
+        frame["entry_bar_open_time"], utc=True, errors="raise"
+    )
     if "score_source" not in frame.columns:
         frame["score_source"] = "unknown"
     if "fold_id" not in frame.columns:
@@ -389,7 +447,9 @@ def _prepare_candidate_frame(candidate_signals_df: pd.DataFrame, history_context
     return frame
 
 
-def _normalize_history_stream_context(history_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_history_stream_context(
+    history_df: pd.DataFrame, current_df: pd.DataFrame
+) -> pd.DataFrame:
     if history_df.empty or current_df.empty:
         return history_df
     current_score_source = current_df["score_source"].dropna().astype(str).mode()

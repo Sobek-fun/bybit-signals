@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from pump_end_v2.gate.feature_view import GATE_FEATURE_COLUMNS, GATE_IDENTITY_COLUMNS
+from pump_end_v2.gate.feature_view import (GATE_FEATURE_COLUMNS,
+                                           GATE_IDENTITY_COLUMNS)
 from pump_end_v2.logging import log_info
 
 GATE_TARGET_META_COLUMNS: tuple[str, ...] = (
@@ -43,17 +44,33 @@ _CANDIDATE_TARGET_COLUMNS: tuple[str, ...] = (
 )
 
 
-def build_gate_dataset(gate_feature_view_df: pd.DataFrame, candidate_signals_df: pd.DataFrame) -> pd.DataFrame:
-    _require_columns(gate_feature_view_df, ("signal_id", *GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS), "gate_feature_view_df")
-    _require_columns(candidate_signals_df, _CANDIDATE_TARGET_COLUMNS, "candidate_signals_df")
+def build_gate_dataset(
+    gate_feature_view_df: pd.DataFrame, candidate_signals_df: pd.DataFrame
+) -> pd.DataFrame:
+    _require_columns(
+        gate_feature_view_df,
+        ("signal_id", *GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS),
+        "gate_feature_view_df",
+    )
+    _require_columns(
+        candidate_signals_df, _CANDIDATE_TARGET_COLUMNS, "candidate_signals_df"
+    )
     _require_unique_signal_id(gate_feature_view_df, "gate_feature_view_df")
     _require_unique_signal_id(candidate_signals_df, "candidate_signals_df")
     _validate_no_leakage_columns()
     target_part = candidate_signals_df.loc[:, list(_CANDIDATE_TARGET_COLUMNS)].copy()
-    merged = gate_feature_view_df.merge(target_part, on="signal_id", how="inner", validate="one_to_one")
-    merged["target_good_short_now"] = pd.to_numeric(merged["target_good_short_now"], errors="coerce").fillna(0).astype(int)
+    merged = gate_feature_view_df.merge(
+        target_part, on="signal_id", how="inner", validate="one_to_one"
+    )
+    merged["target_good_short_now"] = (
+        pd.to_numeric(merged["target_good_short_now"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
     merged["signal_quality_h32"] = merged["signal_quality_h32"].astype(str)
-    merged["target_block_signal"] = (merged["signal_quality_h32"] != "clean_retrace_h32").astype(int)
+    merged["target_block_signal"] = (
+        merged["signal_quality_h32"] != "clean_retrace_h32"
+    ).astype(int)
     merged["target_reason"] = merged["target_reason"].astype(str)
     merged["future_outcome_class"] = merged["future_outcome_class"].astype(str)
     merged["gate_trainable_signal"] = (
@@ -62,9 +79,21 @@ def build_gate_dataset(gate_feature_view_df: pd.DataFrame, candidate_signals_df:
         & merged["signal_quality_h32"].ne("<NA>")
     )
     merged["block_reason"] = merged.apply(_resolve_block_reason, axis=1)
-    ordered = merged.loc[:, [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS, *GATE_TARGET_META_COLUMNS, "gate_trainable_signal"]]
+    ordered = merged.loc[
+        :,
+        [
+            *GATE_IDENTITY_COLUMNS,
+            *GATE_FEATURE_COLUMNS,
+            *GATE_TARGET_META_COLUMNS,
+            "gate_trainable_signal",
+        ],
+    ]
     trainable_rows = int(ordered["gate_trainable_signal"].sum())
-    positive_rate = float(pd.to_numeric(ordered["target_block_signal"], errors="coerce").mean()) if len(ordered) > 0 else 0.0
+    positive_rate = (
+        float(pd.to_numeric(ordered["target_block_signal"], errors="coerce").mean())
+        if len(ordered) > 0
+        else 0.0
+    )
     log_info(
         "GATE",
         (

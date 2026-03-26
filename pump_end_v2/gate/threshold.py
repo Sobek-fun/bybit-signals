@@ -3,7 +3,8 @@ from __future__ import annotations
 import pandas as pd
 
 from pump_end_v2.contracts import ExecutionContract
-from pump_end_v2.execution.metrics import build_execution_metrics, build_execution_window_report
+from pump_end_v2.execution.metrics import (build_execution_metrics,
+                                           build_execution_window_report)
 from pump_end_v2.execution.replay import replay_short_signals_with_symbol_lock
 from pump_end_v2.logging import log_info
 
@@ -63,7 +64,15 @@ _COUNTERFACTUAL_COLUMNS: tuple[str, ...] = (
 
 def build_gate_threshold_grid(base_block_threshold: float) -> list[float]:
     base = float(base_block_threshold)
-    raw = [base - 0.20, base - 0.10, base - 0.05, base, base + 0.05, base + 0.10, base + 0.20]
+    raw = [
+        base - 0.20,
+        base - 0.10,
+        base - 0.05,
+        base,
+        base + 0.05,
+        base + 0.10,
+        base + 0.20,
+    ]
     clipped = [_round6(_clip(value, 0.05, 0.95)) for value in raw]
     return sorted(set(clipped))
 
@@ -75,7 +84,12 @@ def apply_gate_block_threshold(
     _require_columns(scored_signals_df, _APPLY_REQUIRED_COLUMNS, "scored_signals_df")
     threshold = float(block_threshold)
     decision_df = scored_signals_df.copy()
-    decision_df["gate_decision"] = decision_df["p_block"].astype(float).ge(threshold).map({True: "block", False: "keep"})
+    decision_df["gate_decision"] = (
+        decision_df["p_block"]
+        .astype(float)
+        .ge(threshold)
+        .map({True: "block", False: "keep"})
+    )
     decision_df["gate_block_threshold"] = threshold
     kept_signals_df = decision_df[decision_df["gate_decision"] == "keep"].copy()
     return decision_df, kept_signals_df
@@ -87,14 +101,23 @@ def build_gate_threshold_metrics(
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> dict[str, float]:
-    _require_columns(decision_df, ("target_block_signal", "gate_decision", "context_bar_open_time"), "decision_df")
+    _require_columns(
+        decision_df,
+        ("target_block_signal", "gate_decision", "context_bar_open_time"),
+        "decision_df",
+    )
     eval_df = decision_df.copy()
     if "gate_trainable_signal" in eval_df.columns:
         eval_df = eval_df[eval_df["gate_trainable_signal"].astype(bool)].copy()
     signals_before = int(len(eval_df))
     blocked_mask = eval_df["gate_decision"] == "block"
     kept_mask = eval_df["gate_decision"] == "keep"
-    bad_mask = pd.to_numeric(eval_df["target_block_signal"], errors="coerce").fillna(0).astype(int) == 1
+    bad_mask = (
+        pd.to_numeric(eval_df["target_block_signal"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+        == 1
+    )
     good_mask = ~bad_mask
     total_blocked = int(blocked_mask.sum())
     total_kept = int(kept_mask.sum())
@@ -108,11 +131,17 @@ def build_gate_threshold_metrics(
     blocked_bad_precision = _safe_ratio(blocked_bad, total_blocked)
     good_block_tax = _safe_ratio(blocked_good, total_good)
     blocked_share = _safe_ratio(total_blocked, signals_before)
-    eval_window_days = _resolve_eval_window_days(window_start=window_start, window_end=window_end, window_days=window_days)
+    eval_window_days = _resolve_eval_window_days(
+        window_start=window_start, window_end=window_end, window_days=window_days
+    )
     signals_per_30d_after = _compute_signals_per_30d_after(total_kept, eval_window_days)
     density_penalty = _compute_density_penalty(signals_per_30d_after)
     selection_score = (
-        bad_block_rate + good_keep_rate + blocked_bad_precision - good_block_tax - 0.25 * density_penalty
+        bad_block_rate
+        + good_keep_rate
+        + blocked_bad_precision
+        - good_block_tax
+        - 0.25 * density_penalty
     )
     return {
         "signals_before": float(signals_before),
@@ -186,10 +215,18 @@ def select_gate_block_threshold(
     return best_threshold, sweep_df
 
 
-def build_gate_decile_report(scored_signals_df: pd.DataFrame, deciles: int = 10) -> pd.DataFrame:
+def build_gate_decile_report(
+    scored_signals_df: pd.DataFrame, deciles: int = 10
+) -> pd.DataFrame:
     _require_columns(
         scored_signals_df,
-        ("p_block", "future_net_edge_pct", "future_pullback_pct", "future_prepullback_squeeze_pct", "signal_quality_h32"),
+        (
+            "p_block",
+            "future_net_edge_pct",
+            "future_pullback_pct",
+            "future_prepullback_squeeze_pct",
+            "signal_quality_h32",
+        ),
         "scored_signals_df",
     )
     frame = scored_signals_df.copy()
@@ -208,9 +245,15 @@ def build_gate_decile_report(scored_signals_df: pd.DataFrame, deciles: int = 10)
             ]
         )
     frame["p_block"] = pd.to_numeric(frame["p_block"], errors="coerce")
-    frame["future_net_edge_pct"] = pd.to_numeric(frame["future_net_edge_pct"], errors="coerce")
-    frame["future_pullback_pct"] = pd.to_numeric(frame["future_pullback_pct"], errors="coerce")
-    frame["future_prepullback_squeeze_pct"] = pd.to_numeric(frame["future_prepullback_squeeze_pct"], errors="coerce")
+    frame["future_net_edge_pct"] = pd.to_numeric(
+        frame["future_net_edge_pct"], errors="coerce"
+    )
+    frame["future_pullback_pct"] = pd.to_numeric(
+        frame["future_pullback_pct"], errors="coerce"
+    )
+    frame["future_prepullback_squeeze_pct"] = pd.to_numeric(
+        frame["future_prepullback_squeeze_pct"], errors="coerce"
+    )
     frame = frame.dropna(subset=["p_block"]).reset_index(drop=True)
     if frame.empty:
         return pd.DataFrame(columns=["decile", "signals"])
@@ -218,21 +261,29 @@ def build_gate_decile_report(scored_signals_df: pd.DataFrame, deciles: int = 10)
     if bins <= 1:
         frame["decile"] = 1
     else:
-        frame["decile"] = pd.qcut(frame["p_block"], q=bins, labels=False, duplicates="drop") + 1
+        frame["decile"] = (
+            pd.qcut(frame["p_block"], q=bins, labels=False, duplicates="drop") + 1
+        )
     rows: list[dict[str, float]] = []
     for decile, gdf in frame.groupby("decile", sort=True):
         quality = gdf["signal_quality_h32"].astype(str)
-        tp_rate = float((quality == "clean_retrace_h32").mean()) if len(gdf) > 0 else 0.0
-        sl_rate = float(
-            quality.isin(
-                {
-                    "dirty_retrace_h32",
-                    "clean_no_pullback_h32",
-                    "dirty_no_pullback_h32",
-                    "pullback_before_squeeze_h32",
-                }
-            ).mean()
-        ) if len(gdf) > 0 else 0.0
+        tp_rate = (
+            float((quality == "clean_retrace_h32").mean()) if len(gdf) > 0 else 0.0
+        )
+        sl_rate = (
+            float(
+                quality.isin(
+                    {
+                        "dirty_retrace_h32",
+                        "clean_no_pullback_h32",
+                        "dirty_no_pullback_h32",
+                        "pullback_before_squeeze_h32",
+                    }
+                ).mean()
+            )
+            if len(gdf) > 0
+            else 0.0
+        )
         rows.append(
             {
                 "decile": float(decile),
@@ -241,18 +292,28 @@ def build_gate_decile_report(scored_signals_df: pd.DataFrame, deciles: int = 10)
                 "p_block_max": float(gdf["p_block"].max()),
                 "sl_rate": sl_rate,
                 "tp_rate": tp_rate,
-                "avg_future_net_edge_pct": float(gdf["future_net_edge_pct"].mean() * 100.0)
-                if len(gdf) > 0
-                else float("nan"),
-                "mean_pullback_pct": float(gdf["future_pullback_pct"].mean() * 100.0)
-                if len(gdf) > 0
-                else float("nan"),
-                "mean_squeeze_pct": float(gdf["future_prepullback_squeeze_pct"].mean() * 100.0)
-                if len(gdf) > 0
-                else float("nan"),
+                "avg_future_net_edge_pct": (
+                    float(gdf["future_net_edge_pct"].mean() * 100.0)
+                    if len(gdf) > 0
+                    else float("nan")
+                ),
+                "mean_pullback_pct": (
+                    float(gdf["future_pullback_pct"].mean() * 100.0)
+                    if len(gdf) > 0
+                    else float("nan")
+                ),
+                "mean_squeeze_pct": (
+                    float(gdf["future_prepullback_squeeze_pct"].mean() * 100.0)
+                    if len(gdf) > 0
+                    else float("nan")
+                ),
             }
         )
-    return pd.DataFrame(rows).sort_values("decile", kind="mergesort").reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values("decile", kind="mergesort")
+        .reset_index(drop=True)
+    )
 
 
 def select_gate_block_threshold_execution_aware(
@@ -274,11 +335,13 @@ def select_gate_block_threshold_execution_aware(
     rows: list[dict[str, float]] = []
     for threshold in build_gate_threshold_grid(base_block_threshold):
         gate_decisions_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
-        execution_decisions_df, executed_signals_df = replay_short_signals_with_symbol_lock(
-            gate_decisions_df,
-            bars_1m_df,
-            execution_contract,
-            bars_1s_df,
+        execution_decisions_df, executed_signals_df = (
+            replay_short_signals_with_symbol_lock(
+                gate_decisions_df,
+                bars_1m_df,
+                execution_contract,
+                bars_1s_df,
+            )
         )
         execution_decisions_df = execution_decisions_df.merge(
             counterfactual_outcomes_df,
@@ -376,10 +439,12 @@ def build_gate_execution_decision_summary(
     gate_keep_mask = joined["gate_decision"].astype(str) == "keep"
     executed_mask = joined["execution_status"].astype(str) == "executed"
     blocked_gate_mask = joined["execution_status"].astype(str) == "blocked_gate"
-    blocked_symbol_lock_mask = joined["execution_status"].astype(str) == "blocked_symbol_lock"
-    failed_execution_other_mask = gate_keep_mask & ~joined["execution_status"].astype(str).isin(
-        {"executed", "blocked_symbol_lock"}
+    blocked_symbol_lock_mask = (
+        joined["execution_status"].astype(str) == "blocked_symbol_lock"
     )
+    failed_execution_other_mask = gate_keep_mask & ~joined["execution_status"].astype(
+        str
+    ).isin({"executed", "blocked_symbol_lock"})
     counterfactual_outcome = joined["counterfactual_trade_outcome"].astype(str)
     tp_mask = counterfactual_outcome == "tp"
     sl_mask = counterfactual_outcome == "sl"
@@ -403,18 +468,28 @@ def build_gate_execution_decision_summary(
         "tp_blocked_execution": float(tp_blocked_execution),
         "sl_blocked_execution": float(sl_blocked_execution),
         "tp_tax_model": float(_safe_ratio(tp_blocked_model, tp_total_all_candidates)),
-        "sl_capture_model": float(_safe_ratio(sl_blocked_model, sl_total_all_candidates)),
+        "sl_capture_model": float(
+            _safe_ratio(sl_blocked_model, sl_total_all_candidates)
+        ),
         "tp_tax_execution": float(_safe_ratio(tp_blocked_execution, tp_total_kept)),
         "sl_capture_execution": float(_safe_ratio(sl_blocked_execution, sl_total_kept)),
-        "pnl_before": float(pd.to_numeric(joined["counterfactual_trade_pnl_pct"], errors="coerce").fillna(0.0).sum()),
+        "pnl_before": float(
+            pd.to_numeric(joined["counterfactual_trade_pnl_pct"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+        ),
         "pnl_after_execution": float(
-            pd.to_numeric(joined.loc[executed_mask, "trade_pnl_pct"], errors="coerce").fillna(0.0).sum()
+            pd.to_numeric(joined.loc[executed_mask, "trade_pnl_pct"], errors="coerce")
+            .fillna(0.0)
+            .sum()
         ),
     }
     return summary
 
 
-def _compute_signals_per_30d_after(kept_signals_count: int, eval_window_days: float) -> float:
+def _compute_signals_per_30d_after(
+    kept_signals_count: int, eval_window_days: float
+) -> float:
     if kept_signals_count <= 0:
         return 0.0
     safe_window_days = max(float(eval_window_days), 1e-9)
@@ -530,7 +605,9 @@ def attach_counterfactual_execution_outcomes(
         )
     out = pd.DataFrame(rows, columns=list(_COUNTERFACTUAL_COLUMNS))
     if not decision_df["signal_id"].is_unique:
-        raise ValueError("decision_df must have unique signal_id for counterfactual enrichment")
+        raise ValueError(
+            "decision_df must have unique signal_id for counterfactual enrichment"
+        )
     if not out["signal_id"].is_unique:
         raise ValueError("counterfactual outcomes produced duplicate signal_id")
     return out

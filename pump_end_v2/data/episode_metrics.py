@@ -36,11 +36,17 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
             ]
         )
         log_info("METRICS", "summary episodes_total=0 good_episode_share=0.0000")
-        stage_done("METRICS", "BUILD_EPISODE_SUMMARY", elapsed_sec=time.perf_counter() - started)
+        stage_done(
+            "METRICS",
+            "BUILD_EPISODE_SUMMARY",
+            elapsed_sec=time.perf_counter() - started,
+        )
         return out
     summary_rows: list[dict[str, object]] = []
     for episode_id, gdf in resolved_rows.groupby("episode_id", sort=False):
-        gdf = gdf.sort_values("context_bar_open_time", kind="mergesort").reset_index(drop=True)
+        gdf = gdf.sort_values("context_bar_open_time", kind="mergesort").reset_index(
+            drop=True
+        )
         total_rows = len(gdf)
         resolved_count = int(gdf["is_resolved"].sum())
         good_row_count = int((gdf["target_good_short_now"] == 1).sum())
@@ -59,20 +65,34 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
             ideal_entry_row_id = ideal["decision_row_id"]
             ideal_entry_bar_open_time = ideal["entry_bar_open_time"]
             ideal_pullback_pct = float(ideal["future_pullback_pct"])
-            ideal_prepullback_squeeze_pct = float(ideal["future_prepullback_squeeze_pct"])
+            ideal_prepullback_squeeze_pct = float(
+                ideal["future_prepullback_squeeze_pct"]
+            )
             ideal_net_edge_pct = float(ideal["future_net_edge_pct"])
             bars_open_to_ideal_entry = int(
-                (ideal_entry_bar_open_time - gdf["episode_open_time"].iloc[0]).total_seconds() // (15 * 60)
+                (
+                    ideal_entry_bar_open_time - gdf["episode_open_time"].iloc[0]
+                ).total_seconds()
+                // (15 * 60)
             )
-            episode_open_close = pd.to_numeric(gdf["episode_open_close"].iloc[0], errors="coerce")
+            episode_open_close = pd.to_numeric(
+                gdf["episode_open_close"].iloc[0], errors="coerce"
+            )
             ideal_entry_price = pd.to_numeric(ideal["entry_price"], errors="coerce")
-            if pd.notna(episode_open_close) and float(episode_open_close) > 0.0 and pd.notna(ideal_entry_price):
+            if (
+                pd.notna(episode_open_close)
+                and float(episode_open_close) > 0.0
+                and pd.notna(ideal_entry_price)
+            ):
                 extension_open_to_ideal_entry_pct = float(
-                    (float(ideal_entry_price) - float(episode_open_close)) / float(episode_open_close)
+                    (float(ideal_entry_price) - float(episode_open_close))
+                    / float(episode_open_close)
                 )
             else:
                 extension_open_to_ideal_entry_pct = math.nan
-        runup_pct_at_open = float(pd.to_numeric(gdf["runup_pct_at_context"].iloc[0], errors="coerce"))
+        runup_pct_at_open = float(
+            pd.to_numeric(gdf["runup_pct_at_context"].iloc[0], errors="coerce")
+        )
         if good_row_count > 0:
             episode_outcome_class = OutcomeClass.REVERSAL.value
         elif (gdf["future_outcome_class"] == OutcomeClass.CONTINUATION.value).any():
@@ -103,7 +123,9 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
         )
     summary_df = pd.DataFrame(summary_rows)
     good_episode_share = (
-        float((summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean())
+        float(
+            (summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean()
+        )
         if not summary_df.empty
         else 0.0
     )
@@ -111,7 +133,9 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
         "METRICS",
         f"summary episodes_total={len(summary_df)} good_episode_share={good_episode_share:.4f}",
     )
-    stage_done("METRICS", "BUILD_EPISODE_SUMMARY", elapsed_sec=time.perf_counter() - started)
+    stage_done(
+        "METRICS", "BUILD_EPISODE_SUMMARY", elapsed_sec=time.perf_counter() - started
+    )
     return summary_df
 
 
@@ -132,26 +156,40 @@ def build_event_quality_report(summary_df: pd.DataFrame) -> dict[str, float]:
             "mean_good_zone_width_bars": 0.0,
         }
     episodes_total = int(len(summary_df))
-    open_times = pd.to_datetime(summary_df["episode_open_time"], utc=True, errors="coerce")
+    open_times = pd.to_datetime(
+        summary_df["episode_open_time"], utc=True, errors="coerce"
+    )
     span_days = (open_times.max() - open_times.min()).total_seconds() / 86400.0
     if span_days <= 0:
         episodes_per_30d = float(episodes_total) * 30.0
     else:
         episodes_per_30d = float(episodes_total) / (span_days / 30.0)
-    reversal_share = float((summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean())
-    continuation_share = float((summary_df["episode_outcome_class"] == OutcomeClass.CONTINUATION.value).mean())
-    flat_share = float((summary_df["episode_outcome_class"] == OutcomeClass.FLAT.value).mean())
+    reversal_share = float(
+        (summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean()
+    )
+    continuation_share = float(
+        (summary_df["episode_outcome_class"] == OutcomeClass.CONTINUATION.value).mean()
+    )
+    flat_share = float(
+        (summary_df["episode_outcome_class"] == OutcomeClass.FLAT.value).mean()
+    )
     return {
         "episodes_total": episodes_total,
         "episodes_per_30d": episodes_per_30d,
         "reversal_share": reversal_share,
         "continuation_share": continuation_share,
         "flat_share": flat_share,
-        "median_bars_open_to_ideal_entry": float(summary_df["bars_open_to_ideal_entry"].median()),
+        "median_bars_open_to_ideal_entry": float(
+            summary_df["bars_open_to_ideal_entry"].median()
+        ),
         "median_ideal_pullback_pct": float(summary_df["ideal_pullback_pct"].median()),
-        "median_ideal_remaining_squeeze_pct": float(summary_df["ideal_prepullback_squeeze_pct"].median()),
+        "median_ideal_remaining_squeeze_pct": float(
+            summary_df["ideal_prepullback_squeeze_pct"].median()
+        ),
         "median_runup_pct_at_open": float(summary_df["runup_pct_at_open"].median()),
-        "median_extension_open_to_ideal_entry_pct": float(summary_df["extension_open_to_ideal_entry_pct"].median()),
+        "median_extension_open_to_ideal_entry_pct": float(
+            summary_df["extension_open_to_ideal_entry_pct"].median()
+        ),
         "good_episode_share": reversal_share,
         "mean_good_zone_width_bars": float(summary_df["good_zone_width_bars"].mean()),
     }

@@ -6,17 +6,25 @@ import time
 import pandas as pd
 
 from pump_end_v2.config import ResolverConfig
-from pump_end_v2.contracts import OutcomeClass, SignalQualityClass, TargetReason
+from pump_end_v2.contracts import (OutcomeClass, SignalQualityClass,
+                                   TargetReason)
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
-def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config: ResolverConfig) -> pd.DataFrame:
+def resolve_decision_rows(
+    df: pd.DataFrame, decision_rows: pd.DataFrame, config: ResolverConfig
+) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("RESOLVER", "RESOLVE_ROWS")
     if decision_rows.empty:
         out = decision_rows.copy()
-        log_info("RESOLVER", "summary rows_total=0 resolved_rows=0 good_rows=0 reversal_share=0.0000")
-        stage_done("RESOLVER", "RESOLVE_ROWS", elapsed_sec=time.perf_counter() - started)
+        log_info(
+            "RESOLVER",
+            "summary rows_total=0 resolved_rows=0 good_rows=0 reversal_share=0.0000",
+        )
+        stage_done(
+            "RESOLVER", "RESOLVE_ROWS", elapsed_sec=time.perf_counter() - started
+        )
         return out
     resolved = decision_rows.copy()
     resolved["is_resolved"] = False
@@ -40,7 +48,8 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
     )
     resolved["is_ideal_entry"] = False
     market_by_symbol = {
-        symbol: sdf.reset_index(drop=True).copy() for symbol, sdf in df.groupby("symbol", sort=False)
+        symbol: sdf.reset_index(drop=True).copy()
+        for symbol, sdf in df.groupby("symbol", sort=False)
     }
     for idx, row in resolved.iterrows():
         symbol_df = market_by_symbol.get(row["symbol"])
@@ -60,16 +69,28 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
         pullback_series = (entry_price - horizon_df["low"]) / entry_price
         max_squeeze_pct_total = float(squeeze_series.max())
         max_pullback_pct_total = float(pullback_series.max())
-        success_mask = horizon_df["low"] <= entry_price * (1.0 - config.success_pullback_pct)
-        first_success_pullback_index = int(success_mask[success_mask].index[0] - horizon_df.index[0]) if success_mask.any() else None
+        success_mask = horizon_df["low"] <= entry_price * (
+            1.0 - config.success_pullback_pct
+        )
+        first_success_pullback_index = (
+            int(success_mask[success_mask].index[0] - horizon_df.index[0])
+            if success_mask.any()
+            else None
+        )
         if first_success_pullback_index is None:
             future_prepullback_squeeze_pct = max_squeeze_pct_total
         else:
-            future_prepullback_squeeze_pct = float(squeeze_series.iloc[: first_success_pullback_index + 1].max())
+            future_prepullback_squeeze_pct = float(
+                squeeze_series.iloc[: first_success_pullback_index + 1].max()
+            )
         peak_high = float(horizon_df["high"].max())
-        first_peak_index = int((horizon_df["high"] == peak_high).idxmax() - horizon_df.index[0])
+        first_peak_index = int(
+            (horizon_df["high"] == peak_high).idxmax() - horizon_df.index[0]
+        )
         bars_to_resolution = (
-            first_success_pullback_index if first_success_pullback_index is not None else int(config.horizon_bars)
+            first_success_pullback_index
+            if first_success_pullback_index is not None
+            else int(config.horizon_bars)
         )
         future_pullback_pct = max_pullback_pct_total
         future_net_edge_pct = future_pullback_pct - future_prepullback_squeeze_pct
@@ -78,10 +99,12 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
             int(horizon_df.index[0]),
         )
         has_success_pullback = first_success_pullback_index is not None
-        wait_ok = (
-            has_success_pullback and int(first_success_pullback_index) <= int(config.max_wait_bars_for_success)
+        wait_ok = has_success_pullback and int(first_success_pullback_index) <= int(
+            config.max_wait_bars_for_success
         )
-        squeeze_ok = future_prepullback_squeeze_pct <= float(config.max_prepullback_squeeze_pct)
+        squeeze_ok = future_prepullback_squeeze_pct <= float(
+            config.max_prepullback_squeeze_pct
+        )
         pullback_before_squeeze = (
             has_success_pullback
             and first_squeeze_breach_index is not None
@@ -106,7 +129,9 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
             outcome = OutcomeClass.FLAT.value
         resolved.at[idx, "is_resolved"] = True
         resolved.at[idx, "entry_price"] = entry_price
-        resolved.at[idx, "future_prepullback_squeeze_pct"] = future_prepullback_squeeze_pct
+        resolved.at[idx, "future_prepullback_squeeze_pct"] = (
+            future_prepullback_squeeze_pct
+        )
         resolved.at[idx, "future_pullback_pct"] = future_pullback_pct
         resolved.at[idx, "future_net_edge_pct"] = future_net_edge_pct
         resolved.at[idx, "bars_to_pullback"] = first_success_pullback_index
@@ -114,7 +139,9 @@ def resolve_decision_rows(df: pd.DataFrame, decision_rows: pd.DataFrame, config:
         resolved.at[idx, "bars_to_resolution"] = bars_to_resolution
         resolved.at[idx, "future_outcome_class"] = outcome
         resolved.at[idx, "signal_quality_h32"] = signal_quality
-        resolved.at[idx, "target_good_short_now"] = 1 if outcome == OutcomeClass.REVERSAL.value else 0
+        resolved.at[idx, "target_good_short_now"] = (
+            1 if outcome == OutcomeClass.REVERSAL.value else 0
+        )
         resolved.at[idx, "entry_quality_score"] = future_net_edge_pct - 0.001 * min(
             bars_to_resolution, config.horizon_bars
         )
@@ -148,15 +175,23 @@ def _attach_episode_ideal_entry(resolved: pd.DataFrame) -> pd.DataFrame:
         ideal = candidates.iloc[0]
         episode_mask = frame["episode_id"] == episode_id
         frame.loc[episode_mask, "ideal_entry_row_id"] = ideal["decision_row_id"]
-        frame.loc[episode_mask, "ideal_entry_bar_open_time"] = ideal["entry_bar_open_time"]
-        frame.loc[episode_mask, "is_ideal_entry"] = frame.loc[episode_mask, "decision_row_id"] == ideal["decision_row_id"]
+        frame.loc[episode_mask, "ideal_entry_bar_open_time"] = ideal[
+            "entry_bar_open_time"
+        ]
+        frame.loc[episode_mask, "is_ideal_entry"] = (
+            frame.loc[episode_mask, "decision_row_id"] == ideal["decision_row_id"]
+        )
     return frame
 
 
 def _apply_target_reason(resolved: pd.DataFrame) -> pd.DataFrame:
     frame = resolved.copy()
     good_by_episode = (
-        frame.groupby("episode_id")["target_good_short_now"].max().fillna(0).astype(int).to_dict()
+        frame.groupby("episode_id")["target_good_short_now"]
+        .max()
+        .fillna(0)
+        .astype(int)
+        .to_dict()
     )
     for idx, row in frame.iterrows():
         if not bool(row["is_resolved"]):
@@ -165,7 +200,9 @@ def _apply_target_reason(resolved: pd.DataFrame) -> pd.DataFrame:
         if int(row["target_good_short_now"]) == 1:
             frame.at[idx, "target_reason"] = TargetReason.GOOD.value
             continue
-        if good_by_episode.get(row["episode_id"], 0) > 0 and pd.notna(row["ideal_entry_bar_open_time"]):
+        if good_by_episode.get(row["episode_id"], 0) > 0 and pd.notna(
+            row["ideal_entry_bar_open_time"]
+        ):
             if row["entry_bar_open_time"] < row["ideal_entry_bar_open_time"]:
                 frame.at[idx, "target_reason"] = TargetReason.TOO_EARLY.value
                 continue

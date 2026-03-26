@@ -28,7 +28,9 @@ class ArtifactManager:
             (run_dir / relative_dir).mkdir(parents=True, exist_ok=True)
         return run_dir
 
-    def save_config_snapshot(self, run_dir: str | Path, config_path: str | Path) -> Path:
+    def save_config_snapshot(
+        self, run_dir: str | Path, config_path: str | Path
+    ) -> Path:
         target = Path(run_dir) / "config.snapshot.toml"
         source = Path(config_path)
         target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
@@ -36,10 +38,14 @@ class ArtifactManager:
 
     def save_run_manifest(self, run_dir: str | Path, manifest: dict[str, Any]) -> Path:
         target = Path(run_dir) / "run_manifest.json"
-        target.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
+        target.write_text(
+            json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8"
+        )
         return target
 
-    def stage_output_dir(self, run_dir: str | Path, stage_name: str, split: str | None = None) -> Path:
+    def stage_output_dir(
+        self, run_dir: str | Path, stage_name: str, split: str | None = None
+    ) -> Path:
         root = Path(run_dir)
         if stage_name == "prepared":
             return root / "prepared"
