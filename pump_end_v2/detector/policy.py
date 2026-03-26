@@ -95,6 +95,7 @@ EPISODE_POLICY_SUMMARY_COLUMNS: tuple[str, ...] = (
 def apply_episode_aware_detector_policy(
     scored_rows_df: pd.DataFrame,
     detector_policy_config: DetectorPolicyConfig,
+    emit_summary_log: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     _require_columns(scored_rows_df, INPUT_REQUIRED_COLUMNS)
     has_fold_id = "fold_id" in scored_rows_df.columns
@@ -272,10 +273,11 @@ def apply_episode_aware_detector_policy(
         episode_policy_summary_df = episode_policy_summary_df.loc[
             :, list(EPISODE_POLICY_SUMMARY_COLUMNS)
         ].copy()
-    log_info(
-        "POLICY",
-        f"policy apply done episodes_total={len(episode_policy_summary_df)} signals_total={len(candidate_signals_df)}",
-    )
+    if emit_summary_log:
+        log_info(
+            "POLICY",
+            f"policy apply done episodes_total={len(episode_policy_summary_df)} signals_total={len(candidate_signals_df)}",
+        )
     return candidate_signals_df, episode_policy_summary_df
 
 

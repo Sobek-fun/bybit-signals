@@ -1,4 +1,6 @@
 import pandas as pd
+import sys
+import time
 
 from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.execution.metrics import (
@@ -7,6 +9,12 @@ from pump_end_v2.execution.metrics import (
 )
 from pump_end_v2.execution.replay import replay_short_signals_with_symbol_lock
 from pump_end_v2.logging import log_info
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 _SWEEP_COLUMNS: tuple[str, ...] = (
     "block_threshold",
@@ -75,6 +83,19 @@ def build_gate_threshold_grid(base_block_threshold: float) -> list[float]:
     ]
     clipped = [_round6(_clip(value, 0.05, 0.95)) for value in raw]
     return sorted(set(clipped))
+
+
+def _tqdm_kwargs() -> dict[str, object]:
+    return {
+        "disable": not sys.stderr.isatty(),
+        "leave": False,
+        "dynamic_ncols": True,
+        "mininterval": 0.5,
+    }
+
+
+def _is_tty_progress() -> bool:
+    return sys.stderr.isatty()
 
 
 def apply_gate_block_threshold(
@@ -327,15 +348,23 @@ def select_gate_block_threshold_execution_aware(
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> tuple[float, pd.DataFrame]:
+    sweep_started = time.perf_counter()
     counterfactual_outcomes_df = attach_counterfactual_execution_outcomes(
         scored_signals_df,
         bars_15m_df,
         bars_1m_df,
         execution_contract,
         bars_1s_fetcher,
+        split_label="val",
+    )
+    thresholds = build_gate_threshold_grid(base_block_threshold)
+    log_info(
+        "GATE",
+        f"threshold execution sweep start candidates_total={len(thresholds)}",
     )
     rows: list[dict[str, float]] = []
-    for threshold in build_gate_threshold_grid(base_block_threshold):
+    best_selection_score = float("-inf")
+    for idx, threshold in enumerate(thresholds, start=1):
         gate_decisions_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
         execution_decisions_df, executed_signals_df = (
             replay_short_signals_with_symbol_lock(
@@ -344,6 +373,7 @@ def select_gate_block_threshold_execution_aware(
                 bars_1m_df,
                 execution_contract,
                 bars_1s_fetcher,
+                emit_summary_log=False,
             )
         )
         execution_decisions_df = execution_decisions_df.merge(
@@ -375,6 +405,25 @@ def select_gate_block_threshold_execution_aware(
             + 0.25 * worst_6h
             + 0.10 * worst_24h
             - 0.10 * max_losing_streak
+        )
+        best_selection_score = max(best_selection_score, float(selection_score))
+        elapsed = time.perf_counter() - sweep_started
+        rate = idx / elapsed if elapsed > 0 else 0.0
+        eta = (len(thresholds) - idx) / rate if rate > 0 else 0.0
+        log_info(
+            "GATE",
+            (
+                f"threshold execution progress idx={idx}/{len(thresholds)} "
+                f"block_threshold={float(threshold):.6f} "
+                f"signals_after_model={int(summary['after_model'])} "
+                f"signals_after_execution={int(summary['after_execution'])} "
+                f"pnl_after_execution={pnl_sum:.6f} "
+                f"worst_24h_after_execution={worst_24h:.6f} "
+                f"tp_tax_execution={float(summary['tp_tax_execution']):.6f} "
+                f"sl_capture_execution={float(summary['sl_capture_execution']):.6f} "
+                f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f} "
+                f"current_best={best_selection_score:.6f}"
+            ),
         )
         rows.append(
             {
@@ -413,6 +462,10 @@ def select_gate_block_threshold_execution_aware(
         kind="mergesort",
     ).reset_index(drop=True)
     best_threshold = float(ranked.iloc[0]["block_threshold"])
+    log_info(
+        "GATE",
+        f"threshold execution sweep done candidates_total={len(sweep_df)} elapsed_sec={time.perf_counter() - sweep_started:.3f}",
+    )
     log_info(
         "GATE",
         (
@@ -553,6 +606,7 @@ def attach_counterfactual_execution_outcomes(
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None = None,
+    split_label: str = "unknown",
 ) -> pd.DataFrame:
     _require_columns(
         decision_df,
@@ -577,7 +631,26 @@ def attach_counterfactual_execution_outcomes(
         "entry_bar_open_time",
     ]
     rows: list[dict[str, object]] = []
-    for row in decision_df.loc[:, identity_columns].itertuples(index=False):
+    total_signals = len(decision_df)
+    progress_step = max(1, total_signals // 12 if total_signals > 0 else 1)
+    started = time.perf_counter()
+    emit_periodic_log = not _is_tty_progress()
+    status_counts: dict[str, int] = {
+        "tp": 0,
+        "sl": 0,
+        "timeout": 0,
+        "ambiguous": 0,
+    }
+    for processed, row in enumerate(
+        tqdm(
+            decision_df.loc[:, identity_columns].itertuples(index=False),
+            total=total_signals,
+            desc=f"counterfactual {split_label}",
+            unit="signal",
+            **_tqdm_kwargs(),
+        ),
+        start=1,
+    ):
         one_signal = pd.DataFrame(
             [
                 {
@@ -597,8 +670,12 @@ def attach_counterfactual_execution_outcomes(
             bars_1m_df,
             execution_contract,
             bars_1s_fetcher,
+            emit_summary_log=False,
         )
         one = one_decision_df.iloc[0]
+        outcome = str(one.get("trade_outcome", "")).lower()
+        if outcome in status_counts:
+            status_counts[outcome] += 1
         rows.append(
             {
                 "signal_id": row.signal_id,
@@ -608,6 +685,33 @@ def attach_counterfactual_execution_outcomes(
                 "counterfactual_exit_time": one.get("exit_time", pd.NaT),
             }
         )
+        if emit_periodic_log and (processed % progress_step == 0 or processed == total_signals):
+            elapsed = time.perf_counter() - started
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            eta = (total_signals - processed) / rate if rate > 0 else 0.0
+            pct = (processed / total_signals * 100.0) if total_signals > 0 else 0.0
+            avg_sec_per_signal = elapsed / processed if processed > 0 else 0.0
+            log_info(
+                "EXECUTION",
+                (
+                    f"counterfactual progress split={split_label} processed={processed}/{total_signals} "
+                    f"pct={pct:.1f} elapsed_sec={elapsed:.3f} rate_per_sec={rate:.3f} "
+                    f"avg_sec_per_signal={avg_sec_per_signal:.3f} eta_sec={eta:.3f} "
+                    f"tp_so_far={status_counts['tp']} sl_so_far={status_counts['sl']} "
+                    f"timeout_so_far={status_counts['timeout']} ambiguous_so_far={status_counts['ambiguous']}"
+                ),
+            )
+    elapsed_total = time.perf_counter() - started
+    avg_sec_per_signal = elapsed_total / total_signals if total_signals > 0 else 0.0
+    log_info(
+        "EXECUTION",
+        (
+            f"counterfactual done split={split_label} signals_total={total_signals} "
+            f"elapsed_sec={elapsed_total:.3f} avg_sec_per_signal={avg_sec_per_signal:.3f} "
+            f"tp_total={status_counts['tp']} sl_total={status_counts['sl']} "
+            f"timeout_total={status_counts['timeout']} ambiguous_total={status_counts['ambiguous']}"
+        ),
+    )
     out = pd.DataFrame(rows, columns=list(_COUNTERFACTUAL_COLUMNS))
     if not decision_df["signal_id"].is_unique:
         raise ValueError(

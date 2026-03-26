@@ -1,3 +1,4 @@
+import sys
 import time
 
 import pandas as pd
@@ -5,7 +6,22 @@ import pandas as pd
 from pump_end_v2.config import EventOpenerConfig
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 _CONTEXT_DECAY_BARS = 3
+
+
+def _tqdm_kwargs() -> dict[str, object]:
+    return {
+        "disable": not sys.stderr.isatty(),
+        "leave": False,
+        "dynamic_ncols": True,
+        "mininterval": 0.5,
+    }
 
 
 def open_causal_pump_episodes(
@@ -14,7 +30,15 @@ def open_causal_pump_episodes(
     started = time.perf_counter()
     stage_start("EVENT", "OPEN_EPISODES")
     episodes: list[dict[str, object]] = []
-    for symbol, sdf in token_state_df.groupby("symbol", sort=False):
+    grouped = list(token_state_df.groupby("symbol", sort=False))
+    total_symbols = len(grouped)
+    for symbol, sdf in tqdm(
+        grouped,
+        total=total_symbols,
+        desc="open episodes",
+        unit="symbol",
+        **_tqdm_kwargs(),
+    ):
         episodes.extend(
             _open_symbol_episodes(symbol, sdf.reset_index(drop=True), config)
         )
@@ -32,11 +56,16 @@ def open_causal_pump_episodes(
             "max_runup_pct_during_episode",
         ],
     )
+    elapsed = time.perf_counter() - started
+    symbols_per_sec = (total_symbols / elapsed) if elapsed > 0 else 0.0
     log_info(
         "EVENT",
-        f"summary symbols={token_state_df['symbol'].nunique() if not token_state_df.empty else 0} bars={len(token_state_df)} episodes_total={len(episodes_df)}",
+        (
+            f"summary symbols={total_symbols} bars={len(token_state_df)} episodes_total={len(episodes_df)} "
+            f"elapsed_sec={elapsed:.3f} symbols_per_sec={symbols_per_sec:.3f}"
+        ),
     )
-    stage_done("EVENT", "OPEN_EPISODES", elapsed_sec=time.perf_counter() - started)
+    stage_done("EVENT", "OPEN_EPISODES", elapsed_sec=elapsed)
     return episodes_df
 
 

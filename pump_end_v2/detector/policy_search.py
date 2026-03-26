@@ -1,4 +1,5 @@
 from itertools import product
+import time
 
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -257,6 +258,7 @@ def build_detector_train_oof_policy_rows(
     detector_cv_config: DetectorCVConfig,
     detector_model_config: DetectorModelConfig,
 ) -> pd.DataFrame:
+    started = time.perf_counter()
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy OOF scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
@@ -265,16 +267,38 @@ def build_detector_train_oof_policy_rows(
     )
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
     chunks: list[pd.DataFrame] = []
-    for fold in folds:
+    for idx, fold in enumerate(folds, start=1):
+        fold_started = time.perf_counter()
+        log_info(
+            "POLICY",
+            (
+                f"oof fold start fold={idx}/{len(folds)} fold_id={fold.fold_id} "
+                f"train_rows={fold.train_row_count} val_rows={fold.val_row_count} "
+                f"train_start={pd.Timestamp(fold.train_start)} train_end={pd.Timestamp(fold.train_end)} "
+                f"val_start={pd.Timestamp(fold.val_start)} val_end={pd.Timestamp(fold.val_end)}"
+            ),
+        )
         fold_train_raw, _ = filter_fold_rows(frame, fold)
         fold_train_fit = fold_train_raw[
             fold_train_raw["trainable_row"].astype(bool)
         ].copy()
         if fold_train_fit.empty:
+            log_info(
+                "POLICY",
+                f"oof fold skipped fold={idx}/{len(folds)} reason=no_trainable_rows",
+            )
             continue
         model = build_detector_model(detector_model_config)
+        fit_started = time.perf_counter()
         fit_detector_model(
             model, fold_train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+        )
+        log_info(
+            "POLICY",
+            (
+                f"oof fold model_fit done fold={idx}/{len(folds)} "
+                f"rows_fit={len(fold_train_fit)} elapsed_sec_fit={time.perf_counter() - fit_started:.3f}"
+            ),
         )
         val_start = pd.Timestamp(fold.val_start)
         val_end = pd.Timestamp(fold.val_end)
@@ -285,6 +309,10 @@ def build_detector_train_oof_policy_rows(
             & (frame["context_bar_open_time"] <= val_end)
         ].copy()
         if fold_active_rows.empty:
+            log_info(
+                "POLICY",
+                f"oof fold skipped fold={idx}/{len(folds)} reason=no_active_rows",
+            )
             continue
         fold_active_rows = fold_active_rows[
             _build_active_eligibility_mask(
@@ -294,6 +322,10 @@ def build_detector_train_oof_policy_rows(
             )
         ].copy()
         if fold_active_rows.empty:
+            log_info(
+                "POLICY",
+                f"oof fold skipped fold={idx}/{len(folds)} reason=no_active_rows_after_horizon_filter",
+            )
             continue
         fold_warmup_rows = frame[
             (frame["dataset_split"] == "train")
@@ -314,6 +346,20 @@ def build_detector_train_oof_policy_rows(
             score_source="train_oof",
             fold_id=fold.fold_id,
         )
+        context_rows = (
+            int(scored_fold["policy_context_only"].sum()) if len(scored_fold) > 0 else 0
+        )
+        active_rows = (
+            int((~scored_fold["policy_context_only"]).sum()) if len(scored_fold) > 0 else 0
+        )
+        log_info(
+            "POLICY",
+            (
+                f"oof fold policy_rows done fold={idx}/{len(folds)} "
+                f"rows_total={len(scored_fold)} context_rows={context_rows} active_rows={active_rows} "
+                f"elapsed_sec_score={time.perf_counter() - fit_started:.3f}"
+            ),
+        )
         if scored_fold["decision_row_id"].duplicated().any():
             duplicates = (
                 scored_fold.loc[
@@ -326,6 +372,17 @@ def build_detector_train_oof_policy_rows(
                 f"fold scoring rows contain duplicate decision_row_id fold_id={fold.fold_id} sample={duplicates}"
             )
         chunks.append(scored_fold)
+        elapsed = time.perf_counter() - started
+        rate = idx / elapsed if elapsed > 0 else 0.0
+        eta = (len(folds) - idx) / rate if rate > 0 else 0.0
+        rows_accumulated = int(sum(len(chunk) for chunk in chunks))
+        log_info(
+            "POLICY",
+            (
+                f"oof progress folds_done={idx}/{len(folds)} rows_accumulated={rows_accumulated} "
+                f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f} fold_elapsed_sec={time.perf_counter() - fold_started:.3f}"
+            ),
+        )
     if chunks:
         out = pd.concat(chunks, ignore_index=True)
         out = out.sort_values(
@@ -335,7 +392,11 @@ def build_detector_train_oof_policy_rows(
         out = pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
     log_info(
         "POLICY",
-        f"policy OOF scoring rows build done rows_total={len(out)} folds_total={len(folds)}",
+        (
+            f"policy OOF scoring rows build done rows_total={len(out)} folds_total={len(folds)} "
+            f"elapsed_sec_total={time.perf_counter() - started:.3f} "
+            f"rows_per_sec={(len(out) / max(time.perf_counter() - started, 1e-9)):.3f}"
+        ),
     )
     return out.loc[:, list(POLICY_ROW_COLUMNS)].copy()
 
@@ -397,10 +458,23 @@ def sweep_detector_policy(
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
 ) -> pd.DataFrame:
+    started = time.perf_counter()
+    candidates = build_detector_policy_grid(base_policy_config)
+    log_info(
+        "POLICY",
+        (
+            f"policy sweep start candidates_total={len(candidates)} "
+            f"episodes_total={scored_rows_df['episode_id'].nunique() if not scored_rows_df.empty else 0} "
+            f"active_rows={int((~scored_rows_df['policy_context_only'].astype(bool)).sum()) if 'policy_context_only' in scored_rows_df.columns else len(scored_rows_df)}"
+        ),
+    )
     rows: list[dict[str, float]] = []
-    for candidate in build_detector_policy_grid(base_policy_config):
+    best_selection_score = float("-inf")
+    for idx, candidate in enumerate(candidates, start=1):
         candidate_signals_df, episode_policy_summary_df = (
-            apply_episode_aware_detector_policy(scored_rows_df, candidate)
+            apply_episode_aware_detector_policy(
+                scored_rows_df, candidate, emit_summary_log=False
+            )
         )
         metrics = build_detector_policy_metrics(
             candidate_signals_df,
@@ -409,6 +483,24 @@ def sweep_detector_policy(
             window_end=window_end,
             window_days=window_days,
         )
+        best_selection_score = max(
+            best_selection_score, float(metrics["selection_score"])
+        )
+        elapsed = time.perf_counter() - started
+        rate = idx / elapsed if elapsed > 0 else 0.0
+        eta = (len(candidates) - idx) / rate if rate > 0 else 0.0
+        should_log_progress = idx == 1 or idx == len(candidates) or (idx % 4 == 0)
+        if should_log_progress:
+            log_info(
+                "POLICY",
+                (
+                    f"policy sweep progress candidate={idx}/{len(candidates)} "
+                    f"arm={candidate.arm_score_min:.6f} fire={candidate.fire_score_floor:.6f} "
+                    f"turn={candidate.turn_down_delta:.6f} signals_total={len(candidate_signals_df)} "
+                    f"selection_score={float(metrics['selection_score']):.6f} current_best={best_selection_score:.6f} "
+                    f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f}"
+                ),
+            )
         rows.append(
             {
                 "arm_score_min": candidate.arm_score_min,
@@ -434,7 +526,10 @@ def sweep_detector_policy(
             }
         )
     sweep_df = pd.DataFrame(rows, columns=list(SWEEP_COLUMNS))
-    log_info("POLICY", f"policy sweep done candidates_total={len(sweep_df)}")
+    log_info(
+        "POLICY",
+        f"policy sweep done candidates_total={len(sweep_df)} elapsed_sec={time.perf_counter() - started:.3f}",
+    )
     return sweep_df
 
 

@@ -87,6 +87,7 @@ def replay_short_signals_with_symbol_lock(
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_fetcher: OneSecondBarsFetcher | None = None,
+    emit_summary_log: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     _require_columns(decision_df, _DECISION_REQUIRED_COLUMNS, "decision_df")
     decisions = (
@@ -227,14 +228,15 @@ def replay_short_signals_with_symbol_lock(
     blocked_symbol_lock = int(
         (decisions["execution_status"] == "blocked_symbol_lock").sum()
     )
-    log_info(
-        "EXECUTION",
-        (
-            "execution replay done "
-            f"decisions_total={len(decisions)} executed_total={len(executed_signals_df)} "
-            f"blocked_gate={blocked_gate} blocked_symbol_lock={blocked_symbol_lock}"
-        ),
-    )
+    if emit_summary_log:
+        log_info(
+            "EXECUTION",
+            (
+                "execution replay done "
+                f"decisions_total={len(decisions)} executed_total={len(executed_signals_df)} "
+                f"blocked_gate={blocked_gate} blocked_symbol_lock={blocked_symbol_lock}"
+            ),
+        )
     return decisions.reset_index(drop=True), executed_signals_df
 
 

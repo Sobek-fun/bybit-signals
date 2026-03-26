@@ -87,13 +87,51 @@ def run_pump_end_v2_pipeline(
         f"run artifacts initialized run_dir={run_context.run_dir}",
     )
     market_loader = ClickHouseMarketDataLoader(clickhouse_dsn, config)
+    universe_symbols = market_loader.build_universe_symbols()
+    log_info(
+        "PIPELINE",
+        (
+            "FULL_RUN context "
+            f"run_id={run_context.run_id} run_dir={run_context.run_dir} "
+            f"config_path={Path(config_path).resolve()} "
+            f"window_start={pd.Timestamp(config.data_window.start)} "
+            f"window_end={pd.Timestamp(config.data_window.end) if config.data_window.end is not None else pd.Timestamp(config.splits.test_end)} "
+            f"train_end={pd.Timestamp(config.splits.train_end)} "
+            f"val_end={pd.Timestamp(config.splits.val_end)} "
+            f"test_end={pd.Timestamp(config.splits.test_end)} "
+            f"symbols_total={len(universe_symbols)} "
+            f"execution_contract=tp_pct:{float(config.execution.tp_pct):.6f},sl_pct:{float(config.execution.sl_pct):.6f},max_hold_bars:{int(config.execution.max_hold_bars)} "
+            f"detector_policy_baseline=arm:{float(config.detector_policy.arm_score_min):.6f},fire:{float(config.detector_policy.fire_score_floor):.6f},turn:{float(config.detector_policy.turn_down_delta):.6f} "
+            f"gate_threshold_baseline={float(config.gate_config.block_threshold):.6f}"
+        ),
+    )
     bars_1s_fetcher = market_loader.build_1s_fetcher()
 
+    input_started = time.perf_counter()
     stage_start("PIPELINE", "INPUT_LOADING")
     raw_15m = market_loader.load_15m_ohlcv()
     bars_15m = prepare_ohlcv_15m_frame(raw_15m)
-    stage_done("PIPELINE", "INPUT_LOADING")
+    input_elapsed = time.perf_counter() - input_started
+    rows_total = len(bars_15m)
+    symbols_total = int(bars_15m["symbol"].nunique()) if not bars_15m.empty else 0
+    open_time_min = (
+        pd.Timestamp(bars_15m["open_time"].min()) if not bars_15m.empty else pd.NaT
+    )
+    open_time_max = (
+        pd.Timestamp(bars_15m["open_time"].max()) if not bars_15m.empty else pd.NaT
+    )
+    rows_per_sec = (rows_total / input_elapsed) if input_elapsed > 0 else 0.0
+    log_info(
+        "PIPELINE",
+        (
+            f"INPUT_LOADING summary rows_total={rows_total} symbols_total={symbols_total} "
+            f"open_time_min={open_time_min} open_time_max={open_time_max} "
+            f"elapsed_sec={input_elapsed:.3f} rows_per_sec={rows_per_sec:.3f}"
+        ),
+    )
+    stage_done("PIPELINE", "INPUT_LOADING", elapsed_sec=input_elapsed)
 
+    prepared_started = time.perf_counter()
     stage_start("PIPELINE", "PREPARED_LAYERS")
     token_state_full = build_token_state_layer(bars_15m, config.event_opener)
     reference_symbols = {config.references.btc_symbol, config.references.eth_symbol}
@@ -106,8 +144,18 @@ def run_pump_end_v2_pipeline(
     breadth_state = build_breadth_state_layer(
         token_state_full, config.references.btc_symbol, config.references.eth_symbol
     )
-    stage_done("PIPELINE", "PREPARED_LAYERS")
+    prepared_elapsed = time.perf_counter() - prepared_started
+    log_info(
+        "PIPELINE",
+        (
+            f"PREPARED_LAYERS summary elapsed_sec_total={prepared_elapsed:.3f} "
+            f"token_rows={len(token_state_tradable)} reference_rows={len(reference_state)} "
+            f"breadth_rows={len(breadth_state)}"
+        ),
+    )
+    stage_done("PIPELINE", "PREPARED_LAYERS", elapsed_sec=prepared_elapsed)
 
+    event_started = time.perf_counter()
     stage_start("PIPELINE", "EVENT_CORE")
     episodes = open_causal_pump_episodes(token_state_tradable, config.event_opener)
     decision_rows = build_decision_rows(
@@ -116,8 +164,21 @@ def run_pump_end_v2_pipeline(
     resolved_rows = resolve_decision_rows(bars_15m, decision_rows, config.resolver)
     episode_summary = build_episode_summary(resolved_rows)
     event_quality_report = build_event_quality_report(episode_summary)
-    stage_done("PIPELINE", "EVENT_CORE")
+    event_elapsed = time.perf_counter() - event_started
+    resolved_rows_count = int(resolved_rows["is_resolved"].sum()) if not resolved_rows.empty else 0
+    good_rows_count = int((resolved_rows["target_good_short_now"] == 1).sum()) if not resolved_rows.empty else 0
+    good_episode_share = float(event_quality_report.get("good_episode_share", 0.0))
+    log_info(
+        "PIPELINE",
+        (
+            f"EVENT_CORE summary elapsed_sec_total={event_elapsed:.3f} episodes_total={len(episodes)} "
+            f"decision_rows_total={len(decision_rows)} resolved_rows={resolved_rows_count} "
+            f"good_rows={good_rows_count} good_episode_share={good_episode_share:.6f}"
+        ),
+    )
+    stage_done("PIPELINE", "EVENT_CORE", elapsed_sec=event_elapsed)
 
+    detector_dataset_started = time.perf_counter()
     stage_start("PIPELINE", "DETECTOR_DATASET")
     episode_state = build_episode_state_layer(
         token_state_tradable, episodes, decision_rows
@@ -131,8 +192,31 @@ def run_pump_end_v2_pipeline(
     )
     detector_dataset = build_detector_dataset(detector_feature_view, resolved_rows)
     detector_dataset = assign_detector_dataset_splits(detector_dataset, config.splits)
-    stage_done("PIPELINE", "DETECTOR_DATASET")
+    detector_dataset_elapsed = time.perf_counter() - detector_dataset_started
+    split_counts = detector_dataset["dataset_split"].value_counts(dropna=False).to_dict()
+    positive_rate = (
+        float(
+            detector_dataset.loc[
+                detector_dataset["trainable_row"].astype(bool), "target_good_short_now"
+            ]
+            .astype(float)
+            .mean()
+        )
+        if bool(detector_dataset["trainable_row"].astype(bool).any())
+        else 0.0
+    )
+    log_info(
+        "PIPELINE",
+        (
+            f"DETECTOR_DATASET summary elapsed_sec_total={detector_dataset_elapsed:.3f} "
+            f"rows_total={len(detector_dataset)} train_rows={int(split_counts.get('train', 0))} "
+            f"val_rows={int(split_counts.get('val', 0))} test_rows={int(split_counts.get('test', 0))} "
+            f"positive_rate={positive_rate:.6f} feature_cols_total={len(build_detector_feature_manifest().get('feature_columns', []))}"
+        ),
+    )
+    stage_done("PIPELINE", "DETECTOR_DATASET", elapsed_sec=detector_dataset_elapsed)
 
+    detector_oof_started = time.perf_counter()
     stage_start("PIPELINE", "DETECTOR_TRAIN_OOF")
     train_oof_policy_rows = build_detector_train_oof_policy_rows(
         dataset_df=detector_dataset,
@@ -142,8 +226,10 @@ def run_pump_end_v2_pipeline(
         detector_cv_config=config.detector_cv,
         detector_model_config=config.detector_model,
     )
-    stage_done("PIPELINE", "DETECTOR_TRAIN_OOF")
+    detector_oof_elapsed = time.perf_counter() - detector_oof_started
+    stage_done("PIPELINE", "DETECTOR_TRAIN_OOF", elapsed_sec=detector_oof_elapsed)
 
+    detector_val_started = time.perf_counter()
     stage_start("PIPELINE", "DETECTOR_VAL_POLICY")
     _, val_policy_rows = build_detector_val_policy_rows(
         dataset_df=detector_dataset,
@@ -177,8 +263,10 @@ def run_pump_end_v2_pipeline(
         window_end=config.splits.val_end,
     )
     detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
-    stage_done("PIPELINE", "DETECTOR_VAL_POLICY")
+    detector_val_elapsed = time.perf_counter() - detector_val_started
+    stage_done("PIPELINE", "DETECTOR_VAL_POLICY", elapsed_sec=detector_val_elapsed)
 
+    detector_test_started = time.perf_counter()
     stage_start("PIPELINE", "DETECTOR_TEST")
     detector_model_test, test_policy_rows = build_detector_test_policy_rows(
         dataset_df=detector_dataset,
@@ -197,14 +285,50 @@ def run_pump_end_v2_pipeline(
         window_end=config.splits.test_end,
     )
     detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
-    stage_done("PIPELINE", "DETECTOR_TEST")
+    detector_test_elapsed = time.perf_counter() - detector_test_started
+    test_window_days = float(
+        (pd.Timestamp(config.splits.test_end) - pd.Timestamp(config.splits.val_end))
+        / pd.Timedelta(days=1)
+    )
+    test_signals_per_30d_estimate = (
+        len(test_candidate_signals_df) * 30.0 / max(test_window_days, 1e-9)
+    )
+    log_info(
+        "PIPELINE",
+        (
+            f"DETECTOR_TEST summary elapsed_sec_total={detector_test_elapsed:.3f} "
+            f"policy_rows_total={len(test_policy_rows)} candidate_signals_total={len(test_candidate_signals_df)} "
+            f"episodes_total={test_policy_rows['episode_id'].nunique() if not test_policy_rows.empty else 0} "
+            f"signals_per_30d_estimate={test_signals_per_30d_estimate:.6f}"
+        ),
+    )
+    stage_done("PIPELINE", "DETECTOR_TEST", elapsed_sec=detector_test_elapsed)
 
+    gate_val_started = time.perf_counter()
     stage_start("PIPELINE", "GATE_VAL")
     val_symbols, val_start, val_end = _derive_1m_stage_window(
         [train_oof_candidate_signals_df, val_candidate_signals_df], config.execution
     )
+    log_info(
+        "PIPELINE",
+        (
+            f"GATE_VAL context candidate_signals_train_oof={len(train_oof_candidate_signals_df)} "
+            f"candidate_signals_val={len(val_candidate_signals_df)} "
+            f"derived_1m_symbols_total={len(val_symbols)} derived_1m_start={val_start} derived_1m_end={val_end}"
+        ),
+    )
+    val_1m_load_started = time.perf_counter()
     raw_1m_val = market_loader.load_1m_ohlcv(val_symbols, val_start, val_end)
     bars_1m_val = prepare_intraday_bars_frame(raw_1m_val, "1m")
+    val_1m_load_elapsed = time.perf_counter() - val_1m_load_started
+    log_info(
+        "PIPELINE",
+        (
+            f"GATE_VAL 1m load done rows_1m_total={len(bars_1m_val)} "
+            f"symbols_total={bars_1m_val['symbol'].nunique() if not bars_1m_val.empty else 0} "
+            f"elapsed_sec={val_1m_load_elapsed:.3f}"
+        ),
+    )
     (
         _,
         val_scored_signals_df,
@@ -227,6 +351,33 @@ def run_pump_end_v2_pipeline(
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
+    train_rows = int(
+        (
+            (gate_dataset_train_oof_df["score_source"] == "train_oof")
+            & gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool)
+        ).sum()
+    ) if not gate_dataset_train_oof_df.empty else 0
+    val_rows = int(
+        (gate_dataset_val_df["score_source"] == "val_forward").sum()
+    ) if not gate_dataset_val_df.empty else 0
+    positive_rate_train = (
+        float(
+            pd.to_numeric(
+                gate_dataset_train_oof_df.loc[
+                    gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool),
+                    "target_block_signal",
+                ],
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .mean()
+        )
+        if (
+            not gate_dataset_train_oof_df.empty
+            and bool(gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool).any())
+        )
+        else 0.0
+    )
     if gate_status_val == "enabled":
         selected_gate_threshold, gate_threshold_sweep_execution_df = (
             select_gate_block_threshold_execution_aware(
@@ -246,15 +397,45 @@ def run_pump_end_v2_pipeline(
     val_gate_decisions_df, _ = apply_gate_block_threshold(
         val_scored_signals_df, selected_gate_threshold
     )
-    stage_done("PIPELINE", "GATE_VAL")
+    gate_val_elapsed = time.perf_counter() - gate_val_started
+    log_info(
+        "PIPELINE",
+        (
+            f"GATE_VAL summary elapsed_sec_total={gate_val_elapsed:.3f} gate_status={gate_status_val} "
+            f"selected_gate_threshold={float(selected_gate_threshold):.6f} "
+            f"candidate_signals_val={len(val_scored_signals_df)} "
+            f"candidate_signals_after_gate={int((val_gate_decisions_df['gate_decision'] == 'keep').sum())}"
+        ),
+    )
+    stage_done("PIPELINE", "GATE_VAL", elapsed_sec=gate_val_elapsed)
 
+    gate_test_started = time.perf_counter()
     stage_start("PIPELINE", "GATE_TEST")
     test_symbols, test_start, test_end = _derive_1m_stage_window(
         [train_oof_candidate_signals_df, val_candidate_signals_df, test_candidate_signals_df],
         config.execution,
     )
+    history_rows_for_context = len(train_oof_candidate_signals_df) + len(val_candidate_signals_df)
+    log_info(
+        "PIPELINE",
+        (
+            f"GATE_TEST context candidate_signals_test={len(test_candidate_signals_df)} "
+            f"history_rows_for_context={history_rows_for_context} "
+            f"derived_1m_symbols_total={len(test_symbols)} derived_1m_start={test_start} derived_1m_end={test_end}"
+        ),
+    )
+    test_1m_load_started = time.perf_counter()
     raw_1m_test = market_loader.load_1m_ohlcv(test_symbols, test_start, test_end)
     bars_1m_test = prepare_intraday_bars_frame(raw_1m_test, "1m")
+    test_1m_load_elapsed = time.perf_counter() - test_1m_load_started
+    log_info(
+        "PIPELINE",
+        (
+            f"GATE_TEST 1m load done rows_1m_total={len(bars_1m_test)} "
+            f"symbols_total={bars_1m_test['symbol'].nunique() if not bars_1m_test.empty else 0} "
+            f"elapsed_sec={test_1m_load_elapsed:.3f}"
+        ),
+    )
     gate_model_test, test_scored_signals_df, gate_dataset_test_df, gate_status_test = (
         build_gate_test_scored_signals(
             train_oof_candidate_signals_df,
@@ -274,9 +455,36 @@ def run_pump_end_v2_pipeline(
     test_gate_decisions_df, _ = apply_gate_block_threshold(
         test_scored_signals_df, selected_gate_threshold
     )
-    stage_done("PIPELINE", "GATE_TEST")
+    test_rows = int(
+        (gate_dataset_test_df["score_source"] == "test_forward").sum()
+    ) if not gate_dataset_test_df.empty else 0
+    train_rows_for_gate_test = int(
+        (
+            (gate_dataset_test_df["score_source"] == "train_oof")
+            & gate_dataset_test_df["gate_trainable_signal"].astype(bool)
+        ).sum()
+    ) if not gate_dataset_test_df.empty and "score_source" in gate_dataset_test_df.columns else 0
+    kept_total = int((test_gate_decisions_df["gate_decision"] == "keep").sum())
+    blocked_total = int((test_gate_decisions_df["gate_decision"] == "block").sum())
+    keep_rate = kept_total / len(test_gate_decisions_df) if len(test_gate_decisions_df) > 0 else 0.0
+    block_rate = blocked_total / len(test_gate_decisions_df) if len(test_gate_decisions_df) > 0 else 0.0
+    log_info(
+        "PIPELINE",
+        (
+            f"GATE_TEST threshold apply kept_total={kept_total} blocked_total={blocked_total} "
+            f"keep_rate={keep_rate:.6f} block_rate={block_rate:.6f}"
+        ),
+    )
+    gate_test_elapsed = time.perf_counter() - gate_test_started
+    stage_done("PIPELINE", "GATE_TEST", elapsed_sec=gate_test_elapsed)
 
+    execution_replay_started = time.perf_counter()
     stage_start("PIPELINE", "EXECUTION_REPLAY")
+    val_replay_started = time.perf_counter()
+    log_info(
+        "PIPELINE",
+        f"split=val execution replay start decisions_total={len(val_gate_decisions_df)} symbols_total={val_gate_decisions_df['symbol'].nunique() if not val_gate_decisions_df.empty else 0}",
+    )
     val_execution_decisions_df, val_executed_signals_df = (
         replay_short_signals_with_symbol_lock(
             val_gate_decisions_df,
@@ -284,7 +492,27 @@ def run_pump_end_v2_pipeline(
             bars_1m_val,
             config.execution,
             bars_1s_fetcher,
+            emit_summary_log=False,
         )
+    )
+    val_replay_elapsed = time.perf_counter() - val_replay_started
+    val_rate = (
+        len(val_gate_decisions_df) / val_replay_elapsed if val_replay_elapsed > 0 else 0.0
+    )
+    log_info(
+        "PIPELINE",
+        (
+            f"split=val execution replay done executed_total={len(val_executed_signals_df)} "
+            f"blocked_gate={int((val_execution_decisions_df['execution_status'] == 'blocked_gate').sum())} "
+            f"blocked_symbol_lock={int((val_execution_decisions_df['execution_status'] == 'blocked_symbol_lock').sum())} "
+            f"ambiguous={int((val_execution_decisions_df['trade_outcome'] == 'ambiguous').sum())} "
+            f"elapsed_sec={val_replay_elapsed:.3f} decisions_per_sec={val_rate:.3f}"
+        ),
+    )
+    test_replay_started = time.perf_counter()
+    log_info(
+        "PIPELINE",
+        f"split=test execution replay start decisions_total={len(test_gate_decisions_df)} symbols_total={test_gate_decisions_df['symbol'].nunique() if not test_gate_decisions_df.empty else 0}",
     )
     test_execution_decisions_df, test_executed_signals_df = (
         replay_short_signals_with_symbol_lock(
@@ -293,7 +521,22 @@ def run_pump_end_v2_pipeline(
             bars_1m_test,
             config.execution,
             bars_1s_fetcher,
+            emit_summary_log=False,
         )
+    )
+    test_replay_elapsed = time.perf_counter() - test_replay_started
+    test_rate = (
+        len(test_gate_decisions_df) / test_replay_elapsed if test_replay_elapsed > 0 else 0.0
+    )
+    log_info(
+        "PIPELINE",
+        (
+            f"split=test execution replay done executed_total={len(test_executed_signals_df)} "
+            f"blocked_gate={int((test_execution_decisions_df['execution_status'] == 'blocked_gate').sum())} "
+            f"blocked_symbol_lock={int((test_execution_decisions_df['execution_status'] == 'blocked_symbol_lock').sum())} "
+            f"ambiguous={int((test_execution_decisions_df['trade_outcome'] == 'ambiguous').sum())} "
+            f"elapsed_sec={test_replay_elapsed:.3f} decisions_per_sec={test_rate:.3f}"
+        ),
     )
     val_counterfactual_df = attach_counterfactual_execution_outcomes(
         val_execution_decisions_df,
@@ -301,6 +544,7 @@ def run_pump_end_v2_pipeline(
         bars_1m_val,
         config.execution,
         bars_1s_fetcher,
+        split_label="val",
     )
     test_counterfactual_df = attach_counterfactual_execution_outcomes(
         test_execution_decisions_df,
@@ -308,6 +552,7 @@ def run_pump_end_v2_pipeline(
         bars_1m_test,
         config.execution,
         bars_1s_fetcher,
+        split_label="test",
     )
     val_execution_decisions_enriched_df = val_execution_decisions_df.merge(
         val_counterfactual_df,
@@ -327,8 +572,10 @@ def run_pump_end_v2_pipeline(
     test_decision_summary = build_gate_execution_decision_summary(
         test_execution_decisions_enriched_df
     )
-    stage_done("PIPELINE", "EXECUTION_REPLAY")
+    execution_replay_elapsed = time.perf_counter() - execution_replay_started
+    stage_done("PIPELINE", "EXECUTION_REPLAY", elapsed_sec=execution_replay_elapsed)
 
+    execution_reports_started = time.perf_counter()
     stage_start("PIPELINE", "EXECUTION_REPORTS")
     val_metrics = build_execution_metrics(
         val_executed_signals_df,
@@ -350,8 +597,32 @@ def run_pump_end_v2_pipeline(
     test_monthly_report = build_execution_monthly_report(test_executed_signals_df)
     gate_deciles_val = build_gate_decile_report(val_scored_signals_df)
     gate_deciles_test = build_gate_decile_report(test_scored_signals_df)
-    stage_done("PIPELINE", "EXECUTION_REPORTS")
+    log_info(
+        "PIPELINE",
+        (
+            f"split=val reports summary signals={int(val_metrics.get('signals', 0.0))} "
+            f"signals_per_30d={float(val_metrics.get('signals_per_30d', 0.0)):.6f} "
+            f"pnl_sum={float(val_metrics.get('pnl_sum', 0.0)):.6f} "
+            f"worst_6h={float(val_metrics.get('worst_6h_pnl', 0.0)):.6f} "
+            f"worst_24h={float(val_metrics.get('worst_24h_pnl', 0.0)):.6f} "
+            f"max_losing_streak={float(val_metrics.get('max_losing_streak', 0.0)):.0f}"
+        ),
+    )
+    log_info(
+        "PIPELINE",
+        (
+            f"split=test reports summary signals={int(test_metrics.get('signals', 0.0))} "
+            f"signals_per_30d={float(test_metrics.get('signals_per_30d', 0.0)):.6f} "
+            f"pnl_sum={float(test_metrics.get('pnl_sum', 0.0)):.6f} "
+            f"worst_6h={float(test_metrics.get('worst_6h_pnl', 0.0)):.6f} "
+            f"worst_24h={float(test_metrics.get('worst_24h_pnl', 0.0)):.6f} "
+            f"max_losing_streak={float(test_metrics.get('max_losing_streak', 0.0)):.0f}"
+        ),
+    )
+    execution_reports_elapsed = time.perf_counter() - execution_reports_started
+    stage_done("PIPELINE", "EXECUTION_REPORTS", elapsed_sec=execution_reports_elapsed)
 
+    artifacts_started = time.perf_counter()
     stage_start("PIPELINE", "ARTIFACTS_SAVE")
     log_info("ARTIFACTS", "artifacts save started")
     prepared_dir = manager.stage_output_dir(run_context.run_dir, "prepared")
@@ -369,6 +640,18 @@ def run_pump_end_v2_pipeline(
     _save_df_and_log(resolved_rows, prepared_dir / "resolved_rows.parquet")
     _save_df_and_log(episode_summary, prepared_dir / "episode_summary.parquet")
     _save_json_and_log(event_quality_report, prepared_dir / "event_quality_report.json")
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={prepared_dir / 'event_quality_report.json'}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={prepared_dir / 'episodes.parquet'} rows={len(episodes)}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={prepared_dir / 'decision_rows.parquet'} rows={len(decision_rows)}",
+    )
 
     _save_df_and_log(detector_dataset, detector_dir / "dataset.parquet")
     _save_json_and_log(
@@ -377,6 +660,18 @@ def run_pump_end_v2_pipeline(
     _save_df_and_log(detector_policy_sweep_df, detector_dir / "policy_sweep_val.csv")
     _save_json_and_log(
         _policy_to_dict(selected_detector_policy), detector_dir / "selected_policy.json"
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={detector_dir / 'dataset.parquet'} rows={len(detector_dataset)}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={detector_dir / 'policy_sweep_val.csv'} rows={len(detector_policy_sweep_df)}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={detector_dir / 'selected_policy.json'}",
     )
     _save_df_and_log(
         train_oof_policy_rows, detector_dir / "train_oof_policy_rows.parquet"
@@ -441,6 +736,18 @@ def run_pump_end_v2_pipeline(
     _save_json_and_log(
         float(selected_gate_threshold), gate_dir / "selected_threshold.json"
     )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={gate_dir / 'dataset_train_oof.parquet'} rows={len(gate_dataset_train_oof_df)}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={gate_dir / 'threshold_sweep_val_execution.csv'} rows={len(gate_threshold_sweep_execution_df)}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={gate_dir / 'selected_threshold.json'}",
+    )
     _save_df_and_log(gate_deciles_val, gate_dir / "gate_deciles.csv")
     _save_df_and_log(gate_deciles_test, gate_dir / "gate_deciles_test.csv")
     _save_df_and_log(test_scored_signals_df, gate_dir / "test_scored_signals.parquet")
@@ -474,6 +781,14 @@ def run_pump_end_v2_pipeline(
     _save_df_and_log(test_window_24h, eval_test_dir / "window_report_24h.csv")
     _save_df_and_log(test_symbol_report, eval_test_dir / "symbol_report.csv")
     _save_df_and_log(test_monthly_report, eval_test_dir / "monthly_report.csv")
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={eval_test_dir / 'test_signals_holdout.csv'} rows={len(test_executed_signals_df)}",
+    )
+    log_info(
+        "ARTIFACTS",
+        f"key artifact saved path={eval_test_dir / 'metrics_holdout.json'}",
+    )
 
     run_summary = {
         "run_id": run_context.run_id,
@@ -498,9 +813,31 @@ def run_pump_end_v2_pipeline(
         "test_execution_metrics": test_metrics,
     }
     summary_path = _save_json_and_log(run_summary, reports_dir / "run_summary.json")
-    log_info("ARTIFACTS", "artifacts save completed")
-    stage_done("PIPELINE", "ARTIFACTS_SAVE")
-    stage_done("PIPELINE", "FULL_RUN", elapsed_sec=time.perf_counter() - started)
+    log_info("ARTIFACTS", f"key artifact saved path={reports_dir / 'run_summary.json'}")
+    artifacts_elapsed = time.perf_counter() - artifacts_started
+    log_info(
+        "ARTIFACTS",
+        f"artifacts save completed files_key_total=12 elapsed_sec={artifacts_elapsed:.3f}",
+    )
+    stage_done("PIPELINE", "ARTIFACTS_SAVE", elapsed_sec=artifacts_elapsed)
+    gate_status = (
+        "disabled_no_data"
+        if (gate_status_val != "enabled" or gate_status_test != "enabled")
+        else "enabled"
+    )
+    total_elapsed = time.perf_counter() - started
+    log_info(
+        "PIPELINE",
+        (
+            f"FULL_RUN summary elapsed_total_sec={total_elapsed:.3f} gate_status={gate_status} "
+            f"test_candidate_signals={len(test_gate_decisions_df)} test_executed_signals={len(test_executed_signals_df)} "
+            f"signals_per_30d={float(test_metrics.get('signals_per_30d', 0.0)):.6f} "
+            f"pnl_sum={float(test_metrics.get('pnl_sum', 0.0)):.6f} "
+            f"worst_24h={float(test_metrics.get('worst_24h_pnl', 0.0)):.6f} "
+            f"holdout_path={holdout_signals_path} summary_path={summary_path}"
+        ),
+    )
+    stage_done("PIPELINE", "FULL_RUN", elapsed_sec=total_elapsed)
     log_info(
         "RUN",
         f"completed run_dir={run_context.run_dir} test_holdout_signals={holdout_signals_path}",

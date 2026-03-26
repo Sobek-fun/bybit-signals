@@ -98,6 +98,7 @@ def build_gate_val_scored_signals_and_datasets(
         bars_1m_df,
         execution_contract,
         bars_1s_fetcher,
+        split_label="train_oof",
     )
     val_with_execution_df = _enrich_with_counterfactual(
         val_candidate_signals_df,
@@ -105,6 +106,7 @@ def build_gate_val_scored_signals_and_datasets(
         bars_1m_df,
         execution_contract,
         bars_1s_fetcher,
+        split_label="val",
     )
     val_history_df = _slice_history_window(
         train_oof_candidate_signals_df, val_candidate_signals_df, hours=24
@@ -124,6 +126,7 @@ def build_gate_val_scored_signals_and_datasets(
             bars_1m_df,
             execution_contract,
             bars_1s_fetcher,
+            split_label="val_history",
         ),
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
@@ -259,6 +262,7 @@ def build_gate_test_scored_signals(
         bars_1m_df,
         execution_contract,
         bars_1s_fetcher,
+        split_label="train_oof",
     )
     test_with_execution_df = _enrich_with_counterfactual(
         test_candidate_signals_df,
@@ -266,6 +270,7 @@ def build_gate_test_scored_signals(
         bars_1m_df,
         execution_contract,
         bars_1s_fetcher,
+        split_label="test",
     )
     test_history_df = _slice_history_window(
         history_candidate_signals_df, test_candidate_signals_df, hours=24
@@ -285,6 +290,7 @@ def build_gate_test_scored_signals(
             bars_1m_df,
             execution_contract,
             bars_1s_fetcher,
+            split_label="test_history",
         ),
         token_state_df=token_state_df,
         reference_state_df=reference_state_df,
@@ -417,6 +423,7 @@ def _enrich_with_counterfactual(
     bars_1m_df: pd.DataFrame,
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None,
+    split_label: str,
 ) -> pd.DataFrame | None:
     if candidate_signals_df is None:
         return None
@@ -428,6 +435,7 @@ def _enrich_with_counterfactual(
         bars_1m_df,
         execution_contract,
         bars_1s_fetcher,
+        split_label=split_label,
     )
     return candidate_signals_df.merge(
         counterfactual_df,

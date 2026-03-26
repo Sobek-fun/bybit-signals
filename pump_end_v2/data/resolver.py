@@ -1,4 +1,5 @@
 import math
+import sys
 import time
 
 import pandas as pd
@@ -6,6 +7,25 @@ import pandas as pd
 from pump_end_v2.config import ResolverConfig
 from pump_end_v2.contracts import OutcomeClass, SignalQualityClass, TargetReason
 from pump_end_v2.logging import log_info, stage_done, stage_start
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+def _tqdm_kwargs() -> dict[str, object]:
+    return {
+        "disable": not sys.stderr.isatty(),
+        "leave": False,
+        "dynamic_ncols": True,
+        "mininterval": 0.5,
+    }
+
+
+def _is_tty_progress() -> bool:
+    return sys.stderr.isatty()
 
 
 def resolve_decision_rows(
@@ -48,7 +68,19 @@ def resolve_decision_rows(
         symbol: sdf.reset_index(drop=True).copy()
         for symbol, sdf in df.groupby("symbol", sort=False)
     }
-    for idx, row in resolved.iterrows():
+    total_rows = len(resolved)
+    progress_step = max(1, total_rows // 20 if total_rows > 0 else 1)
+    emit_periodic_log = not _is_tty_progress()
+    for processed, (idx, row) in enumerate(
+        tqdm(
+            resolved.iterrows(),
+            total=total_rows,
+            desc="resolve rows",
+            unit="row",
+            **_tqdm_kwargs(),
+        ),
+        start=1,
+    ):
         symbol_df = market_by_symbol.get(row["symbol"])
         if symbol_df is None:
             continue
@@ -142,6 +174,21 @@ def resolve_decision_rows(
         resolved.at[idx, "entry_quality_score"] = future_net_edge_pct - 0.001 * min(
             bars_to_resolution, config.horizon_bars
         )
+        if emit_periodic_log and (processed % progress_step == 0 or processed == total_rows):
+            elapsed = time.perf_counter() - started
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            eta = (total_rows - processed) / rate if rate > 0 else 0.0
+            resolved_so_far = int(resolved["is_resolved"].sum())
+            good_so_far = int((resolved["target_good_short_now"] == 1).sum())
+            pct = (processed / total_rows * 100.0) if total_rows > 0 else 0.0
+            log_info(
+                "RESOLVER",
+                (
+                    f"progress processed={processed} total={total_rows} pct={pct:.1f} "
+                    f"elapsed_sec={elapsed:.3f} rate_per_sec={rate:.2f} eta_sec={eta:.2f} "
+                    f"resolved_rows_so_far={resolved_so_far} good_rows_so_far={good_so_far}"
+                ),
+            )
     resolved = _attach_episode_ideal_entry(resolved)
     resolved = _apply_target_reason(resolved)
     resolved_rows_count = int(resolved["is_resolved"].sum())
