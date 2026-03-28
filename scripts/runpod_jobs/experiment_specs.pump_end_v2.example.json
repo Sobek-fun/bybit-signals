@@ -1,0 +1,27 @@
+{
+  "batch_id": "2026-03-26_pump_end_v2_example",
+  "runtime": {
+    "workspace_root": "/workspace/experiments",
+    "requirements_file": "scripts/runpod_jobs/requirements_runpod.txt",
+    "python_bin": "python3",
+    "pipeline_command": "python -u -m pump_end_v2.cli.run_pump_end_v2 --config pump_end_v2/config/prod_baseline_v1.toml --clickhouse-dsn \"${CH_DB}\"",
+    "clickhouse_dsn_env": "CH_DB",
+    "detector_dir_remote": "",
+    "tokens_file_remote": "",
+    "extra_env": {}
+  },
+  "experiments": [
+    {
+      "exp_id": "pump_end_v2_baseline",
+      "pod_alias": "pod-a",
+      "patch_files": []
+    },
+    {
+      "exp_id": "pump_end_v2_patch_a",
+      "pod_alias": "pod-b",
+      "patch_files": [
+        "scripts/runpod_jobs/examples/patch_a.diff"
+      ]
+    }
+  ]
+}
