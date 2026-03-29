@@ -85,13 +85,13 @@ def build_gate_threshold_grid(
     search_config: GateThresholdSearchConfig | None = None,
     scored_signals_df: pd.DataFrame | None = None,
 ) -> list[float]:
-    candidates: set[float] = set()
     if search_config is not None and len(search_config.threshold_candidates) > 0:
         explicit = [
             _round6(_clip(float(value), 0.0, 1.0))
             for value in search_config.threshold_candidates
         ]
-        candidates.update(explicit)
+        return sorted(set(explicit))
+    candidates: set[float] = set()
     base = float(base_block_threshold)
     raw = [
         base - 0.20,
@@ -270,11 +270,13 @@ def build_gate_decile_report(
             "future_net_edge_pct",
             "future_pullback_pct",
             "future_prepullback_squeeze_pct",
-            "signal_quality_h32",
+            "counterfactual_trade_outcome",
         ),
         "scored_signals_df",
     )
     frame = scored_signals_df.copy()
+    if "gate_trainable_signal" in frame.columns:
+        frame = frame[frame["gate_trainable_signal"].astype(bool)].copy()
     if frame.empty:
         return pd.DataFrame(
             columns=[
@@ -299,6 +301,10 @@ def build_gate_decile_report(
     frame["future_prepullback_squeeze_pct"] = pd.to_numeric(
         frame["future_prepullback_squeeze_pct"], errors="coerce"
     )
+    frame["counterfactual_trade_outcome"] = (
+        frame["counterfactual_trade_outcome"].astype(str).str.strip().str.lower()
+    )
+    frame = frame[frame["counterfactual_trade_outcome"].isin(["tp", "sl"])].copy()
     frame = frame.dropna(subset=["p_block"]).reset_index(drop=True)
     if frame.empty:
         return pd.DataFrame(columns=["decile", "signals"])
@@ -311,24 +317,9 @@ def build_gate_decile_report(
         )
     rows: list[dict[str, float]] = []
     for decile, gdf in frame.groupby("decile", sort=True):
-        quality = gdf["signal_quality_h32"].astype(str)
-        tp_rate = (
-            float((quality == "clean_retrace_h32").mean()) if len(gdf) > 0 else 0.0
-        )
-        sl_rate = (
-            float(
-                quality.isin(
-                    {
-                        "dirty_retrace_h32",
-                        "clean_no_pullback_h32",
-                        "dirty_no_pullback_h32",
-                        "pullback_before_squeeze_h32",
-                    }
-                ).mean()
-            )
-            if len(gdf) > 0
-            else 0.0
-        )
+        outcome = gdf["counterfactual_trade_outcome"]
+        tp_rate = float(outcome.eq("tp").mean()) if len(gdf) > 0 else 0.0
+        sl_rate = float(outcome.eq("sl").mean()) if len(gdf) > 0 else 0.0
         rows.append(
             {
                 "decile": float(decile),
