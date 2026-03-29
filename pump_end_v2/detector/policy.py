@@ -50,6 +50,13 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "peak_p_good_before_fire",
     "p_good_drop_from_peak",
     "distance_from_episode_high_pct",
+    "episode_runup_from_open_pct",
+    "episode_extension_from_open_pct",
+    "bars_since_episode_high",
+    "drawdown_from_episode_high_so_far",
+    "high_retest_count",
+    "high_persistence_4",
+    "episode_pump_context_streak",
     "score_source",
     "fold_id",
     "policy_arm_score_min",
@@ -203,6 +210,23 @@ def apply_episode_aware_detector_policy(
                     "peak_p_good_before_fire": peak_p_good,
                     "p_good_drop_from_peak": drop_from_peak,
                     "distance_from_episode_high_pct": row.distance_from_episode_high_pct,
+                    "episode_runup_from_open_pct": _row_value(
+                        row, "episode_runup_from_open_pct"
+                    ),
+                    "episode_extension_from_open_pct": _row_value(
+                        row, "episode_extension_from_open_pct"
+                    ),
+                    "bars_since_episode_high": _row_value(
+                        row, "bars_since_episode_high"
+                    ),
+                    "drawdown_from_episode_high_so_far": _row_value(
+                        row, "drawdown_from_episode_high_so_far"
+                    ),
+                    "high_retest_count": _row_value(row, "high_retest_count"),
+                    "high_persistence_4": _row_value(row, "high_persistence_4"),
+                    "episode_pump_context_streak": _row_value(
+                        row, "episode_pump_context_streak"
+                    ),
                     "score_source": score_source,
                     "fold_id": fold_id,
                     "policy_arm_score_min": detector_policy_config.arm_score_min,
