@@ -51,6 +51,7 @@ _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
     "signals_after_model",
     "signals_after_execution",
     "blocked_by_model",
+    "blocked_by_model_trainable",
     "blocked_by_symbol_lock",
     "failed_execution_other",
     "signals_per_30d_after_execution",
@@ -60,8 +61,12 @@ _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
     "max_losing_streak_after_execution",
     "tp_tax_model",
     "sl_capture_model",
+    "blocked_sl_precision_model",
     "tp_tax_execution",
     "sl_capture_execution",
+    "model_frontier_admissible",
+    "model_frontier_dominated",
+    "model_frontier_rank",
     "density_penalty",
     "selection_score",
 )
@@ -78,13 +83,15 @@ _COUNTERFACTUAL_COLUMNS: tuple[str, ...] = (
 def build_gate_threshold_grid(
     base_block_threshold: float,
     search_config: GateThresholdSearchConfig | None = None,
+    scored_signals_df: pd.DataFrame | None = None,
 ) -> list[float]:
+    candidates: set[float] = set()
     if search_config is not None and len(search_config.threshold_candidates) > 0:
         explicit = [
             _round6(_clip(float(value), 0.0, 1.0))
             for value in search_config.threshold_candidates
         ]
-        return sorted(set(explicit))
+        candidates.update(explicit)
     base = float(base_block_threshold)
     raw = [
         base - 0.20,
@@ -96,7 +103,9 @@ def build_gate_threshold_grid(
         base + 0.20,
     ]
     clipped = [_round6(_clip(value, 0.05, 0.95)) for value in raw]
-    return sorted(set(clipped))
+    candidates.update(clipped)
+    candidates.update(_build_empirical_threshold_grid(scored_signals_df))
+    return sorted(candidates)
 
 
 def _tqdm_kwargs() -> dict[str, object]:
@@ -197,7 +206,9 @@ def sweep_gate_block_threshold(
     window_days: float | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
-    for threshold in build_gate_threshold_grid(base_block_threshold, search_config):
+    for threshold in build_gate_threshold_grid(
+        base_block_threshold, search_config, scored_signals_df=scored_signals_df
+    ):
         decision_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
         metrics = build_gate_threshold_metrics(
             decision_df,
@@ -391,20 +402,21 @@ def select_gate_block_threshold_execution_aware(
         bars_1s_fetcher=bars_1s_fetcher,
         market_view=execution_market_view,
     )
-    thresholds = build_gate_threshold_grid(base_block_threshold, search_config)
-    candidates: list[tuple[str, float | None]] = [("threshold", threshold) for threshold in thresholds]
-    if (
-        search_config is not None
-        and bool(search_config.include_disabled_candidate)
-    ):
-        candidates.append(("disabled", None))
+    thresholds = build_gate_threshold_grid(
+        base_block_threshold, search_config, scored_signals_df=scored_signals_df
+    )
+    include_disabled_fallback = bool(
+        search_config is not None and bool(search_config.include_disabled_candidate)
+    )
     log_info(
         "GATE",
-        f"threshold execution sweep start candidates_total={len(candidates)}",
+        f"threshold execution sweep start candidates_total={len(thresholds)}",
     )
     rows: list[dict[str, float]] = []
     best_selection_score = float("-inf")
-    for idx, (gate_mode, threshold) in enumerate(candidates, start=1):
+    total_thresholds = len(thresholds)
+    for idx, threshold in enumerate(thresholds, start=1):
+        gate_mode = "threshold"
         if gate_mode == "disabled":
             gate_decisions_df = scored_signals_df.copy()
             gate_decisions_df["gate_decision"] = "keep"
@@ -416,6 +428,191 @@ def select_gate_block_threshold_execution_aware(
         execution_decisions_df, executed_signals_df = (
             replay_short_signals_with_symbol_lock_precomputed(
                 decision_df=gate_decisions_df,
+                independent_outcomes_df=independent_outcomes_df,
+                emit_summary_log=False,
+            )
+        )
+        if not {
+            "counterfactual_trade_outcome",
+            "counterfactual_trade_pnl_pct",
+        }.issubset(execution_decisions_df.columns):
+            execution_decisions_df = execution_decisions_df.merge(
+                counterfactual_outcomes_df,
+                on="signal_id",
+                how="left",
+                validate="one_to_one",
+            )
+        window_6h = build_execution_window_report(executed_signals_df, 6)
+        window_24h = build_execution_window_report(executed_signals_df, 24)
+        execution_metrics = build_execution_metrics(
+            executed_signals_df,
+            window_start=window_start,
+            window_end=window_end,
+            window_days=window_days,
+            precomputed_window_reports={6: window_6h, 24: window_24h},
+        )
+        summary = build_gate_execution_decision_summary(execution_decisions_df)
+        trainable_mask = pd.Series(True, index=gate_decisions_df.index)
+        if "gate_trainable_signal" in gate_decisions_df.columns:
+            trainable_mask = (
+                pd.to_numeric(gate_decisions_df["gate_trainable_signal"], errors="coerce")
+                .fillna(0)
+                .astype(int)
+                .eq(1)
+            )
+        blocked_by_model_trainable = int(
+            (
+                (gate_decisions_df["gate_decision"].astype(str) == "block")
+                & trainable_mask
+            ).sum()
+        )
+        blocked_model_total = int(summary["tp_blocked_model"] + summary["sl_blocked_model"])
+        blocked_sl_precision_model = _safe_ratio(
+            int(summary["sl_blocked_model"]), blocked_model_total
+        )
+        signals_per_30d = float(execution_metrics.get("signals_per_30d", 0.0))
+        pnl_sum = float(execution_metrics.get("pnl_sum", 0.0))
+        worst_6h = float(window_6h["pnl_sum"].min()) if not window_6h.empty else 0.0
+        worst_24h = float(window_24h["pnl_sum"].min()) if not window_24h.empty else 0.0
+        max_losing_streak = float(execution_metrics.get("max_losing_streak", 0.0))
+        density_penalty = _compute_density_penalty(signals_per_30d)
+        selection_score = (
+            pnl_sum
+            + 5.0 * float(summary["sl_capture_execution"])
+            - 5.0 * float(summary["tp_tax_execution"])
+            - 0.75 * density_penalty
+            + 0.25 * worst_6h
+            + 0.10 * worst_24h
+            - 0.10 * max_losing_streak
+        )
+        best_selection_score = max(best_selection_score, float(selection_score))
+        elapsed = time.perf_counter() - sweep_started
+        rate = idx / elapsed if elapsed > 0 else 0.0
+        eta = (total_thresholds - idx) / rate if rate > 0 else 0.0
+        threshold_repr = (
+            f"{float(threshold):.6f}" if threshold is not None else "nan"
+        )
+        log_info(
+            "GATE",
+            (
+                f"threshold execution progress idx={idx}/{total_thresholds} "
+                f"gate_mode={gate_mode} "
+                f"block_threshold={threshold_repr} "
+                f"signals_after_model={int(summary['after_model'])} "
+                f"signals_after_execution={int(summary['after_execution'])} "
+                f"pnl_after_execution={pnl_sum:.6f} "
+                f"worst_24h_after_execution={worst_24h:.6f} "
+                f"tp_tax_execution={float(summary['tp_tax_execution']):.6f} "
+                f"sl_capture_execution={float(summary['sl_capture_execution']):.6f} "
+                f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f} "
+                f"current_best={best_selection_score:.6f}"
+            ),
+        )
+        rows.append(
+            {
+                "gate_mode": gate_mode,
+                "block_threshold": (
+                    float(threshold) if threshold is not None else float("nan")
+                ),
+                "signals_before": float(summary["candidate_signals_before"]),
+                "signals_after_model": float(summary["after_model"]),
+                "signals_after_execution": float(summary["after_execution"]),
+                "blocked_by_model": float(summary["blocked_by_model"]),
+                "blocked_by_model_trainable": float(blocked_by_model_trainable),
+                "blocked_by_symbol_lock": float(summary["blocked_by_symbol_lock"]),
+                "failed_execution_other": float(summary["failed_execution_other"]),
+                "signals_per_30d_after_execution": signals_per_30d,
+                "pnl_after_execution": pnl_sum,
+                "worst_6h_after_execution": worst_6h,
+                "worst_24h_after_execution": worst_24h,
+                "max_losing_streak_after_execution": max_losing_streak,
+                "tp_tax_model": float(summary["tp_tax_model"]),
+                "sl_capture_model": float(summary["sl_capture_model"]),
+                "blocked_sl_precision_model": float(blocked_sl_precision_model),
+                "tp_tax_execution": float(summary["tp_tax_execution"]),
+                "sl_capture_execution": float(summary["sl_capture_execution"]),
+                "model_frontier_admissible": 0.0,
+                "model_frontier_dominated": 0.0,
+                "model_frontier_rank": 0.0,
+                "density_penalty": float(density_penalty),
+                "selection_score": float(selection_score),
+            }
+        )
+    sweep_df = pd.DataFrame(rows, columns=list(_EXECUTION_SWEEP_COLUMNS))
+    if sweep_df.empty:
+        raise ValueError("execution-aware gate threshold sweep returned no candidates")
+    model_stage_df = sweep_df.copy()
+    support_ok_mask = model_stage_df["blocked_by_model_trainable"] > 1.0
+    tp_tax_cap = 1.0
+    if bool(support_ok_mask.any()):
+        tp_tax_cap = float(model_stage_df.loc[support_ok_mask, "tp_tax_model"].min()) + 0.05
+    tp_tax_ok_mask = model_stage_df["tp_tax_model"] <= tp_tax_cap
+    primary_mask = support_ok_mask & tp_tax_ok_mask
+    dominated_mask = pd.Series(False, index=model_stage_df.index)
+    epsilon = 1e-12
+    candidate_indices = list(model_stage_df.index[primary_mask])
+    for row_idx in candidate_indices:
+        current = model_stage_df.loc[row_idx]
+        peer_indices = [idx for idx in candidate_indices if idx != row_idx]
+        if not peer_indices:
+            continue
+        peers = model_stage_df.loc[peer_indices]
+        no_worse = (
+            (peers["tp_tax_model"] <= float(current["tp_tax_model"]) + epsilon)
+            & (peers["sl_capture_model"] >= float(current["sl_capture_model"]) - epsilon)
+            & (
+                peers["blocked_by_model_trainable"]
+                >= float(current["blocked_by_model_trainable"]) - epsilon
+            )
+        )
+        strictly_better = (
+            (peers["tp_tax_model"] < float(current["tp_tax_model"]) - epsilon)
+            | (peers["sl_capture_model"] > float(current["sl_capture_model"]) + epsilon)
+            | (
+                peers["blocked_by_model_trainable"]
+                > float(current["blocked_by_model_trainable"]) + epsilon
+            )
+        )
+        dominated_mask.loc[row_idx] = bool((no_worse & strictly_better).any())
+    model_frontier_admissible = primary_mask & ~dominated_mask
+    model_frontier_rank = (
+        model_stage_df["sl_capture_model"]
+        - model_stage_df["tp_tax_model"]
+        + 0.25 * model_stage_df["blocked_sl_precision_model"]
+        + 0.0001 * model_stage_df["blocked_by_model_trainable"]
+    )
+    sweep_df["model_frontier_admissible"] = model_frontier_admissible.astype(float)
+    sweep_df["model_frontier_dominated"] = dominated_mask.astype(float)
+    sweep_df["model_frontier_rank"] = model_frontier_rank.astype(float)
+    best_mode = "threshold"
+    best_threshold: float | None = None
+    selected_row: pd.Series | None = None
+    if bool(model_frontier_admissible.any()):
+        ranked = sweep_df.loc[model_frontier_admissible].sort_values(
+            by=[
+                "selection_score",
+                "pnl_after_execution",
+                "worst_24h_after_execution",
+                "worst_6h_after_execution",
+                "sl_capture_execution",
+                "tp_tax_execution",
+                "block_threshold",
+            ],
+            ascending=[False, False, False, False, False, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        best_mode = str(ranked.iloc[0]["gate_mode"])
+        best_threshold = (
+            None if best_mode == "disabled" else float(ranked.iloc[0]["block_threshold"])
+        )
+        selected_row = ranked.iloc[0]
+    elif include_disabled_fallback and not bool(primary_mask.any()):
+        disabled_decisions_df = scored_signals_df.copy()
+        disabled_decisions_df["gate_decision"] = "keep"
+        disabled_decisions_df["gate_block_threshold"] = pd.NA
+        execution_decisions_df, executed_signals_df = (
+            replay_short_signals_with_symbol_lock_precomputed(
+                decision_df=disabled_decisions_df,
                 independent_outcomes_df=independent_outcomes_df,
                 emit_summary_log=False,
             )
@@ -455,71 +652,74 @@ def select_gate_block_threshold_execution_aware(
             + 0.10 * worst_24h
             - 0.10 * max_losing_streak
         )
-        best_selection_score = max(best_selection_score, float(selection_score))
-        elapsed = time.perf_counter() - sweep_started
-        rate = idx / elapsed if elapsed > 0 else 0.0
-        eta = (len(candidates) - idx) / rate if rate > 0 else 0.0
-        threshold_repr = (
-            f"{float(threshold):.6f}" if threshold is not None else "nan"
-        )
-        log_info(
-            "GATE",
-            (
-                f"threshold execution progress idx={idx}/{len(candidates)} "
-                f"gate_mode={gate_mode} "
-                f"block_threshold={threshold_repr} "
-                f"signals_after_model={int(summary['after_model'])} "
-                f"signals_after_execution={int(summary['after_execution'])} "
-                f"pnl_after_execution={pnl_sum:.6f} "
-                f"worst_24h_after_execution={worst_24h:.6f} "
-                f"tp_tax_execution={float(summary['tp_tax_execution']):.6f} "
-                f"sl_capture_execution={float(summary['sl_capture_execution']):.6f} "
-                f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f} "
-                f"current_best={best_selection_score:.6f}"
-            ),
-        )
-        rows.append(
-            {
-                "gate_mode": gate_mode,
-                "block_threshold": (
-                    float(threshold) if threshold is not None else float("nan")
+        sweep_df = pd.concat(
+            [
+                sweep_df,
+                pd.DataFrame(
+                    [
+                        {
+                            "gate_mode": "disabled",
+                            "block_threshold": float("nan"),
+                            "signals_before": float(summary["candidate_signals_before"]),
+                            "signals_after_model": float(summary["after_model"]),
+                            "signals_after_execution": float(summary["after_execution"]),
+                            "blocked_by_model": float(summary["blocked_by_model"]),
+                            "blocked_by_model_trainable": 0.0,
+                            "blocked_by_symbol_lock": float(summary["blocked_by_symbol_lock"]),
+                            "failed_execution_other": float(summary["failed_execution_other"]),
+                            "signals_per_30d_after_execution": signals_per_30d,
+                            "pnl_after_execution": pnl_sum,
+                            "worst_6h_after_execution": worst_6h,
+                            "worst_24h_after_execution": worst_24h,
+                            "max_losing_streak_after_execution": max_losing_streak,
+                            "tp_tax_model": float(summary["tp_tax_model"]),
+                            "sl_capture_model": float(summary["sl_capture_model"]),
+                            "blocked_sl_precision_model": 0.0,
+                            "tp_tax_execution": float(summary["tp_tax_execution"]),
+                            "sl_capture_execution": float(summary["sl_capture_execution"]),
+                            "model_frontier_admissible": 0.0,
+                            "model_frontier_dominated": 0.0,
+                            "model_frontier_rank": 0.0,
+                            "density_penalty": float(density_penalty),
+                            "selection_score": float(selection_score),
+                        }
+                    ]
                 ),
-                "signals_before": float(summary["candidate_signals_before"]),
-                "signals_after_model": float(summary["after_model"]),
-                "signals_after_execution": float(summary["after_execution"]),
-                "blocked_by_model": float(summary["blocked_by_model"]),
-                "blocked_by_symbol_lock": float(summary["blocked_by_symbol_lock"]),
-                "failed_execution_other": float(summary["failed_execution_other"]),
-                "signals_per_30d_after_execution": signals_per_30d,
-                "pnl_after_execution": pnl_sum,
-                "worst_6h_after_execution": worst_6h,
-                "worst_24h_after_execution": worst_24h,
-                "max_losing_streak_after_execution": max_losing_streak,
-                "tp_tax_model": float(summary["tp_tax_model"]),
-                "sl_capture_model": float(summary["sl_capture_model"]),
-                "tp_tax_execution": float(summary["tp_tax_execution"]),
-                "sl_capture_execution": float(summary["sl_capture_execution"]),
-                "density_penalty": float(density_penalty),
-                "selection_score": float(selection_score),
-            }
+            ],
+            ignore_index=True,
         )
-    sweep_df = pd.DataFrame(rows, columns=list(_EXECUTION_SWEEP_COLUMNS))
-    if sweep_df.empty:
-        raise ValueError("execution-aware gate threshold sweep returned no candidates")
-    ranked = sweep_df.sort_values(
-        by=[
-            "selection_score",
-            "pnl_after_execution",
-            "signals_per_30d_after_execution",
-            "tp_tax_execution",
-            "block_threshold",
-        ],
-        ascending=[False, False, False, True, True],
-        kind="mergesort",
-    ).reset_index(drop=True)
-    best_mode = str(ranked.iloc[0]["gate_mode"])
-    best_threshold = (
-        None if best_mode == "disabled" else float(ranked.iloc[0]["block_threshold"])
+        best_mode = "disabled"
+        best_threshold = None
+        selected_row = sweep_df.iloc[-1]
+    else:
+        fallback_pool = sweep_df.loc[support_ok_mask].copy()
+        if fallback_pool.empty:
+            fallback_pool = sweep_df.copy()
+        ranked = fallback_pool.sort_values(
+            by=[
+                "model_frontier_rank",
+                "selection_score",
+                "pnl_after_execution",
+                "tp_tax_model",
+                "block_threshold",
+            ],
+            ascending=[False, False, False, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        best_mode = str(ranked.iloc[0]["gate_mode"])
+        best_threshold = (
+            None if best_mode == "disabled" else float(ranked.iloc[0]["block_threshold"])
+        )
+        selected_row = ranked.iloc[0]
+    log_info(
+        "GATE",
+        (
+            "threshold model-frontier summary "
+            f"support_ok={int(support_ok_mask.sum())} "
+            f"tp_tax_ok={int(primary_mask.sum())} "
+            f"frontier_admissible={int(model_frontier_admissible.sum())} "
+            f"tp_tax_cap={tp_tax_cap:.6f}"
+        ),
     )
     log_info(
         "GATE",
@@ -531,7 +731,7 @@ def select_gate_block_threshold_execution_aware(
             "gate threshold execution-aware select done "
             f"best_mode={best_mode} "
             f"best_threshold={(f'{best_threshold:.6f}' if best_threshold is not None else 'None')} "
-            f"best_selection_score={float(ranked.iloc[0]['selection_score']):.6f}"
+            f"best_selection_score={float(selected_row['selection_score']) if selected_row is not None else float('nan'):.6f}"
         ),
     )
     return best_threshold, sweep_df
@@ -652,6 +852,36 @@ def _resolve_eval_window_days(
     if end <= start:
         raise ValueError("window_end must be greater than window_start")
     return float((end - start) / pd.Timedelta(days=1))
+
+
+def _build_empirical_threshold_grid(
+    scored_signals_df: pd.DataFrame | None,
+) -> list[float]:
+    if scored_signals_df is None or scored_signals_df.empty:
+        return []
+    if "p_block" not in scored_signals_df.columns:
+        return []
+    p_block = pd.to_numeric(scored_signals_df["p_block"], errors="coerce").dropna()
+    if p_block.empty:
+        return []
+    clipped = p_block.astype(float).clip(lower=0.0, upper=1.0)
+    unique_scores = sorted(set(float(value) for value in clipped.tolist()))
+    if not unique_scores:
+        return []
+    tail_start = int(len(unique_scores) * 0.60)
+    tail_scores = unique_scores[tail_start:]
+    if len(tail_scores) > 64:
+        positions = {
+            int(round(i * (len(tail_scores) - 1) / 63))
+            for i in range(64)
+        }
+        tail_scores = [tail_scores[pos] for pos in sorted(positions)]
+    quantile_scores = [
+        float(value)
+        for value in clipped.quantile([0.70, 0.80, 0.90, 0.95, 0.975, 0.99]).tolist()
+    ]
+    out = {_round6(_clip(value, 0.0, 1.0)) for value in [*tail_scores, *quantile_scores]}
+    return sorted(out)
 
 
 def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], name: str) -> None:

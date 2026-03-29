@@ -9,7 +9,6 @@ def build_gate_model(model_config: GateModelConfig) -> CatBoostClassifier:
     return CatBoostClassifier(
         loss_function="Logloss",
         eval_metric="Logloss",
-        auto_class_weights="Balanced",
         verbose=False,
         allow_writing_files=False,
         iterations=model_config.iterations,
@@ -25,11 +24,17 @@ def fit_gate_model(
     train_df: pd.DataFrame,
     feature_columns: list[str] | tuple[str, ...],
     target_column: str,
+    tp_row_weight: float = 2.0,
+    sl_row_weight: float = 1.0,
 ) -> CatBoostClassifier:
     _require_columns(train_df, [*feature_columns, target_column], "train_df")
     x_train = train_df.loc[:, list(feature_columns)]
     y_train = train_df[target_column].astype(int)
-    model.fit(x_train, y_train)
+    sample_weight = (
+        y_train.eq(0).astype(float) * float(tp_row_weight)
+        + y_train.eq(1).astype(float) * float(sl_row_weight)
+    )
+    model.fit(x_train, y_train, sample_weight=sample_weight)
     return model
 
 

@@ -142,7 +142,7 @@ def build_gate_val_scored_signals_and_datasets(
     ].copy()
     if (not _is_gate_trainable(train_fit_df)) or val_score_df.empty:
         val_scored_signals_df = _build_disabled_scored_signals(
-            val_candidate_signals_df, "val_forward"
+            val_with_execution_df, "val_forward"
         )
         val_scored_signals_df = _attach_counterfactual_columns(
             val_scored_signals_df, val_with_execution_df
@@ -173,10 +173,20 @@ def build_gate_val_scored_signals_and_datasets(
         )
     model = build_gate_model(gate_model_config)
     try:
-        fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
+        fit_gate_model(
+            model,
+            train_fit_df,
+            GATE_FEATURE_COLUMNS,
+            "target_block_signal",
+            tp_row_weight=2.0,
+            sl_row_weight=1.0,
+        )
     except CatBoostError:
         val_scored_signals_df = _build_disabled_scored_signals(
-            val_candidate_signals_df, "val_forward"
+            val_with_execution_df, "val_forward"
+        )
+        val_scored_signals_df = _attach_counterfactual_columns(
+            val_scored_signals_df, val_with_execution_df
         )
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
@@ -247,9 +257,6 @@ def build_gate_test_scored_signals(
     execution_market_view: object | None = None,
 ) -> tuple[CatBoostClassifier | None, pd.DataFrame, pd.DataFrame, str]:
     if force_disabled_no_data:
-        test_scored_signals_df = _build_disabled_scored_signals(
-            test_candidate_signals_df, "test_forward"
-        )
         test_with_execution_df = _enrich_with_counterfactual(
             test_candidate_signals_df,
             bars_15m_df,
@@ -258,6 +265,9 @@ def build_gate_test_scored_signals(
             bars_1s_fetcher,
             split_label="test",
             execution_market_view=execution_market_view,
+        )
+        test_scored_signals_df = _build_disabled_scored_signals(
+            test_with_execution_df, "test_forward"
         )
         test_scored_signals_df = _attach_counterfactual_columns(
             test_scored_signals_df, test_with_execution_df
@@ -334,7 +344,7 @@ def build_gate_test_scored_signals(
     ].copy()
     if (not _is_gate_trainable(train_fit_df)) or test_score_df.empty:
         test_scored_signals_df = _build_disabled_scored_signals(
-            test_candidate_signals_df, "test_forward"
+            test_with_execution_df, "test_forward"
         )
         test_scored_signals_df = _attach_counterfactual_columns(
             test_scored_signals_df, test_with_execution_df
@@ -355,10 +365,20 @@ def build_gate_test_scored_signals(
         )
     model = build_gate_model(gate_model_config)
     try:
-        fit_gate_model(model, train_fit_df, GATE_FEATURE_COLUMNS, "target_block_signal")
+        fit_gate_model(
+            model,
+            train_fit_df,
+            GATE_FEATURE_COLUMNS,
+            "target_block_signal",
+            tp_row_weight=2.0,
+            sl_row_weight=1.0,
+        )
     except CatBoostError:
         test_scored_signals_df = _build_disabled_scored_signals(
-            test_candidate_signals_df, "test_forward"
+            test_with_execution_df, "test_forward"
+        )
+        test_scored_signals_df = _attach_counterfactual_columns(
+            test_scored_signals_df, test_with_execution_df
         )
         log_info(
             "GATE",
@@ -458,7 +478,12 @@ def _enrich_with_counterfactual(
     if candidate_signals_df is None:
         return None
     if candidate_signals_df.empty:
-        return candidate_signals_df.copy()
+        out = candidate_signals_df.copy()
+        out["counterfactual_execution_status"] = pd.NA
+        out["counterfactual_trade_outcome"] = pd.NA
+        out["counterfactual_trade_pnl_pct"] = pd.NA
+        out["counterfactual_exit_time"] = pd.NaT
+        return out
     counterfactual_df = attach_counterfactual_execution_outcomes(
         candidate_signals_df,
         bars_15m_df,
@@ -484,20 +509,36 @@ def _build_disabled_scored_signals(
     out = candidate_signals_df.copy()
     out["score_source"] = score_source
     out["p_block"] = 0.0
-    target_good = (
-        pd.to_numeric(out.get("target_good_short_now"), errors="coerce")
-        .fillna(0)
-        .astype(int)
+    outcome = (
+        out.get("counterfactual_trade_outcome", pd.Series(pd.NA, index=out.index))
+        .astype(str)
+        .str.strip()
+        .str.lower()
     )
-    out["target_block_signal"] = (1 - target_good).clip(lower=0, upper=1)
-    out["block_reason"] = out.get(
-        "future_outcome_class", pd.Series("unknown", index=out.index)
-    ).astype(str)
+    out["target_block_signal"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    sl_mask = outcome.eq("sl")
+    tp_mask = outcome.eq("tp")
+    out.loc[sl_mask, "target_block_signal"] = 1
+    out.loc[tp_mask, "target_block_signal"] = 0
+    out["block_reason"] = outcome.apply(_resolve_execution_block_reason)
     out["gate_trainable_signal"] = False
     for column in _SCORED_OUTPUT_COLUMNS:
         if column not in out.columns:
             out[column] = pd.NA
     return out.loc[:, list(_SCORED_OUTPUT_COLUMNS)].reset_index(drop=True)
+
+
+def _resolve_execution_block_reason(outcome_value: object) -> str:
+    outcome = str(outcome_value).strip().lower()
+    if outcome == "sl":
+        return "block_sl"
+    if outcome == "tp":
+        return "keep_tp"
+    if outcome == "timeout":
+        return "skip_timeout"
+    if outcome == "ambiguous":
+        return "skip_ambiguous"
+    return "skip_unknown"
 
 
 def _attach_counterfactual_columns(

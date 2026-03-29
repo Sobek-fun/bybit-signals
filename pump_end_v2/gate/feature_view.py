@@ -21,6 +21,13 @@ GATE_FEATURE_COLUMNS: tuple[str, ...] = (
     "detector_p_good_drop_from_peak",
     "detector_episode_age_bars",
     "detector_distance_from_episode_high_pct",
+    "episode_runup_from_open_pct",
+    "episode_extension_from_open_pct",
+    "bars_since_episode_high",
+    "drawdown_from_episode_high_so_far",
+    "high_retest_count",
+    "high_persistence_4",
+    "episode_pump_context_streak",
     "token_close_ret_1",
     "token_close_ret_4",
     "token_close_ret_12",
@@ -72,6 +79,13 @@ _CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
     "p_good_drop_from_peak",
     "episode_age_bars",
     "distance_from_episode_high_pct",
+    "episode_runup_from_open_pct",
+    "episode_extension_from_open_pct",
+    "bars_since_episode_high",
+    "drawdown_from_episode_high_so_far",
+    "high_retest_count",
+    "high_persistence_4",
+    "episode_pump_context_streak",
 )
 
 
@@ -211,6 +225,27 @@ def build_gate_feature_view(
     )
     merged["detector_distance_from_episode_high_pct"] = pd.to_numeric(
         merged["distance_from_episode_high_pct"], errors="coerce"
+    )
+    merged["episode_runup_from_open_pct"] = pd.to_numeric(
+        merged["episode_runup_from_open_pct"], errors="coerce"
+    )
+    merged["episode_extension_from_open_pct"] = pd.to_numeric(
+        merged["episode_extension_from_open_pct"], errors="coerce"
+    )
+    merged["bars_since_episode_high"] = pd.to_numeric(
+        merged["bars_since_episode_high"], errors="coerce"
+    )
+    merged["drawdown_from_episode_high_so_far"] = pd.to_numeric(
+        merged["drawdown_from_episode_high_so_far"], errors="coerce"
+    )
+    merged["high_retest_count"] = pd.to_numeric(
+        merged["high_retest_count"], errors="coerce"
+    )
+    merged["high_persistence_4"] = pd.to_numeric(
+        merged["high_persistence_4"], errors="coerce"
+    )
+    merged["episode_pump_context_streak"] = pd.to_numeric(
+        merged["episode_pump_context_streak"], errors="coerce"
     )
     merged = _append_signal_flow_features(merged)
     merged = _append_strategy_state_features(merged)

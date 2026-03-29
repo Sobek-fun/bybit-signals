@@ -6,6 +6,7 @@ from pump_end_v2.logging import log_info
 GATE_TARGET_META_COLUMNS: tuple[str, ...] = (
     "target_block_signal",
     "block_reason",
+    "counterfactual_trade_outcome",
     "signal_quality_h32",
     "target_good_short_now",
     "target_reason",
@@ -24,6 +25,7 @@ GATE_TARGET_META_COLUMNS: tuple[str, ...] = (
 
 _CANDIDATE_TARGET_COLUMNS: tuple[str, ...] = (
     "signal_id",
+    "counterfactual_trade_outcome",
     "signal_quality_h32",
     "target_good_short_now",
     "target_reason",
@@ -64,18 +66,21 @@ def build_gate_dataset(
         .fillna(0)
         .astype(int)
     )
+    merged["counterfactual_trade_outcome"] = (
+        merged["counterfactual_trade_outcome"].astype(str).str.strip().str.lower()
+    )
     merged["signal_quality_h32"] = merged["signal_quality_h32"].astype(str)
-    merged["target_block_signal"] = (
-        merged["signal_quality_h32"] != "clean_retrace_h32"
-    ).astype(int)
+    merged["target_block_signal"] = pd.Series(pd.NA, index=merged.index, dtype="Int64")
+    sl_mask = merged["counterfactual_trade_outcome"].eq("sl")
+    tp_mask = merged["counterfactual_trade_outcome"].eq("tp")
+    merged.loc[sl_mask, "target_block_signal"] = 1
+    merged.loc[tp_mask, "target_block_signal"] = 0
     merged["target_reason"] = merged["target_reason"].astype(str)
     merged["future_outcome_class"] = merged["future_outcome_class"].astype(str)
-    merged["gate_trainable_signal"] = (
-        merged["signal_quality_h32"].ne("")
-        & merged["signal_quality_h32"].ne("nan")
-        & merged["signal_quality_h32"].ne("<NA>")
+    merged["gate_trainable_signal"] = sl_mask | tp_mask
+    merged["block_reason"] = merged["counterfactual_trade_outcome"].apply(
+        _resolve_block_reason
     )
-    merged["block_reason"] = merged.apply(_resolve_block_reason, axis=1)
     ordered = merged.loc[
         :,
         [
@@ -101,19 +106,17 @@ def build_gate_dataset(
     return ordered.reset_index(drop=True)
 
 
-def _resolve_block_reason(row: pd.Series) -> str:
-    quality = str(row["signal_quality_h32"])
-    if quality == "clean_retrace_h32":
-        return "keep_clean_retrace_h32"
-    if quality == "dirty_retrace_h32":
-        return "block_dirty_retrace_h32"
-    if quality == "clean_no_pullback_h32":
-        return "block_clean_no_pullback_h32"
-    if quality == "dirty_no_pullback_h32":
-        return "block_dirty_no_pullback_h32"
-    if quality == "pullback_before_squeeze_h32":
-        return "block_pullback_before_squeeze_h32"
-    return "block_unknown_quality"
+def _resolve_block_reason(outcome_value: object) -> str:
+    outcome = str(outcome_value).strip().lower()
+    if outcome == "sl":
+        return "block_sl"
+    if outcome == "tp":
+        return "keep_tp"
+    if outcome == "timeout":
+        return "skip_timeout"
+    if outcome == "ambiguous":
+        return "skip_ambiguous"
+    return "skip_unknown"
 
 
 def _validate_no_leakage_columns() -> None:
