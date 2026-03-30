@@ -24,6 +24,7 @@ from pump_end_v2.detector import (
     build_detector_test_policy_rows,
     build_detector_train_oof_policy_rows,
     build_detector_val_policy_rows,
+    compute_eval_window_days_from_policy_rows,
     select_detector_policy,
 )
 from pump_end_v2.execution import (
@@ -46,8 +47,10 @@ from pump_end_v2.features import (
 )
 from pump_end_v2.gate import (
     apply_gate_block_threshold,
+    build_candidate_signal_strength_report,
     build_gate_decile_report,
     build_gate_execution_decision_summary,
+    build_gate_rank_quality_report,
     build_gate_test_scored_signals,
     build_gate_val_scored_signals_and_datasets,
     select_gate_block_threshold_execution_aware,
@@ -250,9 +253,13 @@ def run_pump_end_v2_pipeline(
             train_oof_policy_rows, selected_detector_policy
         )
     )
+    detector_train_oof_window_days = compute_eval_window_days_from_policy_rows(
+        train_oof_policy_rows
+    )
     detector_train_oof_policy_metrics = build_detector_policy_metrics(
         train_oof_candidate_signals_df,
         train_oof_episode_policy_summary_df,
+        window_days=detector_train_oof_window_days,
     )
     val_candidate_signals_df, val_episode_policy_summary_df = (
         apply_episode_aware_detector_policy(val_policy_rows, selected_detector_policy)
@@ -662,6 +669,14 @@ def run_pump_end_v2_pipeline(
     test_monthly_report = build_execution_monthly_report(test_executed_signals_df)
     gate_deciles_val = build_gate_decile_report(val_scored_signals_df)
     gate_deciles_test = build_gate_decile_report(test_scored_signals_df)
+    val_candidate_signal_strength = build_candidate_signal_strength_report(
+        val_scored_signals_df, config.execution
+    )
+    test_candidate_signal_strength = build_candidate_signal_strength_report(
+        test_scored_signals_df, config.execution
+    )
+    val_gate_rank_quality = build_gate_rank_quality_report(val_scored_signals_df)
+    test_gate_rank_quality = build_gate_rank_quality_report(test_scored_signals_df)
     log_info(
         "PIPELINE",
         (
@@ -876,6 +891,10 @@ def run_pump_end_v2_pipeline(
         "detector_val_policy_metrics": detector_val_policy_metrics,
         "detector_train_oof_policy_metrics": detector_train_oof_policy_metrics,
         "detector_test_policy_metrics": detector_test_policy_metrics,
+        "val_candidate_signal_strength": val_candidate_signal_strength,
+        "test_candidate_signal_strength": test_candidate_signal_strength,
+        "val_gate_rank_quality": val_gate_rank_quality,
+        "test_gate_rank_quality": test_gate_rank_quality,
         "val_decision_summary": val_decision_summary,
         "test_decision_summary": test_decision_summary,
         "val_execution_metrics": val_metrics,

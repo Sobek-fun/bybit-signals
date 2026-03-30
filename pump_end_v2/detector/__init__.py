@@ -7,6 +7,7 @@ from pump_end_v2.detector.model import (
 from pump_end_v2.detector.policy import (
     apply_episode_aware_detector_policy,
     build_detector_policy_metrics,
+    compute_eval_window_days_from_policy_rows,
 )
 from pump_end_v2.detector.policy_search import (
     build_detector_policy_grid,
@@ -40,6 +41,7 @@ __all__ = [
     "predict_detector_scores",
     "apply_episode_aware_detector_policy",
     "build_detector_policy_metrics",
+    "compute_eval_window_days_from_policy_rows",
     "build_detector_val_policy_rows",
     "build_detector_train_oof_policy_rows",
     "build_detector_policy_grid",

@@ -21,6 +21,7 @@ from pump_end_v2.detector.model import (
 from pump_end_v2.detector.policy import (
     apply_episode_aware_detector_policy,
     build_detector_policy_metrics,
+    compute_eval_window_days_from_policy_rows,
 )
 from pump_end_v2.detector.splits import (
     filter_fold_rows,
@@ -741,8 +742,11 @@ def build_detector_train_oof_candidate_signal_ledger(
             detector_policy_config=detector_policy_config,
         )
     )
+    train_oof_window_days = compute_eval_window_days_from_policy_rows(scored_rows_df)
     metrics = build_detector_policy_metrics(
-        candidate_signals_df, episode_policy_summary_df
+        candidate_signals_df,
+        episode_policy_summary_df,
+        window_days=train_oof_window_days,
     )
     return candidate_signals_df, episode_policy_summary_df, metrics
 

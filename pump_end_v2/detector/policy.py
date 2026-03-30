@@ -395,6 +395,25 @@ def build_detector_policy_metrics(
     }
 
 
+def compute_eval_window_days_from_policy_rows(policy_rows_df: pd.DataFrame) -> float:
+    if "context_bar_open_time" not in policy_rows_df.columns:
+        return 1.0
+    frame = policy_rows_df.copy()
+    if "policy_context_only" in frame.columns:
+        mask = ~frame["policy_context_only"].astype(bool)
+        frame = frame[mask].copy()
+    if frame.empty:
+        return 1.0
+    timestamps = pd.to_datetime(
+        frame["context_bar_open_time"], utc=True, errors="coerce"
+    ).dropna()
+    unique_active_timestamps = int(pd.Index(timestamps).nunique())
+    if unique_active_timestamps <= 0:
+        return 1.0
+    bars_per_day = float(pd.Timedelta(days=1) / pd.Timedelta(minutes=15))
+    return float(unique_active_timestamps / bars_per_day)
+
+
 def _compute_bars_fire_to_ideal(
     entry_bar_open_time: pd.Timestamp,
     ideal_entry_bar_open_time: pd.Timestamp | None,
