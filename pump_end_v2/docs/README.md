@@ -485,22 +485,26 @@ Baseline gate — **CatBoostClassifier**.
 
 ### Gate target
 
-В текущем коде `target_block_signal = (signal_quality_h32 != clean_retrace_h32)`.
+В текущем коде gate использует единственную каноническую binary-цель по
+`counterfactual_trade_outcome`:
 
-То есть baseline gate по факту учится так:
+- `SL` → `target_block_signal = 1` (сигнал надо блокировать);
+- `TP` → `target_block_signal = 0` (сигнал надо пропускать);
+- `timeout` / `ambiguous` не участвуют в обучении (`gate_trainable_signal = false`).
 
-- `clean_retrace_h32` → keep
-- все остальные signal_quality → block
+`signal_quality_h32` после этого трактуется как diagnostic/meta колонка для анализа,
+а не как оптимизируемая цель gate.
 
 ### `block_reason`
 
-Сейчас gate dataset размечает block reason на основе `signal_quality_h32`, например:
+Сейчас gate dataset размечает `block_reason` на основе
+`counterfactual_trade_outcome`:
 
-- `keep_clean_retrace_h32`
-- `block_dirty_retrace_h32`
-- `block_clean_no_pullback_h32`
-- `block_dirty_no_pullback_h32`
-- `block_pullback_before_squeeze_h32`
+- `block_sl`
+- `keep_tp`
+- `skip_timeout`
+- `skip_ambiguous`
+- `skip_unknown`
 
 ### Важная реальность текущей реализации
 
@@ -557,6 +561,7 @@ Gate policy сейчас предельно простая:
 
 Особенно:
 
+- `blocked_by_model_trainable`
 - `signals_after_execution`
 - `blocked_by_model`
 - `blocked_by_symbol_lock`
@@ -568,7 +573,9 @@ Gate policy сейчас предельно простая:
 
 #### Как читать
 
-- высокий `sl_capture_model` при умеренном `tp_tax_model` — gate полезен;
+- главный критерий полезности gate — model-stage tradeoff:
+  выше `sl_capture_model`, ниже `tp_tax_model`, и достаточный `blocked_by_model_trainable`;
+- execution-метрики (`pnl_after_execution`, worst windows, streak) используются как tie-breaker между model-stage кандидатами;
 - сильное падение `signals_after_execution` без улучшения `pnl_after_execution` — gate слишком агрессивен;
 - если gate отключен (`disabled_no_data`), не надо интерпретировать результаты как “gate плохой” — это означает, что текущий detector на этом run не дал пригодной обучающей базы для gate.
 
