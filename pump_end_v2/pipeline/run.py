@@ -339,6 +339,7 @@ def run_pump_end_v2_pipeline(
         gate_dataset_train_oof_df,
         gate_dataset_val_df,
         gate_status_val,
+        selected_gate_model_config,
     ) = build_gate_val_scored_signals_and_datasets(
         train_oof_candidate_signals_df,
         val_candidate_signals_df,
@@ -352,6 +353,7 @@ def run_pump_end_v2_pipeline(
         config.execution,
         bars_1s_fetcher,
         execution_market_view=execution_market_view_val,
+        search_model_config=config.search_gate_model,
         search_threshold_config=config.search_gate_threshold,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
@@ -469,7 +471,7 @@ def run_pump_end_v2_pipeline(
             token_state_tradable,
             reference_state,
             breadth_state,
-            config.gate_model,
+            selected_gate_model_config,
             bars_15m,
             bars_1m_test,
             config.execution,
@@ -856,6 +858,7 @@ def run_pump_end_v2_pipeline(
         "run_dir": str(run_context.run_dir),
         "config_path": str(Path(config_path).resolve()),
         "selected_detector_policy": _policy_to_dict(selected_detector_policy),
+        "selected_gate_model": _gate_model_to_dict(selected_gate_model_config),
         "selected_gate_mode": selected_gate_mode,
         "selected_gate_threshold": (
             float(selected_gate_threshold)
@@ -939,6 +942,18 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
         "arm_score_min": float(policy.arm_score_min),
         "fire_score_floor": float(policy.fire_score_floor),
         "turn_down_delta": float(policy.turn_down_delta),
+    }
+
+
+def _gate_model_to_dict(model_config: Any) -> dict[str, float]:
+    return {
+        "iterations": float(model_config.iterations),
+        "depth": float(model_config.depth),
+        "learning_rate": float(model_config.learning_rate),
+        "l2_leaf_reg": float(model_config.l2_leaf_reg),
+        "random_seed": float(model_config.random_seed),
+        "tp_row_weight": float(model_config.tp_row_weight),
+        "sl_row_weight": float(model_config.sl_row_weight),
     }
 
 
