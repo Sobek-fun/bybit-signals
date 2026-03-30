@@ -21,6 +21,11 @@ GATE_FEATURE_COLUMNS: tuple[str, ...] = (
     "detector_p_good_drop_from_peak",
     "detector_episode_age_bars",
     "detector_distance_from_episode_high_pct",
+    "detector_policy_p_good_minus_fire_floor",
+    "detector_policy_peak_minus_arm_min",
+    "detector_policy_drop_minus_turn_down",
+    "detector_policy_drop_to_turn_down_ratio",
+    "detector_policy_p_good_band_position",
     "episode_runup_from_open_pct",
     "episode_extension_from_open_pct",
     "bars_since_episode_high",
@@ -77,6 +82,9 @@ _CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
     "p_good",
     "peak_p_good_before_fire",
     "p_good_drop_from_peak",
+    "policy_arm_score_min",
+    "policy_fire_score_floor",
+    "policy_turn_down_delta",
     "episode_age_bars",
     "distance_from_episode_high_pct",
     "episode_runup_from_open_pct",
@@ -226,6 +234,35 @@ def build_gate_feature_view(
     merged["detector_distance_from_episode_high_pct"] = pd.to_numeric(
         merged["distance_from_episode_high_pct"], errors="coerce"
     )
+    policy_arm_score_min = pd.to_numeric(
+        merged["policy_arm_score_min"], errors="coerce"
+    )
+    policy_fire_score_floor = pd.to_numeric(
+        merged["policy_fire_score_floor"], errors="coerce"
+    )
+    policy_turn_down_delta = pd.to_numeric(
+        merged["policy_turn_down_delta"], errors="coerce"
+    )
+    merged["detector_policy_p_good_minus_fire_floor"] = (
+        merged["detector_p_good"] - policy_fire_score_floor
+    )
+    merged["detector_policy_peak_minus_arm_min"] = (
+        merged["detector_peak_p_good_before_fire"] - policy_arm_score_min
+    )
+    merged["detector_policy_drop_minus_turn_down"] = (
+        merged["detector_p_good_drop_from_peak"] - policy_turn_down_delta
+    )
+    safe_turn_down_delta = policy_turn_down_delta.where(
+        policy_turn_down_delta.abs() > 1e-12
+    )
+    merged["detector_policy_drop_to_turn_down_ratio"] = (
+        merged["detector_p_good_drop_from_peak"] / safe_turn_down_delta
+    )
+    policy_band_width = policy_arm_score_min - policy_fire_score_floor
+    safe_policy_band_width = policy_band_width.where(policy_band_width.abs() > 1e-12)
+    merged["detector_policy_p_good_band_position"] = (
+        merged["detector_p_good"] - policy_fire_score_floor
+    ) / safe_policy_band_width
     merged["episode_runup_from_open_pct"] = pd.to_numeric(
         merged["episode_runup_from_open_pct"], errors="coerce"
     )
