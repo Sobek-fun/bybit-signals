@@ -1,4 +1,5 @@
 import pandas as pd
+import math
 import sys
 import time
 
@@ -24,16 +25,20 @@ _SWEEP_COLUMNS: tuple[str, ...] = (
     "block_threshold",
     "signals_before",
     "signals_after",
+    "tp_blocked_model",
+    "sl_blocked_model",
     "blocked_share",
     "bad_block_rate",
     "good_keep_rate",
     "blocked_bad_precision",
     "good_block_tax",
+    "economic_utility_model",
+    "economic_utility_per_candidate",
+    "economic_utility_per_blocked",
     "signals_per_30d_after",
-    "density_penalty",
     "support_ok",
-    "useful_ok",
-    "goal_zone_ok",
+    "utility_ok",
+    "blocked_share_ok",
     "model_zone_distance",
     "selection_score",
 )
@@ -52,6 +57,7 @@ _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
     "gate_mode",
     "block_threshold",
     "signals_before",
+    "blocked_share_model",
     "signals_after_model",
     "signals_after_execution",
     "blocked_by_model",
@@ -68,14 +74,16 @@ _EXECUTION_SWEEP_COLUMNS: tuple[str, ...] = (
     "blocked_sl_precision_model",
     "tp_blocked_model",
     "sl_blocked_model",
-    "model_useful",
+    "economic_utility_model",
+    "economic_utility_per_candidate",
+    "economic_utility_per_blocked",
+    "support_ok",
+    "utility_ok",
+    "blocked_share_ok",
+    "signal_density_ok",
     "model_zone_distance",
     "tp_tax_execution",
     "sl_capture_execution",
-    "model_frontier_admissible",
-    "model_frontier_dominated",
-    "model_frontier_rank",
-    "density_penalty",
     "selection_score",
 )
 
@@ -145,6 +153,7 @@ def apply_gate_block_threshold(
 
 def build_gate_threshold_metrics(
     decision_df: pd.DataFrame,
+    execution_contract: ExecutionContract | None = None,
     search_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
@@ -180,59 +189,77 @@ def build_gate_threshold_metrics(
     blocked_bad_precision = _safe_ratio(blocked_bad, total_blocked)
     good_block_tax = _safe_ratio(blocked_good, total_good)
     blocked_share = _safe_ratio(total_blocked, signals_before)
-    target_sl_capture_model = (
-        float(search_config.target_sl_capture_model)
-        if search_config is not None
-        else 0.20
-    )
-    max_tp_tax_model = (
-        float(search_config.max_tp_tax_model) if search_config is not None else 0.10
-    )
     min_blocked_trainable = (
         int(search_config.min_blocked_trainable) if search_config is not None else 10
     )
-    require_sl_gt_tp = (
-        bool(search_config.require_sl_gt_tp) if search_config is not None else True
+    min_blocked_share_model = (
+        float(search_config.min_blocked_share_model)
+        if search_config is not None and search_config.min_blocked_share_model is not None
+        else None
+    )
+    max_blocked_share_model = (
+        float(search_config.max_blocked_share_model)
+        if search_config is not None and search_config.max_blocked_share_model is not None
+        else None
+    )
+    tp_pct = (
+        float(execution_contract.tp_pct)
+        if execution_contract is not None
+        else 1.0
+    )
+    sl_pct = (
+        abs(float(execution_contract.sl_pct))
+        if execution_contract is not None
+        else 1.0
+    )
+    economic_utility_model = (
+        sl_pct * float(blocked_bad) - tp_pct * float(blocked_good)
+    )
+    economic_utility_per_candidate = (
+        float(economic_utility_model) / float(signals_before)
+        if signals_before > 0
+        else 0.0
+    )
+    economic_utility_per_blocked = (
+        float(economic_utility_model) / float(total_blocked)
+        if total_blocked > 0
+        else 0.0
     )
     support_ok = float(total_blocked >= min_blocked_trainable)
-    useful_ok = float(blocked_bad > blocked_good) if require_sl_gt_tp else 1.0
-    goal_zone_ok = float(
-        (bad_block_rate >= target_sl_capture_model) and (good_block_tax <= max_tp_tax_model)
+    utility_ok = float(economic_utility_model > 0.0)
+    blocked_share_ok = float(
+        _passes_band(blocked_share, min_blocked_share_model, max_blocked_share_model)
     )
     support_scale = float(max(min_blocked_trainable, 1))
-    sl_target_scale = float(max(target_sl_capture_model, 1e-9))
-    tp_target_scale = float(max(max_tp_tax_model, 1e-9))
+    blocked_share_shortfall = _band_shortfall_ratio(
+        blocked_share, min_blocked_share_model, max_blocked_share_model
+    )
     model_zone_distance = (
         max(float(min_blocked_trainable) - float(total_blocked), 0.0) / support_scale
-        + max(target_sl_capture_model - bad_block_rate, 0.0) / sl_target_scale
-        + max(good_block_tax - max_tp_tax_model, 0.0) / tp_target_scale
-        + ((1.0 - useful_ok) if require_sl_gt_tp else 0.0)
+        + blocked_share_shortfall
     )
     eval_window_days = _resolve_eval_window_days(
         window_start=window_start, window_end=window_end, window_days=window_days
     )
     signals_per_30d_after = _compute_signals_per_30d_after(total_kept, eval_window_days)
-    density_penalty = _compute_density_penalty(signals_per_30d_after)
-    selection_score = (
-        -model_zone_distance
-        + (bad_block_rate - good_block_tax)
-        + 0.25 * blocked_bad_precision
-        + 0.0001 * float(total_blocked)
-        - 0.10 * density_penalty
-    )
+    selection_score = float(economic_utility_model)
     return {
         "signals_before": float(signals_before),
         "signals_after": float(total_kept),
+        "tp_blocked_model": float(blocked_good),
+        "sl_blocked_model": float(blocked_bad),
         "blocked_share": float(blocked_share),
         "bad_block_rate": float(bad_block_rate),
         "good_keep_rate": float(good_keep_rate),
         "blocked_bad_precision": float(blocked_bad_precision),
         "good_block_tax": float(good_block_tax),
+        "economic_utility_model": float(economic_utility_model),
+        "economic_utility_per_candidate": float(economic_utility_per_candidate),
+        "economic_utility_per_blocked": float(economic_utility_per_blocked),
         "signals_per_30d_after": float(signals_per_30d_after),
-        "density_penalty": float(density_penalty),
         "support_ok": float(support_ok),
-        "useful_ok": float(useful_ok),
-        "goal_zone_ok": float(goal_zone_ok),
+        "utility_ok": float(utility_ok),
+        "blocked_share_ok": float(blocked_share_ok),
         "model_zone_distance": float(model_zone_distance),
         "selection_score": float(selection_score),
     }
@@ -241,6 +268,7 @@ def build_gate_threshold_metrics(
 def sweep_gate_block_threshold(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    execution_contract: ExecutionContract | None = None,
     search_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
@@ -253,6 +281,7 @@ def sweep_gate_block_threshold(
         decision_df, _ = apply_gate_block_threshold(scored_signals_df, threshold)
         metrics = build_gate_threshold_metrics(
             decision_df,
+            execution_contract=execution_contract,
             search_config=search_config,
             window_start=window_start,
             window_end=window_end,
@@ -267,6 +296,7 @@ def sweep_gate_block_threshold(
 def select_gate_block_threshold(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
+    execution_contract: ExecutionContract | None = None,
     search_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
@@ -275,6 +305,7 @@ def select_gate_block_threshold(
     sweep_df = sweep_gate_block_threshold(
         scored_signals_df,
         base_block_threshold,
+        execution_contract=execution_contract,
         search_config=search_config,
         window_start=window_start,
         window_end=window_end,
@@ -286,15 +317,14 @@ def select_gate_block_threshold(
         by=[
             "model_zone_distance",
             "selection_score",
-            "goal_zone_ok",
             "support_ok",
-            "useful_ok",
+            "utility_ok",
+            "blocked_share_ok",
             "blocked_bad_precision",
             "good_keep_rate",
-            "density_penalty",
             "block_threshold",
         ],
-        ascending=[True, False, False, False, False, False, False, True, True],
+        ascending=[True, False, False, False, False, False, False, True],
         kind="mergesort",
     ).reset_index(drop=True)
     best_threshold = float(ranked.iloc[0]["block_threshold"])
@@ -398,6 +428,84 @@ def build_gate_decile_report(
     )
 
 
+def build_candidate_signal_strength_report(
+    scored_signals_df: pd.DataFrame, execution_contract: ExecutionContract
+) -> dict[str, float | None]:
+    _require_columns(
+        scored_signals_df, ("counterfactual_trade_outcome",), "scored_signals_df"
+    )
+    frame = scored_signals_df.copy()
+    outcome = (
+        frame["counterfactual_trade_outcome"].astype(str).str.strip().str.lower()
+    )
+    resolved = frame[outcome.isin(["tp", "sl"])].copy()
+    resolved_outcome = (
+        resolved["counterfactual_trade_outcome"].astype(str).str.strip().str.lower()
+    )
+    tp_total = int(resolved_outcome.eq("tp").sum())
+    sl_total = int(resolved_outcome.eq("sl").sum())
+    resolved_signals_total = int(tp_total + sl_total)
+    tp_rate_resolved = _safe_ratio(tp_total, resolved_signals_total)
+    tp_pct = float(execution_contract.tp_pct)
+    sl_pct = abs(float(execution_contract.sl_pct))
+    denom = tp_pct + sl_pct
+    tp_rate_breakeven = float(sl_pct / denom) if denom > 0.0 else 0.5
+    tp_rate_edge_vs_breakeven = float(tp_rate_resolved - tp_rate_breakeven)
+    if resolved_signals_total <= 0:
+        zscore: float | None = None
+    else:
+        variance = (
+            tp_rate_breakeven
+            * (1.0 - tp_rate_breakeven)
+            / float(resolved_signals_total)
+        )
+        if variance <= 0.0:
+            zscore = None
+        else:
+            zscore = float(tp_rate_edge_vs_breakeven / math.sqrt(variance))
+    return {
+        "resolved_signals_total": float(resolved_signals_total),
+        "tp_rate_resolved": float(tp_rate_resolved),
+        "tp_rate_breakeven": float(tp_rate_breakeven),
+        "tp_rate_edge_vs_breakeven": float(tp_rate_edge_vs_breakeven),
+        "edge_vs_breakeven_zscore": zscore,
+    }
+
+
+def build_gate_rank_quality_report(
+    scored_signals_df: pd.DataFrame,
+) -> dict[str, float | None]:
+    _require_columns(
+        scored_signals_df,
+        ("counterfactual_trade_outcome", "p_block"),
+        "scored_signals_df",
+    )
+    frame = scored_signals_df.copy()
+    frame["counterfactual_trade_outcome"] = (
+        frame["counterfactual_trade_outcome"].astype(str).str.strip().str.lower()
+    )
+    frame = frame[frame["counterfactual_trade_outcome"].isin(["tp", "sl"])].copy()
+    if frame.empty:
+        return {
+            "trainable_resolved_signals_total": 0.0,
+            "sl_prevalence": 0.0,
+            "roc_auc_block_signal": None,
+        }
+    y = frame["counterfactual_trade_outcome"].eq("sl").astype(int)
+    score = pd.to_numeric(frame["p_block"], errors="coerce")
+    valid = score.notna()
+    y = y[valid]
+    score = score[valid]
+    total = int(len(y))
+    sl_prevalence = float(y.mean()) if total > 0 else 0.0
+    roc_auc = _compute_binary_roc_auc(y, score)
+    return {
+        "trainable_resolved_signals_total": float(total),
+        "sl_prevalence": float(sl_prevalence),
+        "roc_auc_block_signal": roc_auc,
+    }
+
+
 def select_gate_block_threshold_execution_aware(
     scored_signals_df: pd.DataFrame,
     base_block_threshold: float,
@@ -442,26 +550,41 @@ def select_gate_block_threshold_execution_aware(
     thresholds = build_gate_threshold_grid(
         base_block_threshold, search_config, scored_signals_df=scored_signals_df
     )
-    include_disabled_fallback = bool(
-        search_config is not None and bool(search_config.include_disabled_candidate)
-    )
     log_info(
         "GATE",
         f"threshold execution sweep start candidates_total={len(thresholds)}",
     )
     rows: list[dict[str, float]] = []
-    best_selection_score = float("-inf")
     total_thresholds = len(thresholds)
+    tp_pct = float(execution_contract.tp_pct)
+    sl_pct = abs(float(execution_contract.sl_pct))
+    min_blocked_trainable = (
+        int(search_config.min_blocked_trainable) if search_config is not None else 10
+    )
+    min_blocked_share_model = (
+        float(search_config.min_blocked_share_model)
+        if search_config is not None and search_config.min_blocked_share_model is not None
+        else None
+    )
+    max_blocked_share_model = (
+        float(search_config.max_blocked_share_model)
+        if search_config is not None and search_config.max_blocked_share_model is not None
+        else None
+    )
+    min_signals_per_30d_after_execution = (
+        float(search_config.min_signals_per_30d_after_execution)
+        if search_config is not None
+        and search_config.min_signals_per_30d_after_execution is not None
+        else None
+    )
+    max_signals_per_30d_after_execution = (
+        float(search_config.max_signals_per_30d_after_execution)
+        if search_config is not None
+        and search_config.max_signals_per_30d_after_execution is not None
+        else None
+    )
     for idx, threshold in enumerate(thresholds, start=1):
-        gate_mode = "threshold"
-        if gate_mode == "disabled":
-            gate_decisions_df = scored_signals_df.copy()
-            gate_decisions_df["gate_decision"] = "keep"
-            gate_decisions_df["gate_block_threshold"] = pd.NA
-        else:
-            gate_decisions_df, _ = apply_gate_block_threshold(
-                scored_signals_df, float(threshold)
-            )
+        gate_decisions_df, _ = apply_gate_block_threshold(scored_signals_df, float(threshold))
         execution_decisions_df, executed_signals_df = (
             replay_short_signals_with_symbol_lock_precomputed(
                 decision_df=gate_decisions_df,
@@ -512,48 +635,68 @@ def select_gate_block_threshold_execution_aware(
         worst_6h = float(window_6h["pnl_sum"].min()) if not window_6h.empty else 0.0
         worst_24h = float(window_24h["pnl_sum"].min()) if not window_24h.empty else 0.0
         max_losing_streak = float(execution_metrics.get("max_losing_streak", 0.0))
-        density_penalty = _compute_density_penalty(signals_per_30d)
-        selection_score = (
-            10.0 * float(summary["sl_capture_model"])
-            - 10.0 * float(summary["tp_tax_model"])
-            + 0.50 * float(blocked_sl_precision_model)
-            + 0.001 * float(blocked_by_model_trainable)
-            + 0.10 * pnl_sum
-            + 0.03 * worst_6h
-            + 0.01 * worst_24h
-            - 0.02 * max_losing_streak
-            - 0.10 * density_penalty
+        signals_before = float(summary["candidate_signals_before"])
+        blocked_by_model = float(summary["blocked_by_model"])
+        blocked_share_model = _safe_ratio(int(blocked_by_model), int(signals_before))
+        economic_utility_model = (
+            sl_pct * float(summary["sl_blocked_model"])
+            - tp_pct * float(summary["tp_blocked_model"])
         )
-        best_selection_score = max(best_selection_score, float(selection_score))
+        economic_utility_per_candidate = (
+            economic_utility_model / signals_before if signals_before > 0.0 else 0.0
+        )
+        economic_utility_per_blocked = (
+            economic_utility_model / blocked_by_model if blocked_by_model > 0.0 else 0.0
+        )
+        support_ok = float(blocked_by_model_trainable >= min_blocked_trainable)
+        utility_ok = float(economic_utility_model > 0.0)
+        blocked_share_ok = float(
+            _passes_band(blocked_share_model, min_blocked_share_model, max_blocked_share_model)
+        )
+        signal_density_ok = float(
+            _passes_band(
+                signals_per_30d,
+                min_signals_per_30d_after_execution,
+                max_signals_per_30d_after_execution,
+            )
+        )
+        support_shortfall = (
+            max(float(min_blocked_trainable) - float(blocked_by_model_trainable), 0.0)
+            / float(max(min_blocked_trainable, 1))
+        )
+        blocked_share_shortfall = _band_shortfall_ratio(
+            blocked_share_model, min_blocked_share_model, max_blocked_share_model
+        )
+        signal_density_shortfall = _band_shortfall_ratio(
+            signals_per_30d,
+            min_signals_per_30d_after_execution,
+            max_signals_per_30d_after_execution,
+        )
+        model_zone_distance = (
+            support_shortfall + blocked_share_shortfall + signal_density_shortfall
+        )
+        selection_score = float(economic_utility_model)
         elapsed = time.perf_counter() - sweep_started
         rate = idx / elapsed if elapsed > 0 else 0.0
         eta = (total_thresholds - idx) / rate if rate > 0 else 0.0
-        threshold_repr = (
-            f"{float(threshold):.6f}" if threshold is not None else "nan"
-        )
         log_info(
             "GATE",
             (
                 f"threshold execution progress idx={idx}/{total_thresholds} "
-                f"gate_mode={gate_mode} "
-                f"block_threshold={threshold_repr} "
+                f"gate_mode=threshold block_threshold={float(threshold):.6f} "
                 f"signals_after_model={int(summary['after_model'])} "
                 f"signals_after_execution={int(summary['after_execution'])} "
+                f"economic_utility_model={economic_utility_model:.6f} "
                 f"pnl_after_execution={pnl_sum:.6f} "
-                f"worst_24h_after_execution={worst_24h:.6f} "
-                f"tp_tax_execution={float(summary['tp_tax_execution']):.6f} "
-                f"sl_capture_execution={float(summary['sl_capture_execution']):.6f} "
-                f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f} "
-                f"current_best={best_selection_score:.6f}"
+                f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f}"
             ),
         )
         rows.append(
             {
-                "gate_mode": gate_mode,
-                "block_threshold": (
-                    float(threshold) if threshold is not None else float("nan")
-                ),
-                "signals_before": float(summary["candidate_signals_before"]),
+                "gate_mode": "threshold",
+                "block_threshold": float(threshold),
+                "signals_before": signals_before,
+                "blocked_share_model": float(blocked_share_model),
                 "signals_after_model": float(summary["after_model"]),
                 "signals_after_execution": float(summary["after_execution"]),
                 "blocked_by_model": float(summary["blocked_by_model"]),
@@ -570,322 +713,166 @@ def select_gate_block_threshold_execution_aware(
                 "blocked_sl_precision_model": float(blocked_sl_precision_model),
                 "tp_blocked_model": float(summary["tp_blocked_model"]),
                 "sl_blocked_model": float(summary["sl_blocked_model"]),
-                "model_useful": float(
-                    float(summary["sl_blocked_model"])
-                    > float(summary["tp_blocked_model"])
-                ),
-                "model_zone_distance": 0.0,
+                "economic_utility_model": float(economic_utility_model),
+                "economic_utility_per_candidate": float(economic_utility_per_candidate),
+                "economic_utility_per_blocked": float(economic_utility_per_blocked),
+                "support_ok": float(support_ok),
+                "utility_ok": float(utility_ok),
+                "blocked_share_ok": float(blocked_share_ok),
+                "signal_density_ok": float(signal_density_ok),
+                "model_zone_distance": float(model_zone_distance),
                 "tp_tax_execution": float(summary["tp_tax_execution"]),
                 "sl_capture_execution": float(summary["sl_capture_execution"]),
-                "model_frontier_admissible": 0.0,
-                "model_frontier_dominated": 0.0,
-                "model_frontier_rank": 0.0,
-                "density_penalty": float(density_penalty),
                 "selection_score": float(selection_score),
             }
         )
+    disabled_decisions_df = scored_signals_df.copy()
+    disabled_decisions_df["gate_decision"] = "keep"
+    disabled_decisions_df["gate_block_threshold"] = pd.NA
+    execution_decisions_df, executed_signals_df = (
+        replay_short_signals_with_symbol_lock_precomputed(
+            decision_df=disabled_decisions_df,
+            independent_outcomes_df=independent_outcomes_df,
+            emit_summary_log=False,
+        )
+    )
+    if not {
+        "counterfactual_trade_outcome",
+        "counterfactual_trade_pnl_pct",
+    }.issubset(execution_decisions_df.columns):
+        execution_decisions_df = execution_decisions_df.merge(
+            counterfactual_outcomes_df,
+            on="signal_id",
+            how="left",
+            validate="one_to_one",
+        )
+    window_6h = build_execution_window_report(executed_signals_df, 6)
+    window_24h = build_execution_window_report(executed_signals_df, 24)
+    execution_metrics = build_execution_metrics(
+        executed_signals_df,
+        window_start=window_start,
+        window_end=window_end,
+        window_days=window_days,
+        precomputed_window_reports={6: window_6h, 24: window_24h},
+    )
+    summary = build_gate_execution_decision_summary(execution_decisions_df)
+    signals_per_30d = float(execution_metrics.get("signals_per_30d", 0.0))
+    pnl_sum = float(execution_metrics.get("pnl_sum", 0.0))
+    worst_6h = float(window_6h["pnl_sum"].min()) if not window_6h.empty else 0.0
+    worst_24h = float(window_24h["pnl_sum"].min()) if not window_24h.empty else 0.0
+    max_losing_streak = float(execution_metrics.get("max_losing_streak", 0.0))
+    blocked_model_total = int(summary["tp_blocked_model"] + summary["sl_blocked_model"])
+    blocked_sl_precision_model = _safe_ratio(int(summary["sl_blocked_model"]), blocked_model_total)
+    signals_before = float(summary["candidate_signals_before"])
+    blocked_by_model = float(summary["blocked_by_model"])
+    blocked_share_model = _safe_ratio(int(blocked_by_model), int(signals_before))
+    rows.append(
+        {
+            "gate_mode": "disabled",
+            "block_threshold": float("nan"),
+            "signals_before": signals_before,
+            "blocked_share_model": float(blocked_share_model),
+            "signals_after_model": float(summary["after_model"]),
+            "signals_after_execution": float(summary["after_execution"]),
+            "blocked_by_model": float(summary["blocked_by_model"]),
+            "blocked_by_model_trainable": 0.0,
+            "blocked_by_symbol_lock": float(summary["blocked_by_symbol_lock"]),
+            "failed_execution_other": float(summary["failed_execution_other"]),
+            "signals_per_30d_after_execution": signals_per_30d,
+            "pnl_after_execution": pnl_sum,
+            "worst_6h_after_execution": worst_6h,
+            "worst_24h_after_execution": worst_24h,
+            "max_losing_streak_after_execution": max_losing_streak,
+            "tp_tax_model": float(summary["tp_tax_model"]),
+            "sl_capture_model": float(summary["sl_capture_model"]),
+            "blocked_sl_precision_model": float(blocked_sl_precision_model),
+            "tp_blocked_model": float(summary["tp_blocked_model"]),
+            "sl_blocked_model": float(summary["sl_blocked_model"]),
+            "economic_utility_model": 0.0,
+            "economic_utility_per_candidate": 0.0,
+            "economic_utility_per_blocked": 0.0,
+            "support_ok": 0.0,
+            "utility_ok": 0.0,
+            "blocked_share_ok": 1.0,
+            "signal_density_ok": float(
+                _passes_band(
+                    signals_per_30d,
+                    min_signals_per_30d_after_execution,
+                    max_signals_per_30d_after_execution,
+                )
+            ),
+            "model_zone_distance": 0.0,
+            "tp_tax_execution": float(summary["tp_tax_execution"]),
+            "sl_capture_execution": float(summary["sl_capture_execution"]),
+            "selection_score": 0.0,
+        }
+    )
     sweep_df = pd.DataFrame(rows, columns=list(_EXECUTION_SWEEP_COLUMNS))
     if sweep_df.empty:
         raise ValueError("execution-aware gate threshold sweep returned no candidates")
-    target_sl_capture_model = (
-        float(search_config.target_sl_capture_model)
-        if search_config is not None
-        else 0.20
-    )
-    max_tp_tax_model = (
-        float(search_config.max_tp_tax_model) if search_config is not None else 0.10
-    )
-    min_blocked_trainable = (
-        int(search_config.min_blocked_trainable) if search_config is not None else 10
-    )
-    require_sl_gt_tp = (
-        bool(search_config.require_sl_gt_tp) if search_config is not None else True
-    )
-    model_stage_df = sweep_df.copy()
-    support_ok_mask = (
-        model_stage_df["blocked_by_model_trainable"] >= float(min_blocked_trainable)
-    )
-    if require_sl_gt_tp:
-        useful_mask = model_stage_df["model_useful"] > 0.5
+    threshold_rows = sweep_df[sweep_df["gate_mode"].astype(str) == "threshold"].copy()
+    if threshold_rows.empty:
+        selected_row = sweep_df.iloc[0]
     else:
-        useful_mask = pd.Series(True, index=model_stage_df.index)
-    goal_zone_mask = (
-        (model_stage_df["sl_capture_model"] >= target_sl_capture_model)
-        & (model_stage_df["tp_tax_model"] <= max_tp_tax_model)
-    )
-    primary_mask = support_ok_mask & useful_mask & goal_zone_mask
-    dominated_mask = pd.Series(False, index=model_stage_df.index)
-    epsilon = 1e-12
-    candidate_indices = list(model_stage_df.index[primary_mask])
-    for row_idx in candidate_indices:
-        current = model_stage_df.loc[row_idx]
-        peer_indices = [idx for idx in candidate_indices if idx != row_idx]
-        if not peer_indices:
-            continue
-        peers = model_stage_df.loc[peer_indices]
-        no_worse = (
-            (peers["tp_tax_model"] <= float(current["tp_tax_model"]) + epsilon)
-            & (peers["sl_capture_model"] >= float(current["sl_capture_model"]) - epsilon)
-            & (
-                peers["blocked_by_model_trainable"]
-                >= float(current["blocked_by_model_trainable"]) - epsilon
-            )
+        max_threshold_utility = float(
+            pd.to_numeric(threshold_rows["economic_utility_model"], errors="coerce")
+            .fillna(float("-inf"))
+            .max()
         )
-        strictly_better = (
-            (peers["tp_tax_model"] < float(current["tp_tax_model"]) - epsilon)
-            | (peers["sl_capture_model"] > float(current["sl_capture_model"]) + epsilon)
-            | (
-                peers["blocked_by_model_trainable"]
-                > float(current["blocked_by_model_trainable"]) + epsilon
-            )
-        )
-        dominated_mask.loc[row_idx] = bool((no_worse & strictly_better).any())
-    model_frontier_admissible = primary_mask & ~dominated_mask
-    model_frontier_rank = (
-        model_stage_df["sl_capture_model"]
-        - model_stage_df["tp_tax_model"]
-        + 0.25 * model_stage_df["blocked_sl_precision_model"]
-        + 0.0001 * model_stage_df["blocked_by_model_trainable"]
-    )
-    support_scale = float(max(min_blocked_trainable, 1))
-    sl_target_scale = float(max(target_sl_capture_model, 1e-9))
-    tp_target_scale = float(max(max_tp_tax_model, 1e-9))
-    support_shortfall = (
-        (float(min_blocked_trainable) - model_stage_df["blocked_by_model_trainable"])
-        .clip(lower=0.0)
-        .astype(float)
-        / support_scale
-    )
-    sl_shortfall = (
-        (target_sl_capture_model - model_stage_df["sl_capture_model"])
-        .clip(lower=0.0)
-        .astype(float)
-        / sl_target_scale
-    )
-    tp_excess = (
-        (model_stage_df["tp_tax_model"] - max_tp_tax_model)
-        .clip(lower=0.0)
-        .astype(float)
-        / tp_target_scale
-    )
-    if require_sl_gt_tp:
-        utility_shortfall = (1.0 - model_stage_df["model_useful"]).clip(lower=0.0)
-    else:
-        utility_shortfall = pd.Series(0.0, index=model_stage_df.index)
-    model_zone_distance = (
-        support_shortfall + sl_shortfall + tp_excess + utility_shortfall
-    )
-    sweep_df["model_frontier_admissible"] = model_frontier_admissible.astype(float)
-    sweep_df["model_frontier_dominated"] = dominated_mask.astype(float)
-    sweep_df["model_frontier_rank"] = model_frontier_rank.astype(float)
-    sweep_df["model_zone_distance"] = model_zone_distance.astype(float)
-    if include_disabled_fallback:
-        disabled_decisions_df = scored_signals_df.copy()
-        disabled_decisions_df["gate_decision"] = "keep"
-        disabled_decisions_df["gate_block_threshold"] = pd.NA
-        execution_decisions_df, executed_signals_df = (
-            replay_short_signals_with_symbol_lock_precomputed(
-                decision_df=disabled_decisions_df,
-                independent_outcomes_df=independent_outcomes_df,
-                emit_summary_log=False,
-            )
-        )
-        if not {
-            "counterfactual_trade_outcome",
-            "counterfactual_trade_pnl_pct",
-        }.issubset(execution_decisions_df.columns):
-            execution_decisions_df = execution_decisions_df.merge(
-                counterfactual_outcomes_df,
-                on="signal_id",
-                how="left",
-                validate="one_to_one",
-            )
-        window_6h = build_execution_window_report(executed_signals_df, 6)
-        window_24h = build_execution_window_report(executed_signals_df, 24)
-        execution_metrics = build_execution_metrics(
-            executed_signals_df,
-            window_start=window_start,
-            window_end=window_end,
-            window_days=window_days,
-            precomputed_window_reports={6: window_6h, 24: window_24h},
-        )
-        summary = build_gate_execution_decision_summary(execution_decisions_df)
-        signals_per_30d = float(execution_metrics.get("signals_per_30d", 0.0))
-        pnl_sum = float(execution_metrics.get("pnl_sum", 0.0))
-        worst_6h = float(window_6h["pnl_sum"].min()) if not window_6h.empty else 0.0
-        worst_24h = float(window_24h["pnl_sum"].min()) if not window_24h.empty else 0.0
-        max_losing_streak = float(execution_metrics.get("max_losing_streak", 0.0))
-        density_penalty = _compute_density_penalty(signals_per_30d)
-        blocked_model_total = int(summary["tp_blocked_model"] + summary["sl_blocked_model"])
-        blocked_sl_precision_model = _safe_ratio(
-            int(summary["sl_blocked_model"]), blocked_model_total
-        )
-        disabled_selection_score = (
-            10.0 * float(summary["sl_capture_model"])
-            - 10.0 * float(summary["tp_tax_model"])
-            + 0.50 * float(blocked_sl_precision_model)
-            + 0.10 * pnl_sum
-            + 0.03 * worst_6h
-            + 0.01 * worst_24h
-            - 0.02 * max_losing_streak
-            - 0.10 * density_penalty
-        )
-        disabled_model_useful = float(
-            float(summary["sl_blocked_model"]) > float(summary["tp_blocked_model"])
-        )
-        disabled_zone_distance = (
-            max(float(min_blocked_trainable) - 0.0, 0.0) / support_scale
-            + max(target_sl_capture_model - float(summary["sl_capture_model"]), 0.0)
-            / sl_target_scale
-            + max(float(summary["tp_tax_model"]) - max_tp_tax_model, 0.0)
-            / tp_target_scale
-            + (
-                (1.0 - disabled_model_useful)
-                if require_sl_gt_tp
-                else 0.0
-            )
-        )
-        sweep_df = pd.concat(
-            [
-                sweep_df,
-                pd.DataFrame(
-                    [
-                        {
-                            "gate_mode": "disabled",
-                            "block_threshold": float("nan"),
-                            "signals_before": float(summary["candidate_signals_before"]),
-                            "signals_after_model": float(summary["after_model"]),
-                            "signals_after_execution": float(summary["after_execution"]),
-                            "blocked_by_model": float(summary["blocked_by_model"]),
-                            "blocked_by_model_trainable": 0.0,
-                            "blocked_by_symbol_lock": float(summary["blocked_by_symbol_lock"]),
-                            "failed_execution_other": float(summary["failed_execution_other"]),
-                            "signals_per_30d_after_execution": signals_per_30d,
-                            "pnl_after_execution": pnl_sum,
-                            "worst_6h_after_execution": worst_6h,
-                            "worst_24h_after_execution": worst_24h,
-                            "max_losing_streak_after_execution": max_losing_streak,
-                            "tp_tax_model": float(summary["tp_tax_model"]),
-                            "sl_capture_model": float(summary["sl_capture_model"]),
-                            "blocked_sl_precision_model": float(blocked_sl_precision_model),
-                            "tp_blocked_model": float(summary["tp_blocked_model"]),
-                            "sl_blocked_model": float(summary["sl_blocked_model"]),
-                            "model_useful": disabled_model_useful,
-                            "model_zone_distance": float(disabled_zone_distance),
-                            "tp_tax_execution": float(summary["tp_tax_execution"]),
-                            "sl_capture_execution": float(summary["sl_capture_execution"]),
-                            "model_frontier_admissible": 0.0,
-                            "model_frontier_dominated": 0.0,
-                            "model_frontier_rank": 0.0,
-                            "density_penalty": float(density_penalty),
-                            "selection_score": float(disabled_selection_score),
-                        }
-                    ]
-                ),
-            ],
-            ignore_index=True,
-        )
-    best_mode = "threshold"
-    best_threshold: float | None = None
-    selected_row: pd.Series | None = None
-    if bool(model_frontier_admissible.any()):
-        ranked = sweep_df.loc[sweep_df["model_frontier_admissible"] > 0.5].sort_values(
-            by=[
-                "model_frontier_rank",
-                "sl_capture_model",
-                "tp_tax_model",
-                "blocked_sl_precision_model",
-                "blocked_by_model_trainable",
-                "selection_score",
-                "pnl_after_execution",
-                "worst_24h_after_execution",
-                "worst_6h_after_execution",
-                "max_losing_streak_after_execution",
-                "block_threshold",
-            ],
-            ascending=[
-                False,
-                False,
-                True,
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-                True,
-                True,
-            ],
-            kind="mergesort",
-        ).reset_index(drop=True)
-        best_mode = str(ranked.iloc[0]["gate_mode"])
-        best_threshold = (
-            None if best_mode == "disabled" else float(ranked.iloc[0]["block_threshold"])
-        )
-        selected_row = ranked.iloc[0]
-    else:
-        ranked = sweep_df.sort_values(
-            by=[
-                "model_zone_distance",
-                "model_frontier_rank",
-                "sl_capture_model",
-                "tp_tax_model",
-                "blocked_sl_precision_model",
-                "blocked_by_model_trainable",
-                "selection_score",
-                "pnl_after_execution",
-                "worst_24h_after_execution",
-                "worst_6h_after_execution",
-                "max_losing_streak_after_execution",
-                "block_threshold",
-            ],
-            ascending=[
-                True,
-                False,
-                False,
-                True,
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-                True,
-                True,
-            ],
-            kind="mergesort",
-        ).reset_index(drop=True)
-        best_mode = str(ranked.iloc[0]["gate_mode"])
-        best_threshold = (
-            None if best_mode == "disabled" else float(ranked.iloc[0]["block_threshold"])
-        )
-        selected_row = ranked.iloc[0]
+        if max_threshold_utility <= 0.0:
+            selected_row = sweep_df[sweep_df["gate_mode"].astype(str) == "disabled"].iloc[0]
+        else:
+            admissible = threshold_rows[
+                (threshold_rows["support_ok"] > 0.5)
+                & (threshold_rows["utility_ok"] > 0.5)
+                & (threshold_rows["blocked_share_ok"] > 0.5)
+                & (threshold_rows["signal_density_ok"] > 0.5)
+            ].copy()
+            if not admissible.empty:
+                ranked = admissible.sort_values(
+                    by=[
+                        "economic_utility_model",
+                        "tp_tax_model",
+                        "sl_capture_model",
+                        "blocked_sl_precision_model",
+                        "pnl_after_execution",
+                        "worst_24h_after_execution",
+                        "worst_6h_after_execution",
+                        "max_losing_streak_after_execution",
+                        "block_threshold",
+                    ],
+                    ascending=[False, True, False, False, False, False, False, True, True],
+                    kind="mergesort",
+                ).reset_index(drop=True)
+                selected_row = ranked.iloc[0]
+            else:
+                ranked = sweep_df.sort_values(
+                    by=[
+                        "model_zone_distance",
+                        "economic_utility_model",
+                        "tp_tax_model",
+                        "sl_capture_model",
+                        "blocked_sl_precision_model",
+                        "pnl_after_execution",
+                        "worst_24h_after_execution",
+                        "worst_6h_after_execution",
+                        "max_losing_streak_after_execution",
+                        "block_threshold",
+                    ],
+                    ascending=[True, False, True, False, False, False, False, False, True, True],
+                    kind="mergesort",
+                ).reset_index(drop=True)
+                selected_row = ranked.iloc[0]
+    best_mode = str(selected_row["gate_mode"])
+    best_threshold = None if best_mode == "disabled" else float(selected_row["block_threshold"])
     log_info(
         "GATE",
         (
-            "threshold model-frontier summary "
-            f"support_ok={int(support_ok_mask.sum())} "
-            f"useful_ok={int(useful_mask.sum())} "
-            f"goal_zone_ok={int(goal_zone_mask.sum())} "
-            f"primary_ok={int(primary_mask.sum())} "
-            f"frontier_admissible={int(model_frontier_admissible.sum())} "
-            f"target_sl_capture_model={target_sl_capture_model:.6f} "
-            f"max_tp_tax_model={max_tp_tax_model:.6f} "
-            f"min_blocked_trainable={int(min_blocked_trainable)} "
-            f"require_sl_gt_tp={int(require_sl_gt_tp)}"
-        ),
-    )
-    log_info(
-        "GATE",
-        f"threshold execution sweep done candidates_total={len(sweep_df)} elapsed_sec={time.perf_counter() - sweep_started:.3f}",
-    )
-    log_info(
-        "GATE",
-        (
-            "gate threshold execution-aware select done "
+            "threshold execution sweep done "
+            f"candidates_total={len(sweep_df)} elapsed_sec={time.perf_counter() - sweep_started:.3f} "
             f"best_mode={best_mode} "
             f"best_threshold={(f'{best_threshold:.6f}' if best_threshold is not None else 'None')} "
-            f"best_selection_score={float(selected_row['selection_score']) if selected_row is not None else float('nan'):.6f}"
+            f"best_selection_score={float(selected_row['selection_score']):.6f}"
         ),
     )
     return best_threshold, sweep_df
@@ -964,6 +951,49 @@ def _compute_signals_per_30d_after(
         return 0.0
     safe_window_days = max(float(eval_window_days), 1e-9)
     return float(float(kept_signals_count) * 30.0 / safe_window_days)
+
+
+def _passes_band(value: float, lower: float | None, upper: float | None) -> bool:
+    x = float(value)
+    if lower is not None and x < float(lower):
+        return False
+    if upper is not None and x > float(upper):
+        return False
+    return True
+
+
+def _band_shortfall_ratio(value: float, lower: float | None, upper: float | None) -> float:
+    x = float(value)
+    shortfall = 0.0
+    if lower is not None and x < float(lower):
+        shortfall += (float(lower) - x) / max(float(lower), 1e-9)
+    if upper is not None and x > float(upper):
+        shortfall += (x - float(upper)) / max(float(upper), 1e-9)
+    return float(shortfall)
+
+
+def _compute_binary_roc_auc(y_true: pd.Series, y_score: pd.Series) -> float | None:
+    frame = pd.DataFrame({"y": y_true, "score": y_score}).dropna()
+    if frame.empty:
+        return None
+    frame["y"] = pd.to_numeric(frame["y"], errors="coerce")
+    frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
+    frame = frame.dropna()
+    if frame.empty:
+        return None
+    classes = set(int(v) for v in frame["y"].astype(int).unique().tolist())
+    if classes != {0, 1}:
+        return None
+    n_pos = int((frame["y"].astype(int) == 1).sum())
+    n_neg = int((frame["y"].astype(int) == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    if frame["score"].nunique(dropna=True) <= 1:
+        return 0.5
+    ranks = frame["score"].rank(method="average")
+    sum_ranks_pos = float(ranks[frame["y"].astype(int) == 1].sum())
+    auc = (sum_ranks_pos - (n_pos * (n_pos + 1) / 2.0)) / float(n_pos * n_neg)
+    return float(auc)
 
 
 def _compute_density_penalty(signals_per_30d_after: float) -> float:

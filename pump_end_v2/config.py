@@ -82,6 +82,10 @@ class GateThresholdSearchConfig:
     max_tp_tax_model: float
     min_blocked_trainable: int
     require_sl_gt_tp: bool
+    min_blocked_share_model: float | None
+    max_blocked_share_model: float | None
+    min_signals_per_30d_after_execution: float | None
+    max_signals_per_30d_after_execution: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -655,6 +659,46 @@ def _build_gate_threshold_search(
         "search.gate_threshold.min_blocked_trainable",
     )
     require_sl_gt_tp = bool(gate_threshold_section.get("require_sl_gt_tp", True))
+    min_blocked_share_model = _parse_optional_bounded_float(
+        gate_threshold_section.get("min_blocked_share_model"),
+        "search.gate_threshold.min_blocked_share_model",
+        lower=0.0,
+        upper=1.0,
+    )
+    max_blocked_share_model = _parse_optional_bounded_float(
+        gate_threshold_section.get("max_blocked_share_model"),
+        "search.gate_threshold.max_blocked_share_model",
+        lower=0.0,
+        upper=1.0,
+    )
+    if (
+        min_blocked_share_model is not None
+        and max_blocked_share_model is not None
+        and min_blocked_share_model > max_blocked_share_model
+    ):
+        raise ValueError(
+            "search.gate_threshold.min_blocked_share_model must be <= search.gate_threshold.max_blocked_share_model"
+        )
+    min_signals_per_30d_after_execution = _parse_optional_bounded_float(
+        gate_threshold_section.get("min_signals_per_30d_after_execution"),
+        "search.gate_threshold.min_signals_per_30d_after_execution",
+        lower=0.0,
+        upper=None,
+    )
+    max_signals_per_30d_after_execution = _parse_optional_bounded_float(
+        gate_threshold_section.get("max_signals_per_30d_after_execution"),
+        "search.gate_threshold.max_signals_per_30d_after_execution",
+        lower=0.0,
+        upper=None,
+    )
+    if (
+        min_signals_per_30d_after_execution is not None
+        and max_signals_per_30d_after_execution is not None
+        and min_signals_per_30d_after_execution > max_signals_per_30d_after_execution
+    ):
+        raise ValueError(
+            "search.gate_threshold.min_signals_per_30d_after_execution must be <= search.gate_threshold.max_signals_per_30d_after_execution"
+        )
     return GateThresholdSearchConfig(
         threshold_candidates=threshold_candidates,
         include_disabled_candidate=include_disabled_candidate,
@@ -662,7 +706,31 @@ def _build_gate_threshold_search(
         max_tp_tax_model=max_tp_tax_model,
         min_blocked_trainable=min_blocked_trainable,
         require_sl_gt_tp=require_sl_gt_tp,
+        min_blocked_share_model=min_blocked_share_model,
+        max_blocked_share_model=max_blocked_share_model,
+        min_signals_per_30d_after_execution=min_signals_per_30d_after_execution,
+        max_signals_per_30d_after_execution=max_signals_per_30d_after_execution,
     )
+
+
+def _parse_optional_bounded_float(
+    value: Any,
+    field_name: str,
+    *,
+    lower: float | None,
+    upper: float | None,
+) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric or null") from exc
+    if lower is not None and parsed < float(lower):
+        raise ValueError(f"{field_name} must be >= {lower}")
+    if upper is not None and parsed > float(upper):
+        raise ValueError(f"{field_name} must be <= {upper}")
+    return parsed
 
 
 def _build_gate_model(
