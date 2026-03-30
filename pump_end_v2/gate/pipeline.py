@@ -9,6 +9,7 @@ from pump_end_v2.config import (
 from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.gate.dataset import GATE_TARGET_META_COLUMNS, build_gate_dataset
 from pump_end_v2.gate.feature_view import (
+    GATE_CATEGORICAL_FEATURE_COLUMNS,
     GATE_FEATURE_COLUMNS,
     GATE_IDENTITY_COLUMNS,
     build_gate_feature_view,
@@ -244,6 +245,7 @@ def build_gate_val_scored_signals_and_datasets(
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
             base_block_threshold=base_block_threshold,
+            execution_contract=execution_contract,
             search_config=search_threshold_config,
             window_start=window_start,
             window_end=window_end,
@@ -281,6 +283,7 @@ def build_gate_val_scored_signals_and_datasets(
                 candidate_model,
                 train_fit_df,
                 GATE_FEATURE_COLUMNS,
+                GATE_CATEGORICAL_FEATURE_COLUMNS,
                 "target_block_signal",
                 tp_row_weight=candidate_config.tp_row_weight,
                 sl_row_weight=candidate_config.sl_row_weight,
@@ -346,6 +349,7 @@ def build_gate_val_scored_signals_and_datasets(
         threshold_sweep_df = sweep_gate_block_threshold(
             scored_signals_df=val_scored_signals_df,
             base_block_threshold=base_block_threshold,
+            execution_contract=execution_contract,
             search_config=search_threshold_config,
             window_start=window_start,
             window_end=window_end,
@@ -373,6 +377,7 @@ def build_gate_val_scored_signals_and_datasets(
     threshold_sweep_df = sweep_gate_block_threshold(
         scored_signals_df=val_scored_signals_df,
         base_block_threshold=base_block_threshold,
+        execution_contract=execution_contract,
         search_config=search_threshold_config,
         window_start=window_start,
         window_end=window_end,
@@ -532,6 +537,7 @@ def build_gate_test_scored_signals(
             model,
             train_fit_df,
             GATE_FEATURE_COLUMNS,
+            GATE_CATEGORICAL_FEATURE_COLUMNS,
             "target_block_signal",
             tp_row_weight=gate_model_config.tp_row_weight,
             sl_row_weight=gate_model_config.sl_row_weight,
@@ -576,7 +582,9 @@ def _score_gate_dataset_rows(
 ) -> pd.DataFrame:
     if rows_df.empty:
         return pd.DataFrame(columns=list(_SCORED_OUTPUT_COLUMNS))
-    score_df = predict_gate_scores(model, rows_df, GATE_FEATURE_COLUMNS)
+    score_df = predict_gate_scores(
+        model, rows_df, GATE_FEATURE_COLUMNS, GATE_CATEGORICAL_FEATURE_COLUMNS
+    )
     merged = rows_df.merge(
         score_df[["signal_id", "p_block"]],
         on="signal_id",

@@ -15,7 +15,7 @@ GATE_IDENTITY_COLUMNS: tuple[str, ...] = (
     "fold_id",
 )
 
-GATE_FEATURE_COLUMNS: tuple[str, ...] = (
+GATE_NUMERIC_FEATURE_COLUMNS: tuple[str, ...] = (
     "detector_p_good",
     "detector_peak_p_good_before_fire",
     "detector_p_good_drop_from_peak",
@@ -70,6 +70,20 @@ GATE_FEATURE_COLUMNS: tuple[str, ...] = (
     "strategy_recent_tp_rate_24h",
     "strategy_prev_closed_losing_streak",
     "strategy_open_trades_now",
+)
+
+GATE_CATEGORICAL_FEATURE_COLUMNS: tuple[str, ...] = (
+    "cat_detector_band_position",
+    "cat_episode_age_band",
+    "cat_reference_regime",
+    "cat_breadth_advancers_band",
+    "cat_signal_crowding_24h_band",
+    "cat_losing_streak_band",
+)
+
+GATE_FEATURE_COLUMNS: tuple[str, ...] = (
+    *GATE_NUMERIC_FEATURE_COLUMNS,
+    *GATE_CATEGORICAL_FEATURE_COLUMNS,
 )
 
 _CANDIDATE_PROD_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -286,6 +300,7 @@ def build_gate_feature_view(
     )
     merged = _append_signal_flow_features(merged)
     merged = _append_strategy_state_features(merged)
+    merged = _append_regime_categorical_features(merged)
     out = merged.loc[
         ~merged["_history_context_only"].astype(bool),
         [*GATE_IDENTITY_COLUMNS, *GATE_FEATURE_COLUMNS],
@@ -459,6 +474,122 @@ def _append_strategy_state_features(df: pd.DataFrame) -> pd.DataFrame:
     frame["strategy_prev_closed_losing_streak"] = losing_streak_prev
     frame["strategy_open_trades_now"] = open_trades_now
     return frame.drop(columns=["_stream_group_key"], errors="ignore")
+
+
+def _append_regime_categorical_features(df: pd.DataFrame) -> pd.DataFrame:
+    frame = df.copy()
+    detector_band = pd.to_numeric(
+        frame["detector_policy_p_good_band_position"], errors="coerce"
+    )
+    frame["cat_detector_band_position"] = detector_band.apply(
+        _bucket_detector_band_position
+    )
+    episode_age = pd.to_numeric(frame["detector_episode_age_bars"], errors="coerce")
+    frame["cat_episode_age_band"] = episode_age.apply(_bucket_episode_age_band)
+    btc_ret_4 = pd.to_numeric(frame["btc_close_ret_4"], errors="coerce")
+    eth_ret_4 = pd.to_numeric(frame["eth_close_ret_4"], errors="coerce")
+    frame["cat_reference_regime"] = [
+        _bucket_reference_regime(btc, eth) for btc, eth in zip(btc_ret_4, eth_ret_4)
+    ]
+    breadth_advancers = pd.to_numeric(
+        frame["breadth_advancers_share"], errors="coerce"
+    )
+    frame["cat_breadth_advancers_band"] = breadth_advancers.apply(
+        _bucket_breadth_advancers_band
+    )
+    signal_flow_24h = pd.to_numeric(
+        frame["signal_flow_recent_signals_24h"], errors="coerce"
+    )
+    frame["cat_signal_crowding_24h_band"] = signal_flow_24h.apply(
+        _bucket_signal_crowding_24h_band
+    )
+    losing_streak = pd.to_numeric(
+        frame["strategy_prev_closed_losing_streak"], errors="coerce"
+    )
+    frame["cat_losing_streak_band"] = losing_streak.apply(_bucket_losing_streak_band)
+    for column in GATE_CATEGORICAL_FEATURE_COLUMNS:
+        frame[column] = frame[column].where(frame[column].notna(), "unknown")
+        frame[column] = frame[column].astype(str).replace("", "unknown")
+    return frame
+
+
+def _bucket_detector_band_position(value: float) -> str:
+    if pd.isna(value):
+        return "unknown"
+    x = float(value)
+    if x < 0.0:
+        return "below_floor"
+    if x < 0.33:
+        return "low_band"
+    if x < 0.66:
+        return "mid_band"
+    if x < 1.0:
+        return "high_band"
+    return "above_arm"
+
+
+def _bucket_episode_age_band(value: float) -> str:
+    if pd.isna(value):
+        return "unknown"
+    x = int(value)
+    if x <= 1:
+        return "age_0_1"
+    if x <= 3:
+        return "age_2_3"
+    if x <= 6:
+        return "age_4_6"
+    return "age_7_plus"
+
+
+def _bucket_reference_regime(btc_ret_4: float, eth_ret_4: float) -> str:
+    if pd.isna(btc_ret_4) or pd.isna(eth_ret_4):
+        return "unknown"
+    btc_up = float(btc_ret_4) >= 0.0
+    eth_up = float(eth_ret_4) >= 0.0
+    if not btc_up and not eth_up:
+        return "both_down"
+    if not btc_up and eth_up:
+        return "btc_down_eth_up"
+    if btc_up and not eth_up:
+        return "btc_up_eth_down"
+    return "both_up"
+
+
+def _bucket_breadth_advancers_band(value: float) -> str:
+    if pd.isna(value):
+        return "unknown"
+    x = float(value)
+    if x < 0.35:
+        return "breadth_weak"
+    if x <= 0.65:
+        return "breadth_neutral"
+    return "breadth_strong"
+
+
+def _bucket_signal_crowding_24h_band(value: float) -> str:
+    if pd.isna(value):
+        return "unknown"
+    x = int(value)
+    if x <= 0:
+        return "flow_0"
+    if x == 1:
+        return "flow_1"
+    if x <= 3:
+        return "flow_2_3"
+    return "flow_4_plus"
+
+
+def _bucket_losing_streak_band(value: float) -> str:
+    if pd.isna(value):
+        return "unknown"
+    x = int(value)
+    if x <= 0:
+        return "streak_0"
+    if x == 1:
+        return "streak_1"
+    if x == 2:
+        return "streak_2"
+    return "streak_3_plus"
 
 
 def _stream_group_key(row: pd.Series) -> str:

@@ -1,4 +1,9 @@
-from pump_end_v2.gate.feature_view import GATE_FEATURE_COLUMNS, GATE_IDENTITY_COLUMNS
+from pump_end_v2.gate.feature_view import (
+    GATE_CATEGORICAL_FEATURE_COLUMNS,
+    GATE_FEATURE_COLUMNS,
+    GATE_IDENTITY_COLUMNS,
+    GATE_NUMERIC_FEATURE_COLUMNS,
+)
 
 DETECTOR_IDENTITY_COLUMNS: tuple[str, ...] = (
     "decision_row_id",
@@ -96,5 +101,7 @@ def build_gate_feature_manifest() -> dict[str, object]:
     return {
         "feature_columns": list(GATE_FEATURE_COLUMNS),
         "feature_count": len(GATE_FEATURE_COLUMNS),
+        "numeric_feature_columns": list(GATE_NUMERIC_FEATURE_COLUMNS),
+        "categorical_feature_columns": list(GATE_CATEGORICAL_FEATURE_COLUMNS),
         "identity_columns": list(GATE_IDENTITY_COLUMNS),
     }
