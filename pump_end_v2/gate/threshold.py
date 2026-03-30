@@ -765,16 +765,51 @@ def select_gate_block_threshold_execution_aware(
     blocked_sl_precision_model = _safe_ratio(int(summary["sl_blocked_model"]), blocked_model_total)
     signals_before = float(summary["candidate_signals_before"])
     blocked_by_model = float(summary["blocked_by_model"])
-    blocked_share_model = _safe_ratio(int(blocked_by_model), int(signals_before))
+    disabled_blocked_share_model = 0.0
+    disabled_support_ok = float(0 >= min_blocked_trainable)
+    disabled_utility_ok = 0.0
+    disabled_blocked_share_ok = float(
+        _passes_band(
+            disabled_blocked_share_model,
+            min_blocked_share_model,
+            max_blocked_share_model,
+        )
+    )
+    disabled_signal_density_ok = float(
+        _passes_band(
+            signals_per_30d,
+            min_signals_per_30d_after_execution,
+            max_signals_per_30d_after_execution,
+        )
+    )
+    disabled_support_shortfall = (
+        max(float(min_blocked_trainable) - 0.0, 0.0)
+        / float(max(min_blocked_trainable, 1))
+    )
+    disabled_blocked_share_shortfall = _band_shortfall_ratio(
+        disabled_blocked_share_model,
+        min_blocked_share_model,
+        max_blocked_share_model,
+    )
+    disabled_signal_density_shortfall = _band_shortfall_ratio(
+        signals_per_30d,
+        min_signals_per_30d_after_execution,
+        max_signals_per_30d_after_execution,
+    )
+    disabled_model_zone_distance = (
+        disabled_support_shortfall
+        + disabled_blocked_share_shortfall
+        + disabled_signal_density_shortfall
+    )
     rows.append(
         {
             "gate_mode": "disabled",
             "block_threshold": float("nan"),
             "signals_before": signals_before,
-            "blocked_share_model": float(blocked_share_model),
+            "blocked_share_model": float(disabled_blocked_share_model),
             "signals_after_model": float(summary["after_model"]),
             "signals_after_execution": float(summary["after_execution"]),
-            "blocked_by_model": float(summary["blocked_by_model"]),
+            "blocked_by_model": float(blocked_by_model),
             "blocked_by_model_trainable": 0.0,
             "blocked_by_symbol_lock": float(summary["blocked_by_symbol_lock"]),
             "failed_execution_other": float(summary["failed_execution_other"]),
@@ -791,17 +826,11 @@ def select_gate_block_threshold_execution_aware(
             "economic_utility_model": 0.0,
             "economic_utility_per_candidate": 0.0,
             "economic_utility_per_blocked": 0.0,
-            "support_ok": 0.0,
-            "utility_ok": 0.0,
-            "blocked_share_ok": 1.0,
-            "signal_density_ok": float(
-                _passes_band(
-                    signals_per_30d,
-                    min_signals_per_30d_after_execution,
-                    max_signals_per_30d_after_execution,
-                )
-            ),
-            "model_zone_distance": 0.0,
+            "support_ok": float(disabled_support_ok),
+            "utility_ok": float(disabled_utility_ok),
+            "blocked_share_ok": float(disabled_blocked_share_ok),
+            "signal_density_ok": float(disabled_signal_density_ok),
+            "model_zone_distance": float(disabled_model_zone_distance),
             "tp_tax_execution": float(summary["tp_tax_execution"]),
             "sl_capture_execution": float(summary["sl_capture_execution"]),
             "selection_score": 0.0,
