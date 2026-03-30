@@ -1,7 +1,11 @@
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostError
 
-from pump_end_v2.config import GateModelConfig, GateThresholdSearchConfig
+from pump_end_v2.config import (
+    GateModelConfig,
+    GateModelSearchConfig,
+    GateThresholdSearchConfig,
+)
 from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.gate.dataset import GATE_TARGET_META_COLUMNS, build_gate_dataset
 from pump_end_v2.gate.feature_view import (
@@ -12,6 +16,7 @@ from pump_end_v2.gate.feature_view import (
 from pump_end_v2.gate.model import build_gate_model, fit_gate_model, predict_gate_scores
 from pump_end_v2.gate.threshold import (
     attach_counterfactual_execution_outcomes,
+    select_gate_block_threshold_execution_aware,
     sweep_gate_block_threshold,
 )
 from pump_end_v2.logging import log_info
@@ -69,6 +74,93 @@ def _is_gate_trainable(train_fit_df: pd.DataFrame) -> bool:
     return informative_features > 0
 
 
+def _build_gate_model_candidates(
+    base_config: GateModelConfig, search_config: GateModelSearchConfig | None
+) -> list[GateModelConfig]:
+    if search_config is None:
+        return [base_config]
+    depth_values = (
+        list(search_config.depth_candidates)
+        if len(search_config.depth_candidates) > 0
+        else [int(base_config.depth)]
+    )
+    l2_values = (
+        list(search_config.l2_leaf_reg_candidates)
+        if len(search_config.l2_leaf_reg_candidates) > 0
+        else [float(base_config.l2_leaf_reg)]
+    )
+    seed_values = (
+        list(search_config.random_seed_candidates)
+        if len(search_config.random_seed_candidates) > 0
+        else [int(base_config.random_seed)]
+    )
+    tp_weight_values = (
+        list(search_config.tp_row_weight_candidates)
+        if len(search_config.tp_row_weight_candidates) > 0
+        else [float(base_config.tp_row_weight)]
+    )
+    lr_iter_values = (
+        list(search_config.learning_rate_iteration_pairs)
+        if len(search_config.learning_rate_iteration_pairs) > 0
+        else [(float(base_config.learning_rate), int(base_config.iterations))]
+    )
+    out: list[GateModelConfig] = []
+    seen: set[tuple[int, int, float, float, int, float, float]] = set()
+    for learning_rate, iterations in lr_iter_values:
+        for depth in depth_values:
+            for l2_leaf_reg in l2_values:
+                for random_seed in seed_values:
+                    for tp_row_weight in tp_weight_values:
+                        candidate = GateModelConfig(
+                            iterations=int(iterations),
+                            depth=int(depth),
+                            learning_rate=float(learning_rate),
+                            l2_leaf_reg=float(l2_leaf_reg),
+                            random_seed=int(random_seed),
+                            tp_row_weight=float(tp_row_weight),
+                            sl_row_weight=float(base_config.sl_row_weight),
+                        )
+                        key = (
+                            candidate.iterations,
+                            candidate.depth,
+                            candidate.learning_rate,
+                            candidate.l2_leaf_reg,
+                            candidate.random_seed,
+                            candidate.tp_row_weight,
+                            candidate.sl_row_weight,
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append(candidate)
+    if not out:
+        out.append(base_config)
+    return out
+
+
+def _resolve_selected_selector_score(
+    selected_threshold: float | None, threshold_sweep_df: pd.DataFrame
+) -> float:
+    if threshold_sweep_df.empty:
+        return float("-inf")
+    if selected_threshold is None:
+        disabled_rows = threshold_sweep_df[
+            threshold_sweep_df["gate_mode"].astype(str) == "disabled"
+        ]
+        if disabled_rows.empty:
+            return float("-inf")
+        return float(pd.to_numeric(disabled_rows["selection_score"], errors="coerce").max())
+    threshold_rows = threshold_sweep_df[
+        threshold_sweep_df["gate_mode"].astype(str).eq("threshold")
+        & pd.to_numeric(threshold_sweep_df["block_threshold"], errors="coerce").sub(
+            float(selected_threshold)
+        ).abs().le(1e-9)
+    ]
+    if threshold_rows.empty:
+        return float("-inf")
+    return float(pd.to_numeric(threshold_rows["selection_score"], errors="coerce").max())
+
+
 def build_gate_val_scored_signals_and_datasets(
     train_oof_candidate_signals_df: pd.DataFrame,
     val_candidate_signals_df: pd.DataFrame,
@@ -82,6 +174,7 @@ def build_gate_val_scored_signals_and_datasets(
     execution_contract: ExecutionContract,
     bars_1s_fetcher: object | None = None,
     execution_market_view: object | None = None,
+    search_model_config: GateModelSearchConfig | None = None,
     search_threshold_config: GateThresholdSearchConfig | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
@@ -93,6 +186,7 @@ def build_gate_val_scored_signals_and_datasets(
     pd.DataFrame,
     pd.DataFrame,
     str,
+    GateModelConfig,
 ]:
     train_oof_with_execution_df = _enrich_with_counterfactual(
         train_oof_candidate_signals_df,
@@ -170,18 +264,79 @@ def build_gate_val_scored_signals_and_datasets(
             train_gate_dataset_df,
             val_gate_dataset_df,
             _GATE_STATUS_DISABLED_NO_DATA,
+            gate_model_config,
         )
-    model = build_gate_model(gate_model_config)
-    try:
-        fit_gate_model(
-            model,
-            train_fit_df,
-            GATE_FEATURE_COLUMNS,
-            "target_block_signal",
-            tp_row_weight=2.0,
-            sl_row_weight=1.0,
+    model_candidates = _build_gate_model_candidates(
+        gate_model_config, search_model_config
+    )
+    best_model: CatBoostClassifier | None = None
+    best_model_config = gate_model_config
+    best_scored_signals_df: pd.DataFrame | None = None
+    best_selector_score = float("-inf")
+    best_threshold_for_candidate: float | None = None
+    for candidate_idx, candidate_config in enumerate(model_candidates, start=1):
+        candidate_model = build_gate_model(candidate_config)
+        try:
+            fit_gate_model(
+                candidate_model,
+                train_fit_df,
+                GATE_FEATURE_COLUMNS,
+                "target_block_signal",
+                tp_row_weight=candidate_config.tp_row_weight,
+                sl_row_weight=candidate_config.sl_row_weight,
+            )
+        except CatBoostError:
+            continue
+        candidate_scored_signals_df = _score_gate_dataset_rows(candidate_model, val_score_df)
+        candidate_scored_signals_df = _attach_counterfactual_columns(
+            candidate_scored_signals_df, val_with_execution_df
         )
-    except CatBoostError:
+        selected_threshold, threshold_sweep_execution_df = (
+            select_gate_block_threshold_execution_aware(
+                scored_signals_df=candidate_scored_signals_df,
+                base_block_threshold=base_block_threshold,
+                bars_15m_df=bars_15m_df,
+                bars_1m_df=bars_1m_df,
+                execution_contract=execution_contract,
+                bars_1s_fetcher=bars_1s_fetcher,
+                execution_market_view=execution_market_view,
+                search_config=search_threshold_config,
+                window_start=window_start,
+                window_end=window_end,
+                window_days=window_days,
+            )
+        )
+        candidate_selector_score = _resolve_selected_selector_score(
+            selected_threshold, threshold_sweep_execution_df
+        )
+        threshold_repr = (
+            f"{float(selected_threshold):.6f}"
+            if selected_threshold is not None
+            else "None"
+        )
+        log_info(
+            "GATE",
+            (
+                "gate model search candidate "
+                f"idx={candidate_idx}/{len(model_candidates)} "
+                f"depth={candidate_config.depth} "
+                f"l2_leaf_reg={candidate_config.l2_leaf_reg:.6f} "
+                f"random_seed={candidate_config.random_seed} "
+                f"learning_rate={candidate_config.learning_rate:.6f} "
+                f"iterations={candidate_config.iterations} "
+                f"tp_row_weight={candidate_config.tp_row_weight:.6f} "
+                f"selected_threshold={threshold_repr} "
+                f"selector_score={candidate_selector_score:.6f}"
+            ),
+        )
+        if candidate_selector_score <= best_selector_score:
+            continue
+        best_selector_score = candidate_selector_score
+        best_model = candidate_model
+        best_model_config = candidate_config
+        best_scored_signals_df = candidate_scored_signals_df
+        best_threshold_for_candidate = selected_threshold
+    if best_model is None or best_scored_signals_df is None:
         val_scored_signals_df = _build_disabled_scored_signals(
             val_with_execution_df, "val_forward"
         )
@@ -211,11 +366,10 @@ def build_gate_val_scored_signals_and_datasets(
             train_gate_dataset_df,
             val_gate_dataset_df,
             _GATE_STATUS_DISABLED_NO_DATA,
+            gate_model_config,
         )
-    val_scored_signals_df = _score_gate_dataset_rows(model, val_score_df)
-    val_scored_signals_df = _attach_counterfactual_columns(
-        val_scored_signals_df, val_with_execution_df
-    )
+    model = best_model
+    val_scored_signals_df = best_scored_signals_df
     threshold_sweep_df = sweep_gate_block_threshold(
         scored_signals_df=val_scored_signals_df,
         base_block_threshold=base_block_threshold,
@@ -228,7 +382,15 @@ def build_gate_val_scored_signals_and_datasets(
         "GATE",
         (
             "gate val wrapper done "
-            f"train_rows={len(train_fit_df)} val_rows={len(val_score_df)} scored_rows={len(val_scored_signals_df)}"
+            f"train_rows={len(train_fit_df)} val_rows={len(val_score_df)} scored_rows={len(val_scored_signals_df)} "
+            f"selected_model_depth={best_model_config.depth} "
+            f"selected_model_l2={best_model_config.l2_leaf_reg:.6f} "
+            f"selected_model_seed={best_model_config.random_seed} "
+            f"selected_model_lr={best_model_config.learning_rate:.6f} "
+            f"selected_model_iterations={best_model_config.iterations} "
+            f"selected_model_tp_row_weight={best_model_config.tp_row_weight:.6f} "
+            f"selected_threshold={f'{float(best_threshold_for_candidate):.6f}' if best_threshold_for_candidate is not None else 'None'} "
+            f"selected_score={best_selector_score:.6f}"
         ),
     )
     return (
@@ -238,6 +400,7 @@ def build_gate_val_scored_signals_and_datasets(
         train_gate_dataset_df,
         val_gate_dataset_df,
         _GATE_STATUS_ENABLED,
+        best_model_config,
     )
 
 
@@ -370,8 +533,8 @@ def build_gate_test_scored_signals(
             train_fit_df,
             GATE_FEATURE_COLUMNS,
             "target_block_signal",
-            tp_row_weight=2.0,
-            sl_row_weight=1.0,
+            tp_row_weight=gate_model_config.tp_row_weight,
+            sl_row_weight=gate_model_config.sl_row_weight,
         )
     except CatBoostError:
         test_scored_signals_df = _build_disabled_scored_signals(

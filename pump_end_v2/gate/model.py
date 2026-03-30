@@ -24,7 +24,7 @@ def fit_gate_model(
     train_df: pd.DataFrame,
     feature_columns: list[str] | tuple[str, ...],
     target_column: str,
-    tp_row_weight: float = 2.0,
+    tp_row_weight: float = 1.0,
     sl_row_weight: float = 1.0,
 ) -> CatBoostClassifier:
     _require_columns(train_df, [*feature_columns, target_column], "train_df")

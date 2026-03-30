@@ -65,6 +65,25 @@ depth = 5
 learning_rate = 0.05
 l2_leaf_reg = 3.0
 random_seed = 42
+tp_row_weight = 1.5
+sl_row_weight = 1.0
+
+[search.gate_threshold]
+include_disabled_candidate = false
+target_sl_capture_model = 0.20
+max_tp_tax_model = 0.10
+min_blocked_trainable = 10
+require_sl_gt_tp = true
+
+[search.gate_model]
+depth_candidates = [4, 5, 6]
+l2_leaf_reg_candidates = [2.0, 3.0, 6.0]
+random_seed_candidates = [42, 137]
+tp_row_weight_candidates = [1.25, 1.5, 1.75]
+learning_rate_iteration_pairs = [
+    { learning_rate = 0.05, iterations = 400 },
+    { learning_rate = 0.03, iterations = 700 },
+]
 
 [execution]
 tp_pct = 0.045

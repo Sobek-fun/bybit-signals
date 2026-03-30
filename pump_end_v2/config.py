@@ -78,6 +78,10 @@ class GateConfig:
 class GateThresholdSearchConfig:
     threshold_candidates: tuple[float, ...]
     include_disabled_candidate: bool
+    target_sl_capture_model: float
+    max_tp_tax_model: float
+    min_blocked_trainable: int
+    require_sl_gt_tp: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +91,17 @@ class GateModelConfig:
     learning_rate: float
     l2_leaf_reg: float
     random_seed: int
+    tp_row_weight: float
+    sl_row_weight: float
+
+
+@dataclass(frozen=True, slots=True)
+class GateModelSearchConfig:
+    depth_candidates: tuple[int, ...]
+    l2_leaf_reg_candidates: tuple[float, ...]
+    random_seed_candidates: tuple[int, ...]
+    tp_row_weight_candidates: tuple[float, ...]
+    learning_rate_iteration_pairs: tuple[tuple[float, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +144,7 @@ class V2Config:
     search_detector_policy: DetectorPolicySearchConfig | None
     gate_config: GateConfig
     search_gate_threshold: GateThresholdSearchConfig | None
+    search_gate_model: GateModelSearchConfig | None
     gate_model: GateModelConfig
     execution: ExecutionContract
 
@@ -149,8 +165,8 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     _validate_splits(config["splits"])
     _validate_data(config["data"])
     _validate_detector(config["detector"])
-    _validate_gate(config["gate"])
     _validate_execution(config["execution"])
+    _validate_gate(config["gate"], config["execution"])
     _validate_compute(config["compute"])
     splits = _build_splits(config["splits"])
     references = _build_references(config["data"]["references"])
@@ -163,15 +179,16 @@ def validate_config(config: dict[str, Any]) -> V2Config:
     detector_cv = _build_detector_cv(config["detector"])
     detector_policy = _build_detector_policy(config["detector"])
     search_detector_policy = _build_detector_policy_search(config.get("search"))
-    gate_config = _build_gate_config(config["gate"])
-    search_gate_threshold = _build_gate_threshold_search(config.get("search"))
-    gate_model = _build_gate_model(config["gate"])
     execution = ExecutionContract(
         tp_pct=float(config["execution"]["tp_pct"]),
         sl_pct=float(config["execution"]["sl_pct"]),
         max_hold_bars=int(config["execution"]["max_hold_bars"]),
         entry_shift_bars=int(config["execution"]["entry_shift_bars"]),
     )
+    gate_config = _build_gate_config(config["gate"])
+    search_gate_threshold = _build_gate_threshold_search(config.get("search"))
+    search_gate_model = _build_gate_model_search(config.get("search"))
+    gate_model = _build_gate_model(config["gate"], execution)
     return V2Config(
         raw=copy.deepcopy(config),
         splits=splits,
@@ -187,6 +204,7 @@ def validate_config(config: dict[str, Any]) -> V2Config:
         search_detector_policy=search_detector_policy,
         gate_config=gate_config,
         search_gate_threshold=search_gate_threshold,
+        search_gate_model=search_gate_model,
         gate_model=gate_model,
         execution=execution,
     )
@@ -264,9 +282,15 @@ def _validate_detector(detector_section: dict[str, Any]) -> None:
     _build_detector_policy(detector_section)
 
 
-def _validate_gate(gate_section: dict[str, Any]) -> None:
+def _validate_gate(gate_section: dict[str, Any], execution_section: dict[str, Any]) -> None:
     _build_gate_config(gate_section)
-    _build_gate_model(gate_section)
+    execution = ExecutionContract(
+        tp_pct=float(execution_section["tp_pct"]),
+        sl_pct=float(execution_section["sl_pct"]),
+        max_hold_bars=int(execution_section["max_hold_bars"]),
+        entry_shift_bars=int(execution_section["entry_shift_bars"]),
+    )
+    _build_gate_model(gate_section, execution)
 
 
 def _validate_non_negative(section: dict[str, Any], section_name: str) -> None:
@@ -614,16 +638,51 @@ def _build_gate_threshold_search(
     include_disabled_candidate = bool(
         gate_threshold_section.get("include_disabled_candidate", False)
     )
+    target_sl_capture_model = float(
+        gate_threshold_section.get("target_sl_capture_model", 0.20)
+    )
+    if not (0.0 <= target_sl_capture_model <= 1.0):
+        raise ValueError(
+            "search.gate_threshold.target_sl_capture_model must satisfy 0 <= x <= 1"
+        )
+    max_tp_tax_model = float(gate_threshold_section.get("max_tp_tax_model", 0.10))
+    if not (0.0 <= max_tp_tax_model <= 1.0):
+        raise ValueError(
+            "search.gate_threshold.max_tp_tax_model must satisfy 0 <= x <= 1"
+        )
+    min_blocked_trainable = _require_non_negative_int(
+        gate_threshold_section.get("min_blocked_trainable", 10),
+        "search.gate_threshold.min_blocked_trainable",
+    )
+    require_sl_gt_tp = bool(gate_threshold_section.get("require_sl_gt_tp", True))
     return GateThresholdSearchConfig(
         threshold_candidates=threshold_candidates,
         include_disabled_candidate=include_disabled_candidate,
+        target_sl_capture_model=target_sl_capture_model,
+        max_tp_tax_model=max_tp_tax_model,
+        min_blocked_trainable=min_blocked_trainable,
+        require_sl_gt_tp=require_sl_gt_tp,
     )
 
 
-def _build_gate_model(section: dict[str, Any]) -> GateModelConfig:
+def _build_gate_model(
+    section: dict[str, Any], execution_contract: ExecutionContract
+) -> GateModelConfig:
     model_section = section.get("model")
     if not isinstance(model_section, dict):
         raise ValueError("missing required section: gate.model")
+    sl_row_weight = _require_positive_float(
+        model_section.get("sl_row_weight", 1.0), "gate.model.sl_row_weight"
+    )
+    default_tp_row_weight = (
+        float(execution_contract.tp_pct) / float(execution_contract.sl_pct)
+        if float(execution_contract.sl_pct) > 0.0
+        else 1.0
+    )
+    tp_row_weight = _require_positive_float(
+        model_section.get("tp_row_weight", default_tp_row_weight),
+        "gate.model.tp_row_weight",
+    )
     return GateModelConfig(
         iterations=_require_positive_int(
             model_section.get("iterations"), "gate.model.iterations"
@@ -638,4 +697,91 @@ def _build_gate_model(section: dict[str, Any]) -> GateModelConfig:
         random_seed=_require_non_negative_int(
             model_section.get("random_seed"), "gate.model.random_seed"
         ),
+        tp_row_weight=tp_row_weight,
+        sl_row_weight=sl_row_weight,
+    )
+
+
+def _parse_positive_int_candidates(value: Any, field_name: str) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    out: list[int] = []
+    for item in value:
+        parsed = _require_positive_int(item, field_name)
+        out.append(parsed)
+    return tuple(out)
+
+
+def _parse_non_negative_int_candidates(value: Any, field_name: str) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    out: list[int] = []
+    for item in value:
+        parsed = _require_non_negative_int(item, field_name)
+        out.append(parsed)
+    return tuple(out)
+
+
+def _build_gate_model_search(search_section: Any) -> GateModelSearchConfig | None:
+    if search_section is None:
+        return None
+    if not isinstance(search_section, dict):
+        raise ValueError("search section must be a table")
+    gate_model_section = search_section.get("gate_model")
+    if gate_model_section is None:
+        return None
+    if not isinstance(gate_model_section, dict):
+        raise ValueError("search.gate_model must be a table")
+    depth_candidates = _parse_positive_int_candidates(
+        gate_model_section.get("depth_candidates", []),
+        "search.gate_model.depth_candidates",
+    )
+    l2_leaf_reg_candidates = _parse_float_candidates(
+        gate_model_section.get("l2_leaf_reg_candidates", []),
+        "search.gate_model.l2_leaf_reg_candidates",
+    )
+    for value in l2_leaf_reg_candidates:
+        if float(value) <= 0.0:
+            raise ValueError(
+                "search.gate_model.l2_leaf_reg_candidates must contain positive values"
+            )
+    random_seed_candidates = _parse_non_negative_int_candidates(
+        gate_model_section.get("random_seed_candidates", []),
+        "search.gate_model.random_seed_candidates",
+    )
+    tp_row_weight_candidates = _parse_float_candidates(
+        gate_model_section.get("tp_row_weight_candidates", []),
+        "search.gate_model.tp_row_weight_candidates",
+    )
+    for value in tp_row_weight_candidates:
+        if float(value) <= 0.0:
+            raise ValueError(
+                "search.gate_model.tp_row_weight_candidates must contain positive values"
+            )
+    raw_pairs = gate_model_section.get("learning_rate_iteration_pairs", [])
+    if not isinstance(raw_pairs, list):
+        raise ValueError(
+            "search.gate_model.learning_rate_iteration_pairs must be a list"
+        )
+    learning_rate_iteration_pairs: list[tuple[float, int]] = []
+    for idx, pair in enumerate(raw_pairs):
+        if not isinstance(pair, dict):
+            raise ValueError(
+                "search.gate_model.learning_rate_iteration_pairs entries must be tables"
+            )
+        learning_rate = _require_positive_float(
+            pair.get("learning_rate"),
+            f"search.gate_model.learning_rate_iteration_pairs[{idx}].learning_rate",
+        )
+        iterations = _require_positive_int(
+            pair.get("iterations"),
+            f"search.gate_model.learning_rate_iteration_pairs[{idx}].iterations",
+        )
+        learning_rate_iteration_pairs.append((learning_rate, iterations))
+    return GateModelSearchConfig(
+        depth_candidates=depth_candidates,
+        l2_leaf_reg_candidates=l2_leaf_reg_candidates,
+        random_seed_candidates=random_seed_candidates,
+        tp_row_weight_candidates=tp_row_weight_candidates,
+        learning_rate_iteration_pairs=tuple(learning_rate_iteration_pairs),
     )
