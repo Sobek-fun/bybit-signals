@@ -1,4 +1,5 @@
 from itertools import product
+import math
 import time
 
 import pandas as pd
@@ -13,6 +14,7 @@ from pump_end_v2.config import (
     ResolverConfig,
     SplitBounds,
 )
+from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.detector.model import (
     build_detector_model,
     fit_detector_model,
@@ -51,6 +53,7 @@ POLICY_ROW_COLUMNS: tuple[str, ...] = (
     "high_persistence_4",
     "episode_pump_context_streak",
     "target_good_short_now",
+    "target_contract_like_short_now",
     "target_reason",
     "future_outcome_class",
     "signal_quality_h32",
@@ -83,6 +86,13 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "arm_to_fire_conversion",
     "density_sanity_penalty",
     "selection_score",
+    "contract_like_resolved_signals_total",
+    "contract_like_good_signals",
+    "contract_like_bad_signals",
+    "contract_like_tp_rate",
+    "contract_like_edge_vs_breakeven",
+    "contract_like_edge_zscore",
+    "contract_like_economic_utility",
 )
 
 POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -97,6 +107,7 @@ POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "episode_age_bars",
     "distance_from_episode_high_pct",
     "target_good_short_now",
+    "target_contract_like_short_now",
     *DETECTOR_FEATURE_COLUMNS,
 )
 
@@ -124,7 +135,7 @@ def build_detector_val_policy_rows(
         )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
-        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_contract_like_short_now"
     )
     val_rows = frame[frame["dataset_split"] == "val"].copy()
     if val_rows.empty:
@@ -203,7 +214,7 @@ def build_detector_test_policy_rows(
         )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
-        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_contract_like_short_now"
     )
     test_rows = frame[frame["dataset_split"] == "test"].copy()
     if test_rows.empty:
@@ -300,7 +311,10 @@ def build_detector_train_oof_policy_rows(
         model = build_detector_model(detector_model_config)
         fit_started = time.perf_counter()
         fit_detector_model(
-            model, fold_train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+            model,
+            fold_train_fit,
+            DETECTOR_FEATURE_COLUMNS,
+            "target_contract_like_short_now",
         )
         log_info(
             "POLICY",
@@ -506,6 +520,7 @@ def sweep_detector_policy(
     scored_rows_df: pd.DataFrame,
     base_policy_config: DetectorPolicyConfig,
     search_config: DetectorPolicySearchConfig | None = None,
+    execution_contract: ExecutionContract | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -534,6 +549,9 @@ def sweep_detector_policy(
             window_start=window_start,
             window_end=window_end,
             window_days=window_days,
+        )
+        contract_metrics = _compute_contract_like_policy_metrics(
+            candidate_signals_df, execution_contract
         )
         best_selection_score = max(
             best_selection_score, float(metrics["selection_score"])
@@ -575,6 +593,25 @@ def sweep_detector_policy(
                     metrics["fires_per_30d"]
                 ),
                 "selection_score": metrics["selection_score"],
+                "contract_like_resolved_signals_total": contract_metrics[
+                    "contract_like_resolved_signals_total"
+                ],
+                "contract_like_good_signals": contract_metrics[
+                    "contract_like_good_signals"
+                ],
+                "contract_like_bad_signals": contract_metrics[
+                    "contract_like_bad_signals"
+                ],
+                "contract_like_tp_rate": contract_metrics["contract_like_tp_rate"],
+                "contract_like_edge_vs_breakeven": contract_metrics[
+                    "contract_like_edge_vs_breakeven"
+                ],
+                "contract_like_edge_zscore": contract_metrics[
+                    "contract_like_edge_zscore"
+                ],
+                "contract_like_economic_utility": contract_metrics[
+                    "contract_like_economic_utility"
+                ],
             }
         )
     sweep_df = pd.DataFrame(rows, columns=list(SWEEP_COLUMNS))
@@ -589,6 +626,7 @@ def select_detector_policy(
     scored_rows_df: pd.DataFrame,
     base_policy_config: DetectorPolicyConfig,
     search_config: DetectorPolicySearchConfig | None = None,
+    execution_contract: ExecutionContract | None = None,
     window_start: pd.Timestamp | None = None,
     window_end: pd.Timestamp | None = None,
     window_days: float | None = None,
@@ -597,6 +635,7 @@ def select_detector_policy(
         scored_rows_df,
         base_policy_config,
         search_config=search_config,
+        execution_contract=execution_contract,
         window_start=window_start,
         window_end=window_end,
         window_days=window_days,
@@ -613,26 +652,7 @@ def select_detector_policy(
         ranked = ranked[
             pd.to_numeric(ranked["episodes_fired"], errors="coerce").fillna(0.0) > 0.0
         ].copy()
-    ranked["_median_future_edge_sort"] = pd.to_numeric(
-        ranked["median_future_net_edge_pct_at_fire"], errors="coerce"
-    ).fillna(float("-inf"))
-    ranked["_median_bars_abs_sort"] = (
-        pd.to_numeric(ranked["median_bars_fire_to_ideal"], errors="coerce")
-        .abs()
-        .fillna(float("inf"))
-    )
-    ranked = ranked.sort_values(
-        by=[
-            "selection_score",
-            "_median_future_edge_sort",
-            "episodes_fired",
-            "_median_bars_abs_sort",
-            "arm_score_min",
-            "turn_down_delta",
-        ],
-        ascending=[False, False, False, True, True, True],
-        kind="mergesort",
-    ).reset_index(drop=True)
+    ranked = _rank_contract_like_utility(ranked)
     best = ranked.iloc[0]
     best_policy = DetectorPolicyConfig(
         arm_score_min=float(best["arm_score_min"]),
@@ -646,6 +666,8 @@ def select_detector_policy(
             f"best_policy=arm={best_policy.arm_score_min:.6f},"
             f"fire={best_policy.fire_score_floor:.6f},"
             f"turn={best_policy.turn_down_delta:.6f} "
+            "selector_mode=contract_like_utility "
+            f"best_contract_like_economic_utility={float(best['contract_like_economic_utility']):.6f} "
             f"best_selection_score={float(best['selection_score']):.6f}"
         ),
     )
@@ -816,6 +838,12 @@ def _round6(value: float) -> float:
     return float(round(float(value), 6))
 
 
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
 def _require_columns(df: pd.DataFrame, columns: tuple[str, ...]) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
@@ -836,6 +864,7 @@ def _available_rows_to_score_columns(rows_to_score: pd.DataFrame) -> list[str]:
         "high_persistence_4",
         "episode_pump_context_streak",
         "target_good_short_now",
+        "target_contract_like_short_now",
         "target_reason",
         "future_outcome_class",
         "signal_quality_h32",
@@ -860,3 +889,107 @@ def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
     if value < 15.0:
         return float((15.0 - value) / 15.0)
     return float((value - 180.0) / 180.0)
+
+
+def _compute_contract_like_policy_metrics(
+    candidate_signals_df: pd.DataFrame, execution_contract: ExecutionContract | None
+) -> dict[str, float]:
+    if execution_contract is None or candidate_signals_df.empty:
+        return {
+            "contract_like_resolved_signals_total": 0.0,
+            "contract_like_good_signals": 0.0,
+            "contract_like_bad_signals": 0.0,
+            "contract_like_tp_rate": 0.0,
+            "contract_like_edge_vs_breakeven": 0.0,
+            "contract_like_edge_zscore": 0.0,
+            "contract_like_economic_utility": 0.0,
+        }
+    pullback = pd.to_numeric(
+        candidate_signals_df.get("future_pullback_pct"), errors="coerce"
+    )
+    squeeze = pd.to_numeric(
+        candidate_signals_df.get("future_prepullback_squeeze_pct"), errors="coerce"
+    )
+    resolved_mask = pullback.notna() & squeeze.notna()
+    resolved_total = int(resolved_mask.sum())
+    if resolved_total <= 0:
+        return {
+            "contract_like_resolved_signals_total": 0.0,
+            "contract_like_good_signals": 0.0,
+            "contract_like_bad_signals": 0.0,
+            "contract_like_tp_rate": 0.0,
+            "contract_like_edge_vs_breakeven": 0.0,
+            "contract_like_edge_zscore": 0.0,
+            "contract_like_economic_utility": 0.0,
+        }
+    tp_pct = float(execution_contract.tp_pct)
+    sl_pct = float(execution_contract.sl_pct)
+    contract_like_good = resolved_mask & (pullback >= tp_pct) & (squeeze <= sl_pct)
+    good_signals = int(contract_like_good.sum())
+    bad_signals = int(resolved_total - good_signals)
+    contract_like_tp_rate = _safe_ratio(good_signals, resolved_total)
+    tp_rate_breakeven = sl_pct / (tp_pct + sl_pct)
+    contract_like_edge_vs_breakeven = contract_like_tp_rate - tp_rate_breakeven
+    zscore_denominator = math.sqrt(
+        tp_rate_breakeven * (1.0 - tp_rate_breakeven) / float(resolved_total)
+    )
+    contract_like_edge_zscore = (
+        contract_like_edge_vs_breakeven / zscore_denominator
+        if zscore_denominator > 0.0
+        else 0.0
+    )
+    contract_like_economic_utility = tp_pct * float(good_signals) - sl_pct * float(
+        bad_signals
+    )
+    return {
+        "contract_like_resolved_signals_total": float(resolved_total),
+        "contract_like_good_signals": float(good_signals),
+        "contract_like_bad_signals": float(bad_signals),
+        "contract_like_tp_rate": float(contract_like_tp_rate),
+        "contract_like_edge_vs_breakeven": float(contract_like_edge_vs_breakeven),
+        "contract_like_edge_zscore": float(contract_like_edge_zscore),
+        "contract_like_economic_utility": float(contract_like_economic_utility),
+    }
+
+
+def _rank_contract_like_utility(ranked: pd.DataFrame) -> pd.DataFrame:
+    local = ranked.copy()
+    local["_contract_like_economic_utility_sort"] = pd.to_numeric(
+        local["contract_like_economic_utility"], errors="coerce"
+    ).fillna(float("-inf"))
+    local["_contract_like_edge_zscore_sort"] = pd.to_numeric(
+        local["contract_like_edge_zscore"], errors="coerce"
+    ).fillna(float("-inf"))
+    local["_contract_like_tp_rate_sort"] = pd.to_numeric(
+        local["contract_like_tp_rate"], errors="coerce"
+    ).fillna(float("-inf"))
+    local["_median_future_edge_sort"] = pd.to_numeric(
+        local["median_future_net_edge_pct_at_fire"], errors="coerce"
+    ).fillna(float("-inf"))
+    local["_bad_episode_fire_rate_sort"] = pd.to_numeric(
+        local["bad_episode_fire_rate"], errors="coerce"
+    ).fillna(float("inf"))
+    local["_fires_per_30d_sort"] = pd.to_numeric(
+        local["fires_per_30d"], errors="coerce"
+    ).fillna(float("inf"))
+    local["_arm_score_min_sort"] = pd.to_numeric(
+        local["arm_score_min"], errors="coerce"
+    ).fillna(float("-inf"))
+    local["_turn_down_delta_sort"] = pd.to_numeric(
+        local["turn_down_delta"], errors="coerce"
+    ).fillna(float("inf"))
+    local = local.sort_values(
+        by=[
+            "_contract_like_economic_utility_sort",
+            "_contract_like_edge_zscore_sort",
+            "_contract_like_tp_rate_sort",
+            "_median_future_edge_sort",
+            "_bad_episode_fire_rate_sort",
+            "_fires_per_30d_sort",
+            "_arm_score_min_sort",
+            "_turn_down_delta_sort",
+        ],
+        ascending=[False, False, False, False, True, True, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return local
