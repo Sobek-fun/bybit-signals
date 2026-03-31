@@ -14,10 +14,6 @@ INPUT_REQUIRED_COLUMNS: tuple[str, ...] = (
     "decision_time",
     "entry_bar_open_time",
     "p_good",
-    "p_too_early",
-    "p_too_late",
-    "p_continuation_flat",
-    "predicted_reason_group",
     "score_source",
     "policy_context_only",
     "episode_age_bars",
@@ -51,10 +47,6 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "entry_bar_open_time",
     "episode_age_bars",
     "p_good",
-    "p_too_early",
-    "p_too_late",
-    "p_continuation_flat",
-    "predicted_reason_group",
     "peak_p_good_before_fire",
     "p_good_drop_from_peak",
     "distance_from_episode_high_pct",
@@ -70,8 +62,6 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "policy_arm_score_min",
     "policy_fire_score_floor",
     "policy_turn_down_delta",
-    "policy_max_too_early_prob",
-    "policy_max_too_late_prob",
     "target_good_short_now",
     "target_reason",
     "future_outcome_class",
@@ -105,9 +95,6 @@ EPISODE_POLICY_SUMMARY_COLUMNS: tuple[str, ...] = (
     "fire_future_outcome_class",
     "fire_signal_quality_h32",
     "fire_future_net_edge_pct",
-    "fire_p_too_early",
-    "fire_p_too_late",
-    "fire_predicted_reason_group",
     "bars_fire_to_ideal",
 )
 
@@ -117,15 +104,6 @@ def apply_episode_aware_detector_policy(
     detector_policy_config: DetectorPolicyConfig,
     emit_summary_log: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    runtime_cache = build_detector_policy_runtime_cache(scored_rows_df)
-    return apply_episode_aware_detector_policy_cached(
-        runtime_cache=runtime_cache,
-        detector_policy_config=detector_policy_config,
-        emit_summary_log=emit_summary_log,
-    )
-
-
-def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[str, Any]:
     _require_columns(scored_rows_df, INPUT_REQUIRED_COLUMNS)
     has_fold_id = "fold_id" in scored_rows_df.columns
     frame = scored_rows_df.copy()
@@ -144,10 +122,6 @@ def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[st
         )
     frame["policy_context_only"] = frame["policy_context_only"].astype(bool)
     frame["p_good"] = frame["p_good"].astype(float)
-    frame["p_too_early"] = frame["p_too_early"].astype(float)
-    frame["p_too_late"] = frame["p_too_late"].astype(float)
-    frame["p_continuation_flat"] = frame["p_continuation_flat"].astype(float)
-    frame["predicted_reason_group"] = frame["predicted_reason_group"].astype(str)
     if not has_fold_id:
         frame["fold_id"] = pd.NA
     sort_columns = ["score_source", "episode_id", "context_bar_open_time"]
@@ -162,41 +136,19 @@ def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[st
     group_columns = ["score_source", "episode_id"]
     if has_fold_id:
         group_columns = ["score_source", "fold_id", "episode_id"]
-    prepared_groups: list[dict[str, Any]] = []
-    for _, group in frame.groupby(group_columns, sort=False, dropna=False):
-        prepared = group.reset_index(drop=True)
-        prepared_groups.append(
-            {
-                "rows_tuples": list(prepared.itertuples(index=False)),
-                "symbol": str(prepared["symbol"].iloc[0]),
-                "episode_id": str(prepared["episode_id"].iloc[0]),
-                "score_source": str(prepared["score_source"].iloc[0]),
-                "fold_id": prepared["fold_id"].iloc[0] if has_fold_id else pd.NA,
-                "active_rows_total": int((~prepared["policy_context_only"]).sum()),
-                "good_episode_flag": _compute_good_episode_flag(
-                    prepared.loc[~prepared["policy_context_only"]]
-                ),
-            }
-        )
-    return {"prepared_groups": prepared_groups}
-
-
-def apply_episode_aware_detector_policy_cached(
-    runtime_cache: dict[str, Any],
-    detector_policy_config: DetectorPolicyConfig,
-    emit_summary_log: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
     candidate_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
-    for prepared_group in runtime_cache["prepared_groups"]:
-        symbol = prepared_group["symbol"]
-        episode_id = prepared_group["episode_id"]
-        score_source = prepared_group["score_source"]
-        fold_id = prepared_group["fold_id"]
-        active_rows_total = prepared_group["active_rows_total"]
+    for _, group in frame.groupby(group_columns, sort=False, dropna=False):
+        group = group.reset_index(drop=True)
+        symbol = str(group["symbol"].iloc[0])
+        episode_id = str(group["episode_id"].iloc[0])
+        score_source = str(group["score_source"].iloc[0])
+        fold_id = group["fold_id"].iloc[0] if has_fold_id else pd.NA
+        active_rows = group.loc[~group["policy_context_only"]]
+        active_rows_total = int(len(active_rows))
         if active_rows_total == 0:
             continue
-        good_episode_flag = prepared_group["good_episode_flag"]
+        good_episode_flag = _compute_good_episode_flag(active_rows)
         armed_flag = False
         had_arm = False
         fired = False
@@ -204,14 +156,10 @@ def apply_episode_aware_detector_policy_cached(
         reset_count = 0
         peak_p_good: float | None = None
         fire_signal_row: dict[str, Any] | None = None
-        for row in prepared_group["rows_tuples"]:
+        for row in group.itertuples(index=False):
             if fired or expired:
                 continue
             current_p_good = float(row.p_good)
-            current_p_too_early = float(row.p_too_early)
-            current_p_too_late = float(row.p_too_late)
-            current_p_continuation_flat = float(row.p_continuation_flat)
-            current_predicted_reason_group = str(row.predicted_reason_group)
             if current_p_good >= detector_policy_config.arm_score_min:
                 if not armed_flag:
                     armed_flag = True
@@ -225,9 +173,6 @@ def apply_episode_aware_detector_policy_cached(
             if (
                 drop_from_peak >= detector_policy_config.turn_down_delta
                 and current_p_good >= detector_policy_config.fire_score_floor
-                and current_predicted_reason_group == "good"
-                and current_p_too_early <= detector_policy_config.max_too_early_prob
-                and current_p_too_late <= detector_policy_config.max_too_late_prob
             ):
                 if bool(row.policy_context_only):
                     expired = True
@@ -262,10 +207,6 @@ def apply_episode_aware_detector_policy_cached(
                     "entry_bar_open_time": pd.Timestamp(row.entry_bar_open_time),
                     "episode_age_bars": row.episode_age_bars,
                     "p_good": current_p_good,
-                    "p_too_early": current_p_too_early,
-                    "p_too_late": current_p_too_late,
-                    "p_continuation_flat": current_p_continuation_flat,
-                    "predicted_reason_group": current_predicted_reason_group,
                     "peak_p_good_before_fire": peak_p_good,
                     "p_good_drop_from_peak": drop_from_peak,
                     "distance_from_episode_high_pct": row.distance_from_episode_high_pct,
@@ -291,8 +232,6 @@ def apply_episode_aware_detector_policy_cached(
                     "policy_arm_score_min": detector_policy_config.arm_score_min,
                     "policy_fire_score_floor": detector_policy_config.fire_score_floor,
                     "policy_turn_down_delta": detector_policy_config.turn_down_delta,
-                    "policy_max_too_early_prob": detector_policy_config.max_too_early_prob,
-                    "policy_max_too_late_prob": detector_policy_config.max_too_late_prob,
                     "bars_fire_to_ideal": bars_fire_to_ideal,
                 }
                 for column in _OPTIONAL_HINDSIGHT_COLUMNS:
@@ -336,15 +275,6 @@ def apply_episode_aware_detector_policy_cached(
                 ),
                 "fire_future_net_edge_pct": (
                     fire_signal_row["future_net_edge_pct"] if fire_signal_row else pd.NA
-                ),
-                "fire_p_too_early": (
-                    fire_signal_row["p_too_early"] if fire_signal_row else pd.NA
-                ),
-                "fire_p_too_late": (
-                    fire_signal_row["p_too_late"] if fire_signal_row else pd.NA
-                ),
-                "fire_predicted_reason_group": (
-                    fire_signal_row["predicted_reason_group"] if fire_signal_row else pd.NA
                 ),
                 "bars_fire_to_ideal": (
                     fire_signal_row["bars_fire_to_ideal"] if fire_signal_row else pd.NA

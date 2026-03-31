@@ -2,10 +2,6 @@ import time
 
 import pandas as pd
 
-from pump_end_v2.detector.reason_classes import (
-    MODEL_REASON_CLASS_TO_ID,
-    map_target_reason_to_model_class,
-)
 from pump_end_v2.features.manifest import (
     BLOCKED_COLUMNS,
     DETECTOR_FEATURE_COLUMNS,
@@ -48,15 +44,6 @@ def build_detector_dataset(
         how="inner",
         validate="one_to_one",
     )
-    reason_groups = merged["target_reason"].map(map_target_reason_to_model_class)
-    merged["target_reason_group"] = reason_groups
-    merged["target_reason_group_id"] = reason_groups.map(
-        lambda value: MODEL_REASON_CLASS_TO_ID[value] if value is not None else pd.NA
-    )
-    merged["target_reason_group"] = merged["target_reason_group"].where(
-        merged["target_reason_group"].notna(), pd.NA
-    )
-    merged["target_reason_group_id"] = merged["target_reason_group_id"].astype("Int64")
     if len(merged) != len(detector_feature_view_df):
         missing = sorted(
             set(detector_feature_view_df["decision_row_id"])
@@ -70,29 +57,10 @@ def build_detector_dataset(
             merged["target_reason"].astype(str) != "invalid_context"
     )
     merged["detector_trainable_row"] = merged["trainable_row"].astype(int)
-    trainable_mask = merged["trainable_row"].astype(bool)
-    missing_reason_group_mask = (
-        merged["target_reason_group"].isna() | merged["target_reason_group_id"].isna()
-    )
-    if bool((trainable_mask & missing_reason_group_mask).any()):
-        sample_ids = (
-            merged.loc[
-                trainable_mask & missing_reason_group_mask, "decision_row_id"
-            ]
-            .astype(str)
-            .head(5)
-            .tolist()
-        )
-        raise ValueError(
-            "trainable rows with missing multiclass target columns "
-            f"count={int((trainable_mask & missing_reason_group_mask).sum())} sample={sample_ids}"
-        )
     ordered_columns = [
         *DETECTOR_IDENTITY_COLUMNS,
         *DETECTOR_FEATURE_COLUMNS,
         *TARGET_META_COLUMNS,
-        "target_reason_group",
-        "target_reason_group_id",
         "trainable_row",
         "detector_trainable_row",
     ]
@@ -108,18 +76,11 @@ def build_detector_dataset(
         if trainable_rows > 0
         else 0.0
     )
-    reason_group_distribution = (
-        dataset.loc[dataset["trainable_row"].astype(bool), "target_reason_group"]
-        .value_counts(dropna=False)
-        .sort_index()
-        .to_dict()
-    )
     log_info(
         "DETECTOR",
         (
             f"dataset build done rows_total={len(dataset)} "
-            f"resolved_rows={resolved_rows} trainable_rows={trainable_rows} "
-            f"positive_rate={positive_rate:.4f} reason_group_distribution={reason_group_distribution}"
+            f"resolved_rows={resolved_rows} trainable_rows={trainable_rows} positive_rate={positive_rate:.4f}"
         ),
     )
     stage_done("DETECTOR", "DATASET_BUILD", elapsed_sec=time.perf_counter() - started)

@@ -20,8 +20,6 @@ from pump_end_v2.detector.model import (
 )
 from pump_end_v2.detector.policy import (
     apply_episode_aware_detector_policy,
-    apply_episode_aware_detector_policy_cached,
-    build_detector_policy_runtime_cache,
     build_detector_policy_metrics,
     compute_eval_window_days_from_policy_rows,
 )
@@ -40,11 +38,6 @@ POLICY_ROW_COLUMNS: tuple[str, ...] = (
     "decision_time",
     "entry_bar_open_time",
     "p_good",
-    "p_too_early",
-    "p_too_late",
-    "p_continuation_flat",
-    "predicted_reason_group",
-    "predicted_reason_group_id",
     "score_source",
     "fold_id",
     "policy_context_only",
@@ -59,8 +52,6 @@ POLICY_ROW_COLUMNS: tuple[str, ...] = (
     "episode_pump_context_streak",
     "target_good_short_now",
     "target_reason",
-    "target_reason_group",
-    "target_reason_group_id",
     "future_outcome_class",
     "signal_quality_h32",
     "future_prepullback_squeeze_pct",
@@ -79,8 +70,6 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "arm_score_min",
     "fire_score_floor",
     "turn_down_delta",
-    "max_too_early_prob",
-    "max_too_late_prob",
     "episodes_total",
     "episodes_with_good_zone",
     "episodes_fired",
@@ -108,8 +97,6 @@ POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "episode_age_bars",
     "distance_from_episode_high_pct",
     "target_good_short_now",
-    "target_reason_group",
-    "target_reason_group_id",
     *DETECTOR_FEATURE_COLUMNS,
 )
 
@@ -137,7 +124,7 @@ def build_detector_val_policy_rows(
         )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
-        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_reason_group_id"
+        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
     )
     val_rows = frame[frame["dataset_split"] == "val"].copy()
     if val_rows.empty:
@@ -216,7 +203,7 @@ def build_detector_test_policy_rows(
         )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
-        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_reason_group_id"
+        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
     )
     test_rows = frame[frame["dataset_split"] == "test"].copy()
     if test_rows.empty:
@@ -313,7 +300,7 @@ def build_detector_train_oof_policy_rows(
         model = build_detector_model(detector_model_config)
         fit_started = time.perf_counter()
         fit_detector_model(
-            model, fold_train_fit, DETECTOR_FEATURE_COLUMNS, "target_reason_group_id"
+            model, fold_train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
         )
         log_info(
             "POLICY",
@@ -433,29 +420,11 @@ def build_detector_policy_grid(
             and len(search_config.fire_candidates) > 0
             and len(search_config.turn_candidates) > 0
     ):
-        too_early_candidates = (
-            list(search_config.max_too_early_candidates)
-            if len(search_config.max_too_early_candidates) > 0
-            else [base_policy_config.max_too_early_prob]
-        )
-        too_late_candidates = (
-            list(search_config.max_too_late_candidates)
-            if len(search_config.max_too_late_candidates) > 0
-            else [base_policy_config.max_too_late_prob]
-        )
         grid: list[DetectorPolicyConfig] = []
-        for (
-                arm_score_min,
-                fire_score_floor,
-                turn_down_delta,
-                max_too_early_prob,
-                max_too_late_prob,
-        ) in product(
+        for arm_score_min, fire_score_floor, turn_down_delta in product(
                 search_config.arm_candidates,
                 search_config.fire_candidates,
                 search_config.turn_candidates,
-                too_early_candidates,
-                too_late_candidates,
         ):
             if not (0.0 < float(arm_score_min) <= 1.0):
                 continue
@@ -463,27 +432,19 @@ def build_detector_policy_grid(
                 continue
             if not (0.0 < float(turn_down_delta) <= 1.0):
                 continue
-            if not (0.0 <= float(max_too_early_prob) <= 1.0):
-                continue
-            if not (0.0 <= float(max_too_late_prob) <= 1.0):
-                continue
             grid.append(
                 DetectorPolicyConfig(
                     arm_score_min=_round6(float(arm_score_min)),
                     fire_score_floor=_round6(float(fire_score_floor)),
                     turn_down_delta=_round6(float(turn_down_delta)),
-                    max_too_early_prob=_round6(float(max_too_early_prob)),
-                    max_too_late_prob=_round6(float(max_too_late_prob)),
                 )
             )
-        unique: dict[tuple[float, float, float, float, float], DetectorPolicyConfig] = {}
+        unique: dict[tuple[float, float, float], DetectorPolicyConfig] = {}
         for candidate in grid:
             key = (
                 candidate.arm_score_min,
                 candidate.fire_score_floor,
                 candidate.turn_down_delta,
-                candidate.max_too_early_prob,
-                candidate.max_too_late_prob,
             )
             unique[key] = candidate
         return sorted(
@@ -492,8 +453,6 @@ def build_detector_policy_grid(
                 item.arm_score_min,
                 item.fire_score_floor,
                 item.turn_down_delta,
-                item.max_too_early_prob,
-                item.max_too_late_prob,
             ),
         )
     arm_candidates = sorted(
@@ -520,25 +479,10 @@ def build_detector_policy_grid(
             if candidate > 0.0
         }
     )
-    max_too_early_candidates = sorted(
-        {
-            _round6(_clip(base_policy_config.max_too_early_prob + delta, 0.05, 1.0))
-            for delta in (-0.15, 0.0, 0.15)
-        }
-    )
-    max_too_late_candidates = sorted(
-        {
-            _round6(_clip(base_policy_config.max_too_late_prob + delta, 0.05, 1.0))
-            for delta in (-0.15, 0.0, 0.15)
-        }
-    )
     grid: list[DetectorPolicyConfig] = []
-    for arm_score_min, max_too_early_prob, max_too_late_prob in product(
-            arm_candidates, max_too_early_candidates, max_too_late_candidates
-    ):
+    for arm_score_min in arm_candidates:
         for fire_score_floor, turn_down_delta in product(
-                fire_candidates,
-                turn_candidates,
+                fire_candidates, turn_candidates
         ):
             if fire_score_floor > arm_score_min:
                 continue
@@ -553,8 +497,6 @@ def build_detector_policy_grid(
                     arm_score_min=arm_score_min,
                     fire_score_floor=fire_score_floor,
                     turn_down_delta=turn_down_delta,
-                    max_too_early_prob=max_too_early_prob,
-                    max_too_late_prob=max_too_late_prob,
                 )
             )
     return grid
@@ -570,7 +512,6 @@ def sweep_detector_policy(
 ) -> pd.DataFrame:
     started = time.perf_counter()
     candidates = build_detector_policy_grid(base_policy_config, search_config)
-    runtime_cache = build_detector_policy_runtime_cache(scored_rows_df)
     log_info(
         "POLICY",
         (
@@ -583,10 +524,8 @@ def sweep_detector_policy(
     best_selection_score = float("-inf")
     for idx, candidate in enumerate(candidates, start=1):
         candidate_signals_df, episode_policy_summary_df = (
-            apply_episode_aware_detector_policy_cached(
-                runtime_cache=runtime_cache,
-                detector_policy_config=candidate,
-                emit_summary_log=False,
+            apply_episode_aware_detector_policy(
+                scored_rows_df, candidate, emit_summary_log=False
             )
         )
         metrics = build_detector_policy_metrics(
@@ -609,10 +548,7 @@ def sweep_detector_policy(
                 (
                     f"policy sweep progress candidate={idx}/{len(candidates)} "
                     f"arm={candidate.arm_score_min:.6f} fire={candidate.fire_score_floor:.6f} "
-                    f"turn={candidate.turn_down_delta:.6f} "
-                    f"max_too_early={candidate.max_too_early_prob:.6f} "
-                    f"max_too_late={candidate.max_too_late_prob:.6f} "
-                    f"signals_total={len(candidate_signals_df)} "
+                    f"turn={candidate.turn_down_delta:.6f} signals_total={len(candidate_signals_df)} "
                     f"selection_score={float(metrics['selection_score']):.6f} current_best={best_selection_score:.6f} "
                     f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f}"
                 ),
@@ -622,8 +558,6 @@ def sweep_detector_policy(
                 "arm_score_min": candidate.arm_score_min,
                 "fire_score_floor": candidate.fire_score_floor,
                 "turn_down_delta": candidate.turn_down_delta,
-                "max_too_early_prob": candidate.max_too_early_prob,
-                "max_too_late_prob": candidate.max_too_late_prob,
                 "episodes_total": metrics["episodes_total"],
                 "episodes_with_good_zone": metrics["episodes_with_good_zone"],
                 "episodes_fired": metrics["episodes_fired"],
@@ -695,10 +629,8 @@ def select_detector_policy(
             "_median_bars_abs_sort",
             "arm_score_min",
             "turn_down_delta",
-            "max_too_early_prob",
-            "max_too_late_prob",
         ],
-        ascending=[False, False, False, True, True, True, True, True],
+        ascending=[False, False, False, True, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
     best = ranked.iloc[0]
@@ -706,8 +638,6 @@ def select_detector_policy(
         arm_score_min=float(best["arm_score_min"]),
         fire_score_floor=float(best["fire_score_floor"]),
         turn_down_delta=float(best["turn_down_delta"]),
-        max_too_early_prob=float(best["max_too_early_prob"]),
-        max_too_late_prob=float(best["max_too_late_prob"]),
     )
     log_info(
         "POLICY",
@@ -715,9 +645,7 @@ def select_detector_policy(
             "policy select done "
             f"best_policy=arm={best_policy.arm_score_min:.6f},"
             f"fire={best_policy.fire_score_floor:.6f},"
-            f"turn={best_policy.turn_down_delta:.6f},"
-            f"max_too_early={best_policy.max_too_early_prob:.6f},"
-            f"max_too_late={best_policy.max_too_late_prob:.6f} "
+            f"turn={best_policy.turn_down_delta:.6f} "
             f"best_selection_score={float(best['selection_score']):.6f}"
         ),
     )
@@ -909,8 +837,6 @@ def _available_rows_to_score_columns(rows_to_score: pd.DataFrame) -> list[str]:
         "episode_pump_context_streak",
         "target_good_short_now",
         "target_reason",
-        "target_reason_group",
-        "target_reason_group_id",
         "future_outcome_class",
         "signal_quality_h32",
         "future_prepullback_squeeze_pct",
