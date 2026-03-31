@@ -64,7 +64,7 @@ from pump_end_v2.run_context import create_run_context
 
 
 def run_pump_end_v2_pipeline(
-    config_path: str | Path, clickhouse_dsn: str
+        config_path: str | Path, clickhouse_dsn: str
 ) -> dict[str, object]:
     started = time.perf_counter()
     stage_start("PIPELINE", "FULL_RUN")
@@ -164,9 +164,7 @@ def run_pump_end_v2_pipeline(
     decision_rows = build_decision_rows(
         token_state_tradable, episodes, config.execution
     )
-    resolved_rows = resolve_decision_rows(
-        bars_15m, decision_rows, config.resolver, config.execution
-    )
+    resolved_rows = resolve_decision_rows(bars_15m, decision_rows, config.resolver)
     episode_summary = build_episode_summary(resolved_rows)
     event_quality_report = build_event_quality_report(episode_summary)
     event_elapsed = time.perf_counter() - event_started
@@ -199,17 +197,15 @@ def run_pump_end_v2_pipeline(
     detector_dataset = assign_detector_dataset_splits(detector_dataset, config.splits)
     detector_dataset_elapsed = time.perf_counter() - detector_dataset_started
     split_counts = detector_dataset["dataset_split"].value_counts(dropna=False).to_dict()
-    detector_active_target_column = "target_contract_like_short_now"
-    train_active_target_mask = detector_dataset["trainable_row"].astype(bool) & (
-        detector_dataset["dataset_split"].astype(str) == "train"
-    )
     positive_rate = (
         float(
-            detector_dataset.loc[train_active_target_mask, detector_active_target_column]
+            detector_dataset.loc[
+                detector_dataset["trainable_row"].astype(bool), "target_good_short_now"
+            ]
             .astype(float)
             .mean()
         )
-        if bool(train_active_target_mask.any())
+        if bool(detector_dataset["trainable_row"].astype(bool).any())
         else 0.0
     )
     log_info(
@@ -249,7 +245,6 @@ def run_pump_end_v2_pipeline(
         val_policy_rows,
         config.detector_policy,
         search_config=config.search_detector_policy,
-        execution_contract=config.execution,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
@@ -275,11 +270,7 @@ def run_pump_end_v2_pipeline(
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
-    detector_val_target_metrics = build_detector_target_metrics(
-        val_policy_rows,
-        target_column=detector_active_target_column,
-        reason_column=None,
-    )
+    detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
     detector_val_elapsed = time.perf_counter() - detector_val_started
     stage_done("PIPELINE", "DETECTOR_VAL_POLICY", elapsed_sec=detector_val_elapsed)
 
@@ -301,18 +292,14 @@ def run_pump_end_v2_pipeline(
         window_start=config.splits.val_end,
         window_end=config.splits.test_end,
     )
-    detector_test_target_metrics = build_detector_target_metrics(
-        test_policy_rows,
-        target_column=detector_active_target_column,
-        reason_column=None,
-    )
+    detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
     detector_test_elapsed = time.perf_counter() - detector_test_started
     test_window_days = float(
         (pd.Timestamp(config.splits.test_end) - pd.Timestamp(config.splits.val_end))
         / pd.Timedelta(days=1)
     )
     test_signals_per_30d_estimate = (
-        len(test_candidate_signals_df) * 30.0 / max(test_window_days, 1e-9)
+            len(test_candidate_signals_df) * 30.0 / max(test_window_days, 1e-9)
     )
     log_info(
         "PIPELINE",
@@ -380,8 +367,8 @@ def run_pump_end_v2_pipeline(
     )
     train_rows = int(
         (
-            (gate_dataset_train_oof_df["score_source"] == "train_oof")
-            & gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool)
+                (gate_dataset_train_oof_df["score_source"] == "train_oof")
+                & gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool)
         ).sum()
     ) if not gate_dataset_train_oof_df.empty else 0
     val_rows = int(
@@ -400,8 +387,8 @@ def run_pump_end_v2_pipeline(
             .mean()
         )
         if (
-            not gate_dataset_train_oof_df.empty
-            and bool(gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool).any())
+                not gate_dataset_train_oof_df.empty
+                and bool(gate_dataset_train_oof_df["gate_trainable_signal"].astype(bool).any())
         )
         else 0.0
     )
@@ -513,8 +500,8 @@ def run_pump_end_v2_pipeline(
     ) if not gate_dataset_test_df.empty else 0
     train_rows_for_gate_test = int(
         (
-            (gate_dataset_test_df["score_source"] == "train_oof")
-            & gate_dataset_test_df["gate_trainable_signal"].astype(bool)
+                (gate_dataset_test_df["score_source"] == "train_oof")
+                & gate_dataset_test_df["gate_trainable_signal"].astype(bool)
         ).sum()
     ) if not gate_dataset_test_df.empty and "score_source" in gate_dataset_test_df.columns else 0
     kept_total = int((test_gate_decisions_df["gate_decision"] == "keep").sum())
@@ -885,8 +872,6 @@ def run_pump_end_v2_pipeline(
         "run_id": run_context.run_id,
         "run_dir": str(run_context.run_dir),
         "config_path": str(Path(config_path).resolve()),
-        "detector_target_mode": "contract_like_tp_sl",
-        "detector_train_positive_rate_active_target": float(positive_rate),
         "selected_detector_policy": _policy_to_dict(selected_detector_policy),
         "selected_gate_model": _gate_model_to_dict(selected_gate_model_config),
         "selected_gate_mode": selected_gate_mode,
@@ -992,7 +977,7 @@ def _gate_model_to_dict(model_config: Any) -> dict[str, float]:
 
 
 def _derive_1m_stage_intervals(
-    candidate_frames: list, execution_contract
+        candidate_frames: list, execution_contract
 ) -> dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]]:
     by_symbol: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
     horizon = pd.Timedelta(minutes=int(execution_contract.max_hold_bars) * 15 + 15)
@@ -1037,7 +1022,7 @@ def _derive_1m_stage_intervals(
 
 
 def _summarize_1m_intervals(
-    symbol_intervals: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]],
+        symbol_intervals: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]],
 ) -> tuple[tuple[str, ...], pd.Timestamp, pd.Timestamp]:
     if not symbol_intervals:
         now_utc = pd.Timestamp.utcnow()

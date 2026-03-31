@@ -5,12 +5,7 @@ import time
 import pandas as pd
 
 from pump_end_v2.config import ResolverConfig
-from pump_end_v2.contracts import (
-    ExecutionContract,
-    OutcomeClass,
-    SignalQualityClass,
-    TargetReason,
-)
+from pump_end_v2.contracts import OutcomeClass, SignalQualityClass, TargetReason
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 try:
@@ -34,10 +29,7 @@ def _is_tty_progress() -> bool:
 
 
 def resolve_decision_rows(
-    df: pd.DataFrame,
-    decision_rows: pd.DataFrame,
-    config: ResolverConfig,
-    execution_contract: ExecutionContract,
+        df: pd.DataFrame, decision_rows: pd.DataFrame, config: ResolverConfig
 ) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("RESOLVER", "RESOLVE_ROWS")
@@ -55,17 +47,14 @@ def resolve_decision_rows(
     resolved["is_resolved"] = False
     resolved["entry_price"] = math.nan
     resolved["future_prepullback_squeeze_pct"] = math.nan
-    resolved["future_contract_prepullback_squeeze_pct"] = math.nan
     resolved["future_pullback_pct"] = math.nan
     resolved["future_net_edge_pct"] = math.nan
     resolved["bars_to_pullback"] = pd.NA
-    resolved["bars_to_contract_pullback"] = pd.NA
     resolved["bars_to_peak_after_row"] = pd.NA
     resolved["bars_to_resolution"] = pd.NA
     resolved["future_outcome_class"] = pd.NA
     resolved["signal_quality_h32"] = pd.NA
     resolved["target_good_short_now"] = 0
-    resolved["target_contract_like_short_now"] = 0
     resolved["target_reason"] = TargetReason.INVALID_CONTEXT.value
     resolved["entry_quality_score"] = math.nan
     resolved["ideal_entry_row_id"] = pd.NA
@@ -83,14 +72,14 @@ def resolve_decision_rows(
     progress_step = max(1, total_rows // 20 if total_rows > 0 else 1)
     emit_periodic_log = not _is_tty_progress()
     for processed, (idx, row) in enumerate(
-        tqdm(
-            resolved.iterrows(),
-            total=total_rows,
-            desc="resolve rows",
-            unit="row",
-            **_tqdm_kwargs(),
-        ),
-        start=1,
+            tqdm(
+                resolved.iterrows(),
+                total=total_rows,
+                desc="resolve rows",
+                unit="row",
+                **_tqdm_kwargs(),
+            ),
+            start=1,
     ):
         symbol_df = market_by_symbol.get(row["symbol"])
         if symbol_df is None:
@@ -99,7 +88,7 @@ def resolve_decision_rows(
         if not entry_mask.any():
             continue
         entry_pos = int(entry_mask[entry_mask].index[0])
-        horizon_df = symbol_df.iloc[entry_pos : entry_pos + config.horizon_bars].copy()
+        horizon_df = symbol_df.iloc[entry_pos: entry_pos + config.horizon_bars].copy()
         if len(horizon_df) < config.horizon_bars:
             continue
         entry_price = float(horizon_df["open"].iloc[0])
@@ -110,19 +99,11 @@ def resolve_decision_rows(
         max_squeeze_pct_total = float(squeeze_series.max())
         max_pullback_pct_total = float(pullback_series.max())
         success_mask = horizon_df["low"] <= entry_price * (
-            1.0 - config.success_pullback_pct
+                1.0 - config.success_pullback_pct
         )
         first_success_pullback_index = (
             int(success_mask[success_mask].index[0] - horizon_df.index[0])
             if success_mask.any()
-            else None
-        )
-        contract_success_mask = horizon_df["low"] <= entry_price * (
-            1.0 - float(execution_contract.tp_pct)
-        )
-        first_contract_pullback_index = (
-            int(contract_success_mask[contract_success_mask].index[0] - horizon_df.index[0])
-            if contract_success_mask.any()
             else None
         )
         if first_success_pullback_index is None:
@@ -130,12 +111,6 @@ def resolve_decision_rows(
         else:
             future_prepullback_squeeze_pct = float(
                 squeeze_series.iloc[: first_success_pullback_index + 1].max()
-            )
-        if first_contract_pullback_index is None:
-            future_contract_prepullback_squeeze_pct = max_squeeze_pct_total
-        else:
-            future_contract_prepullback_squeeze_pct = float(
-                squeeze_series.iloc[: first_contract_pullback_index + 1].max()
             )
         peak_high = float(horizon_df["high"].max())
         first_peak_index = int(
@@ -160,9 +135,9 @@ def resolve_decision_rows(
             config.max_prepullback_squeeze_pct
         )
         pullback_before_squeeze = (
-            has_success_pullback
-            and first_squeeze_breach_index is not None
-            and int(first_success_pullback_index) < int(first_squeeze_breach_index)
+                has_success_pullback
+                and first_squeeze_breach_index is not None
+                and int(first_success_pullback_index) < int(first_squeeze_breach_index)
         )
         is_reversal = has_success_pullback and squeeze_ok and wait_ok
         if is_reversal:
@@ -186,28 +161,15 @@ def resolve_decision_rows(
         resolved.at[idx, "future_prepullback_squeeze_pct"] = (
             future_prepullback_squeeze_pct
         )
-        resolved.at[idx, "future_contract_prepullback_squeeze_pct"] = (
-            future_contract_prepullback_squeeze_pct
-        )
         resolved.at[idx, "future_pullback_pct"] = future_pullback_pct
         resolved.at[idx, "future_net_edge_pct"] = future_net_edge_pct
         resolved.at[idx, "bars_to_pullback"] = first_success_pullback_index
-        resolved.at[idx, "bars_to_contract_pullback"] = first_contract_pullback_index
         resolved.at[idx, "bars_to_peak_after_row"] = first_peak_index
         resolved.at[idx, "bars_to_resolution"] = bars_to_resolution
         resolved.at[idx, "future_outcome_class"] = outcome
         resolved.at[idx, "signal_quality_h32"] = signal_quality
         resolved.at[idx, "target_good_short_now"] = (
             1 if outcome == OutcomeClass.REVERSAL.value else 0
-        )
-        resolved.at[idx, "target_contract_like_short_now"] = (
-            1
-            if (
-                first_contract_pullback_index is not None
-                and future_contract_prepullback_squeeze_pct
-                <= float(execution_contract.sl_pct)
-            )
-            else 0
         )
         resolved.at[idx, "entry_quality_score"] = future_net_edge_pct - 0.001 * min(
             bars_to_resolution, config.horizon_bars
@@ -261,7 +223,7 @@ def _attach_episode_ideal_entry(resolved: pd.DataFrame) -> pd.DataFrame:
             "entry_bar_open_time"
         ]
         frame.loc[episode_mask, "is_ideal_entry"] = (
-            frame.loc[episode_mask, "decision_row_id"] == ideal["decision_row_id"]
+                frame.loc[episode_mask, "decision_row_id"] == ideal["decision_row_id"]
         )
     return frame
 
@@ -283,7 +245,7 @@ def _apply_target_reason(resolved: pd.DataFrame) -> pd.DataFrame:
             frame.at[idx, "target_reason"] = TargetReason.GOOD.value
             continue
         if good_by_episode.get(row["episode_id"], 0) > 0 and pd.notna(
-            row["ideal_entry_bar_open_time"]
+                row["ideal_entry_bar_open_time"]
         ):
             if row["entry_bar_open_time"] < row["ideal_entry_bar_open_time"]:
                 frame.at[idx, "target_reason"] = TargetReason.TOO_EARLY.value

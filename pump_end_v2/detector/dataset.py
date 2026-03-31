@@ -14,14 +14,11 @@ TARGET_META_COLUMNS: tuple[str, ...] = (
     "future_outcome_class",
     "signal_quality_h32",
     "target_good_short_now",
-    "target_contract_like_short_now",
     "target_reason",
     "future_prepullback_squeeze_pct",
-    "future_contract_prepullback_squeeze_pct",
     "future_pullback_pct",
     "future_net_edge_pct",
     "bars_to_pullback",
-    "bars_to_contract_pullback",
     "bars_to_peak_after_row",
     "bars_to_resolution",
     "entry_quality_score",
@@ -32,8 +29,7 @@ TARGET_META_COLUMNS: tuple[str, ...] = (
 
 
 def build_detector_dataset(
-    detector_feature_view_df: pd.DataFrame,
-    resolved_rows_df: pd.DataFrame,
+        detector_feature_view_df: pd.DataFrame, resolved_rows_df: pd.DataFrame
 ) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("DETECTOR", "DATASET_BUILD")
@@ -58,7 +54,7 @@ def build_detector_dataset(
             f"missing resolver rows for decision_row_id count={len(missing)} sample={preview}"
         )
     merged["trainable_row"] = merged["is_resolved"].astype(bool) & (
-        merged["target_reason"].astype(str) != "invalid_context"
+            merged["target_reason"].astype(str) != "invalid_context"
     )
     merged["detector_trainable_row"] = merged["trainable_row"].astype(int)
     ordered_columns = [
