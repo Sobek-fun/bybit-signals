@@ -104,7 +104,9 @@ def run_pump_end_v2_pipeline(
             f"test_end={pd.Timestamp(config.splits.test_end)} "
             f"symbols_total={len(universe_symbols)} "
             f"execution_contract=tp_pct:{float(config.execution.tp_pct):.6f},sl_pct:{float(config.execution.sl_pct):.6f},max_hold_bars:{int(config.execution.max_hold_bars)} "
-            f"detector_policy_baseline=arm:{float(config.detector_policy.arm_score_min):.6f},fire:{float(config.detector_policy.fire_score_floor):.6f},turn:{float(config.detector_policy.turn_down_delta):.6f} "
+            f"detector_policy_baseline=arm:{float(config.detector_policy.arm_score_min):.6f},fire:{float(config.detector_policy.fire_score_floor):.6f},turn:{float(config.detector_policy.turn_down_delta):.6f},"
+            f"max_too_early:{float(config.detector_policy.max_too_early_prob):.6f},"
+            f"max_too_late:{float(config.detector_policy.max_too_late_prob):.6f} "
             f"gate_threshold_baseline={float(config.gate_config.block_threshold):.6f}"
         ),
     )
@@ -208,13 +210,23 @@ def run_pump_end_v2_pipeline(
         if bool(detector_dataset["trainable_row"].astype(bool).any())
         else 0.0
     )
+    train_reason_group_distribution = (
+        detector_dataset.loc[
+            detector_dataset["trainable_row"].astype(bool), "target_reason_group"
+        ]
+        .value_counts(dropna=False)
+        .sort_index()
+        .to_dict()
+    )
     log_info(
         "PIPELINE",
         (
             f"DETECTOR_DATASET summary elapsed_sec_total={detector_dataset_elapsed:.3f} "
             f"rows_total={len(detector_dataset)} train_rows={int(split_counts.get('train', 0))} "
             f"val_rows={int(split_counts.get('val', 0))} test_rows={int(split_counts.get('test', 0))} "
-            f"positive_rate={positive_rate:.6f} feature_cols_total={len(build_detector_feature_manifest().get('feature_columns', []))}"
+            f"positive_rate={positive_rate:.6f} "
+            f"train_reason_group_distribution={train_reason_group_distribution} "
+            f"feature_cols_total={len(build_detector_feature_manifest().get('feature_columns', []))}"
         ),
     )
     stage_done("PIPELINE", "DETECTOR_DATASET", elapsed_sec=detector_dataset_elapsed)
@@ -888,6 +900,9 @@ def run_pump_end_v2_pipeline(
         "gate_status_val": gate_status_val,
         "gate_status_test": gate_status_test,
         "event_quality_report": event_quality_report,
+        "detector_train_reason_group_distribution": train_reason_group_distribution,
+        "detector_val_target_metrics": detector_val_target_metrics,
+        "detector_test_target_metrics": detector_test_target_metrics,
         "detector_val_policy_metrics": detector_val_policy_metrics,
         "detector_train_oof_policy_metrics": detector_train_oof_policy_metrics,
         "detector_test_policy_metrics": detector_test_policy_metrics,
@@ -961,6 +976,8 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
         "arm_score_min": float(policy.arm_score_min),
         "fire_score_floor": float(policy.fire_score_floor),
         "turn_down_delta": float(policy.turn_down_delta),
+        "max_too_early_prob": float(policy.max_too_early_prob),
+        "max_too_late_prob": float(policy.max_too_late_prob),
     }
 
 
