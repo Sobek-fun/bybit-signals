@@ -60,6 +60,8 @@ class DetectorPolicyConfig:
     arm_score_min: float
     fire_score_floor: float
     turn_down_delta: float
+    max_too_early_prob: float
+    max_too_late_prob: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +69,8 @@ class DetectorPolicySearchConfig:
     arm_candidates: tuple[float, ...]
     fire_candidates: tuple[float, ...]
     turn_candidates: tuple[float, ...]
+    max_too_early_candidates: tuple[float, ...]
+    max_too_late_candidates: tuple[float, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +558,8 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
     arm_score_min = float(section.get("arm_score_min"))
     fire_score_floor = float(section.get("fire_score_floor"))
     turn_down_delta = float(section.get("turn_down_delta"))
+    max_too_early_prob = float(section.get("max_too_early_prob", 1.0))
+    max_too_late_prob = float(section.get("max_too_late_prob", 1.0))
     if not (0.0 < arm_score_min <= 1.0):
         raise ValueError("detector.arm_score_min must satisfy 0 < x <= 1")
     if not (0.0 <= fire_score_floor <= arm_score_min):
@@ -562,10 +568,16 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
         )
     if not (0.0 < turn_down_delta <= 1.0):
         raise ValueError("detector.turn_down_delta must satisfy 0 < x <= 1")
+    if not (0.0 <= max_too_early_prob <= 1.0):
+        raise ValueError("detector.max_too_early_prob must satisfy 0 <= x <= 1")
+    if not (0.0 <= max_too_late_prob <= 1.0):
+        raise ValueError("detector.max_too_late_prob must satisfy 0 <= x <= 1")
     return DetectorPolicyConfig(
         arm_score_min=arm_score_min,
         fire_score_floor=fire_score_floor,
         turn_down_delta=turn_down_delta,
+        max_too_early_prob=max_too_early_prob,
+        max_too_late_prob=max_too_late_prob,
     )
 
 
@@ -609,10 +621,30 @@ def _build_detector_policy_search(
         detector_policy_section.get("turn_candidates", []),
         "search.detector_policy.turn_candidates",
     )
+    max_too_early_candidates = _parse_float_candidates(
+        detector_policy_section.get("max_too_early_candidates", []),
+        "search.detector_policy.max_too_early_candidates",
+    )
+    max_too_late_candidates = _parse_float_candidates(
+        detector_policy_section.get("max_too_late_candidates", []),
+        "search.detector_policy.max_too_late_candidates",
+    )
+    for value in max_too_early_candidates:
+        if not (0.0 <= float(value) <= 1.0):
+            raise ValueError(
+                "search.detector_policy.max_too_early_candidates must satisfy 0 <= x <= 1"
+            )
+    for value in max_too_late_candidates:
+        if not (0.0 <= float(value) <= 1.0):
+            raise ValueError(
+                "search.detector_policy.max_too_late_candidates must satisfy 0 <= x <= 1"
+            )
     return DetectorPolicySearchConfig(
         arm_candidates=arm_candidates,
         fire_candidates=fire_candidates,
         turn_candidates=turn_candidates,
+        max_too_early_candidates=max_too_early_candidates,
+        max_too_late_candidates=max_too_late_candidates,
     )
 
 
