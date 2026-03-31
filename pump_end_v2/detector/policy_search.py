@@ -2,7 +2,6 @@ from itertools import product
 import time
 
 import pandas as pd
-from catboost import CatBoostClassifier
 
 from pump_end_v2.config import (
     DetectorCVConfig,
@@ -14,10 +13,13 @@ from pump_end_v2.config import (
     SplitBounds,
 )
 from pump_end_v2.detector.model import (
+    SequenceDetector,
+    build_detector_feature_importance_table,
     build_detector_model,
     fit_detector_model,
     predict_detector_scores,
 )
+from pump_end_v2.detector.sequence_dataset import DetectorSequenceStore
 from pump_end_v2.detector.policy import (
     apply_episode_aware_detector_policy,
     build_detector_policy_metrics,
@@ -27,7 +29,7 @@ from pump_end_v2.detector.splits import (
     filter_fold_rows,
     generate_detector_walkforward_folds,
 )
-from pump_end_v2.features.manifest import DETECTOR_FEATURE_COLUMNS
+from pump_end_v2.features.manifest import DETECTOR_SEQUENCE_FEATURE_COLUMNS
 from pump_end_v2.logging import log_info
 
 POLICY_ROW_COLUMNS: tuple[str, ...] = (
@@ -97,7 +99,13 @@ POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "episode_age_bars",
     "distance_from_episode_high_pct",
     "target_good_short_now",
-    *DETECTOR_FEATURE_COLUMNS,
+)
+
+OOF_IMPORTANCE_COLUMNS: tuple[str, ...] = (
+    "fold_id",
+    "feature",
+    "importance_raw",
+    "importance_norm",
 )
 
 
@@ -107,7 +115,8 @@ def build_detector_val_policy_rows(
         resolver_config: ResolverConfig,
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
-) -> tuple[CatBoostClassifier, pd.DataFrame]:
+        sequence_store: DetectorSequenceStore,
+) -> tuple[SequenceDetector, pd.DataFrame]:
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy val scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
@@ -124,7 +133,11 @@ def build_detector_val_policy_rows(
         )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
-        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+        model,
+        train_fit,
+        DETECTOR_SEQUENCE_FEATURE_COLUMNS,
+        "target_good_short_now",
+        sequence_store=sequence_store,
     )
     val_rows = frame[frame["dataset_split"] == "val"].copy()
     if val_rows.empty:
@@ -167,6 +180,7 @@ def build_detector_val_policy_rows(
         rows_to_score=score_window,
         score_source="val_forward",
         fold_id=pd.NA,
+        sequence_store=sequence_store,
     )
     context_rows = int(scored["policy_context_only"].sum()) if len(scored) > 0 else 0
     active_rows = int((~scored["policy_context_only"]).sum()) if len(scored) > 0 else 0
@@ -186,7 +200,8 @@ def build_detector_test_policy_rows(
         resolver_config: ResolverConfig,
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
-) -> tuple[CatBoostClassifier, pd.DataFrame]:
+        sequence_store: DetectorSequenceStore,
+) -> tuple[SequenceDetector, pd.DataFrame]:
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy test scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
@@ -203,7 +218,11 @@ def build_detector_test_policy_rows(
         )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
-        model, train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+        model,
+        train_fit,
+        DETECTOR_SEQUENCE_FEATURE_COLUMNS,
+        "target_good_short_now",
+        sequence_store=sequence_store,
     )
     test_rows = frame[frame["dataset_split"] == "test"].copy()
     if test_rows.empty:
@@ -246,6 +265,7 @@ def build_detector_test_policy_rows(
         rows_to_score=score_window,
         score_source="test_forward",
         fold_id=pd.NA,
+        sequence_store=sequence_store,
     )
     context_rows = int(scored["policy_context_only"].sum()) if len(scored) > 0 else 0
     active_rows = int((~scored["policy_context_only"]).sum()) if len(scored) > 0 else 0
@@ -266,7 +286,8 @@ def build_detector_train_oof_policy_rows(
         event_opener_config: EventOpenerConfig,
         detector_cv_config: DetectorCVConfig,
         detector_model_config: DetectorModelConfig,
-) -> pd.DataFrame:
+        sequence_store: DetectorSequenceStore,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     started = time.perf_counter()
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy OOF scoring rows build start")
@@ -276,6 +297,7 @@ def build_detector_train_oof_policy_rows(
     )
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
     chunks: list[pd.DataFrame] = []
+    importance_chunks: list[pd.DataFrame] = []
     for idx, fold in enumerate(folds, start=1):
         fold_started = time.perf_counter()
         log_info(
@@ -300,7 +322,18 @@ def build_detector_train_oof_policy_rows(
         model = build_detector_model(detector_model_config)
         fit_started = time.perf_counter()
         fit_detector_model(
-            model, fold_train_fit, DETECTOR_FEATURE_COLUMNS, "target_good_short_now"
+            model,
+            fold_train_fit,
+            DETECTOR_SEQUENCE_FEATURE_COLUMNS,
+            "target_good_short_now",
+            sequence_store=sequence_store,
+        )
+        fold_importance = build_detector_feature_importance_table(
+            model, DETECTOR_SEQUENCE_FEATURE_COLUMNS
+        ).copy()
+        fold_importance["fold_id"] = fold.fold_id
+        importance_chunks.append(
+            fold_importance.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
         )
         log_info(
             "POLICY",
@@ -354,6 +387,7 @@ def build_detector_train_oof_policy_rows(
             rows_to_score=fold_score_rows,
             score_source="train_oof",
             fold_id=fold.fold_id,
+            sequence_store=sequence_store,
         )
         context_rows = (
             int(scored_fold["policy_context_only"].sum()) if len(scored_fold) > 0 else 0
@@ -399,6 +433,11 @@ def build_detector_train_oof_policy_rows(
         ).reset_index(drop=True)
     else:
         out = pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
+    if importance_chunks:
+        oof_importance_df = pd.concat(importance_chunks, ignore_index=True)
+        oof_importance_df = oof_importance_df.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
+    else:
+        oof_importance_df = pd.DataFrame(columns=list(OOF_IMPORTANCE_COLUMNS))
     log_info(
         "POLICY",
         (
@@ -407,7 +446,7 @@ def build_detector_train_oof_policy_rows(
             f"rows_per_sec={(len(out) / max(time.perf_counter() - started, 1e-9)):.3f}"
         ),
     )
-    return out.loc[:, list(POLICY_ROW_COLUMNS)].copy()
+    return out.loc[:, list(POLICY_ROW_COLUMNS)].copy(), oof_importance_df
 
 
 def build_detector_policy_grid(
@@ -659,13 +698,15 @@ def build_detector_val_candidate_signal_ledger(
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
         detector_policy_config: DetectorPolicyConfig,
-) -> tuple[CatBoostClassifier, pd.DataFrame, pd.DataFrame, dict[str, float]]:
+        sequence_store: DetectorSequenceStore,
+) -> tuple[SequenceDetector, pd.DataFrame, pd.DataFrame, dict[str, float]]:
     model, scored_rows_df = build_detector_val_policy_rows(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
         event_opener_config=event_opener_config,
         detector_model_config=detector_model_config,
+        sequence_store=sequence_store,
     )
     candidate_signals_df, episode_policy_summary_df = (
         apply_episode_aware_detector_policy(
@@ -689,13 +730,15 @@ def build_detector_test_candidate_signal_ledger(
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
         detector_policy_config: DetectorPolicyConfig,
-) -> tuple[CatBoostClassifier, pd.DataFrame, pd.DataFrame, dict[str, float]]:
+        sequence_store: DetectorSequenceStore,
+) -> tuple[SequenceDetector, pd.DataFrame, pd.DataFrame, dict[str, float]]:
     model, scored_rows_df = build_detector_test_policy_rows(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
         event_opener_config=event_opener_config,
         detector_model_config=detector_model_config,
+        sequence_store=sequence_store,
     )
     candidate_signals_df, episode_policy_summary_df = (
         apply_episode_aware_detector_policy(
@@ -727,14 +770,16 @@ def build_detector_train_oof_candidate_signal_ledger(
         detector_cv_config: DetectorCVConfig,
         detector_model_config: DetectorModelConfig,
         detector_policy_config: DetectorPolicyConfig,
+        sequence_store: DetectorSequenceStore,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
-    scored_rows_df = build_detector_train_oof_policy_rows(
+    scored_rows_df, _ = build_detector_train_oof_policy_rows(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
         event_opener_config=event_opener_config,
         detector_cv_config=detector_cv_config,
         detector_model_config=detector_model_config,
+        sequence_store=sequence_store,
     )
     candidate_signals_df, episode_policy_summary_df = (
         apply_episode_aware_detector_policy(
@@ -770,15 +815,19 @@ def _prepare_dataset_frame(dataset_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _score_policy_window(
-        model: CatBoostClassifier,
+        model: SequenceDetector,
         rows_to_score: pd.DataFrame,
         score_source: str,
         fold_id: object,
+        sequence_store: DetectorSequenceStore,
 ) -> pd.DataFrame:
     if rows_to_score.empty:
         return pd.DataFrame(columns=list(POLICY_ROW_COLUMNS))
     score_frame = predict_detector_scores(
-        model, rows_to_score, DETECTOR_FEATURE_COLUMNS
+        model,
+        rows_to_score,
+        DETECTOR_SEQUENCE_FEATURE_COLUMNS,
+        sequence_store=sequence_store,
     )
     merged = score_frame.merge(
         rows_to_score[_available_rows_to_score_columns(rows_to_score)],

@@ -3,6 +3,7 @@ from pump_end_v2.features.detector_view import build_detector_feature_view
 from pump_end_v2.features.episode_state import build_episode_state_layer
 from pump_end_v2.features.manifest import (
     DETECTOR_FEATURE_COLUMNS,
+    DETECTOR_SEQUENCE_FEATURE_COLUMNS,
     build_detector_feature_manifest,
     build_gate_feature_manifest,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "build_episode_state_layer",
     "build_detector_feature_view",
     "DETECTOR_FEATURE_COLUMNS",
+    "DETECTOR_SEQUENCE_FEATURE_COLUMNS",
     "build_detector_feature_manifest",
     "build_gate_feature_manifest",
 ]

@@ -67,6 +67,25 @@ DETECTOR_FEATURE_COLUMNS: tuple[str, ...] = (
     "breadth_volume_spike_share",
 )
 
+DETECTOR_SEQUENCE_FEATURE_COLUMNS: tuple[str, ...] = (
+    "eth_close_ret_12",
+    "liquidity_score_12",
+    "btc_close_ret_12",
+    "macd_hist",
+    "btc_intrabar_range_pct",
+    "rolling_volatility_12",
+    "eth_close_ret_4",
+    "macd_line",
+    "btc_close_ret_4",
+    "dollar_volume",
+    "mfi_like_14",
+    "episode_extension_from_open_pct",
+    "close_ret_4",
+    "eth_intrabar_range_pct",
+    "rsi_like_14",
+    "rolling_volatility_4",
+)
+
 BLOCKED_COLUMNS: tuple[str, ...] = (
     "episode_close_time",
     "duration_bars",

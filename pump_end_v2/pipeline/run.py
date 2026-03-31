@@ -19,6 +19,8 @@ from pump_end_v2.detector import (
     apply_episode_aware_detector_policy,
     assign_detector_dataset_splits,
     build_detector_dataset,
+    build_detector_feature_importance_table,
+    build_detector_sequence_store,
     build_detector_policy_metrics,
     build_detector_target_metrics,
     build_detector_test_policy_rows,
@@ -26,6 +28,7 @@ from pump_end_v2.detector import (
     build_detector_val_policy_rows,
     compute_eval_window_days_from_policy_rows,
     select_detector_policy,
+    summarize_detector_oof_importance,
 )
 from pump_end_v2.execution import (
     build_execution_market_view,
@@ -45,6 +48,7 @@ from pump_end_v2.features import (
     build_reference_state_layer,
     build_token_state_layer,
 )
+from pump_end_v2.features.manifest import DETECTOR_SEQUENCE_FEATURE_COLUMNS
 from pump_end_v2.gate import (
     apply_gate_block_threshold,
     build_candidate_signal_strength_report,
@@ -195,6 +199,13 @@ def run_pump_end_v2_pipeline(
     )
     detector_dataset = build_detector_dataset(detector_feature_view, resolved_rows)
     detector_dataset = assign_detector_dataset_splits(detector_dataset, config.splits)
+    detector_sequence_store = build_detector_sequence_store(
+        detector_dataset_df=detector_dataset,
+        token_state_tradable_df=token_state_tradable,
+        reference_state_df=reference_state,
+        breadth_state_df=breadth_state,
+        episode_state_df=episode_state,
+    )
     detector_dataset_elapsed = time.perf_counter() - detector_dataset_started
     split_counts = detector_dataset["dataset_split"].value_counts(dropna=False).to_dict()
     positive_rate = (
@@ -214,20 +225,24 @@ def run_pump_end_v2_pipeline(
             f"DETECTOR_DATASET summary elapsed_sec_total={detector_dataset_elapsed:.3f} "
             f"rows_total={len(detector_dataset)} train_rows={int(split_counts.get('train', 0))} "
             f"val_rows={int(split_counts.get('val', 0))} test_rows={int(split_counts.get('test', 0))} "
-            f"positive_rate={positive_rate:.6f} feature_cols_total={len(build_detector_feature_manifest().get('feature_columns', []))}"
+            f"positive_rate={positive_rate:.6f} feature_cols_total={len(build_detector_feature_manifest().get('feature_columns', []))} "
+            f"sequence_lookback_bars={detector_sequence_store.lookback_bars} "
+            f"sequence_feature_count={len(detector_sequence_store.feature_columns)} "
+            f"sequence_shape={[int(v) for v in detector_sequence_store.x.shape]}"
         ),
     )
     stage_done("PIPELINE", "DETECTOR_DATASET", elapsed_sec=detector_dataset_elapsed)
 
     detector_oof_started = time.perf_counter()
     stage_start("PIPELINE", "DETECTOR_TRAIN_OOF")
-    train_oof_policy_rows = build_detector_train_oof_policy_rows(
+    train_oof_policy_rows, detector_oof_importance_folds_df = build_detector_train_oof_policy_rows(
         dataset_df=detector_dataset,
         split_bounds=config.splits,
         resolver_config=config.resolver,
         event_opener_config=config.event_opener,
         detector_cv_config=config.detector_cv,
         detector_model_config=config.detector_model,
+        sequence_store=detector_sequence_store,
     )
     detector_oof_elapsed = time.perf_counter() - detector_oof_started
     stage_done("PIPELINE", "DETECTOR_TRAIN_OOF", elapsed_sec=detector_oof_elapsed)
@@ -240,6 +255,7 @@ def run_pump_end_v2_pipeline(
         resolver_config=config.resolver,
         event_opener_config=config.event_opener,
         detector_model_config=config.detector_model,
+        sequence_store=detector_sequence_store,
     )
     selected_detector_policy, detector_policy_sweep_df = select_detector_policy(
         val_policy_rows,
@@ -282,6 +298,7 @@ def run_pump_end_v2_pipeline(
         resolver_config=config.resolver,
         event_opener_config=config.event_opener,
         detector_model_config=config.detector_model,
+        sequence_store=detector_sequence_store,
     )
     test_candidate_signals_df, test_episode_policy_summary_df = (
         apply_episode_aware_detector_policy(test_policy_rows, selected_detector_policy)
@@ -293,6 +310,24 @@ def run_pump_end_v2_pipeline(
         window_end=config.splits.test_end,
     )
     detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
+    detector_train_fit_importance_df = build_detector_feature_importance_table(
+        detector_model_test, DETECTOR_SEQUENCE_FEATURE_COLUMNS
+    )
+    detector_oof_importance_summary_df = summarize_detector_oof_importance(
+        detector_oof_importance_folds_df, top_k=20
+    )
+    sequence_train_stats = (
+        detector_model_test.train_stats
+        if hasattr(detector_model_test, "train_stats")
+        else {}
+    )
+    sequence_spec = {
+        "lookback_bars": int(detector_sequence_store.lookback_bars),
+        "feature_columns": list(detector_sequence_store.feature_columns),
+        "feature_count": int(len(detector_sequence_store.feature_columns)),
+        "history_valid_flag_enabled": True,
+        "in_episode_flag_enabled": True,
+    }
     detector_test_elapsed = time.perf_counter() - detector_test_started
     test_window_days = float(
         (pd.Timestamp(config.splits.test_end) - pd.Timestamp(config.splits.val_end))
@@ -738,6 +773,22 @@ def run_pump_end_v2_pipeline(
         build_detector_feature_manifest(), detector_dir / "feature_manifest.json"
     )
     _save_df_and_log(detector_policy_sweep_df, detector_dir / "policy_sweep_val.csv")
+    _save_df_and_log(
+        detector_train_fit_importance_df,
+        detector_dir / "feature_importance_train_fit.csv",
+    )
+    _save_df_and_log(
+        detector_oof_importance_folds_df,
+        detector_dir / "feature_importance_oof_folds.csv",
+    )
+    _save_df_and_log(
+        detector_oof_importance_summary_df,
+        detector_dir / "feature_importance_oof_summary.csv",
+    )
+    _save_json_and_log(sequence_spec, detector_dir / "sequence_spec.json")
+    _save_json_and_log(
+        sequence_train_stats, detector_dir / "sequence_train_stats.json"
+    )
     _save_json_and_log(
         _policy_to_dict(selected_detector_policy), detector_dir / "selected_policy.json"
     )
@@ -891,6 +942,23 @@ def run_pump_end_v2_pipeline(
         "detector_val_policy_metrics": detector_val_policy_metrics,
         "detector_train_oof_policy_metrics": detector_train_oof_policy_metrics,
         "detector_test_policy_metrics": detector_test_policy_metrics,
+        "detector_feature_importance": {
+            "train_fit_features_total": int(len(detector_train_fit_importance_df)),
+            "oof_folds_total": int(
+                detector_oof_importance_folds_df["fold_id"].nunique()
+            )
+            if not detector_oof_importance_folds_df.empty
+            else 0,
+            "oof_summary_features_total": int(len(detector_oof_importance_summary_df)),
+        },
+        "sequence_lookback_bars": int(detector_sequence_store.lookback_bars),
+        "sequence_feature_count": int(len(detector_sequence_store.feature_columns)),
+        "sequence_train_rows": int(
+            (
+                detector_sequence_store.meta_df["dataset_split"].astype(str) == "train"
+            ).sum()
+        ),
+        "sequence_shape": [int(v) for v in detector_sequence_store.x.shape],
         "val_candidate_signal_strength": val_candidate_signal_strength,
         "test_candidate_signal_strength": test_candidate_signal_strength,
         "val_gate_rank_quality": val_gate_rank_quality,
