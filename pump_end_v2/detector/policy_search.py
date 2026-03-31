@@ -20,6 +20,8 @@ from pump_end_v2.detector.model import (
 )
 from pump_end_v2.detector.policy import (
     apply_episode_aware_detector_policy,
+    apply_episode_aware_detector_policy_cached,
+    build_detector_policy_runtime_cache,
     build_detector_policy_metrics,
     compute_eval_window_days_from_policy_rows,
 )
@@ -568,6 +570,7 @@ def sweep_detector_policy(
 ) -> pd.DataFrame:
     started = time.perf_counter()
     candidates = build_detector_policy_grid(base_policy_config, search_config)
+    runtime_cache = build_detector_policy_runtime_cache(scored_rows_df)
     log_info(
         "POLICY",
         (
@@ -580,8 +583,10 @@ def sweep_detector_policy(
     best_selection_score = float("-inf")
     for idx, candidate in enumerate(candidates, start=1):
         candidate_signals_df, episode_policy_summary_df = (
-            apply_episode_aware_detector_policy(
-                scored_rows_df, candidate, emit_summary_log=False
+            apply_episode_aware_detector_policy_cached(
+                runtime_cache=runtime_cache,
+                detector_policy_config=candidate,
+                emit_summary_log=False,
             )
         )
         metrics = build_detector_policy_metrics(
