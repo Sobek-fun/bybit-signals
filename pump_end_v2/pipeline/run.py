@@ -164,7 +164,9 @@ def run_pump_end_v2_pipeline(
     decision_rows = build_decision_rows(
         token_state_tradable, episodes, config.execution
     )
-    resolved_rows = resolve_decision_rows(bars_15m, decision_rows, config.resolver)
+    resolved_rows = resolve_decision_rows(
+        bars_15m, decision_rows, config.resolver, config.execution
+    )
     episode_summary = build_episode_summary(resolved_rows)
     event_quality_report = build_event_quality_report(episode_summary)
     event_elapsed = time.perf_counter() - event_started
@@ -197,15 +199,17 @@ def run_pump_end_v2_pipeline(
     detector_dataset = assign_detector_dataset_splits(detector_dataset, config.splits)
     detector_dataset_elapsed = time.perf_counter() - detector_dataset_started
     split_counts = detector_dataset["dataset_split"].value_counts(dropna=False).to_dict()
+    detector_active_target_column = "target_contract_like_short_now"
+    train_active_target_mask = detector_dataset["trainable_row"].astype(bool) & (
+        detector_dataset["dataset_split"].astype(str) == "train"
+    )
     positive_rate = (
         float(
-            detector_dataset.loc[
-                detector_dataset["trainable_row"].astype(bool), "target_good_short_now"
-            ]
+            detector_dataset.loc[train_active_target_mask, detector_active_target_column]
             .astype(float)
             .mean()
         )
-        if bool(detector_dataset["trainable_row"].astype(bool).any())
+        if bool(train_active_target_mask.any())
         else 0.0
     )
     log_info(
@@ -245,6 +249,7 @@ def run_pump_end_v2_pipeline(
         val_policy_rows,
         config.detector_policy,
         search_config=config.search_detector_policy,
+        execution_contract=config.execution,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
@@ -270,7 +275,11 @@ def run_pump_end_v2_pipeline(
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
     )
-    detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
+    detector_val_target_metrics = build_detector_target_metrics(
+        val_policy_rows,
+        target_column=detector_active_target_column,
+        reason_column=None,
+    )
     detector_val_elapsed = time.perf_counter() - detector_val_started
     stage_done("PIPELINE", "DETECTOR_VAL_POLICY", elapsed_sec=detector_val_elapsed)
 
@@ -292,7 +301,11 @@ def run_pump_end_v2_pipeline(
         window_start=config.splits.val_end,
         window_end=config.splits.test_end,
     )
-    detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
+    detector_test_target_metrics = build_detector_target_metrics(
+        test_policy_rows,
+        target_column=detector_active_target_column,
+        reason_column=None,
+    )
     detector_test_elapsed = time.perf_counter() - detector_test_started
     test_window_days = float(
         (pd.Timestamp(config.splits.test_end) - pd.Timestamp(config.splits.val_end))
@@ -872,6 +885,8 @@ def run_pump_end_v2_pipeline(
         "run_id": run_context.run_id,
         "run_dir": str(run_context.run_dir),
         "config_path": str(Path(config_path).resolve()),
+        "detector_target_mode": "contract_like_tp_sl",
+        "detector_train_positive_rate_active_target": float(positive_rate),
         "selected_detector_policy": _policy_to_dict(selected_detector_policy),
         "selected_gate_model": _gate_model_to_dict(selected_gate_model_config),
         "selected_gate_mode": selected_gate_mode,

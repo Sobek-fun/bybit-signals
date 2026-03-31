@@ -5,7 +5,12 @@ import time
 import pandas as pd
 
 from pump_end_v2.config import ResolverConfig
-from pump_end_v2.contracts import OutcomeClass, SignalQualityClass, TargetReason
+from pump_end_v2.contracts import (
+    ExecutionContract,
+    OutcomeClass,
+    SignalQualityClass,
+    TargetReason,
+)
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 try:
@@ -29,7 +34,10 @@ def _is_tty_progress() -> bool:
 
 
 def resolve_decision_rows(
-    df: pd.DataFrame, decision_rows: pd.DataFrame, config: ResolverConfig
+    df: pd.DataFrame,
+    decision_rows: pd.DataFrame,
+    config: ResolverConfig,
+    execution_contract: ExecutionContract,
 ) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("RESOLVER", "RESOLVE_ROWS")
@@ -47,14 +55,17 @@ def resolve_decision_rows(
     resolved["is_resolved"] = False
     resolved["entry_price"] = math.nan
     resolved["future_prepullback_squeeze_pct"] = math.nan
+    resolved["future_contract_prepullback_squeeze_pct"] = math.nan
     resolved["future_pullback_pct"] = math.nan
     resolved["future_net_edge_pct"] = math.nan
     resolved["bars_to_pullback"] = pd.NA
+    resolved["bars_to_contract_pullback"] = pd.NA
     resolved["bars_to_peak_after_row"] = pd.NA
     resolved["bars_to_resolution"] = pd.NA
     resolved["future_outcome_class"] = pd.NA
     resolved["signal_quality_h32"] = pd.NA
     resolved["target_good_short_now"] = 0
+    resolved["target_contract_like_short_now"] = 0
     resolved["target_reason"] = TargetReason.INVALID_CONTEXT.value
     resolved["entry_quality_score"] = math.nan
     resolved["ideal_entry_row_id"] = pd.NA
@@ -106,11 +117,25 @@ def resolve_decision_rows(
             if success_mask.any()
             else None
         )
+        contract_success_mask = horizon_df["low"] <= entry_price * (
+            1.0 - float(execution_contract.tp_pct)
+        )
+        first_contract_pullback_index = (
+            int(contract_success_mask[contract_success_mask].index[0] - horizon_df.index[0])
+            if contract_success_mask.any()
+            else None
+        )
         if first_success_pullback_index is None:
             future_prepullback_squeeze_pct = max_squeeze_pct_total
         else:
             future_prepullback_squeeze_pct = float(
                 squeeze_series.iloc[: first_success_pullback_index + 1].max()
+            )
+        if first_contract_pullback_index is None:
+            future_contract_prepullback_squeeze_pct = max_squeeze_pct_total
+        else:
+            future_contract_prepullback_squeeze_pct = float(
+                squeeze_series.iloc[: first_contract_pullback_index + 1].max()
             )
         peak_high = float(horizon_df["high"].max())
         first_peak_index = int(
@@ -161,15 +186,28 @@ def resolve_decision_rows(
         resolved.at[idx, "future_prepullback_squeeze_pct"] = (
             future_prepullback_squeeze_pct
         )
+        resolved.at[idx, "future_contract_prepullback_squeeze_pct"] = (
+            future_contract_prepullback_squeeze_pct
+        )
         resolved.at[idx, "future_pullback_pct"] = future_pullback_pct
         resolved.at[idx, "future_net_edge_pct"] = future_net_edge_pct
         resolved.at[idx, "bars_to_pullback"] = first_success_pullback_index
+        resolved.at[idx, "bars_to_contract_pullback"] = first_contract_pullback_index
         resolved.at[idx, "bars_to_peak_after_row"] = first_peak_index
         resolved.at[idx, "bars_to_resolution"] = bars_to_resolution
         resolved.at[idx, "future_outcome_class"] = outcome
         resolved.at[idx, "signal_quality_h32"] = signal_quality
         resolved.at[idx, "target_good_short_now"] = (
             1 if outcome == OutcomeClass.REVERSAL.value else 0
+        )
+        resolved.at[idx, "target_contract_like_short_now"] = (
+            1
+            if (
+                first_contract_pullback_index is not None
+                and future_contract_prepullback_squeeze_pct
+                <= float(execution_contract.sl_pct)
+            )
+            else 0
         )
         resolved.at[idx, "entry_quality_score"] = future_net_edge_pct - 0.001 * min(
             bars_to_resolution, config.horizon_bars
