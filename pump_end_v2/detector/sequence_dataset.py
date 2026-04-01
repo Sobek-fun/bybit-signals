@@ -157,6 +157,18 @@ def build_detector_sequence_store(
                 ):
                     value = float(episode_values[episode_pos[feature]])
                 x[row_idx, step, pos] = value
+    invalid_mask = ~np.isfinite(x)
+    if invalid_mask.any():
+        invalid_positions = np.argwhere(invalid_mask)
+        invalid_count = int(invalid_positions.shape[0])
+        sample_positions = [
+            (int(pos[0]), int(pos[1]), int(pos[2]))
+            for pos in invalid_positions[:10]
+        ]
+        raise ValueError(
+            "sequence store contains non-finite values: "
+            f"count={invalid_count} sample_positions={sample_positions}"
+        )
     row_index = {
         str(row.decision_row_id): idx
         for idx, row in enumerate(meta_df.loc[:, ["decision_row_id"]].itertuples(index=False))
@@ -220,7 +232,13 @@ def _build_token_lookup(
     for row in frame.itertuples(index=False):
         symbol = str(row.symbol)
         ts = pd.Timestamp(row.open_time).value
-        values = np.asarray(row[2:], dtype=np.float32)
+        numeric_values = pd.to_numeric(
+            pd.Series(row[2:]), errors="coerce"
+        ).fillna(0.0)
+        values = numeric_values.to_numpy(dtype=np.float32, copy=False)
+        values = np.where(np.isfinite(values), values, 0.0).astype(
+            np.float32, copy=False
+        )
         out[(symbol, ts)] = values
     return out
 
@@ -235,7 +253,14 @@ def _build_time_lookup(
     out: dict[int, np.ndarray] = {}
     for row in frame.itertuples(index=False):
         ts = pd.Timestamp(row[0]).value
-        out[ts] = np.asarray(row[1:], dtype=np.float32)
+        numeric_values = pd.to_numeric(
+            pd.Series(row[1:]), errors="coerce"
+        ).fillna(0.0)
+        values = numeric_values.to_numpy(dtype=np.float32, copy=False)
+        values = np.where(np.isfinite(values), values, 0.0).astype(
+            np.float32, copy=False
+        )
+        out[ts] = values
     return out
 
 
@@ -251,7 +276,14 @@ def _build_episode_lookup(
     out: dict[tuple[str, int], np.ndarray] = {}
     for row in frame.itertuples(index=False):
         key = (str(row.episode_id), pd.Timestamp(row.context_bar_open_time).value)
-        out[key] = np.asarray(row[2:], dtype=np.float32)
+        numeric_values = pd.to_numeric(
+            pd.Series(row[2:]), errors="coerce"
+        ).fillna(0.0)
+        values = numeric_values.to_numpy(dtype=np.float32, copy=False)
+        values = np.where(np.isfinite(values), values, 0.0).astype(
+            np.float32, copy=False
+        )
+        out[key] = values
     return out
 
 

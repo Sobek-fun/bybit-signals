@@ -30,6 +30,11 @@ class SequenceDetector:
     feature_columns: tuple[str, ...]
     lookback_bars: int
     random_seed: int
+    batch_size: int
+    max_epochs: int
+    early_stopping_patience: int
+    sequence_learning_rate: float
+    weight_decay: float
     scaler_mean: np.ndarray | None = None
     scaler_std: np.ndarray | None = None
     sequence_store: DetectorSequenceStore | None = None
@@ -53,14 +58,30 @@ class SequenceDetector:
 
 
 def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+    import torch
+
     feature_columns = tuple(DETECTOR_SEQUENCE_FEATURE_COLUMNS)
     input_feature_count = len(feature_columns) + 2
-    network = SequenceTCNBinaryClassifier(input_feature_count=input_feature_count)
+    torch.manual_seed(int(model_config.random_seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(model_config.random_seed))
+    network = SequenceTCNBinaryClassifier(
+        input_feature_count=input_feature_count,
+        hidden_channels=int(model_config.hidden_channels),
+        kernel_size=int(model_config.kernel_size),
+        dilations=tuple(int(v) for v in model_config.dilations),
+        dropout=float(model_config.dropout),
+    )
     return SequenceDetector(
         network=network,
         feature_columns=feature_columns,
         lookback_bars=SEQUENCE_LOOKBACK_BARS,
         random_seed=int(model_config.random_seed),
+        batch_size=int(model_config.batch_size),
+        max_epochs=int(model_config.max_epochs),
+        early_stopping_patience=int(model_config.early_stopping_patience),
+        sequence_learning_rate=float(model_config.sequence_learning_rate),
+        weight_decay=float(model_config.weight_decay),
     )
 
 
@@ -107,6 +128,11 @@ def fit_detector_model(
         x_eval=x_eval_input,
         y_eval=y_eval,
         random_seed=int(model.random_seed),
+        batch_size=int(model.batch_size),
+        max_epochs=int(model.max_epochs),
+        early_stopping_patience=int(model.early_stopping_patience),
+        learning_rate=float(model.sequence_learning_rate),
+        weight_decay=float(model.weight_decay),
     )
     model.scaler_mean = scaler_mean
     model.scaler_std = scaler_std
@@ -144,11 +170,7 @@ def build_detector_feature_importance_table(
     if not features:
         return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
     if not hasattr(model, "get_feature_importance"):
-        base = np.zeros(len(features), dtype=np.float32)
-        norm = np.ones(len(features), dtype=np.float32) / float(len(features))
-        return pd.DataFrame(
-            {"feature": features, "importance_raw": base, "importance_norm": norm}
-        )
+        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
     raw_values = model.get_feature_importance(type="FeatureImportance")
     if len(raw_values) != len(features):
         raise ValueError(
@@ -247,7 +269,8 @@ def _fit_scaler(x: np.ndarray, valid_mask: np.ndarray) -> tuple[np.ndarray, np.n
     std = np.ones(feature_count, dtype=np.float32)
     for feature_idx in range(feature_count):
         values = x[:, :, feature_idx]
-        valid_values = values[valid_mask]
+        finite_mask = valid_mask & np.isfinite(values)
+        valid_values = values[finite_mask]
         if valid_values.size == 0:
             continue
         m = float(np.mean(valid_values))
@@ -261,6 +284,9 @@ def _transform_with_scaler(
     x: np.ndarray, valid_mask: np.ndarray, mean: np.ndarray, std: np.ndarray
 ) -> np.ndarray:
     transformed = (x - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
+    transformed = np.nan_to_num(
+        transformed, nan=0.0, posinf=0.0, neginf=0.0
+    )
     transformed = transformed.astype(np.float32, copy=False)
     transformed[~valid_mask] = 0.0
     return transformed

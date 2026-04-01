@@ -140,6 +140,14 @@ def train_sequence_model(
     learning_rate: float = SEQUENCE_LEARNING_RATE,
     weight_decay: float = SEQUENCE_WEIGHT_DECAY,
 ) -> SequenceTrainStats:
+    if not np.isfinite(x_train).all():
+        raise ValueError("train_sequence_model received non-finite x_train")
+    if not np.isfinite(y_train).all():
+        raise ValueError("train_sequence_model received non-finite y_train")
+    if x_eval is not None and not np.isfinite(x_eval).all():
+        raise ValueError("train_sequence_model received non-finite x_eval")
+    if y_eval is not None and not np.isfinite(y_eval).all():
+        raise ValueError("train_sequence_model received non-finite y_eval")
     torch.manual_seed(int(random_seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -180,6 +188,8 @@ def train_sequence_model(
             optimizer.zero_grad(set_to_none=True)
             logits = model(batch_x)
             loss = criterion(logits, batch_y)
+            if not torch.isfinite(loss):
+                raise ValueError(f"non-finite train loss detected: loss={float(loss.item())}")
             loss.backward()
             optimizer.step()
         model.eval()
@@ -190,6 +200,8 @@ def train_sequence_model(
             else:
                 train_logits = model(x_train_t.to(device))
                 eval_loss = float(criterion(train_logits, y_train_t.to(device)).item())
+        if not np.isfinite(eval_loss):
+            raise ValueError(f"non-finite eval loss detected: eval_loss={eval_loss}")
         if eval_loss < best_loss:
             best_loss = eval_loss
             best_epoch = epoch
@@ -199,8 +211,9 @@ def train_sequence_model(
             patience_left -= 1
             if patience_left <= 0:
                 break
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    if best_state is None:
+        raise ValueError("sequence model training failed: best_state is None")
+    model.load_state_dict(best_state)
     train_positive_rate = float(np.mean(y_train > 0.5)) if len(y_train) > 0 else 0.0
     return SequenceTrainStats(
         train_positive_rate=train_positive_rate,
