@@ -104,6 +104,15 @@ def apply_episode_aware_detector_policy(
     detector_policy_config: DetectorPolicyConfig,
     emit_summary_log: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    runtime_cache = build_detector_policy_runtime_cache(scored_rows_df)
+    return apply_episode_aware_detector_policy_cached(
+        runtime_cache=runtime_cache,
+        detector_policy_config=detector_policy_config,
+        emit_summary_log=emit_summary_log,
+    )
+
+
+def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[str, Any]:
     _require_columns(scored_rows_df, INPUT_REQUIRED_COLUMNS)
     has_fold_id = "fold_id" in scored_rows_df.columns
     frame = scored_rows_df.copy()
@@ -136,19 +145,41 @@ def apply_episode_aware_detector_policy(
     group_columns = ["score_source", "episode_id"]
     if has_fold_id:
         group_columns = ["score_source", "fold_id", "episode_id"]
+    prepared_groups: list[dict[str, Any]] = []
+    for _, group in frame.groupby(group_columns, sort=False, dropna=False):
+        prepared = group.reset_index(drop=True)
+        prepared_groups.append(
+            {
+                "rows_tuples": list(prepared.itertuples(index=False)),
+                "symbol": str(prepared["symbol"].iloc[0]),
+                "episode_id": str(prepared["episode_id"].iloc[0]),
+                "score_source": str(prepared["score_source"].iloc[0]),
+                "fold_id": prepared["fold_id"].iloc[0] if has_fold_id else pd.NA,
+                "active_rows_total": int((~prepared["policy_context_only"]).sum()),
+                "good_episode_flag": _compute_good_episode_flag(
+                    prepared.loc[~prepared["policy_context_only"]]
+                ),
+            }
+        )
+    return {"prepared_groups": prepared_groups}
+
+
+def apply_episode_aware_detector_policy_cached(
+    runtime_cache: dict[str, Any],
+    detector_policy_config: DetectorPolicyConfig,
+    emit_summary_log: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     candidate_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
-    for _, group in frame.groupby(group_columns, sort=False, dropna=False):
-        group = group.reset_index(drop=True)
-        symbol = str(group["symbol"].iloc[0])
-        episode_id = str(group["episode_id"].iloc[0])
-        score_source = str(group["score_source"].iloc[0])
-        fold_id = group["fold_id"].iloc[0] if has_fold_id else pd.NA
-        active_rows = group.loc[~group["policy_context_only"]]
-        active_rows_total = int(len(active_rows))
+    for prepared_group in runtime_cache["prepared_groups"]:
+        symbol = prepared_group["symbol"]
+        episode_id = prepared_group["episode_id"]
+        score_source = prepared_group["score_source"]
+        fold_id = prepared_group["fold_id"]
+        active_rows_total = prepared_group["active_rows_total"]
         if active_rows_total == 0:
             continue
-        good_episode_flag = _compute_good_episode_flag(active_rows)
+        good_episode_flag = prepared_group["good_episode_flag"]
         armed_flag = False
         had_arm = False
         fired = False
@@ -156,7 +187,7 @@ def apply_episode_aware_detector_policy(
         reset_count = 0
         peak_p_good: float | None = None
         fire_signal_row: dict[str, Any] | None = None
-        for row in group.itertuples(index=False):
+        for row in prepared_group["rows_tuples"]:
             if fired or expired:
                 continue
             current_p_good = float(row.p_good)
