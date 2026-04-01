@@ -53,6 +53,8 @@ class DetectorModelConfig:
     batch_size: int
     max_epochs: int
     early_stopping_patience: int
+    fit_eval_fraction: float
+    fit_eval_min_rows: int
     sequence_learning_rate: float
     weight_decay: float
 
@@ -570,6 +572,18 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
         early_stopping_patience=_require_positive_int(
             model_section.get("early_stopping_patience", 5),
             "detector.model.early_stopping_patience",
+        ),
+        fit_eval_fraction=_require_bounded_float(
+            model_section.get("fit_eval_fraction", 0.2),
+            "detector.model.fit_eval_fraction",
+            lower=0.0,
+            upper=0.5,
+            inclusive_lower=False,
+            inclusive_upper=False,
+        ),
+        fit_eval_min_rows=_require_positive_int(
+            model_section.get("fit_eval_min_rows", 128),
+            "detector.model.fit_eval_min_rows",
         ),
         sequence_learning_rate=_require_positive_float(
             model_section.get("sequence_learning_rate", 1e-3),

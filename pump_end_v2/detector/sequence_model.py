@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -114,6 +114,13 @@ class SequenceTrainStats:
     early_stopping_patience: int
     best_val_loss: float
     best_epoch: int
+    epochs_ran: int
+    monitor_name: str
+    train_rows_total: int
+    eval_rows_total: int
+    eval_positive_rate: float
+    stopped_early: bool
+    training_history: list[dict[str, float | int]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, float | int]:
         return {
@@ -124,6 +131,12 @@ class SequenceTrainStats:
             "early_stopping_patience": int(self.early_stopping_patience),
             "best_val_loss": float(self.best_val_loss),
             "best_epoch": int(self.best_epoch),
+            "epochs_ran": int(self.epochs_ran),
+            "monitor_name": str(self.monitor_name),
+            "train_rows_total": int(self.train_rows_total),
+            "eval_rows_total": int(self.eval_rows_total),
+            "eval_positive_rate": float(self.eval_positive_rate),
+            "stopped_early": bool(self.stopped_early),
         }
 
 
@@ -171,17 +184,24 @@ def train_sequence_model(
         weight_decay=float(weight_decay),
     )
     eval_data: tuple[Tensor, Tensor] | None = None
+    monitor_name = "train_loss_fallback"
     if x_eval is not None and y_eval is not None and len(x_eval) > 0:
         eval_data = (
             torch.tensor(x_eval, dtype=torch.float32, device=device),
             torch.tensor(y_eval, dtype=torch.float32, device=device),
         )
+        monitor_name = "eval_loss"
     best_loss = float("inf")
     best_epoch = 0
     best_state: dict[str, Tensor] | None = None
     patience_left = int(early_stopping_patience)
+    epochs_ran = 0
+    stopped_early = False
+    training_history: list[dict[str, float | int]] = []
     for epoch in range(1, int(max_epochs) + 1):
         model.train()
+        train_loss_sum = 0.0
+        train_count = 0
         for batch_x, batch_y in train_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
@@ -192,6 +212,10 @@ def train_sequence_model(
                 raise ValueError(f"non-finite train loss detected: loss={float(loss.item())}")
             loss.backward()
             optimizer.step()
+            batch_size_local = int(batch_y.shape[0])
+            train_loss_sum += float(loss.item()) * float(batch_size_local)
+            train_count += batch_size_local
+        train_loss = float(train_loss_sum / float(max(train_count, 1)))
         model.eval()
         with torch.no_grad():
             if eval_data is not None:
@@ -202,19 +226,45 @@ def train_sequence_model(
                 eval_loss = float(criterion(train_logits, y_train_t.to(device)).item())
         if not np.isfinite(eval_loss):
             raise ValueError(f"non-finite eval loss detected: eval_loss={eval_loss}")
+        is_best_epoch = False
         if eval_loss < best_loss:
             best_loss = eval_loss
             best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience_left = int(early_stopping_patience)
+            is_best_epoch = True
         else:
             patience_left -= 1
             if patience_left <= 0:
+                epochs_ran = int(epoch)
+                stopped_early = True
+                training_history.append(
+                    {
+                        "epoch": int(epoch),
+                        "train_loss": float(train_loss),
+                        "eval_loss": float(eval_loss),
+                        "is_best_epoch": int(is_best_epoch),
+                    }
+                )
                 break
+        epochs_ran = int(epoch)
+        training_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(train_loss),
+                "eval_loss": float(eval_loss),
+                "is_best_epoch": int(is_best_epoch),
+            }
+        )
     if best_state is None:
         raise ValueError("sequence model training failed: best_state is None")
     model.load_state_dict(best_state)
     train_positive_rate = float(np.mean(y_train > 0.5)) if len(y_train) > 0 else 0.0
+    eval_positive_rate = (
+        float(np.mean(y_eval > 0.5))
+        if y_eval is not None and len(y_eval) > 0
+        else 0.0
+    )
     return SequenceTrainStats(
         train_positive_rate=train_positive_rate,
         pos_weight=pos_weight_value,
@@ -223,6 +273,13 @@ def train_sequence_model(
         early_stopping_patience=int(early_stopping_patience),
         best_val_loss=float(best_loss if np.isfinite(best_loss) else 0.0),
         best_epoch=int(best_epoch),
+        epochs_ran=int(epochs_ran),
+        monitor_name=monitor_name,
+        train_rows_total=int(len(y_train)),
+        eval_rows_total=int(0 if y_eval is None else len(y_eval)),
+        eval_positive_rate=float(eval_positive_rate),
+        stopped_early=bool(stopped_early),
+        training_history=training_history,
     )
 
 

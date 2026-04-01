@@ -15,7 +15,7 @@ from pump_end_v2.config import (
 )
 from pump_end_v2.detector.model import (
     SequenceDetector,
-    build_detector_feature_importance_table,
+    build_sequence_permutation_importance_table,
     build_detector_model,
     fit_detector_model,
     predict_detector_scores,
@@ -29,7 +29,6 @@ from pump_end_v2.detector.policy import (
     compute_eval_window_days_from_policy_rows,
 )
 from pump_end_v2.detector.splits import (
-    filter_fold_rows,
     generate_detector_walkforward_folds,
 )
 from pump_end_v2.features.manifest import DETECTOR_SEQUENCE_FEATURE_COLUMNS
@@ -111,6 +110,15 @@ OOF_IMPORTANCE_COLUMNS: tuple[str, ...] = (
     "importance_norm",
 )
 
+OOF_SEQUENCE_HISTORY_COLUMNS: tuple[str, ...] = (
+    "fold_id",
+    "epoch",
+    "train_loss",
+    "eval_loss",
+    "is_best_epoch",
+    "monitor_name",
+)
+
 
 def build_detector_val_policy_rows(
         dataset_df: pd.DataFrame,
@@ -127,19 +135,33 @@ def build_detector_val_policy_rows(
     effective_train_end = pd.Timestamp(split_bounds.train_end) - purge_gap_timedelta
     train_fit = frame[
         (frame["dataset_split"] == "train")
-        & frame["trainable_row"].astype(bool)
         & (frame["context_bar_open_time"] <= effective_train_end)
         ].copy()
-    if train_fit.empty:
+    train_inner_fit, fit_eval_df, fit_split_meta = _split_fit_train_eval_chronological(
+        train_fit,
+        detector_model_config,
+        target_column="target_good_short_now",
+    )
+    if train_inner_fit.empty:
         raise ValueError(
             "no trainable train rows available for detector val policy scoring"
         )
+    log_info(
+        "POLICY",
+        (
+            "detector val fit split "
+            f"monitor_name={fit_split_meta['monitor_name']} "
+            f"train_rows={fit_split_meta['train_rows']} eval_rows={fit_split_meta['eval_rows']} "
+            f"fallback_reason={fit_split_meta['fallback_reason']}"
+        ),
+    )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
         model,
-        train_fit,
+        train_inner_fit,
         DETECTOR_SEQUENCE_FEATURE_COLUMNS,
         "target_good_short_now",
+        eval_df=fit_eval_df,
         sequence_store=sequence_store,
     )
     val_rows = frame[frame["dataset_split"] == "val"].copy()
@@ -209,22 +231,36 @@ def build_detector_test_policy_rows(
     log_info("POLICY", "policy test scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
     purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
-    effective_train_end = pd.Timestamp(split_bounds.train_end) - purge_gap_timedelta
+    effective_train_end = pd.Timestamp(split_bounds.val_end) - purge_gap_timedelta
     train_fit = frame[
-        (frame["dataset_split"] == "train")
-        & frame["trainable_row"].astype(bool)
+        frame["dataset_split"].isin(["train", "val"])
         & (frame["context_bar_open_time"] <= effective_train_end)
         ].copy()
-    if train_fit.empty:
+    train_inner_fit, fit_eval_df, fit_split_meta = _split_fit_train_eval_chronological(
+        train_fit,
+        detector_model_config,
+        target_column="target_good_short_now",
+    )
+    if train_inner_fit.empty:
         raise ValueError(
-            "no trainable train rows available for detector test policy scoring"
+            "no trainable train/val rows available for detector test policy scoring"
         )
+    log_info(
+        "POLICY",
+        (
+            "detector test fit split "
+            f"monitor_name={fit_split_meta['monitor_name']} "
+            f"train_rows={fit_split_meta['train_rows']} eval_rows={fit_split_meta['eval_rows']} "
+            f"fallback_reason={fit_split_meta['fallback_reason']}"
+        ),
+    )
     model = build_detector_model(detector_model_config)
     fit_detector_model(
         model,
-        train_fit,
+        train_inner_fit,
         DETECTOR_SEQUENCE_FEATURE_COLUMNS,
         "target_good_short_now",
+        eval_df=fit_eval_df,
         sequence_store=sequence_store,
     )
     test_rows = frame[frame["dataset_split"] == "test"].copy()
@@ -290,36 +326,48 @@ def build_detector_train_oof_policy_rows(
         detector_cv_config: DetectorCVConfig,
         detector_model_config: DetectorModelConfig,
         sequence_store: DetectorSequenceStore,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     started = time.perf_counter()
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy OOF scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
+    train_split = frame[frame["dataset_split"] == "train"].copy()
+    train_context_ns = train_split["context_bar_open_time"].to_numpy(dtype=np.int64, copy=False)
     folds = generate_detector_walkforward_folds(
         frame, split_bounds, resolver_config, detector_cv_config
     )
+    folds_total = len(folds)
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
     chunks: list[pd.DataFrame] = []
     importance_chunks: list[pd.DataFrame] = []
+    history_chunks: list[pd.DataFrame] = []
+    rows_accumulated = 0
     for idx, fold in enumerate(folds, start=1):
         fold_started = time.perf_counter()
         log_info(
             "POLICY",
             (
-                f"oof fold start fold={idx}/{len(folds)} fold_id={fold.fold_id} "
+                f"oof fold start fold={idx}/{folds_total} fold_id={fold.fold_id} "
                 f"train_rows={fold.train_row_count} val_rows={fold.val_row_count} "
                 f"train_start={pd.Timestamp(fold.train_start)} train_end={pd.Timestamp(fold.train_end)} "
                 f"val_start={pd.Timestamp(fold.val_start)} val_end={pd.Timestamp(fold.val_end)}"
             ),
         )
-        fold_train_raw, _ = filter_fold_rows(frame, fold)
-        fold_train_fit = fold_train_raw[
-            fold_train_raw["trainable_row"].astype(bool)
-        ].copy()
+        fold_train_start_ns = pd.Timestamp(fold.train_start).value
+        fold_train_end_ns = pd.Timestamp(fold.train_end).value
+        fold_train_mask = (train_context_ns >= fold_train_start_ns) & (
+            train_context_ns <= fold_train_end_ns
+        )
+        fold_train_raw = train_split.loc[fold_train_mask].copy()
+        fold_train_fit, fold_eval_fit, fit_split_meta = _split_fit_train_eval_chronological(
+            fold_train_raw,
+            detector_model_config,
+            target_column="target_good_short_now",
+        )
         if fold_train_fit.empty:
             log_info(
                 "POLICY",
-                f"oof fold skipped fold={idx}/{len(folds)} reason=no_trainable_rows",
+                f"oof fold skipped fold={idx}/{folds_total} reason=no_trainable_rows",
             )
             continue
         model = build_detector_model(detector_model_config)
@@ -329,34 +377,42 @@ def build_detector_train_oof_policy_rows(
             fold_train_fit,
             DETECTOR_SEQUENCE_FEATURE_COLUMNS,
             "target_good_short_now",
+            eval_df=fold_eval_fit,
             sequence_store=sequence_store,
         )
-        fold_importance = build_detector_feature_importance_table(
-            model, DETECTOR_SEQUENCE_FEATURE_COLUMNS
-        ).copy()
-        fold_importance["fold_id"] = fold.fold_id
-        importance_chunks.append(
-            fold_importance.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
-        )
+        if getattr(model, "training_history", None):
+            fold_history = pd.DataFrame(model.training_history)
+            if not fold_history.empty:
+                fold_history["fold_id"] = fold.fold_id
+                fold_history["monitor_name"] = str(
+                    model.train_stats.get("monitor_name", "train_loss_fallback")
+                )
+                history_chunks.append(
+                    fold_history.loc[:, list(OOF_SEQUENCE_HISTORY_COLUMNS)].copy()
+                )
         log_info(
             "POLICY",
             (
-                f"oof fold model_fit done fold={idx}/{len(folds)} "
-                f"rows_fit={len(fold_train_fit)} elapsed_sec_fit={time.perf_counter() - fit_started:.3f}"
+                f"oof fold model_fit done fold={idx}/{folds_total} "
+                f"rows_fit={len(fold_train_fit)} eval_rows={0 if fold_eval_fit is None else len(fold_eval_fit)} "
+                f"monitor_name={fit_split_meta['monitor_name']} "
+                f"fallback_reason={fit_split_meta['fallback_reason']} "
+                f"elapsed_sec_fit={time.perf_counter() - fit_started:.3f}"
             ),
         )
         val_start = pd.Timestamp(fold.val_start)
         val_end = pd.Timestamp(fold.val_end)
         warmup_start = val_start - warmup_timedelta
-        fold_active_rows = frame[
-            (frame["dataset_split"] == "train")
-            & (frame["context_bar_open_time"] >= val_start)
-            & (frame["context_bar_open_time"] <= val_end)
-            ].copy()
+        val_start_ns = val_start.value
+        val_end_ns = val_end.value
+        active_mask = (train_context_ns >= val_start_ns) & (
+            train_context_ns <= val_end_ns
+        )
+        fold_active_rows = train_split.loc[active_mask].copy()
         if fold_active_rows.empty:
             log_info(
                 "POLICY",
-                f"oof fold skipped fold={idx}/{len(folds)} reason=no_active_rows",
+                f"oof fold skipped fold={idx}/{folds_total} reason=no_active_rows",
             )
             continue
         fold_active_rows = fold_active_rows[
@@ -369,14 +425,24 @@ def build_detector_train_oof_policy_rows(
         if fold_active_rows.empty:
             log_info(
                 "POLICY",
-                f"oof fold skipped fold={idx}/{len(folds)} reason=no_active_rows_after_horizon_filter",
+                f"oof fold skipped fold={idx}/{folds_total} reason=no_active_rows_after_horizon_filter",
             )
             continue
-        fold_warmup_rows = frame[
-            (frame["dataset_split"] == "train")
-            & (frame["context_bar_open_time"] >= warmup_start)
-            & (frame["context_bar_open_time"] < val_start)
-            ].copy()
+        fold_importance = build_sequence_permutation_importance_table(
+            model=model,
+            eval_df=fold_active_rows,
+            target_column="target_good_short_now",
+            sequence_store=sequence_store,
+        ).copy()
+        fold_importance["fold_id"] = fold.fold_id
+        importance_chunks.append(
+            fold_importance.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
+        )
+        warmup_start_ns = warmup_start.value
+        warmup_mask = (train_context_ns >= warmup_start_ns) & (
+            train_context_ns < val_start_ns
+        )
+        fold_warmup_rows = train_split.loc[warmup_mask].copy()
         fold_warmup_rows["policy_context_only"] = True
         fold_active_rows["policy_context_only"] = False
         fold_score_rows = pd.concat(
@@ -401,7 +467,7 @@ def build_detector_train_oof_policy_rows(
         log_info(
             "POLICY",
             (
-                f"oof fold policy_rows done fold={idx}/{len(folds)} "
+                f"oof fold policy_rows done fold={idx}/{folds_total} "
                 f"rows_total={len(scored_fold)} context_rows={context_rows} active_rows={active_rows} "
                 f"elapsed_sec_score={time.perf_counter() - fit_started:.3f}"
             ),
@@ -418,14 +484,14 @@ def build_detector_train_oof_policy_rows(
                 f"fold scoring rows contain duplicate decision_row_id fold_id={fold.fold_id} sample={duplicates}"
             )
         chunks.append(scored_fold)
+        rows_accumulated += len(scored_fold)
         elapsed = time.perf_counter() - started
         rate = idx / elapsed if elapsed > 0 else 0.0
-        eta = (len(folds) - idx) / rate if rate > 0 else 0.0
-        rows_accumulated = int(sum(len(chunk) for chunk in chunks))
+        eta = (folds_total - idx) / rate if rate > 0 else 0.0
         log_info(
             "POLICY",
             (
-                f"oof progress folds_done={idx}/{len(folds)} rows_accumulated={rows_accumulated} "
+                f"oof progress folds_done={idx}/{folds_total} rows_accumulated={rows_accumulated} "
                 f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f} fold_elapsed_sec={time.perf_counter() - fold_started:.3f}"
             ),
         )
@@ -441,15 +507,20 @@ def build_detector_train_oof_policy_rows(
         oof_importance_df = oof_importance_df.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
     else:
         oof_importance_df = pd.DataFrame(columns=list(OOF_IMPORTANCE_COLUMNS))
+    if history_chunks:
+        oof_history_df = pd.concat(history_chunks, ignore_index=True)
+        oof_history_df = oof_history_df.loc[:, list(OOF_SEQUENCE_HISTORY_COLUMNS)].copy()
+    else:
+        oof_history_df = pd.DataFrame(columns=list(OOF_SEQUENCE_HISTORY_COLUMNS))
     log_info(
         "POLICY",
         (
-            f"policy OOF scoring rows build done rows_total={len(out)} folds_total={len(folds)} "
+            f"policy OOF scoring rows build done rows_total={len(out)} folds_total={folds_total} "
             f"elapsed_sec_total={time.perf_counter() - started:.3f} "
             f"rows_per_sec={(len(out) / max(time.perf_counter() - started, 1e-9)):.3f}"
         ),
     )
-    return out.loc[:, list(POLICY_ROW_COLUMNS)].copy(), oof_importance_df
+    return out.loc[:, list(POLICY_ROW_COLUMNS)].copy(), oof_importance_df, oof_history_df
 
 
 def build_detector_policy_grid(
@@ -778,7 +849,7 @@ def build_detector_train_oof_candidate_signal_ledger(
         detector_policy_config: DetectorPolicyConfig,
         sequence_store: DetectorSequenceStore,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
-    scored_rows_df, _ = build_detector_train_oof_policy_rows(
+    scored_rows_df, _, _ = build_detector_train_oof_policy_rows(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
@@ -800,6 +871,125 @@ def build_detector_train_oof_candidate_signal_ledger(
         window_days=train_oof_window_days,
     )
     return candidate_signals_df, episode_policy_summary_df, metrics
+
+
+def _split_fit_train_eval_chronological(
+        fit_frame: pd.DataFrame,
+        detector_model_config: DetectorModelConfig,
+        target_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, dict[str, object]]:
+    if fit_frame.empty:
+        return (
+            fit_frame.copy(),
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": 0,
+                "eval_rows": 0,
+                "fallback_reason": "empty_fit_frame",
+            },
+        )
+    trainable = fit_frame[fit_frame["trainable_row"].astype(bool)].copy()
+    if trainable.empty:
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": 0,
+                "eval_rows": 0,
+                "fallback_reason": "no_trainable_rows",
+            },
+        )
+    trainable = trainable.sort_values(
+        ["context_bar_open_time", "decision_row_id"], kind="mergesort"
+    ).reset_index(drop=True)
+    total_rows = int(len(trainable))
+    eval_rows = int(
+        max(
+            int(detector_model_config.fit_eval_min_rows),
+            int(np.floor(float(total_rows) * float(detector_model_config.fit_eval_fraction))),
+        )
+    )
+    if eval_rows <= 0:
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": int(len(trainable)),
+                "eval_rows": 0,
+                "fallback_reason": "eval_rows_non_positive",
+            },
+        )
+    if eval_rows >= total_rows:
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": int(len(trainable)),
+                "eval_rows": 0,
+                "fallback_reason": "eval_rows_exhaust_train",
+            },
+        )
+    train_inner = trainable.iloc[: total_rows - eval_rows].copy()
+    eval_inner = trainable.iloc[total_rows - eval_rows:].copy()
+    if len(train_inner) < 2 or len(eval_inner) < 2:
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": int(len(trainable)),
+                "eval_rows": 0,
+                "fallback_reason": "split_too_small",
+            },
+        )
+    train_classes = (
+        pd.to_numeric(train_inner[target_column], errors="coerce")
+        .fillna(0.0)
+        .astype(int)
+        .unique()
+    )
+    eval_classes = (
+        pd.to_numeric(eval_inner[target_column], errors="coerce")
+        .fillna(0.0)
+        .astype(int)
+        .unique()
+    )
+    if len(train_classes) < 2:
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": int(len(trainable)),
+                "eval_rows": 0,
+                "fallback_reason": "train_single_class",
+            },
+        )
+    if len(eval_classes) < 2:
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": int(len(trainable)),
+                "eval_rows": 0,
+                "fallback_reason": "eval_single_class",
+            },
+        )
+    return (
+        train_inner,
+        eval_inner,
+        {
+            "monitor_name": "eval_loss",
+            "train_rows": int(len(train_inner)),
+            "eval_rows": int(len(eval_inner)),
+            "fallback_reason": "",
+        },
+    )
 
 
 def _prepare_dataset_frame(dataset_df: pd.DataFrame) -> pd.DataFrame:
@@ -861,10 +1051,14 @@ def _build_active_eligibility_mask(
     horizon_delta = pd.Timedelta(
         minutes=15 * max(int(resolver_config.horizon_bars) - 1, 0)
     )
-    horizon_end = (
-            pd.to_datetime(rows_df["entry_bar_open_time"], utc=True, errors="raise")
-            + horizon_delta
-    )
+    entry_bar_open_time = rows_df["entry_bar_open_time"]
+    if pd.api.types.is_datetime64_any_dtype(
+        entry_bar_open_time
+    ) or pd.api.types.is_datetime64tz_dtype(entry_bar_open_time):
+        entry_times = entry_bar_open_time
+    else:
+        entry_times = pd.to_datetime(entry_bar_open_time, utc=True, errors="raise")
+    horizon_end = entry_times + horizon_delta
     return horizon_end <= pd.Timestamp(active_window_end)
 
 

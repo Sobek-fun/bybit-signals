@@ -33,12 +33,15 @@ class SequenceDetector:
     batch_size: int
     max_epochs: int
     early_stopping_patience: int
+    fit_eval_fraction: float
+    fit_eval_min_rows: int
     sequence_learning_rate: float
     weight_decay: float
     scaler_mean: np.ndarray | None = None
     scaler_std: np.ndarray | None = None
     sequence_store: DetectorSequenceStore | None = None
-    train_stats: dict[str, float | int] = field(default_factory=dict)
+    train_stats: dict[str, float | int | bool | str] = field(default_factory=dict)
+    training_history: list[dict[str, float | int]] = field(default_factory=list)
 
     def save_model(self, path: str | Path) -> None:
         target = Path(path)
@@ -48,9 +51,12 @@ class SequenceDetector:
             "feature_columns": list(self.feature_columns),
             "lookback_bars": int(self.lookback_bars),
             "random_seed": int(self.random_seed),
+            "fit_eval_fraction": float(self.fit_eval_fraction),
+            "fit_eval_min_rows": int(self.fit_eval_min_rows),
             "scaler_mean": self.scaler_mean,
             "scaler_std": self.scaler_std,
             "train_stats": json.dumps(self.train_stats, ensure_ascii=True),
+            "training_history": json.dumps(self.training_history, ensure_ascii=True),
         }
         import torch
 
@@ -80,6 +86,8 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
         batch_size=int(model_config.batch_size),
         max_epochs=int(model_config.max_epochs),
         early_stopping_patience=int(model_config.early_stopping_patience),
+        fit_eval_fraction=float(model_config.fit_eval_fraction),
+        fit_eval_min_rows=int(model_config.fit_eval_min_rows),
         sequence_learning_rate=float(model_config.sequence_learning_rate),
         weight_decay=float(model_config.weight_decay),
     )
@@ -137,6 +145,7 @@ def fit_detector_model(
     model.scaler_mean = scaler_mean
     model.scaler_std = scaler_std
     model.train_stats = stats.to_dict()
+    model.training_history = list(stats.training_history)
     return model
 
 
@@ -244,6 +253,57 @@ def summarize_detector_oof_importance(
     ].copy()
 
 
+def build_sequence_permutation_importance_table(
+    model: SequenceDetector,
+    eval_df: pd.DataFrame,
+    target_column: str,
+    sequence_store: DetectorSequenceStore | None = None,
+) -> pd.DataFrame:
+    if eval_df.empty:
+        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
+    if model.scaler_mean is None or model.scaler_std is None:
+        raise ValueError("model is not fitted: scaler stats are missing")
+    _require_columns(eval_df, ["decision_row_id", target_column], "eval_df")
+    store = _resolve_sequence_store(model, sequence_store)
+    feature_columns = list(model.feature_columns)
+    if not feature_columns:
+        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
+    x_eval_raw, valid_eval, in_episode_eval = extract_sequences_for_rows(
+        store, eval_df["decision_row_id"].astype(str)
+    )
+    y_eval = (
+        pd.to_numeric(eval_df[target_column], errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=np.float32)
+    )
+    if len(y_eval) == 0:
+        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
+    x_eval_scaled = _transform_with_scaler(
+        x_eval_raw, valid_eval, model.scaler_mean, model.scaler_std
+    )
+    x_eval_input = _stack_model_inputs(x_eval_scaled, valid_eval, in_episode_eval)
+    baseline_pred = predict_sequence_model_proba(model.network, x_eval_input).astype(float)
+    baseline_loss = _binary_logloss(y_eval.astype(float), baseline_pred)
+    rng = np.random.default_rng(int(model.random_seed))
+    rows: list[dict[str, float | str]] = []
+    for feature_idx, feature_name in enumerate(feature_columns):
+        shuffled = x_eval_scaled.copy()
+        perm = rng.permutation(shuffled.shape[0])
+        shuffled[:, :, feature_idx] = shuffled[perm, :, feature_idx]
+        shuffled_input = _stack_model_inputs(shuffled, valid_eval, in_episode_eval)
+        perm_pred = predict_sequence_model_proba(model.network, shuffled_input).astype(float)
+        perm_loss = _binary_logloss(y_eval.astype(float), perm_pred)
+        rows.append(
+            {
+                "feature": str(feature_name),
+                "importance_raw": float(perm_loss - baseline_loss),
+            }
+        )
+    out = pd.DataFrame(rows, columns=["feature", "importance_raw"])
+    out["importance_norm"] = _normalize_importance(out["importance_raw"])
+    return out
+
+
 def _normalize_importance(values: pd.Series) -> pd.Series:
     clipped = pd.to_numeric(values, errors="coerce").fillna(0.0).clip(lower=0.0)
     total = float(clipped.sum())
@@ -304,3 +364,13 @@ def _require_columns(df: pd.DataFrame, columns: list[str], name: str) -> None:
     missing = [col for col in columns if col not in df.columns]
     if missing:
         raise ValueError(f"{name} missing required columns: {missing}")
+
+
+def _binary_logloss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+    if y.shape[0] == 0:
+        return 0.0
+    p = np.clip(p, 1e-7, 1.0 - 1e-7)
+    loss = -(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
+    return float(np.mean(loss))
