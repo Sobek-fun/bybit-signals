@@ -3,6 +3,7 @@ from pump_end_v2.detector.model import (
     SequenceDetector,
     build_detector_feature_importance_table,
     build_detector_model,
+    build_sequence_permutation_importance_table,
     fit_detector_model,
     predict_detector_scores,
     summarize_detector_oof_importance,
@@ -35,7 +36,11 @@ from pump_end_v2.detector.splits import (
     generate_detector_walkforward_folds,
     summarize_detector_splits,
 )
-from pump_end_v2.detector.target_metrics import build_detector_target_metrics
+from pump_end_v2.detector.target_metrics import (
+    build_detector_rank_quality_report,
+    build_detector_score_decile_report,
+    build_detector_target_metrics,
+)
 
 __all__ = [
     "build_detector_dataset",
@@ -50,6 +55,7 @@ __all__ = [
     "build_detector_model",
     "SequenceDetector",
     "build_detector_feature_importance_table",
+    "build_sequence_permutation_importance_table",
     "fit_detector_model",
     "predict_detector_scores",
     "summarize_detector_oof_importance",
@@ -66,4 +72,6 @@ __all__ = [
     "build_detector_test_policy_rows",
     "build_detector_test_candidate_signal_ledger",
     "build_detector_target_metrics",
+    "build_detector_score_decile_report",
+    "build_detector_rank_quality_report",
 ]
