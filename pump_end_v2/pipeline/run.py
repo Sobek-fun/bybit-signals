@@ -19,7 +19,8 @@ from pump_end_v2.detector import (
     apply_episode_aware_detector_policy,
     assign_detector_dataset_splits,
     build_detector_dataset,
-    build_detector_feature_importance_table,
+    build_detector_rank_quality_report,
+    build_detector_score_decile_report,
     build_detector_sequence_store,
     build_detector_policy_metrics,
     build_detector_target_metrics,
@@ -48,7 +49,6 @@ from pump_end_v2.features import (
     build_reference_state_layer,
     build_token_state_layer,
 )
-from pump_end_v2.features.manifest import DETECTOR_SEQUENCE_FEATURE_COLUMNS
 from pump_end_v2.gate import (
     apply_gate_block_threshold,
     build_candidate_signal_strength_report,
@@ -235,7 +235,11 @@ def run_pump_end_v2_pipeline(
 
     detector_oof_started = time.perf_counter()
     stage_start("PIPELINE", "DETECTOR_TRAIN_OOF")
-    train_oof_policy_rows, detector_oof_importance_folds_df = build_detector_train_oof_policy_rows(
+    (
+        train_oof_policy_rows,
+        detector_oof_importance_folds_df,
+        detector_oof_training_history_df,
+    ) = build_detector_train_oof_policy_rows(
         dataset_df=detector_dataset,
         split_bounds=config.splits,
         resolver_config=config.resolver,
@@ -287,6 +291,8 @@ def run_pump_end_v2_pipeline(
         window_end=config.splits.val_end,
     )
     detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
+    detector_val_score_deciles_df = build_detector_score_decile_report(val_policy_rows)
+    detector_val_rank_quality = build_detector_rank_quality_report(val_policy_rows)
     detector_val_elapsed = time.perf_counter() - detector_val_started
     stage_done("PIPELINE", "DETECTOR_VAL_POLICY", elapsed_sec=detector_val_elapsed)
 
@@ -310,9 +316,8 @@ def run_pump_end_v2_pipeline(
         window_end=config.splits.test_end,
     )
     detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
-    detector_train_fit_importance_df = build_detector_feature_importance_table(
-        detector_model_test, DETECTOR_SEQUENCE_FEATURE_COLUMNS
-    )
+    detector_test_score_deciles_df = build_detector_score_decile_report(test_policy_rows)
+    detector_test_rank_quality = build_detector_rank_quality_report(test_policy_rows)
     detector_oof_importance_summary_df = summarize_detector_oof_importance(
         detector_oof_importance_folds_df, top_k=20
     )
@@ -320,6 +325,9 @@ def run_pump_end_v2_pipeline(
         detector_model_test.train_stats
         if hasattr(detector_model_test, "train_stats")
         else {}
+    )
+    sequence_training_history_train_only_df = pd.DataFrame(
+        getattr(detector_model_test, "training_history", [])
     )
     sequence_spec = {
         "lookback_bars": int(detector_sequence_store.lookback_bars),
@@ -704,14 +712,20 @@ def run_pump_end_v2_pipeline(
     test_monthly_report = build_execution_monthly_report(test_executed_signals_df)
     gate_deciles_val = build_gate_decile_report(val_scored_signals_df)
     gate_deciles_test = build_gate_decile_report(test_scored_signals_df)
-    val_candidate_signal_strength = build_candidate_signal_strength_report(
+    gate_val_candidate_signal_strength = build_candidate_signal_strength_report(
         val_scored_signals_df, config.execution
     )
-    test_candidate_signal_strength = build_candidate_signal_strength_report(
+    gate_test_candidate_signal_strength = build_candidate_signal_strength_report(
         test_scored_signals_df, config.execution
     )
     val_gate_rank_quality = build_gate_rank_quality_report(val_scored_signals_df)
     test_gate_rank_quality = build_gate_rank_quality_report(test_scored_signals_df)
+    detector_val_candidate_signal_strength = build_candidate_signal_strength_report(
+        val_execution_decisions_enriched_df, config.execution
+    )
+    detector_test_candidate_signal_strength = build_candidate_signal_strength_report(
+        test_execution_decisions_enriched_df, config.execution
+    )
     log_info(
         "PIPELINE",
         (
@@ -773,24 +787,27 @@ def run_pump_end_v2_pipeline(
         build_detector_feature_manifest(), detector_dir / "feature_manifest.json"
     )
     _save_df_and_log(detector_policy_sweep_df, detector_dir / "policy_sweep_val.csv")
-    if not detector_train_fit_importance_df.empty:
-        _save_df_and_log(
-            detector_train_fit_importance_df,
-            detector_dir / "feature_importance_train_fit.csv",
-        )
     if not detector_oof_importance_folds_df.empty:
         _save_df_and_log(
             detector_oof_importance_folds_df,
-            detector_dir / "feature_importance_oof_folds.csv",
+            detector_dir / "sequence_feature_importance_oof_folds.csv",
         )
     if not detector_oof_importance_summary_df.empty:
         _save_df_and_log(
             detector_oof_importance_summary_df,
-            detector_dir / "feature_importance_oof_summary.csv",
+            detector_dir / "sequence_feature_importance_oof_summary.csv",
         )
     _save_json_and_log(sequence_spec, detector_dir / "sequence_spec.json")
     _save_json_and_log(
-        sequence_train_stats, detector_dir / "sequence_train_stats.json"
+        sequence_train_stats, detector_dir / "sequence_train_stats_train_only.json"
+    )
+    _save_df_and_log(
+        sequence_training_history_train_only_df,
+        detector_dir / "sequence_training_history_train_only.csv",
+    )
+    _save_df_and_log(
+        detector_oof_training_history_df,
+        detector_dir / "sequence_training_history_oof.csv",
     )
     _save_json_and_log(
         _policy_to_dict(selected_detector_policy), detector_dir / "selected_policy.json"
@@ -836,6 +853,12 @@ def run_pump_end_v2_pipeline(
     _save_json_and_log(
         detector_val_target_metrics, detector_dir / "val_target_metrics.json"
     )
+    _save_df_and_log(
+        detector_val_score_deciles_df, detector_dir / "val_score_deciles.csv"
+    )
+    _save_json_and_log(
+        detector_val_rank_quality, detector_dir / "val_rank_quality.json"
+    )
     _save_df_and_log(test_policy_rows, detector_dir / "test_policy_rows.parquet")
     _save_df_and_log(
         test_candidate_signals_df, detector_dir / "test_candidate_signals.parquet"
@@ -849,6 +872,20 @@ def run_pump_end_v2_pipeline(
     )
     _save_json_and_log(
         detector_test_target_metrics, detector_dir / "test_target_metrics.json"
+    )
+    _save_df_and_log(
+        detector_test_score_deciles_df, detector_dir / "test_score_deciles.csv"
+    )
+    _save_json_and_log(
+        detector_test_rank_quality, detector_dir / "test_rank_quality.json"
+    )
+    _save_json_and_log(
+        detector_val_candidate_signal_strength,
+        detector_dir / "val_candidate_signal_strength.json",
+    )
+    _save_json_and_log(
+        detector_test_candidate_signal_strength,
+        detector_dir / "test_candidate_signal_strength.json",
     )
     _save_model_and_log(detector_model_test, detector_dir / "model_train_only.cbm")
 
@@ -946,17 +983,14 @@ def run_pump_end_v2_pipeline(
         "detector_train_oof_policy_metrics": detector_train_oof_policy_metrics,
         "detector_test_policy_metrics": detector_test_policy_metrics,
         "detector_feature_importance": {
-            "train_fit_features_total": int(len(detector_train_fit_importance_df)),
+            "train_fit_features_total": 0,
             "oof_folds_total": int(
                 detector_oof_importance_folds_df["fold_id"].nunique()
             )
             if not detector_oof_importance_folds_df.empty
             else 0,
             "oof_summary_features_total": int(len(detector_oof_importance_summary_df)),
-            "model_importance_available": bool(
-                (not detector_train_fit_importance_df.empty)
-                or (not detector_oof_importance_folds_df.empty)
-            ),
+            "model_importance_available": bool(not detector_oof_importance_folds_df.empty),
         },
         "sequence_lookback_bars": int(detector_sequence_store.lookback_bars),
         "sequence_feature_count": int(len(detector_sequence_store.feature_columns)),
@@ -966,8 +1000,8 @@ def run_pump_end_v2_pipeline(
             ).sum()
         ),
         "sequence_shape": [int(v) for v in detector_sequence_store.x.shape],
-        "val_candidate_signal_strength": val_candidate_signal_strength,
-        "test_candidate_signal_strength": test_candidate_signal_strength,
+        "val_candidate_signal_strength": gate_val_candidate_signal_strength,
+        "test_candidate_signal_strength": gate_test_candidate_signal_strength,
         "val_gate_rank_quality": val_gate_rank_quality,
         "test_gate_rank_quality": test_gate_rank_quality,
         "val_decision_summary": val_decision_summary,
