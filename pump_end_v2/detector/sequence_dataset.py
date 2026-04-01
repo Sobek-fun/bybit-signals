@@ -112,6 +112,72 @@ def build_detector_sequence_store(
     }
     breadth_pos = {feature: idx for idx, feature in enumerate(breadth_feature_columns)}
     episode_pos = {feature: idx for idx, feature in enumerate(episode_feature_columns)}
+    token_assign_targets = np.asarray(
+        [feature_pos[feature] for feature in feature_columns if feature in token_pos],
+        dtype=np.int32,
+    )
+    token_assign_sources = np.asarray(
+        [token_pos[feature] for feature in feature_columns if feature in token_pos],
+        dtype=np.int32,
+    )
+    reference_assign_targets = np.asarray(
+        [
+            feature_pos[feature]
+            for feature in feature_columns
+            if feature in reference_pos and feature not in token_pos
+        ],
+        dtype=np.int32,
+    )
+    reference_assign_sources = np.asarray(
+        [
+            reference_pos[feature]
+            for feature in feature_columns
+            if feature in reference_pos and feature not in token_pos
+        ],
+        dtype=np.int32,
+    )
+    breadth_assign_targets = np.asarray(
+        [
+            feature_pos[feature]
+            for feature in feature_columns
+            if feature in breadth_pos
+            and feature not in token_pos
+            and feature not in reference_pos
+        ],
+        dtype=np.int32,
+    )
+    breadth_assign_sources = np.asarray(
+        [
+            breadth_pos[feature]
+            for feature in feature_columns
+            if feature in breadth_pos
+            and feature not in token_pos
+            and feature not in reference_pos
+        ],
+        dtype=np.int32,
+    )
+    episode_assign_targets = np.asarray(
+        [
+            feature_pos[feature]
+            for feature in feature_columns
+            if feature in episode_pos
+            and feature not in token_pos
+            and feature not in reference_pos
+            and feature not in breadth_pos
+        ],
+        dtype=np.int32,
+    )
+    episode_assign_sources = np.asarray(
+        [
+            episode_pos[feature]
+            for feature in feature_columns
+            if feature in episode_pos
+            and feature not in token_pos
+            and feature not in reference_pos
+            and feature not in breadth_pos
+        ],
+        dtype=np.int32,
+    )
     token_lookup = _build_token_lookup(token_state_tradable_df, token_feature_columns)
     reference_lookup = _build_time_lookup(
         reference_state_df, _REFERENCE_TIME_COLUMN, reference_feature_columns
@@ -142,21 +208,24 @@ def build_detector_sequence_store(
             if is_in_episode:
                 in_episode_mask[row_idx, step] = True
             episode_values = episode_lookup.get((episode_id, ts)) if is_in_episode else None
-            for feature, pos in feature_pos.items():
-                value = 0.0
-                if feature in token_pos and token_values is not None:
-                    value = float(token_values[token_pos[feature]])
-                elif feature in reference_pos and reference_values is not None:
-                    value = float(reference_values[reference_pos[feature]])
-                elif feature in breadth_pos and breadth_values is not None:
-                    value = float(breadth_values[breadth_pos[feature]])
-                elif (
-                    feature in episode_pos
-                    and episode_values is not None
-                    and is_in_episode
-                ):
-                    value = float(episode_values[episode_pos[feature]])
-                x[row_idx, step, pos] = value
+            if token_values is not None and token_assign_targets.size > 0:
+                x[row_idx, step, token_assign_targets] = token_values[token_assign_sources]
+            if reference_values is not None and reference_assign_targets.size > 0:
+                x[row_idx, step, reference_assign_targets] = reference_values[
+                    reference_assign_sources
+                ]
+            if breadth_values is not None and breadth_assign_targets.size > 0:
+                x[row_idx, step, breadth_assign_targets] = breadth_values[
+                    breadth_assign_sources
+                ]
+            if (
+                episode_values is not None
+                and is_in_episode
+                and episode_assign_targets.size > 0
+            ):
+                x[row_idx, step, episode_assign_targets] = episode_values[
+                    episode_assign_sources
+                ]
     invalid_mask = ~np.isfinite(x)
     if invalid_mask.any():
         invalid_positions = np.argwhere(invalid_mask)
@@ -228,17 +297,22 @@ def _build_token_lookup(
     _require_columns(token_state_df, required, "token_state_tradable_df")
     frame = token_state_df.loc[:, list(required)].copy()
     frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="raise")
-    out: dict[tuple[str, int], np.ndarray] = {}
-    for row in frame.itertuples(index=False):
-        symbol = str(row.symbol)
-        ts = pd.Timestamp(row.open_time).value
-        numeric_values = pd.to_numeric(
-            pd.Series(row[2:]), errors="coerce"
-        ).fillna(0.0)
-        values = numeric_values.to_numpy(dtype=np.float32, copy=False)
-        values = np.where(np.isfinite(values), values, 0.0).astype(
-            np.float32, copy=False
+    if feature_columns:
+        feature_block = (
+            frame.loc[:, list(feature_columns)]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32, copy=True)
         )
+        np.nan_to_num(feature_block, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        feature_block = np.zeros((len(frame), 0), dtype=np.float32)
+    symbols = frame["symbol"].astype(str).to_numpy(copy=False)
+    timestamps = frame["open_time"].map(lambda ts: pd.Timestamp(ts).value).to_numpy(
+        dtype=np.int64, copy=False
+    )
+    out: dict[tuple[str, int], np.ndarray] = {}
+    for symbol, ts, values in zip(symbols, timestamps, feature_block, strict=False):
         out[(symbol, ts)] = values
     return out
 
@@ -250,16 +324,21 @@ def _build_time_lookup(
     _require_columns(source_df, required, "time_feature_df")
     frame = source_df.loc[:, list(required)].copy()
     frame[time_column] = pd.to_datetime(frame[time_column], utc=True, errors="raise")
-    out: dict[int, np.ndarray] = {}
-    for row in frame.itertuples(index=False):
-        ts = pd.Timestamp(row[0]).value
-        numeric_values = pd.to_numeric(
-            pd.Series(row[1:]), errors="coerce"
-        ).fillna(0.0)
-        values = numeric_values.to_numpy(dtype=np.float32, copy=False)
-        values = np.where(np.isfinite(values), values, 0.0).astype(
-            np.float32, copy=False
+    if feature_columns:
+        feature_block = (
+            frame.loc[:, list(feature_columns)]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32, copy=True)
         )
+        np.nan_to_num(feature_block, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        feature_block = np.zeros((len(frame), 0), dtype=np.float32)
+    timestamps = frame[time_column].map(lambda ts: pd.Timestamp(ts).value).to_numpy(
+        dtype=np.int64, copy=False
+    )
+    out: dict[int, np.ndarray] = {}
+    for ts, values in zip(timestamps, feature_block, strict=False):
         out[ts] = values
     return out
 
@@ -273,16 +352,25 @@ def _build_episode_lookup(
     frame["context_bar_open_time"] = pd.to_datetime(
         frame["context_bar_open_time"], utc=True, errors="raise"
     )
-    out: dict[tuple[str, int], np.ndarray] = {}
-    for row in frame.itertuples(index=False):
-        key = (str(row.episode_id), pd.Timestamp(row.context_bar_open_time).value)
-        numeric_values = pd.to_numeric(
-            pd.Series(row[2:]), errors="coerce"
-        ).fillna(0.0)
-        values = numeric_values.to_numpy(dtype=np.float32, copy=False)
-        values = np.where(np.isfinite(values), values, 0.0).astype(
-            np.float32, copy=False
+    if feature_columns:
+        feature_block = (
+            frame.loc[:, list(feature_columns)]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32, copy=True)
         )
+        np.nan_to_num(feature_block, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        feature_block = np.zeros((len(frame), 0), dtype=np.float32)
+    episode_ids = frame["episode_id"].astype(str).to_numpy(copy=False)
+    timestamps = frame["context_bar_open_time"].map(lambda ts: pd.Timestamp(ts).value).to_numpy(
+        dtype=np.int64, copy=False
+    )
+    out: dict[tuple[str, int], np.ndarray] = {}
+    for episode_id, ts, values in zip(
+        episode_ids, timestamps, feature_block, strict=False
+    ):
+        key = (episode_id, ts)
         out[key] = values
     return out
 
