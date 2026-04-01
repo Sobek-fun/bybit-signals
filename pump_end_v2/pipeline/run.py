@@ -773,18 +773,21 @@ def run_pump_end_v2_pipeline(
         build_detector_feature_manifest(), detector_dir / "feature_manifest.json"
     )
     _save_df_and_log(detector_policy_sweep_df, detector_dir / "policy_sweep_val.csv")
-    _save_df_and_log(
-        detector_train_fit_importance_df,
-        detector_dir / "feature_importance_train_fit.csv",
-    )
-    _save_df_and_log(
-        detector_oof_importance_folds_df,
-        detector_dir / "feature_importance_oof_folds.csv",
-    )
-    _save_df_and_log(
-        detector_oof_importance_summary_df,
-        detector_dir / "feature_importance_oof_summary.csv",
-    )
+    if not detector_train_fit_importance_df.empty:
+        _save_df_and_log(
+            detector_train_fit_importance_df,
+            detector_dir / "feature_importance_train_fit.csv",
+        )
+    if not detector_oof_importance_folds_df.empty:
+        _save_df_and_log(
+            detector_oof_importance_folds_df,
+            detector_dir / "feature_importance_oof_folds.csv",
+        )
+    if not detector_oof_importance_summary_df.empty:
+        _save_df_and_log(
+            detector_oof_importance_summary_df,
+            detector_dir / "feature_importance_oof_summary.csv",
+        )
     _save_json_and_log(sequence_spec, detector_dir / "sequence_spec.json")
     _save_json_and_log(
         sequence_train_stats, detector_dir / "sequence_train_stats.json"
@@ -950,6 +953,10 @@ def run_pump_end_v2_pipeline(
             if not detector_oof_importance_folds_df.empty
             else 0,
             "oof_summary_features_total": int(len(detector_oof_importance_summary_df)),
+            "model_importance_available": bool(
+                (not detector_train_fit_importance_df.empty)
+                or (not detector_oof_importance_folds_df.empty)
+            ),
         },
         "sequence_lookback_bars": int(detector_sequence_store.lookback_bars),
         "sequence_feature_count": int(len(detector_sequence_store.feature_columns)),

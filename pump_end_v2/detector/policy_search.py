@@ -1,6 +1,7 @@
 from itertools import product
 import time
 
+import numpy as np
 import pandas as pd
 
 from pump_end_v2.config import (
@@ -837,6 +838,11 @@ def _score_policy_window(
     )
     merged["score_source"] = score_source
     merged["fold_id"] = fold_id
+    _log_p_good_distribution(
+        merged,
+        score_source=score_source,
+        fold_id=fold_id,
+    )
     return merged.loc[:, list(POLICY_ROW_COLUMNS)].copy()
 
 
@@ -909,3 +915,63 @@ def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
     if value < 15.0:
         return float((15.0 - value) / 15.0)
     return float((value - 180.0) / 180.0)
+
+
+def _log_p_good_distribution(
+        scored_rows_df: pd.DataFrame,
+        score_source: str,
+        fold_id: object,
+) -> None:
+    if scored_rows_df.empty:
+        log_info(
+            "POLICY",
+            (
+                f"p_good distribution source={score_source} fold_id={fold_id} "
+                "active_rows=0 nan_share=0.000000 min=0.000000 q01=0.000000 "
+                "q10=0.000000 q50=0.000000 q90=0.000000 q99=0.000000 max=0.000000"
+            ),
+        )
+        return
+    active_mask = ~scored_rows_df["policy_context_only"].astype(bool)
+    active_p_good = pd.to_numeric(
+        scored_rows_df.loc[active_mask, "p_good"], errors="coerce"
+    )
+    active_count = int(active_p_good.shape[0])
+    if active_count <= 0:
+        log_info(
+            "POLICY",
+            (
+                f"p_good distribution source={score_source} fold_id={fold_id} "
+                "active_rows=0 nan_share=0.000000 min=0.000000 q01=0.000000 "
+                "q10=0.000000 q50=0.000000 q90=0.000000 q99=0.000000 max=0.000000"
+            ),
+        )
+        return
+    values = active_p_good.to_numpy(dtype=float, copy=False)
+    finite_values = values[np.isfinite(values)]
+    nan_share = float(np.mean(~np.isfinite(values)))
+    if finite_values.size == 0:
+        min_v = 0.0
+        q01_v = 0.0
+        q10_v = 0.0
+        q50_v = 0.0
+        q90_v = 0.0
+        q99_v = 0.0
+        max_v = 0.0
+    else:
+        min_v = float(np.min(finite_values))
+        q01_v = float(np.quantile(finite_values, 0.01))
+        q10_v = float(np.quantile(finite_values, 0.10))
+        q50_v = float(np.quantile(finite_values, 0.50))
+        q90_v = float(np.quantile(finite_values, 0.90))
+        q99_v = float(np.quantile(finite_values, 0.99))
+        max_v = float(np.max(finite_values))
+    log_info(
+        "POLICY",
+        (
+            f"p_good distribution source={score_source} fold_id={fold_id} "
+            f"active_rows={active_count} nan_share={nan_share:.6f} min={min_v:.6f} "
+            f"q01={q01_v:.6f} q10={q10_v:.6f} q50={q50_v:.6f} q90={q90_v:.6f} "
+            f"q99={q99_v:.6f} max={max_v:.6f}"
+        ),
+    )

@@ -16,6 +16,7 @@ def build_detector_target_metrics(
     if frame.empty:
         return {
             "rows_total": 0.0,
+            "p_good_nan_share": 0.0,
             "good_row_precision": 0.0,
             "good_row_recall": 0.0,
             "too_early_fp_rate": 0.0,
@@ -23,9 +24,9 @@ def build_detector_target_metrics(
             "continuation_fp_rate": 0.0,
             "flat_fp_rate": 0.0,
         }
-    predicted_good = pd.to_numeric(frame["p_good"], errors="coerce").fillna(
-        0.0
-    ) >= float(good_threshold)
+    p_good_numeric = pd.to_numeric(frame["p_good"], errors="coerce")
+    p_good_nan_share = float(p_good_numeric.isna().mean())
+    predicted_good = p_good_numeric.fillna(0.0) >= float(good_threshold)
     actual_good = (
             pd.to_numeric(frame["target_good_short_now"], errors="coerce")
             .fillna(0)
@@ -38,6 +39,7 @@ def build_detector_target_metrics(
     reasons = frame["target_reason"].astype(str).str.strip().str.lower()
     return {
         "rows_total": float(len(frame)),
+        "p_good_nan_share": p_good_nan_share,
         "good_row_precision": _safe_ratio(tp, pred_pos),
         "good_row_recall": _safe_ratio(tp, actual_pos),
         "too_early_fp_rate": _reason_fp_rate(predicted_good, reasons, "too_early"),
