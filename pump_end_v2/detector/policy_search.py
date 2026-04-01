@@ -141,6 +141,7 @@ def build_detector_val_policy_rows(
         train_fit,
         detector_model_config,
         target_column="target_good_short_now",
+        purge_gap_timedelta=purge_gap_timedelta,
     )
     if train_inner_fit.empty:
         raise ValueError(
@@ -240,6 +241,7 @@ def build_detector_test_policy_rows(
         train_fit,
         detector_model_config,
         target_column="target_good_short_now",
+        purge_gap_timedelta=purge_gap_timedelta,
     )
     if train_inner_fit.empty:
         raise ValueError(
@@ -288,6 +290,7 @@ def build_detector_test_policy_rows(
         return model, scored
     active_start = test_active["context_bar_open_time"].min()
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
     warmup_start = active_start - warmup_timedelta
     warmup_rows = frame[
         (frame["context_bar_open_time"] >= warmup_start)
@@ -363,6 +366,7 @@ def build_detector_train_oof_policy_rows(
             fold_train_raw,
             detector_model_config,
             target_column="target_good_short_now",
+            purge_gap_timedelta=purge_gap_timedelta,
         )
         if fold_train_fit.empty:
             log_info(
@@ -428,16 +432,20 @@ def build_detector_train_oof_policy_rows(
                 f"oof fold skipped fold={idx}/{folds_total} reason=no_active_rows_after_horizon_filter",
             )
             continue
-        fold_importance = build_sequence_permutation_importance_table(
-            model=model,
-            eval_df=fold_active_rows,
-            target_column="target_good_short_now",
-            sequence_store=sequence_store,
-        ).copy()
-        fold_importance["fold_id"] = fold.fold_id
-        importance_chunks.append(
-            fold_importance.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
-        )
+        fold_importance_rows = fold_active_rows[
+            fold_active_rows["trainable_row"].astype(bool)
+        ].copy()
+        if not fold_importance_rows.empty:
+            fold_importance = build_sequence_permutation_importance_table(
+                model=model,
+                eval_df=fold_importance_rows,
+                target_column="target_good_short_now",
+                sequence_store=sequence_store,
+            ).copy()
+            fold_importance["fold_id"] = fold.fold_id
+            importance_chunks.append(
+                fold_importance.loc[:, list(OOF_IMPORTANCE_COLUMNS)].copy()
+            )
         warmup_start_ns = warmup_start.value
         warmup_mask = (train_context_ns >= warmup_start_ns) & (
             train_context_ns < val_start_ns
@@ -877,6 +885,7 @@ def _split_fit_train_eval_chronological(
         fit_frame: pd.DataFrame,
         detector_model_config: DetectorModelConfig,
         target_column: str,
+        purge_gap_timedelta: pd.Timedelta,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None, dict[str, object]]:
     if fit_frame.empty:
         return (
@@ -933,8 +942,15 @@ def _split_fit_train_eval_chronological(
                 "fallback_reason": "eval_rows_exhaust_train",
             },
         )
-    train_inner = trainable.iloc[: total_rows - eval_rows].copy()
-    eval_inner = trainable.iloc[total_rows - eval_rows:].copy()
+    split_idx = int(total_rows - eval_rows)
+    eval_start_time = pd.Timestamp(trainable.iloc[split_idx]["context_bar_open_time"])
+    train_cutoff_time = eval_start_time - purge_gap_timedelta
+    train_inner = trainable[
+        trainable["context_bar_open_time"] < train_cutoff_time
+    ].copy()
+    eval_inner = trainable[
+        trainable["context_bar_open_time"] >= eval_start_time
+    ].copy()
     if len(train_inner) < 2 or len(eval_inner) < 2:
         return (
             trainable,
