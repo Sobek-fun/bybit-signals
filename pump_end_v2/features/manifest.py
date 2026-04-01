@@ -84,6 +84,16 @@ DETECTOR_SEQUENCE_FEATURE_COLUMNS: tuple[str, ...] = (
     "eth_intrabar_range_pct",
     "rsi_like_14",
     "rolling_volatility_4",
+    "runup_pct_at_context",
+    "volume_ratio_at_context",
+    "pump_context_flag",
+    "distance_from_episode_high_pct",
+    "episode_age_bars",
+    "bars_since_episode_high",
+    "drawdown_from_episode_high_so_far",
+    "high_retest_count",
+    "high_persistence_4",
+    "episode_pump_context_streak",
 )
 
 BLOCKED_COLUMNS: tuple[str, ...] = (
@@ -111,6 +121,8 @@ def build_detector_feature_manifest() -> dict[str, object]:
     return {
         "feature_columns": list(DETECTOR_FEATURE_COLUMNS),
         "feature_count": len(DETECTOR_FEATURE_COLUMNS),
+        "sequence_feature_columns": list(DETECTOR_SEQUENCE_FEATURE_COLUMNS),
+        "sequence_feature_count": len(DETECTOR_SEQUENCE_FEATURE_COLUMNS),
         "identity_columns": list(DETECTOR_IDENTITY_COLUMNS),
         "blocked_columns": list(BLOCKED_COLUMNS),
     }

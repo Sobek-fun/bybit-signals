@@ -17,6 +17,9 @@ EPISODE_STATE_COLUMNS: tuple[str, ...] = (
     "distance_from_episode_high_pct",
     "episode_runup_from_open_pct",
     "episode_extension_from_open_pct",
+    "runup_pct_at_context",
+    "volume_ratio_at_context",
+    "pump_context_flag",
     "bars_since_episode_high",
     "drawdown_from_episode_high_so_far",
     "high_retest_count",
@@ -34,7 +37,10 @@ def build_episode_state_layer(
     stage_start("LAYERS", "EPISODE_STATE")
     if decision_rows_df.empty:
         out = pd.DataFrame(columns=list(EPISODE_STATE_COLUMNS))
-        log_info("LAYERS", "episode_state summary rows_total=0 cols_total=16")
+        log_info(
+            "LAYERS",
+            f"episode_state summary rows_total=0 cols_total={len(EPISODE_STATE_COLUMNS)}",
+        )
         stage_done("LAYERS", "EPISODE_STATE", elapsed_sec=time.perf_counter() - started)
         return out
     market = token_state_df[["symbol", "open_time", "close"]].rename(
