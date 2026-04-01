@@ -46,6 +46,15 @@ class DetectorModelConfig:
     learning_rate: float
     l2_leaf_reg: float
     random_seed: int
+    hidden_channels: int
+    kernel_size: int
+    dilations: tuple[int, ...]
+    dropout: float
+    batch_size: int
+    max_epochs: int
+    early_stopping_patience: int
+    sequence_learning_rate: float
+    weight_decay: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,7 +539,80 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
         random_seed=_require_non_negative_int(
             model_section.get("random_seed"), "detector.model.random_seed"
         ),
+        hidden_channels=_require_positive_int(
+            model_section.get("hidden_channels", 64),
+            "detector.model.hidden_channels",
+        ),
+        kernel_size=_require_positive_int(
+            model_section.get("kernel_size", 3),
+            "detector.model.kernel_size",
+        ),
+        dilations=_parse_positive_int_tuple(
+            model_section.get("dilations", [1, 2, 4]),
+            "detector.model.dilations",
+        ),
+        dropout=_require_bounded_float(
+            model_section.get("dropout", 0.10),
+            "detector.model.dropout",
+            lower=0.0,
+            upper=1.0,
+            inclusive_lower=True,
+            inclusive_upper=True,
+        ),
+        batch_size=_require_positive_int(
+            model_section.get("batch_size", 256),
+            "detector.model.batch_size",
+        ),
+        max_epochs=_require_positive_int(
+            model_section.get("max_epochs", 40),
+            "detector.model.max_epochs",
+        ),
+        early_stopping_patience=_require_positive_int(
+            model_section.get("early_stopping_patience", 5),
+            "detector.model.early_stopping_patience",
+        ),
+        sequence_learning_rate=_require_positive_float(
+            model_section.get("sequence_learning_rate", 1e-3),
+            "detector.model.sequence_learning_rate",
+        ),
+        weight_decay=_require_non_negative_float(
+            model_section.get("weight_decay", 1e-4),
+            "detector.model.weight_decay",
+        ),
     )
+
+
+def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    if not value:
+        raise ValueError(f"{field_name} must be non-empty")
+    out: list[int] = []
+    for item in value:
+        out.append(_require_positive_int(item, field_name))
+    return tuple(out)
+
+
+def _require_bounded_float(
+    value: Any,
+    field_name: str,
+    *,
+    lower: float,
+    upper: float,
+    inclusive_lower: bool,
+    inclusive_upper: bool,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+    lower_ok = parsed >= lower if inclusive_lower else parsed > lower
+    upper_ok = parsed <= upper if inclusive_upper else parsed < upper
+    if not (lower_ok and upper_ok):
+        lower_mark = "[" if inclusive_lower else "("
+        upper_mark = "]" if inclusive_upper else ")"
+        raise ValueError(f"{field_name} must be in range {lower_mark}{lower}, {upper}{upper_mark}")
+    return parsed
 
 
 def _build_detector_cv(section: dict[str, Any]) -> DetectorCVConfig:
