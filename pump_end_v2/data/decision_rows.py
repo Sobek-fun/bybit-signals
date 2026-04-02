@@ -28,7 +28,10 @@ DECISION_ROW_COLUMNS: tuple[str, ...] = (
 
 
 def build_decision_rows(
-    token_state_df: pd.DataFrame, episodes: pd.DataFrame, execution: ExecutionContract
+    token_state_df: pd.DataFrame,
+    episodes: pd.DataFrame,
+    execution: ExecutionContract,
+    decision_window_bars: int,
 ) -> pd.DataFrame:
     started = time.perf_counter()
     stage_start("ROWS", "BUILD_DECISION_ROWS")
@@ -52,6 +55,11 @@ def build_decision_rows(
             (symbol_context["open_time"] >= episode.episode_open_time)
             & (symbol_context["open_time"] <= episode.episode_close_time)
         ].copy()
+        if episode_slice.empty:
+            continue
+        episode_slice = episode_slice.sort_values("open_time", kind="mergesort").head(
+            int(decision_window_bars)
+        )
         if episode_slice.empty:
             continue
         episode_slice["episode_age_bars"] = range(1, len(episode_slice) + 1)

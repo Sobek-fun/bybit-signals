@@ -8,11 +8,16 @@ from pump_end_v2.features.manifest import (
     DETECTOR_SEQUENCE_FEATURE_COLUMNS,
 )
 
-SEQUENCE_LOOKBACK_BARS = 16
+SEQUENCE_PRE_EPISODE_CONTEXT_BARS = 16
+SEQUENCE_DECISION_WINDOW_BARS = 6
+SEQUENCE_LOOKBACK_BARS = (
+    SEQUENCE_PRE_EPISODE_CONTEXT_BARS + SEQUENCE_DECISION_WINDOW_BARS
+)
 _BAR_NS = int(pd.Timedelta(minutes=15).value)
 
 _META_COLUMNS: tuple[str, ...] = (
     *DETECTOR_IDENTITY_COLUMNS,
+    "episode_open_time",
     "dataset_split",
     "trainable_row",
     "target_good_short_now",
@@ -36,6 +41,8 @@ class DetectorSequenceStore:
     row_index_by_decision_row_id: dict[str, int]
     feature_columns: tuple[str, ...]
     lookback_bars: int
+    pre_episode_context_bars: int
+    decision_window_bars: int
 
 
 def build_detector_sequence_store(
@@ -45,10 +52,24 @@ def build_detector_sequence_store(
     breadth_state_df: pd.DataFrame,
     episode_state_df: pd.DataFrame,
     feature_columns: tuple[str, ...] = DETECTOR_SEQUENCE_FEATURE_COLUMNS,
-    lookback_bars: int = SEQUENCE_LOOKBACK_BARS,
+    lookback_bars: int | None = None,
+    pre_episode_context_bars: int = SEQUENCE_PRE_EPISODE_CONTEXT_BARS,
+    decision_window_bars: int = SEQUENCE_DECISION_WINDOW_BARS,
 ) -> DetectorSequenceStore:
-    if int(lookback_bars) != SEQUENCE_LOOKBACK_BARS:
-        raise ValueError(f"lookback_bars must be {SEQUENCE_LOOKBACK_BARS}")
+    pre_episode_context_bars = int(pre_episode_context_bars)
+    decision_window_bars = int(decision_window_bars)
+    if pre_episode_context_bars <= 0:
+        raise ValueError("pre_episode_context_bars must be positive")
+    if decision_window_bars <= 0:
+        raise ValueError("decision_window_bars must be positive")
+    computed_lookback_bars = pre_episode_context_bars + decision_window_bars
+    if lookback_bars is None:
+        lookback_bars = computed_lookback_bars
+    lookback_bars = int(lookback_bars)
+    if lookback_bars != computed_lookback_bars:
+        raise ValueError(
+            "lookback_bars must equal pre_episode_context_bars + decision_window_bars"
+        )
     _require_columns(detector_dataset_df, _META_COLUMNS, "detector_dataset_df")
     feature_columns = tuple(feature_columns)
     if not feature_columns:
@@ -62,6 +83,9 @@ def build_detector_sequence_store(
     )
     meta_df["entry_bar_open_time"] = pd.to_datetime(
         meta_df["entry_bar_open_time"], utc=True, errors="raise"
+    )
+    meta_df["episode_open_time"] = pd.to_datetime(
+        meta_df["episode_open_time"], utc=True, errors="raise"
     )
     token_feature_columns = _resolve_source_columns(
         feature_columns,
@@ -197,15 +221,18 @@ def build_detector_sequence_store(
         episode_id = str(getattr(row, _EPISODE_ID_COLUMN))
         context_ts = pd.Timestamp(getattr(row, "context_bar_open_time")).value
         open_ts = int(episode_open_ts.get(episode_id, context_ts + 1))
+        window_start_ts = open_ts - pre_episode_context_bars * _BAR_NS
         for step in range(lookback_bars):
-            ts = context_ts - (lookback_bars - 1 - step) * _BAR_NS
+            ts = window_start_ts + step * _BAR_NS
+            if ts > context_ts:
+                continue
             token_values = token_lookup.get((symbol, ts))
             if token_values is not None:
                 valid_mask[row_idx, step] = True
             reference_values = reference_lookup.get(ts)
             breadth_values = breadth_lookup.get(ts)
-            is_in_episode = open_ts <= ts <= context_ts
-            if is_in_episode:
+            is_in_episode = open_ts <= ts <= context_ts and token_values is not None
+            if is_in_episode and valid_mask[row_idx, step]:
                 in_episode_mask[row_idx, step] = True
             episode_values = episode_lookup.get((episode_id, ts)) if is_in_episode else None
             if token_values is not None and token_assign_targets.size > 0:
@@ -250,6 +277,8 @@ def build_detector_sequence_store(
         row_index_by_decision_row_id=row_index,
         feature_columns=feature_columns,
         lookback_bars=lookback_bars,
+        pre_episode_context_bars=pre_episode_context_bars,
+        decision_window_bars=decision_window_bars,
     )
 
 
@@ -377,12 +406,12 @@ def _build_episode_lookup(
 
 def _build_episode_open_times(meta_df: pd.DataFrame) -> dict[str, int]:
     grouped = (
-        meta_df.loc[:, ["episode_id", "context_bar_open_time"]]
-        .groupby("episode_id", as_index=False)["context_bar_open_time"]
+        meta_df.loc[:, ["episode_id", "episode_open_time"]]
+        .groupby("episode_id", as_index=False)["episode_open_time"]
         .min()
     )
     return {
-        str(row.episode_id): pd.Timestamp(row.context_bar_open_time).value
+        str(row.episode_id): pd.Timestamp(row.episode_open_time).value
         for row in grouped.itertuples(index=False)
     }
 
