@@ -1302,7 +1302,7 @@ def _build_execution_aware_selector_metrics(
     )
     tp_rate_edge_vs_breakeven = float(tp_rate_resolved - tp_rate_breakeven)
     if resolved_signals_total <= 0:
-        edge_vs_breakeven_zscore: float | None = None
+        edge_vs_breakeven_zscore = math.nan
     else:
         variance = (
                 tp_rate_breakeven
@@ -1312,7 +1312,7 @@ def _build_execution_aware_selector_metrics(
         edge_vs_breakeven_zscore = (
             float(tp_rate_edge_vs_breakeven / math.sqrt(variance))
             if variance > 0.0
-            else None
+            else math.nan
         )
     return {
         "resolved_signals_total": float(resolved_signals_total),
