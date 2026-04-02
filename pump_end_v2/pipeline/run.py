@@ -166,9 +166,36 @@ def run_pump_end_v2_pipeline(
     stage_start("PIPELINE", "EVENT_CORE")
     episodes = open_causal_pump_episodes(token_state_tradable, config.event_opener)
     decision_rows = build_decision_rows(
-        token_state_tradable, episodes, config.execution
+        token_state_tradable,
+        episodes,
+        config.execution,
+        decision_window_bars=config.detector_model.decision_window_bars,
     )
-    resolved_rows = resolve_decision_rows(bars_15m, decision_rows, config.resolver)
+    resolver_intervals = _derive_1m_stage_intervals([decision_rows], config.execution)
+    resolver_symbols, resolver_start, resolver_end = _summarize_1m_intervals(
+        resolver_intervals
+    )
+    log_info(
+        "PIPELINE",
+        (
+            f"EVENT_CORE resolver 1m context symbols_total={len(resolver_symbols)} "
+            f"window_start={resolver_start} window_end={resolver_end}"
+        ),
+    )
+    raw_1m_resolver = market_loader.load_1m_ohlcv_intervals(resolver_intervals)
+    bars_1m_resolver = prepare_intraday_bars_frame(raw_1m_resolver, "1m")
+    execution_market_view_resolver = build_execution_market_view(
+        bars_15m, bars_1m_resolver
+    )
+    resolved_rows = resolve_decision_rows(
+        bars_15m_df=bars_15m,
+        bars_1m_df=bars_1m_resolver,
+        decision_rows=decision_rows,
+        execution_contract=config.execution,
+        config=config.resolver,
+        bars_1s_fetcher=bars_1s_fetcher,
+        execution_market_view=execution_market_view_resolver,
+    )
     episode_summary = build_episode_summary(resolved_rows)
     event_quality_report = build_event_quality_report(episode_summary)
     event_elapsed = time.perf_counter() - event_started
@@ -205,6 +232,8 @@ def run_pump_end_v2_pipeline(
         reference_state_df=reference_state,
         breadth_state_df=breadth_state,
         episode_state_df=episode_state,
+        pre_episode_context_bars=config.detector_model.pre_episode_context_bars,
+        decision_window_bars=config.detector_model.decision_window_bars,
     )
     detector_dataset_elapsed = time.perf_counter() - detector_dataset_started
     split_counts = detector_dataset["dataset_split"].value_counts(dropna=False).to_dict()
@@ -243,6 +272,7 @@ def run_pump_end_v2_pipeline(
         dataset_df=detector_dataset,
         split_bounds=config.splits,
         resolver_config=config.resolver,
+        execution_contract=config.execution,
         event_opener_config=config.event_opener,
         detector_cv_config=config.detector_cv,
         detector_model_config=config.detector_model,
@@ -257,6 +287,7 @@ def run_pump_end_v2_pipeline(
         dataset_df=detector_dataset,
         split_bounds=config.splits,
         resolver_config=config.resolver,
+        execution_contract=config.execution,
         event_opener_config=config.event_opener,
         detector_model_config=config.detector_model,
         sequence_store=detector_sequence_store,
@@ -302,6 +333,7 @@ def run_pump_end_v2_pipeline(
         dataset_df=detector_dataset,
         split_bounds=config.splits,
         resolver_config=config.resolver,
+        execution_contract=config.execution,
         event_opener_config=config.event_opener,
         detector_model_config=config.detector_model,
         sequence_store=detector_sequence_store,
@@ -330,6 +362,10 @@ def run_pump_end_v2_pipeline(
         getattr(detector_model_test, "training_history", [])
     )
     sequence_spec = {
+        "pre_episode_context_bars": int(
+            detector_sequence_store.pre_episode_context_bars
+        ),
+        "decision_window_bars": int(detector_sequence_store.decision_window_bars),
         "lookback_bars": int(detector_sequence_store.lookback_bars),
         "feature_columns": list(detector_sequence_store.feature_columns),
         "feature_count": int(len(detector_sequence_store.feature_columns)),
@@ -993,6 +1029,12 @@ def run_pump_end_v2_pipeline(
             "model_importance_available": bool(not detector_oof_importance_folds_df.empty),
         },
         "sequence_lookback_bars": int(detector_sequence_store.lookback_bars),
+        "sequence_pre_episode_context_bars": int(
+            detector_sequence_store.pre_episode_context_bars
+        ),
+        "sequence_decision_window_bars": int(
+            detector_sequence_store.decision_window_bars
+        ),
         "sequence_feature_count": int(len(detector_sequence_store.feature_columns)),
         "sequence_train_rows": int(
             (

@@ -4,6 +4,7 @@ from datetime import datetime
 import pandas as pd
 
 from pump_end_v2.config import DetectorCVConfig, ResolverConfig, SplitBounds
+from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.logging import log_info
 
 
@@ -68,6 +69,7 @@ def generate_detector_walkforward_folds(
     dataset_df: pd.DataFrame,
     split_bounds: SplitBounds,
     resolver_config: ResolverConfig,
+    execution_contract: ExecutionContract,
     detector_cv_config: DetectorCVConfig,
 ) -> list[DetectorFold]:
     _validate_fold_inputs(dataset_df)
@@ -75,7 +77,8 @@ def generate_detector_walkforward_folds(
     if train_df.empty:
         log_info(
             "CV",
-            f"fold generation summary folds_total=0 purge_gap_bars={resolver_config.horizon_bars}",
+            "fold generation summary folds_total=0 "
+            f"purge_gap_bars={int(execution_contract.entry_shift_bars) + int(execution_contract.max_hold_bars)}",
         )
         return []
     train_df["context_bar_open_time"] = pd.to_datetime(
@@ -90,7 +93,10 @@ def generate_detector_walkforward_folds(
     )
     min_train_delta = pd.Timedelta(days=detector_cv_config.min_train_days)
     fold_span_delta = pd.Timedelta(days=detector_cv_config.fold_span_days)
-    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
+    purge_gap_bars = int(execution_contract.entry_shift_bars) + int(
+        execution_contract.max_hold_bars
+    )
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * purge_gap_bars)
     val_window_delta = fold_span_delta - pd.Timedelta(minutes=15)
     candidate_folds: list[DetectorFold] = []
     cursor = train_start + min_train_delta
@@ -113,7 +119,7 @@ def generate_detector_walkforward_folds(
                     train_end=fold_train["context_bar_open_time"].max().to_pydatetime(),
                     val_start=val_start.to_pydatetime(),
                     val_end=val_end.to_pydatetime(),
-                    purge_gap_bars=resolver_config.horizon_bars,
+                    purge_gap_bars=purge_gap_bars,
                     train_row_count=len(fold_train),
                     val_row_count=len(fold_val),
                 )
@@ -137,7 +143,7 @@ def generate_detector_walkforward_folds(
         )
     log_info(
         "CV",
-        f"fold generation summary folds_total={len(folds)} purge_gap_bars={resolver_config.horizon_bars}",
+        f"fold generation summary folds_total={len(folds)} purge_gap_bars={purge_gap_bars}",
     )
     return folds
 

@@ -108,7 +108,7 @@ class SequenceTCNBinaryClassifier(nn.Module):
 @dataclass(slots=True)
 class SequenceTrainStats:
     train_positive_rate: float
-    pos_weight: float
+    mean_sample_weight_train: float
     batch_size: int
     max_epochs: int
     early_stopping_patience: int
@@ -125,7 +125,7 @@ class SequenceTrainStats:
     def to_dict(self) -> dict[str, float | int]:
         return {
             "train_positive_rate": float(self.train_positive_rate),
-            "pos_weight": float(self.pos_weight),
+            "mean_sample_weight_train": float(self.mean_sample_weight_train),
             "batch_size": int(self.batch_size),
             "max_epochs": int(self.max_epochs),
             "early_stopping_patience": int(self.early_stopping_patience),
@@ -144,8 +144,10 @@ def train_sequence_model(
     model: SequenceTCNBinaryClassifier,
     x_train: np.ndarray,
     y_train: np.ndarray,
+    sample_weight_train: np.ndarray,
     x_eval: np.ndarray | None,
     y_eval: np.ndarray | None,
+    sample_weight_eval: np.ndarray | None,
     random_seed: int,
     batch_size: int = SEQUENCE_BATCH_SIZE,
     max_epochs: int = SEQUENCE_MAX_EPOCHS,
@@ -157,38 +159,41 @@ def train_sequence_model(
         raise ValueError("train_sequence_model received non-finite x_train")
     if not np.isfinite(y_train).all():
         raise ValueError("train_sequence_model received non-finite y_train")
+    if not np.isfinite(sample_weight_train).all():
+        raise ValueError("train_sequence_model received non-finite sample_weight_train")
     if x_eval is not None and not np.isfinite(x_eval).all():
         raise ValueError("train_sequence_model received non-finite x_eval")
     if y_eval is not None and not np.isfinite(y_eval).all():
         raise ValueError("train_sequence_model received non-finite y_eval")
+    if sample_weight_eval is not None and not np.isfinite(sample_weight_eval).all():
+        raise ValueError("train_sequence_model received non-finite sample_weight_eval")
     torch.manual_seed(int(random_seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     x_train_t = torch.tensor(x_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.float32)
-    train_ds = TensorDataset(x_train_t, y_train_t)
+    w_train_t = torch.tensor(sample_weight_train, dtype=torch.float32)
+    train_ds = TensorDataset(x_train_t, y_train_t, w_train_t)
     train_loader = DataLoader(
         train_ds,
         batch_size=int(batch_size),
         shuffle=True,
         drop_last=False,
     )
-    positives = float(np.sum(y_train > 0.5))
-    negatives = float(len(y_train) - positives)
-    pos_weight_value = float(negatives / positives) if positives > 0.0 else 1.0
-    pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(learning_rate),
         weight_decay=float(weight_decay),
     )
-    eval_data: tuple[Tensor, Tensor] | None = None
+    eval_data: tuple[Tensor, Tensor, Tensor] | None = None
     monitor_name = "train_loss_fallback"
     if x_eval is not None and y_eval is not None and len(x_eval) > 0:
+        if sample_weight_eval is None:
+            sample_weight_eval = np.ones(len(y_eval), dtype=np.float32)
         eval_data = (
             torch.tensor(x_eval, dtype=torch.float32, device=device),
             torch.tensor(y_eval, dtype=torch.float32, device=device),
+            torch.tensor(sample_weight_eval, dtype=torch.float32, device=device),
         )
         monitor_name = "eval_loss"
     best_loss = float("inf")
@@ -202,12 +207,13 @@ def train_sequence_model(
         model.train()
         train_loss_sum = 0.0
         train_count = 0
-        for batch_x, batch_y in train_loader:
+        for batch_x, batch_y, batch_w in train_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
+            batch_w = batch_w.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(batch_x)
-            loss = criterion(logits, batch_y)
+            loss = _weighted_bce_loss(logits, batch_y, batch_w)
             if not torch.isfinite(loss):
                 raise ValueError(f"non-finite train loss detected: loss={float(loss.item())}")
             loss.backward()
@@ -220,10 +226,18 @@ def train_sequence_model(
         with torch.no_grad():
             if eval_data is not None:
                 eval_logits = model(eval_data[0])
-                eval_loss = float(criterion(eval_logits, eval_data[1]).item())
+                eval_loss = float(
+                    _weighted_bce_loss(eval_logits, eval_data[1], eval_data[2]).item()
+                )
             else:
                 train_logits = model(x_train_t.to(device))
-                eval_loss = float(criterion(train_logits, y_train_t.to(device)).item())
+                eval_loss = float(
+                    _weighted_bce_loss(
+                        train_logits,
+                        y_train_t.to(device),
+                        w_train_t.to(device),
+                    ).item()
+                )
         if not np.isfinite(eval_loss):
             raise ValueError(f"non-finite eval loss detected: eval_loss={eval_loss}")
         is_best_epoch = False
@@ -267,7 +281,7 @@ def train_sequence_model(
     )
     return SequenceTrainStats(
         train_positive_rate=train_positive_rate,
-        pos_weight=pos_weight_value,
+        mean_sample_weight_train=float(np.mean(sample_weight_train)),
         batch_size=int(batch_size),
         max_epochs=int(max_epochs),
         early_stopping_patience=int(early_stopping_patience),
@@ -281,6 +295,15 @@ def train_sequence_model(
         stopped_early=bool(stopped_early),
         training_history=training_history,
     )
+
+
+def _weighted_bce_loss(logits: Tensor, targets: Tensor, sample_weight: Tensor) -> Tensor:
+    per_row_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    weights = torch.clamp(sample_weight, min=0.0)
+    denom = torch.sum(weights)
+    if float(denom.item()) <= 0.0:
+        return torch.mean(per_row_loss)
+    return torch.sum(per_row_loss * weights) / denom
 
 
 def predict_sequence_model_proba(

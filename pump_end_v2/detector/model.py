@@ -9,7 +9,6 @@ import pandas as pd
 from pump_end_v2.config import DetectorModelConfig
 from pump_end_v2.detector.sequence_dataset import (
     DetectorSequenceStore,
-    SEQUENCE_LOOKBACK_BARS,
     extract_sequences_for_rows,
 )
 from pump_end_v2.detector.sequence_model import (
@@ -78,10 +77,13 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
         dilations=tuple(int(v) for v in model_config.dilations),
         dropout=float(model_config.dropout),
     )
+    lookback_bars = int(model_config.pre_episode_context_bars) + int(
+        model_config.decision_window_bars
+    )
     return SequenceDetector(
         network=network,
         feature_columns=feature_columns,
-        lookback_bars=SEQUENCE_LOOKBACK_BARS,
+        lookback_bars=lookback_bars,
         random_seed=int(model_config.random_seed),
         batch_size=int(model_config.batch_size),
         max_epochs=int(model_config.max_epochs),
@@ -110,6 +112,14 @@ def fit_detector_model(
     y_train = pd.to_numeric(train_df[target_column], errors="coerce").fillna(0.0).to_numpy(
         dtype=np.float32
     )
+    if "target_row_weight" in train_df.columns:
+        sample_weight_train = (
+            pd.to_numeric(train_df["target_row_weight"], errors="coerce")
+            .fillna(1.0)
+            .to_numpy(dtype=np.float32)
+        )
+    else:
+        sample_weight_train = np.ones(len(train_df), dtype=np.float32)
     if len(y_train) == 0:
         raise ValueError("fit_detector_model received empty train rows")
     scaler_mean, scaler_std = _fit_scaler(x_train_raw, valid_train)
@@ -117,6 +127,7 @@ def fit_detector_model(
     x_train_input = _stack_model_inputs(x_train_scaled, valid_train, in_episode_train)
     x_eval_input: np.ndarray | None = None
     y_eval: np.ndarray | None = None
+    sample_weight_eval: np.ndarray | None = None
     if eval_df is not None and len(eval_df) > 0:
         _require_columns(eval_df, ["decision_row_id", target_column], "eval_df")
         x_eval_raw, valid_eval, in_episode_eval = extract_sequences_for_rows(
@@ -125,6 +136,14 @@ def fit_detector_model(
         y_eval = pd.to_numeric(eval_df[target_column], errors="coerce").fillna(0.0).to_numpy(
             dtype=np.float32
         )
+        if "target_row_weight" in eval_df.columns:
+            sample_weight_eval = (
+                pd.to_numeric(eval_df["target_row_weight"], errors="coerce")
+                .fillna(1.0)
+                .to_numpy(dtype=np.float32)
+            )
+        else:
+            sample_weight_eval = np.ones(len(eval_df), dtype=np.float32)
         x_eval_scaled = _transform_with_scaler(
             x_eval_raw, valid_eval, scaler_mean, scaler_std
         )
@@ -133,8 +152,10 @@ def fit_detector_model(
         model=model.network,
         x_train=x_train_input,
         y_train=y_train,
+        sample_weight_train=sample_weight_train,
         x_eval=x_eval_input,
         y_eval=y_eval,
+        sample_weight_eval=sample_weight_eval,
         random_seed=int(model.random_seed),
         batch_size=int(model.batch_size),
         max_epochs=int(model.max_epochs),

@@ -13,6 +13,7 @@ from pump_end_v2.config import (
     ResolverConfig,
     SplitBounds,
 )
+from pump_end_v2.contracts import ExecutionContract
 from pump_end_v2.detector.model import (
     SequenceDetector,
     build_sequence_permutation_importance_table,
@@ -56,6 +57,12 @@ POLICY_ROW_COLUMNS: tuple[str, ...] = (
     "episode_pump_context_streak",
     "target_good_short_now",
     "target_reason",
+    "row_trade_outcome",
+    "row_trade_pnl_pct",
+    "row_mfe_pct",
+    "row_mae_pct",
+    "row_holding_bars",
+    "target_row_weight",
     "future_outcome_class",
     "signal_quality_h32",
     "future_prepullback_squeeze_pct",
@@ -82,7 +89,8 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "fired_good_rate",
     "fires_per_30d",
     "median_bars_fire_to_ideal",
-    "median_future_net_edge_pct_at_fire",
+    "median_row_trade_pnl_pct_at_fire",
+    "median_row_mae_pct_at_fire",
     "reset_without_fire_share",
     "arm_to_fire_conversion",
     "density_sanity_penalty",
@@ -124,6 +132,7 @@ def build_detector_val_policy_rows(
         dataset_df: pd.DataFrame,
         split_bounds: SplitBounds,
         resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
         sequence_store: DetectorSequenceStore,
@@ -131,7 +140,10 @@ def build_detector_val_policy_rows(
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy val scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
-    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
+    label_horizon_bars = int(execution_contract.entry_shift_bars) + int(
+        execution_contract.max_hold_bars
+    )
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * label_horizon_bars)
     effective_train_end = pd.Timestamp(split_bounds.train_end) - purge_gap_timedelta
     train_fit = frame[
         (frame["dataset_split"] == "train")
@@ -177,7 +189,7 @@ def build_detector_val_policy_rows(
     val_active = val_rows[
         _build_active_eligibility_mask(
             val_rows,
-            resolver_config=resolver_config,
+            execution_contract=execution_contract,
             active_window_end=active_window_end,
         )
     ].copy()
@@ -224,6 +236,7 @@ def build_detector_test_policy_rows(
         dataset_df: pd.DataFrame,
         split_bounds: SplitBounds,
         resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
         sequence_store: DetectorSequenceStore,
@@ -231,7 +244,10 @@ def build_detector_test_policy_rows(
     _require_columns(dataset_df, POLICY_BASE_REQUIRED_COLUMNS)
     log_info("POLICY", "policy test scoring rows build start")
     frame = _prepare_dataset_frame(dataset_df)
-    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
+    label_horizon_bars = int(execution_contract.entry_shift_bars) + int(
+        execution_contract.max_hold_bars
+    )
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * label_horizon_bars)
     effective_train_end = pd.Timestamp(split_bounds.val_end) - purge_gap_timedelta
     train_fit = frame[
         frame["dataset_split"].isin(["train", "val"])
@@ -277,7 +293,7 @@ def build_detector_test_policy_rows(
     test_active = test_rows[
         _build_active_eligibility_mask(
             test_rows,
-            resolver_config=resolver_config,
+            execution_contract=execution_contract,
             active_window_end=active_window_end,
         )
     ].copy()
@@ -324,6 +340,7 @@ def build_detector_train_oof_policy_rows(
         dataset_df: pd.DataFrame,
         split_bounds: SplitBounds,
         resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         event_opener_config: EventOpenerConfig,
         detector_cv_config: DetectorCVConfig,
         detector_model_config: DetectorModelConfig,
@@ -336,11 +353,14 @@ def build_detector_train_oof_policy_rows(
     train_split = frame[frame["dataset_split"] == "train"].copy()
     train_context_ns = train_split["context_bar_open_time"].to_numpy(dtype=np.int64, copy=False)
     folds = generate_detector_walkforward_folds(
-        frame, split_bounds, resolver_config, detector_cv_config
+        frame, split_bounds, resolver_config, execution_contract, detector_cv_config
     )
     folds_total = len(folds)
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
-    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
+    label_horizon_bars = int(execution_contract.entry_shift_bars) + int(
+        execution_contract.max_hold_bars
+    )
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * label_horizon_bars)
     chunks: list[pd.DataFrame] = []
     importance_chunks: list[pd.DataFrame] = []
     history_chunks: list[pd.DataFrame] = []
@@ -422,7 +442,7 @@ def build_detector_train_oof_policy_rows(
         fold_active_rows = fold_active_rows[
             _build_active_eligibility_mask(
                 fold_active_rows,
-                resolver_config=resolver_config,
+                execution_contract=execution_contract,
                 active_window_end=val_end,
             )
         ].copy()
@@ -690,9 +710,10 @@ def sweep_detector_policy(
                 "fired_good_rate": metrics["fired_good_rate"],
                 "fires_per_30d": metrics["fires_per_30d"],
                 "median_bars_fire_to_ideal": metrics["median_bars_fire_to_ideal"],
-                "median_future_net_edge_pct_at_fire": metrics[
-                    "median_future_net_edge_pct_at_fire"
+                "median_row_trade_pnl_pct_at_fire": metrics[
+                    "median_row_trade_pnl_pct_at_fire"
                 ],
+                "median_row_mae_pct_at_fire": metrics["median_row_mae_pct_at_fire"],
                 "reset_without_fire_share": metrics["reset_without_fire_share"],
                 "arm_to_fire_conversion": metrics["arm_to_fire_conversion"],
                 "density_sanity_penalty": _compute_detector_density_sanity_penalty(
@@ -737,8 +758,8 @@ def select_detector_policy(
         ranked = ranked[
             pd.to_numeric(ranked["episodes_fired"], errors="coerce").fillna(0.0) > 0.0
             ].copy()
-    ranked["_median_future_edge_sort"] = pd.to_numeric(
-        ranked["median_future_net_edge_pct_at_fire"], errors="coerce"
+    ranked["_median_row_trade_pnl_sort"] = pd.to_numeric(
+        ranked["median_row_trade_pnl_pct_at_fire"], errors="coerce"
     ).fillna(float("-inf"))
     ranked["_median_bars_abs_sort"] = (
         pd.to_numeric(ranked["median_bars_fire_to_ideal"], errors="coerce")
@@ -748,7 +769,7 @@ def select_detector_policy(
     ranked = ranked.sort_values(
         by=[
             "selection_score",
-            "_median_future_edge_sort",
+            "_median_row_trade_pnl_sort",
             "episodes_fired",
             "_median_bars_abs_sort",
             "arm_score_min",
@@ -780,6 +801,7 @@ def build_detector_val_candidate_signal_ledger(
         dataset_df: pd.DataFrame,
         split_bounds: SplitBounds,
         resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
         detector_policy_config: DetectorPolicyConfig,
@@ -789,6 +811,7 @@ def build_detector_val_candidate_signal_ledger(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
+        execution_contract=execution_contract,
         event_opener_config=event_opener_config,
         detector_model_config=detector_model_config,
         sequence_store=sequence_store,
@@ -812,6 +835,7 @@ def build_detector_test_candidate_signal_ledger(
         dataset_df: pd.DataFrame,
         split_bounds: SplitBounds,
         resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         event_opener_config: EventOpenerConfig,
         detector_model_config: DetectorModelConfig,
         detector_policy_config: DetectorPolicyConfig,
@@ -821,6 +845,7 @@ def build_detector_test_candidate_signal_ledger(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
+        execution_contract=execution_contract,
         event_opener_config=event_opener_config,
         detector_model_config=detector_model_config,
         sequence_store=sequence_store,
@@ -851,6 +876,7 @@ def build_detector_train_oof_candidate_signal_ledger(
         dataset_df: pd.DataFrame,
         split_bounds: SplitBounds,
         resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         event_opener_config: EventOpenerConfig,
         detector_cv_config: DetectorCVConfig,
         detector_model_config: DetectorModelConfig,
@@ -861,6 +887,7 @@ def build_detector_train_oof_candidate_signal_ledger(
         dataset_df=dataset_df,
         split_bounds=split_bounds,
         resolver_config=resolver_config,
+        execution_contract=execution_contract,
         event_opener_config=event_opener_config,
         detector_cv_config=detector_cv_config,
         detector_model_config=detector_model_config,
@@ -1059,14 +1086,15 @@ def _score_policy_window(
 
 def _build_active_eligibility_mask(
         rows_df: pd.DataFrame,
-        resolver_config: ResolverConfig,
+        execution_contract: ExecutionContract,
         active_window_end: pd.Timestamp,
 ) -> pd.Series:
     if rows_df.empty:
         return pd.Series(dtype=bool)
-    horizon_delta = pd.Timedelta(
-        minutes=15 * max(int(resolver_config.horizon_bars) - 1, 0)
+    label_horizon_bars = int(execution_contract.entry_shift_bars) + int(
+        execution_contract.max_hold_bars
     )
+    horizon_delta = pd.Timedelta(minutes=15 * max(label_horizon_bars, 0))
     entry_bar_open_time = rows_df["entry_bar_open_time"]
     if pd.api.types.is_datetime64_any_dtype(
         entry_bar_open_time
@@ -1107,6 +1135,12 @@ def _available_rows_to_score_columns(rows_to_score: pd.DataFrame) -> list[str]:
         "episode_pump_context_streak",
         "target_good_short_now",
         "target_reason",
+        "row_trade_outcome",
+        "row_trade_pnl_pct",
+        "row_mfe_pct",
+        "row_mae_pct",
+        "row_holding_bars",
+        "target_row_weight",
         "future_outcome_class",
         "signal_quality_h32",
         "future_prepullback_squeeze_pct",
