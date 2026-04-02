@@ -1094,7 +1094,7 @@ def _build_active_eligibility_mask(
     label_horizon_bars = int(execution_contract.entry_shift_bars) + int(
         execution_contract.max_hold_bars
     )
-    horizon_delta = pd.Timedelta(minutes=15 * max(label_horizon_bars, 0))
+    horizon_delta = pd.Timedelta(minutes=15 * max(label_horizon_bars - 1, 0))
     entry_bar_open_time = rows_df["entry_bar_open_time"]
     if pd.api.types.is_datetime64_any_dtype(
         entry_bar_open_time
