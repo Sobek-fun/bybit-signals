@@ -290,7 +290,6 @@ def build_detector_test_policy_rows(
         return model, scored
     active_start = test_active["context_bar_open_time"].min()
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
-    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
     warmup_start = active_start - warmup_timedelta
     warmup_rows = frame[
         (frame["context_bar_open_time"] >= warmup_start)
@@ -341,6 +340,7 @@ def build_detector_train_oof_policy_rows(
     )
     folds_total = len(folds)
     warmup_timedelta = pd.Timedelta(minutes=15 * event_opener_config.max_episode_bars)
+    purge_gap_timedelta = pd.Timedelta(minutes=15 * resolver_config.horizon_bars)
     chunks: list[pd.DataFrame] = []
     importance_chunks: list[pd.DataFrame] = []
     history_chunks: list[pd.DataFrame] = []
