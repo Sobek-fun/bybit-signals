@@ -3,9 +3,9 @@ import pandas as pd
 
 
 def build_detector_target_metrics(
-        policy_rows_df: pd.DataFrame, good_threshold: float = 0.5
+    policy_rows_df: pd.DataFrame, good_threshold: float = 0.5
 ) -> dict[str, float]:
-    required_columns = ("p_good", "target_good_short_now", "target_reason")
+    required_columns = ("p_good", "target_reason")
     missing = [
         column for column in required_columns if column not in policy_rows_df.columns
     ]
@@ -18,28 +18,22 @@ def build_detector_target_metrics(
         return {
             "rows_total": 0.0,
             "p_good_nan_share": 0.0,
-            "good_row_precision": 0.0,
-            "good_row_recall": 0.0,
-            "too_early_fp_rate": 0.0,
-            "too_late_fp_rate": 0.0,
-            "continuation_fp_rate": 0.0,
-            "flat_fp_rate": 0.0,
-            "roc_auc_good_vs_bad": 0.0,
-            "mean_p_good_good": 0.0,
-            "mean_p_good_too_early": 0.0,
-            "mean_p_good_too_late": 0.0,
-            "mean_p_good_continuation": 0.0,
-            "mean_p_good_flat": 0.0,
+            "tp_row_precision": 0.0,
+            "tp_row_recall": 0.0,
+            "sl_fp_rate": 0.0,
+            "timeout_fp_rate": 0.0,
+            "ambiguous_fp_rate": 0.0,
+            "roc_auc_tp_vs_non_tp": 0.0,
+            "mean_p_good_tp": 0.0,
+            "mean_p_good_sl": 0.0,
+            "mean_p_good_timeout": 0.0,
+            "mean_p_good_ambiguous": 0.0,
         }
     p_good_numeric = pd.to_numeric(frame["p_good"], errors="coerce")
     p_good_nan_share = float(p_good_numeric.isna().mean())
     predicted_good = p_good_numeric.fillna(0.0) >= float(good_threshold)
-    actual_good = (
-            pd.to_numeric(frame["target_good_short_now"], errors="coerce")
-            .fillna(0)
-            .astype(int)
-            == 1
-    )
+    reasons = frame["target_reason"].astype(str).str.strip().str.lower()
+    actual_good = reasons.eq("tp")
     valid_auc_mask = p_good_numeric.notna()
     auc_score = _binary_roc_auc(
         actual_good.loc[valid_auc_mask].astype(int),
@@ -48,26 +42,21 @@ def build_detector_target_metrics(
     tp = int((predicted_good & actual_good).sum())
     pred_pos = int(predicted_good.sum())
     actual_pos = int(actual_good.sum())
-    reasons = frame["target_reason"].astype(str).str.strip().str.lower()
     return {
         "rows_total": float(len(frame)),
         "p_good_nan_share": p_good_nan_share,
-        "good_row_precision": _safe_ratio(tp, pred_pos),
-        "good_row_recall": _safe_ratio(tp, actual_pos),
-        "too_early_fp_rate": _reason_fp_rate(predicted_good, reasons, "too_early"),
-        "too_late_fp_rate": _reason_fp_rate(predicted_good, reasons, "too_late"),
-        "continuation_fp_rate": _reason_fp_rate(
-            predicted_good, reasons, "continuation"
+        "tp_row_precision": _safe_ratio(tp, pred_pos),
+        "tp_row_recall": _safe_ratio(tp, actual_pos),
+        "sl_fp_rate": _reason_fp_rate(predicted_good, reasons, "sl"),
+        "timeout_fp_rate": _reason_fp_rate(predicted_good, reasons, "timeout"),
+        "ambiguous_fp_rate": _reason_fp_rate(predicted_good, reasons, "ambiguous"),
+        "roc_auc_tp_vs_non_tp": float(auc_score),
+        "mean_p_good_tp": _mean_p_good_for_reason(p_good_numeric, reasons, "tp"),
+        "mean_p_good_sl": _mean_p_good_for_reason(p_good_numeric, reasons, "sl"),
+        "mean_p_good_timeout": _mean_p_good_for_reason(p_good_numeric, reasons, "timeout"),
+        "mean_p_good_ambiguous": _mean_p_good_for_reason(
+            p_good_numeric, reasons, "ambiguous"
         ),
-        "flat_fp_rate": _reason_fp_rate(predicted_good, reasons, "flat"),
-        "roc_auc_good_vs_bad": float(auc_score),
-        "mean_p_good_good": _mean_p_good_for_reason(p_good_numeric, reasons, "good"),
-        "mean_p_good_too_early": _mean_p_good_for_reason(p_good_numeric, reasons, "too_early"),
-        "mean_p_good_too_late": _mean_p_good_for_reason(p_good_numeric, reasons, "too_late"),
-        "mean_p_good_continuation": _mean_p_good_for_reason(
-            p_good_numeric, reasons, "continuation"
-        ),
-        "mean_p_good_flat": _mean_p_good_for_reason(p_good_numeric, reasons, "flat"),
     }
 
 
@@ -75,10 +64,9 @@ def build_detector_score_decile_report(policy_rows_df: pd.DataFrame) -> pd.DataF
     required_columns = (
         "p_good",
         "target_reason",
-        "target_good_short_now",
-        "future_net_edge_pct",
-        "future_pullback_pct",
-        "future_prepullback_squeeze_pct",
+        "row_trade_pnl_pct",
+        "row_mfe_pct",
+        "row_mae_pct",
     )
     missing = [
         column for column in required_columns if column not in policy_rows_df.columns
@@ -96,14 +84,13 @@ def build_detector_score_decile_report(policy_rows_df: pd.DataFrame) -> pd.DataF
                 "p_good_min",
                 "p_good_max",
                 "p_good_mean",
-                "good_rate",
-                "too_early_share",
-                "too_late_share",
-                "continuation_share",
-                "flat_share",
-                "avg_future_net_edge_pct",
-                "mean_future_pullback_pct",
-                "mean_future_prepullback_squeeze_pct",
+                "tp_rate",
+                "sl_share",
+                "timeout_share",
+                "ambiguous_share",
+                "avg_row_trade_pnl_pct",
+                "mean_row_mfe_pct",
+                "mean_row_mae_pct",
             ]
         )
     frame["p_good"] = pd.to_numeric(frame["p_good"], errors="coerce")
@@ -116,32 +103,22 @@ def build_detector_score_decile_report(policy_rows_df: pd.DataFrame) -> pd.DataF
                 "p_good_min",
                 "p_good_max",
                 "p_good_mean",
-                "good_rate",
-                "too_early_share",
-                "too_late_share",
-                "continuation_share",
-                "flat_share",
-                "avg_future_net_edge_pct",
-                "mean_future_pullback_pct",
-                "mean_future_prepullback_squeeze_pct",
+                "tp_rate",
+                "sl_share",
+                "timeout_share",
+                "ambiguous_share",
+                "avg_row_trade_pnl_pct",
+                "mean_row_mfe_pct",
+                "mean_row_mae_pct",
             ]
         )
     quantiles = min(10, int(len(frame)))
     ranks = frame["p_good"].rank(method="first")
     frame["decile"] = pd.qcut(ranks, q=quantiles, labels=False) + 1
     frame["target_reason"] = frame["target_reason"].astype(str).str.strip().str.lower()
-    frame["target_good_short_now"] = (
-        pd.to_numeric(frame["target_good_short_now"], errors="coerce").fillna(0.0).astype(float)
-    )
-    frame["future_net_edge_pct"] = pd.to_numeric(
-        frame["future_net_edge_pct"], errors="coerce"
-    )
-    frame["future_pullback_pct"] = pd.to_numeric(
-        frame["future_pullback_pct"], errors="coerce"
-    )
-    frame["future_prepullback_squeeze_pct"] = pd.to_numeric(
-        frame["future_prepullback_squeeze_pct"], errors="coerce"
-    )
+    frame["row_trade_pnl_pct"] = pd.to_numeric(frame["row_trade_pnl_pct"], errors="coerce")
+    frame["row_mfe_pct"] = pd.to_numeric(frame["row_mfe_pct"], errors="coerce")
+    frame["row_mae_pct"] = pd.to_numeric(frame["row_mae_pct"], errors="coerce")
     out_rows: list[dict[str, float | int]] = []
     for decile_value, group in frame.groupby("decile", sort=True):
         rows_total = int(len(group))
@@ -153,25 +130,20 @@ def build_detector_score_decile_report(policy_rows_df: pd.DataFrame) -> pd.DataF
                 "p_good_min": float(group["p_good"].min()),
                 "p_good_max": float(group["p_good"].max()),
                 "p_good_mean": float(group["p_good"].mean()),
-                "good_rate": float(group["target_good_short_now"].mean()),
-                "too_early_share": _safe_ratio(int((reasons == "too_early").sum()), rows_total),
-                "too_late_share": _safe_ratio(int((reasons == "too_late").sum()), rows_total),
-                "continuation_share": _safe_ratio(
-                    int((reasons == "continuation").sum()), rows_total
-                ),
-                "flat_share": _safe_ratio(int((reasons == "flat").sum()), rows_total),
-                "avg_future_net_edge_pct": float(group["future_net_edge_pct"].mean()),
-                "mean_future_pullback_pct": float(group["future_pullback_pct"].mean()),
-                "mean_future_prepullback_squeeze_pct": float(
-                    group["future_prepullback_squeeze_pct"].mean()
-                ),
+                "tp_rate": _safe_ratio(int((reasons == "tp").sum()), rows_total),
+                "sl_share": _safe_ratio(int((reasons == "sl").sum()), rows_total),
+                "timeout_share": _safe_ratio(int((reasons == "timeout").sum()), rows_total),
+                "ambiguous_share": _safe_ratio(int((reasons == "ambiguous").sum()), rows_total),
+                "avg_row_trade_pnl_pct": float(group["row_trade_pnl_pct"].mean()),
+                "mean_row_mfe_pct": float(group["row_mfe_pct"].mean()),
+                "mean_row_mae_pct": float(group["row_mae_pct"].mean()),
             }
         )
     return pd.DataFrame(out_rows).sort_values("decile", kind="mergesort").reset_index(drop=True)
 
 
 def build_detector_rank_quality_report(policy_rows_df: pd.DataFrame) -> dict[str, float]:
-    required_columns = ("p_good", "target_good_short_now")
+    required_columns = ("p_good", "target_reason")
     missing = [
         column for column in required_columns if column not in policy_rows_df.columns
     ]
@@ -183,47 +155,48 @@ def build_detector_rank_quality_report(policy_rows_df: pd.DataFrame) -> dict[str
     if frame.empty:
         return {
             "rows_total": 0.0,
-            "roc_auc_good_vs_bad": 0.0,
-            "mean_p_good_good": 0.0,
-            "mean_p_good_bad": 0.0,
-            "top_decile_good_rate": 0.0,
-            "bottom_decile_good_rate": 0.0,
+            "roc_auc_tp_vs_non_tp": 0.0,
+            "mean_p_good_tp": 0.0,
+            "mean_p_good_non_tp": 0.0,
+            "top_decile_tp_rate": 0.0,
+            "bottom_decile_tp_rate": 0.0,
         }
     frame["p_good"] = pd.to_numeric(frame["p_good"], errors="coerce")
-    frame["target_good_short_now"] = (
-        pd.to_numeric(frame["target_good_short_now"], errors="coerce").fillna(0.0).astype(int)
-    )
+    frame["target_reason"] = frame["target_reason"].astype(str).str.strip().str.lower()
+    frame["target_tp"] = frame["target_reason"].eq("tp").astype(int)
     frame = frame[frame["p_good"].notna()].copy()
     if frame.empty:
         return {
             "rows_total": 0.0,
-            "roc_auc_good_vs_bad": 0.0,
-            "mean_p_good_good": 0.0,
-            "mean_p_good_bad": 0.0,
-            "top_decile_good_rate": 0.0,
-            "bottom_decile_good_rate": 0.0,
+            "roc_auc_tp_vs_non_tp": 0.0,
+            "mean_p_good_tp": 0.0,
+            "mean_p_good_non_tp": 0.0,
+            "top_decile_tp_rate": 0.0,
+            "bottom_decile_tp_rate": 0.0,
         }
-    auc_score = _binary_roc_auc(frame["target_good_short_now"], frame["p_good"])
-    mean_p_good_good = float(frame.loc[frame["target_good_short_now"] == 1, "p_good"].mean())
-    mean_p_good_bad = float(frame.loc[frame["target_good_short_now"] != 1, "p_good"].mean())
+    auc_score = _binary_roc_auc(frame["target_tp"], frame["p_good"])
+    mean_p_good_tp = float(frame.loc[frame["target_tp"] == 1, "p_good"].mean())
+    mean_p_good_non_tp = float(frame.loc[frame["target_tp"] != 1, "p_good"].mean())
     quantiles = min(10, int(len(frame)))
     ranks = frame["p_good"].rank(method="first")
     frame["decile"] = pd.qcut(ranks, q=quantiles, labels=False) + 1
     top_decile = int(frame["decile"].max())
     bottom_decile = int(frame["decile"].min())
-    top_decile_good_rate = float(
-        frame.loc[frame["decile"] == top_decile, "target_good_short_now"].mean()
+    top_decile_tp_rate = float(
+        frame.loc[frame["decile"] == top_decile, "target_tp"].mean()
     )
-    bottom_decile_good_rate = float(
-        frame.loc[frame["decile"] == bottom_decile, "target_good_short_now"].mean()
+    bottom_decile_tp_rate = float(
+        frame.loc[frame["decile"] == bottom_decile, "target_tp"].mean()
     )
     return {
         "rows_total": float(len(frame)),
-        "roc_auc_good_vs_bad": float(auc_score),
-        "mean_p_good_good": 0.0 if np.isnan(mean_p_good_good) else float(mean_p_good_good),
-        "mean_p_good_bad": 0.0 if np.isnan(mean_p_good_bad) else float(mean_p_good_bad),
-        "top_decile_good_rate": float(top_decile_good_rate),
-        "bottom_decile_good_rate": float(bottom_decile_good_rate),
+        "roc_auc_tp_vs_non_tp": float(auc_score),
+        "mean_p_good_tp": 0.0 if np.isnan(mean_p_good_tp) else float(mean_p_good_tp),
+        "mean_p_good_non_tp": 0.0
+        if np.isnan(mean_p_good_non_tp)
+        else float(mean_p_good_non_tp),
+        "top_decile_tp_rate": float(top_decile_tp_rate),
+        "bottom_decile_tp_rate": float(bottom_decile_tp_rate),
     }
 
 

@@ -23,6 +23,12 @@ INPUT_REQUIRED_COLUMNS: tuple[str, ...] = (
 _OPTIONAL_HINDSIGHT_COLUMNS: tuple[str, ...] = (
     "target_good_short_now",
     "target_reason",
+    "row_trade_outcome",
+    "row_trade_pnl_pct",
+    "row_mfe_pct",
+    "row_mae_pct",
+    "row_holding_bars",
+    "target_row_weight",
     "future_outcome_class",
     "signal_quality_h32",
     "future_prepullback_squeeze_pct",
@@ -64,6 +70,12 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "policy_turn_down_delta",
     "target_good_short_now",
     "target_reason",
+    "row_trade_outcome",
+    "row_trade_pnl_pct",
+    "row_mfe_pct",
+    "row_mae_pct",
+    "row_holding_bars",
+    "target_row_weight",
     "future_outcome_class",
     "signal_quality_h32",
     "future_prepullback_squeeze_pct",
@@ -94,7 +106,8 @@ EPISODE_POLICY_SUMMARY_COLUMNS: tuple[str, ...] = (
     "fire_target_reason",
     "fire_future_outcome_class",
     "fire_signal_quality_h32",
-    "fire_future_net_edge_pct",
+    "fire_row_trade_pnl_pct",
+    "fire_row_mae_pct",
     "bars_fire_to_ideal",
 )
 
@@ -304,8 +317,11 @@ def apply_episode_aware_detector_policy_cached(
                 "fire_signal_quality_h32": (
                     fire_signal_row["signal_quality_h32"] if fire_signal_row else pd.NA
                 ),
-                "fire_future_net_edge_pct": (
-                    fire_signal_row["future_net_edge_pct"] if fire_signal_row else pd.NA
+                "fire_row_trade_pnl_pct": (
+                    fire_signal_row["row_trade_pnl_pct"] if fire_signal_row else pd.NA
+                ),
+                "fire_row_mae_pct": (
+                    fire_signal_row["row_mae_pct"] if fire_signal_row else pd.NA
                 ),
                 "bars_fire_to_ideal": (
                     fire_signal_row["bars_fire_to_ideal"] if fire_signal_row else pd.NA
@@ -382,10 +398,19 @@ def build_detector_policy_metrics(
         if len(candidate_signals_df) > 0
         else float("nan")
     )
-    median_future_net_edge_pct_at_fire = (
+    median_row_trade_pnl_pct_at_fire = (
         float(
             pd.to_numeric(
-                candidate_signals_df.get("future_net_edge_pct"), errors="coerce"
+                candidate_signals_df.get("row_trade_pnl_pct"), errors="coerce"
+            ).median()
+        )
+        if len(candidate_signals_df) > 0
+        else float("nan")
+    )
+    median_row_mae_pct_at_fire = (
+        float(
+            pd.to_numeric(
+                candidate_signals_df.get("row_mae_pct"), errors="coerce"
             ).median()
         )
         if len(candidate_signals_df) > 0
@@ -418,7 +443,8 @@ def build_detector_policy_metrics(
         "fired_good_rate": float(fired_good_rate),
         "fires_per_30d": float(fires_per_30d),
         "median_bars_fire_to_ideal": float(median_bars_fire_to_ideal),
-        "median_future_net_edge_pct_at_fire": float(median_future_net_edge_pct_at_fire),
+        "median_row_trade_pnl_pct_at_fire": float(median_row_trade_pnl_pct_at_fire),
+        "median_row_mae_pct_at_fire": float(median_row_mae_pct_at_fire),
         "reset_without_fire_share": float(reset_without_fire_share),
         "arm_to_fire_conversion": float(arm_to_fire_conversion),
         "density_sanity_penalty": float(density_sanity_penalty),
@@ -500,7 +526,8 @@ def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
 def _compute_good_episode_flag(active_rows: pd.DataFrame) -> bool:
     if "signal_quality_h32" in active_rows.columns:
         quality = active_rows["signal_quality_h32"].astype(str)
-        return bool((quality == "clean_retrace_h32").any())
+        if bool((quality == "clean_retrace_h32").any()):
+            return True
     if "target_good_short_now" in active_rows.columns:
         return bool(
             (

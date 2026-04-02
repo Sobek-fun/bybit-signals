@@ -10,7 +10,14 @@ from pump_end_v2.features.manifest import (
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 TARGET_META_COLUMNS: tuple[str, ...] = (
+    "episode_open_time",
     "is_resolved",
+    "row_trade_outcome",
+    "row_trade_pnl_pct",
+    "row_mfe_pct",
+    "row_mae_pct",
+    "row_holding_bars",
+    "target_row_weight",
     "future_outcome_class",
     "signal_quality_h32",
     "target_good_short_now",
@@ -54,7 +61,10 @@ def build_detector_dataset(
             f"missing resolver rows for decision_row_id count={len(missing)} sample={preview}"
         )
     merged["trainable_row"] = merged["is_resolved"].astype(bool) & (
-            merged["target_reason"].astype(str) != "invalid_context"
+        ~merged["target_reason"]
+        .astype(str)
+        .str.lower()
+        .isin(["invalid_context", "ambiguous"])
     )
     merged["detector_trainable_row"] = merged["trainable_row"].astype(int)
     ordered_columns = [

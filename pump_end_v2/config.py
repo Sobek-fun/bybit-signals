@@ -37,6 +37,9 @@ class ResolverConfig:
     max_prepullback_squeeze_pct: float
     flat_max_abs_move_pct: float
     max_wait_bars_for_success: int
+    tp_row_weight: float
+    sl_row_weight: float
+    timeout_row_weight: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,8 @@ class DetectorModelConfig:
     fit_eval_min_rows: int
     sequence_learning_rate: float
     weight_decay: float
+    pre_episode_context_bars: int
+    decision_window_bars: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +444,15 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
             section.get("flat_max_abs_move_pct"), "data.resolver.flat_max_abs_move_pct"
         ),
         max_wait_bars_for_success=max_wait_bars_for_success,
+        tp_row_weight=_require_positive_float(
+            section.get("tp_row_weight", 1.0), "data.resolver.tp_row_weight"
+        ),
+        sl_row_weight=_require_positive_float(
+            section.get("sl_row_weight", 1.5), "data.resolver.sl_row_weight"
+        ),
+        timeout_row_weight=_require_positive_float(
+            section.get("timeout_row_weight", 0.5), "data.resolver.timeout_row_weight"
+        ),
     )
 
 
@@ -592,6 +606,14 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
         weight_decay=_require_non_negative_float(
             model_section.get("weight_decay", 1e-4),
             "detector.model.weight_decay",
+        ),
+        pre_episode_context_bars=_require_positive_int(
+            model_section.get("pre_episode_context_bars", 16),
+            "detector.model.pre_episode_context_bars",
+        ),
+        decision_window_bars=_require_positive_int(
+            model_section.get("decision_window_bars", 6),
+            "detector.model.decision_window_bars",
         ),
     )
 

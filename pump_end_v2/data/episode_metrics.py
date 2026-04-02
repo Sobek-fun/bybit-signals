@@ -3,7 +3,6 @@ import time
 
 import pandas as pd
 
-from pump_end_v2.contracts import OutcomeClass
 from pump_end_v2.logging import log_info, stage_done, stage_start
 
 
@@ -25,11 +24,10 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "good_zone_width_bars",
                 "ideal_entry_row_id",
                 "ideal_entry_bar_open_time",
-                "ideal_pullback_pct",
-                "ideal_prepullback_squeeze_pct",
-                "ideal_net_edge_pct",
+                "ideal_trade_pnl_pct",
+                "ideal_mfe_pct",
+                "ideal_mae_pct",
                 "bars_open_to_ideal_entry",
-                "extension_open_to_ideal_entry_pct",
                 "episode_outcome_class",
             ]
         )
@@ -53,50 +51,29 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
         if ideal_row.empty:
             ideal_entry_row_id = pd.NA
             ideal_entry_bar_open_time = pd.NaT
-            ideal_pullback_pct = math.nan
-            ideal_prepullback_squeeze_pct = math.nan
-            ideal_net_edge_pct = math.nan
+            ideal_trade_pnl_pct = math.nan
+            ideal_mfe_pct = math.nan
+            ideal_mae_pct = math.nan
             bars_open_to_ideal_entry = math.nan
-            extension_open_to_ideal_entry_pct = math.nan
         else:
             ideal = ideal_row.iloc[0]
             ideal_entry_row_id = ideal["decision_row_id"]
             ideal_entry_bar_open_time = ideal["entry_bar_open_time"]
-            ideal_pullback_pct = float(ideal["future_pullback_pct"])
-            ideal_prepullback_squeeze_pct = float(
-                ideal["future_prepullback_squeeze_pct"]
+            ideal_trade_pnl_pct = float(
+                pd.to_numeric(ideal["row_trade_pnl_pct"], errors="coerce")
             )
-            ideal_net_edge_pct = float(ideal["future_net_edge_pct"])
+            ideal_mfe_pct = float(pd.to_numeric(ideal["row_mfe_pct"], errors="coerce"))
+            ideal_mae_pct = float(pd.to_numeric(ideal["row_mae_pct"], errors="coerce"))
             bars_open_to_ideal_entry = int(
                 (
                     ideal_entry_bar_open_time - gdf["episode_open_time"].iloc[0]
                 ).total_seconds()
                 // (15 * 60)
             )
-            episode_open_close = pd.to_numeric(
-                gdf["episode_open_close"].iloc[0], errors="coerce"
-            )
-            ideal_entry_price = pd.to_numeric(ideal["entry_price"], errors="coerce")
-            if (
-                pd.notna(episode_open_close)
-                and float(episode_open_close) > 0.0
-                and pd.notna(ideal_entry_price)
-            ):
-                extension_open_to_ideal_entry_pct = float(
-                    (float(ideal_entry_price) - float(episode_open_close))
-                    / float(episode_open_close)
-                )
-            else:
-                extension_open_to_ideal_entry_pct = math.nan
         runup_pct_at_open = float(
             pd.to_numeric(gdf["runup_pct_at_context"].iloc[0], errors="coerce")
         )
-        if good_row_count > 0:
-            episode_outcome_class = OutcomeClass.REVERSAL.value
-        elif (gdf["future_outcome_class"] == OutcomeClass.CONTINUATION.value).any():
-            episode_outcome_class = OutcomeClass.CONTINUATION.value
-        else:
-            episode_outcome_class = OutcomeClass.FLAT.value
+        episode_outcome_class = "tradeable" if good_row_count > 0 else "not_tradeable"
         summary_rows.append(
             {
                 "episode_id": episode_id,
@@ -111,18 +88,17 @@ def build_episode_summary(resolved_rows: pd.DataFrame) -> pd.DataFrame:
                 "good_zone_width_bars": good_zone_width_bars,
                 "ideal_entry_row_id": ideal_entry_row_id,
                 "ideal_entry_bar_open_time": ideal_entry_bar_open_time,
-                "ideal_pullback_pct": ideal_pullback_pct,
-                "ideal_prepullback_squeeze_pct": ideal_prepullback_squeeze_pct,
-                "ideal_net_edge_pct": ideal_net_edge_pct,
+                "ideal_trade_pnl_pct": ideal_trade_pnl_pct,
+                "ideal_mfe_pct": ideal_mfe_pct,
+                "ideal_mae_pct": ideal_mae_pct,
                 "bars_open_to_ideal_entry": bars_open_to_ideal_entry,
-                "extension_open_to_ideal_entry_pct": extension_open_to_ideal_entry_pct,
                 "episode_outcome_class": episode_outcome_class,
             }
         )
     summary_df = pd.DataFrame(summary_rows)
     good_episode_share = (
         float(
-            (summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean()
+            (summary_df["episode_outcome_class"] == "tradeable").mean()
         )
         if not summary_df.empty
         else 0.0
@@ -142,16 +118,14 @@ def build_event_quality_report(summary_df: pd.DataFrame) -> dict[str, float]:
         return {
             "episodes_total": 0,
             "episodes_per_30d": 0.0,
-            "reversal_share": 0.0,
-            "continuation_share": 0.0,
-            "flat_share": 0.0,
-            "median_bars_open_to_ideal_entry": math.nan,
-            "median_ideal_pullback_pct": math.nan,
-            "median_ideal_remaining_squeeze_pct": math.nan,
-            "median_runup_pct_at_open": math.nan,
-            "median_extension_open_to_ideal_entry_pct": math.nan,
             "good_episode_share": 0.0,
             "mean_good_zone_width_bars": 0.0,
+            "tradeable_episode_share": 0.0,
+            "median_bars_open_to_ideal_entry": math.nan,
+            "median_runup_pct_at_open": math.nan,
+            "median_ideal_trade_pnl_pct": math.nan,
+            "median_ideal_mfe_pct": math.nan,
+            "median_ideal_mae_pct": math.nan,
         }
     episodes_total = int(len(summary_df))
     open_times = pd.to_datetime(
@@ -162,32 +136,20 @@ def build_event_quality_report(summary_df: pd.DataFrame) -> dict[str, float]:
         episodes_per_30d = float(episodes_total) * 30.0
     else:
         episodes_per_30d = float(episodes_total) / (span_days / 30.0)
-    reversal_share = float(
-        (summary_df["episode_outcome_class"] == OutcomeClass.REVERSAL.value).mean()
-    )
-    continuation_share = float(
-        (summary_df["episode_outcome_class"] == OutcomeClass.CONTINUATION.value).mean()
-    )
-    flat_share = float(
-        (summary_df["episode_outcome_class"] == OutcomeClass.FLAT.value).mean()
+    tradeable_episode_share = float(
+        (summary_df["episode_outcome_class"] == "tradeable").mean()
     )
     return {
         "episodes_total": episodes_total,
         "episodes_per_30d": episodes_per_30d,
-        "reversal_share": reversal_share,
-        "continuation_share": continuation_share,
-        "flat_share": flat_share,
+        "good_episode_share": tradeable_episode_share,
+        "tradeable_episode_share": tradeable_episode_share,
+        "mean_good_zone_width_bars": float(summary_df["good_zone_width_bars"].mean()),
         "median_bars_open_to_ideal_entry": float(
             summary_df["bars_open_to_ideal_entry"].median()
         ),
-        "median_ideal_pullback_pct": float(summary_df["ideal_pullback_pct"].median()),
-        "median_ideal_remaining_squeeze_pct": float(
-            summary_df["ideal_prepullback_squeeze_pct"].median()
-        ),
         "median_runup_pct_at_open": float(summary_df["runup_pct_at_open"].median()),
-        "median_extension_open_to_ideal_entry_pct": float(
-            summary_df["extension_open_to_ideal_entry_pct"].median()
-        ),
-        "good_episode_share": reversal_share,
-        "mean_good_zone_width_bars": float(summary_df["good_zone_width_bars"].mean()),
+        "median_ideal_trade_pnl_pct": float(summary_df["ideal_trade_pnl_pct"].median()),
+        "median_ideal_mfe_pct": float(summary_df["ideal_mfe_pct"].median()),
+        "median_ideal_mae_pct": float(summary_df["ideal_mae_pct"].median()),
     }

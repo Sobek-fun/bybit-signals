@@ -24,11 +24,10 @@ class SignalQualityClass(StrEnum):
 
 
 class TargetReason(StrEnum):
-    GOOD = "good"
-    TOO_EARLY = "too_early"
-    TOO_LATE = "too_late"
-    CONTINUATION = "continuation"
-    FLAT = "flat"
+    TP = "tp"
+    SL = "sl"
+    TIMEOUT = "timeout"
+    AMBIGUOUS = "ambiguous"
     INVALID_CONTEXT = "invalid_context"
 
 
