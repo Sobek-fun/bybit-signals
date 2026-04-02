@@ -73,6 +73,11 @@ random_seed = 42
 tp_row_weight = 1.5
 sl_row_weight = 1.0
 
+[search.detector_policy]
+selector_val_fires_per_30d_min = 110.0
+selector_val_fires_per_30d_max = 180.0
+selector_min_resolved_signals = 80
+
 [search.gate_threshold]
 include_disabled_candidate = false
 target_sl_capture_model = 0.20

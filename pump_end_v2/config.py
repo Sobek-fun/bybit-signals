@@ -83,6 +83,9 @@ class DetectorPolicySearchConfig:
     arm_candidates: tuple[float, ...]
     fire_candidates: tuple[float, ...]
     turn_candidates: tuple[float, ...]
+    selector_val_fires_per_30d_min: float
+    selector_val_fires_per_30d_max: float
+    selector_min_resolved_signals: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -727,10 +730,34 @@ def _build_detector_policy_search(
         detector_policy_section.get("turn_candidates", []),
         "search.detector_policy.turn_candidates",
     )
+    selector_val_fires_per_30d_min = float(
+        detector_policy_section.get("selector_val_fires_per_30d_min", 110.0)
+    )
+    selector_val_fires_per_30d_max = float(
+        detector_policy_section.get("selector_val_fires_per_30d_max", 180.0)
+    )
+    selector_min_resolved_signals = int(
+        detector_policy_section.get("selector_min_resolved_signals", 80)
+    )
+    if selector_val_fires_per_30d_min <= 0.0:
+        raise ValueError(
+            "search.detector_policy.selector_val_fires_per_30d_min must be positive"
+        )
+    if selector_val_fires_per_30d_max <= selector_val_fires_per_30d_min:
+        raise ValueError(
+            "search.detector_policy.selector_val_fires_per_30d_max must be > search.detector_policy.selector_val_fires_per_30d_min"
+        )
+    if selector_min_resolved_signals <= 0:
+        raise ValueError(
+            "search.detector_policy.selector_min_resolved_signals must be positive"
+        )
     return DetectorPolicySearchConfig(
         arm_candidates=arm_candidates,
         fire_candidates=fire_candidates,
         turn_candidates=turn_candidates,
+        selector_val_fires_per_30d_min=selector_val_fires_per_30d_min,
+        selector_val_fires_per_30d_max=selector_val_fires_per_30d_max,
+        selector_min_resolved_signals=selector_min_resolved_signals,
     )
 
 
