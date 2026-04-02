@@ -1,3 +1,4 @@
+import math
 from itertools import product
 import time
 
@@ -95,6 +96,15 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "arm_to_fire_conversion",
     "density_sanity_penalty",
     "selection_score",
+    "resolved_signals_total",
+    "tp_rate_resolved",
+    "sl_rate_resolved",
+    "tp_rate_breakeven",
+    "tp_rate_edge_vs_breakeven",
+    "edge_vs_breakeven_zscore",
+    "selector_density_ok",
+    "selector_support_ok",
+    "selector_density_distance",
 )
 
 POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -646,6 +656,7 @@ def build_detector_policy_grid(
 def sweep_detector_policy(
         scored_rows_df: pd.DataFrame,
         base_policy_config: DetectorPolicyConfig,
+        execution_contract: ExecutionContract,
         search_config: DetectorPolicySearchConfig | None = None,
         window_start: pd.Timestamp | None = None,
         window_end: pd.Timestamp | None = None,
@@ -654,6 +665,14 @@ def sweep_detector_policy(
     started = time.perf_counter()
     candidates = build_detector_policy_grid(base_policy_config, search_config)
     runtime_cache = build_detector_policy_runtime_cache(scored_rows_df)
+    (
+        selector_val_fires_per_30d_min,
+        selector_val_fires_per_30d_max,
+        selector_min_resolved_signals,
+    ) = _resolve_selector_thresholds(search_config)
+    density_center = (
+        selector_val_fires_per_30d_min + selector_val_fires_per_30d_max
+    ) / 2.0
     log_info(
         "POLICY",
         (
@@ -679,6 +698,20 @@ def sweep_detector_policy(
             window_end=window_end,
             window_days=window_days,
         )
+        selector_metrics = _build_execution_aware_selector_metrics(
+            candidate_signals_df, execution_contract
+        )
+        fires_per_30d = float(metrics["fires_per_30d"])
+        resolved_signals_total = float(selector_metrics["resolved_signals_total"])
+        selector_density_ok = (
+            selector_val_fires_per_30d_min
+            <= fires_per_30d
+            <= selector_val_fires_per_30d_max
+        )
+        selector_support_ok = (
+            resolved_signals_total >= float(selector_min_resolved_signals)
+        )
+        selector_density_distance = abs(fires_per_30d - density_center)
         best_selection_score = max(
             best_selection_score, float(metrics["selection_score"])
         )
@@ -693,6 +726,8 @@ def sweep_detector_policy(
                     f"policy sweep progress candidate={idx}/{len(candidates)} "
                     f"arm={candidate.arm_score_min:.6f} fire={candidate.fire_score_floor:.6f} "
                     f"turn={candidate.turn_down_delta:.6f} signals_total={len(candidate_signals_df)} "
+                    f"tp_rate_resolved={float(selector_metrics['tp_rate_resolved']):.6f} "
+                    f"resolved_signals_total={int(round(resolved_signals_total))} "
                     f"selection_score={float(metrics['selection_score']):.6f} current_best={best_selection_score:.6f} "
                     f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f}"
                 ),
@@ -720,6 +755,15 @@ def sweep_detector_policy(
                     metrics["fires_per_30d"]
                 ),
                 "selection_score": metrics["selection_score"],
+                "resolved_signals_total": resolved_signals_total,
+                "tp_rate_resolved": selector_metrics["tp_rate_resolved"],
+                "sl_rate_resolved": selector_metrics["sl_rate_resolved"],
+                "tp_rate_breakeven": selector_metrics["tp_rate_breakeven"],
+                "tp_rate_edge_vs_breakeven": selector_metrics["tp_rate_edge_vs_breakeven"],
+                "edge_vs_breakeven_zscore": selector_metrics["edge_vs_breakeven_zscore"],
+                "selector_density_ok": selector_density_ok,
+                "selector_support_ok": selector_support_ok,
+                "selector_density_distance": selector_density_distance,
             }
         )
     sweep_df = pd.DataFrame(rows, columns=list(SWEEP_COLUMNS))
@@ -733,6 +777,7 @@ def sweep_detector_policy(
 def select_detector_policy(
         scored_rows_df: pd.DataFrame,
         base_policy_config: DetectorPolicyConfig,
+        execution_contract: ExecutionContract,
         search_config: DetectorPolicySearchConfig | None = None,
         window_start: pd.Timestamp | None = None,
         window_end: pd.Timestamp | None = None,
@@ -741,6 +786,7 @@ def select_detector_policy(
     sweep_df = sweep_detector_policy(
         scored_rows_df,
         base_policy_config,
+        execution_contract=execution_contract,
         search_config=search_config,
         window_start=window_start,
         window_end=window_end,
@@ -758,24 +804,62 @@ def select_detector_policy(
         ranked = ranked[
             pd.to_numeric(ranked["episodes_fired"], errors="coerce").fillna(0.0) > 0.0
             ].copy()
-    ranked["_median_row_trade_pnl_sort"] = pd.to_numeric(
-        ranked["median_row_trade_pnl_pct_at_fire"], errors="coerce"
+    (
+        selector_val_fires_per_30d_min,
+        selector_val_fires_per_30d_max,
+        selector_min_resolved_signals,
+    ) = _resolve_selector_thresholds(search_config)
+    density_center = (
+        selector_val_fires_per_30d_min + selector_val_fires_per_30d_max
+    ) / 2.0
+    fires_per_30d = pd.to_numeric(ranked["fires_per_30d"], errors="coerce").fillna(0.0)
+    resolved_signals_total = pd.to_numeric(
+        ranked["resolved_signals_total"], errors="coerce"
+    ).fillna(0.0)
+    ranked["selector_density_ok"] = (
+        (fires_per_30d >= selector_val_fires_per_30d_min)
+        & (fires_per_30d <= selector_val_fires_per_30d_max)
+    ).astype(bool)
+    ranked["selector_support_ok"] = (
+        resolved_signals_total >= float(selector_min_resolved_signals)
+    ).astype(bool)
+    ranked["selector_density_distance"] = (fires_per_30d - density_center).abs()
+    density_and_support = ranked[
+        ranked["selector_density_ok"] & ranked["selector_support_ok"]
+    ].copy()
+    support_only = ranked[ranked["selector_support_ok"]].copy()
+    if not density_and_support.empty:
+        admissible = density_and_support
+        fallback_tier = "density_and_support"
+    elif not support_only.empty:
+        admissible = support_only
+        fallback_tier = "support_only"
+    else:
+        admissible = ranked.copy()
+        fallback_tier = "positive_fire_only"
+    admissible["tp_rate_resolved"] = pd.to_numeric(
+        admissible["tp_rate_resolved"], errors="coerce"
     ).fillna(float("-inf"))
-    ranked["_median_bars_abs_sort"] = (
-        pd.to_numeric(ranked["median_bars_fire_to_ideal"], errors="coerce")
-        .abs()
-        .fillna(float("inf"))
-    )
-    ranked = ranked.sort_values(
+    admissible["edge_vs_breakeven_zscore"] = pd.to_numeric(
+        admissible["edge_vs_breakeven_zscore"], errors="coerce"
+    ).fillna(float("-inf"))
+    admissible["selector_density_distance"] = pd.to_numeric(
+        admissible["selector_density_distance"], errors="coerce"
+    ).fillna(float("inf"))
+    admissible["resolved_signals_total"] = pd.to_numeric(
+        admissible["resolved_signals_total"], errors="coerce"
+    ).fillna(0.0)
+    ranked = admissible.sort_values(
         by=[
-            "selection_score",
-            "_median_row_trade_pnl_sort",
-            "episodes_fired",
-            "_median_bars_abs_sort",
+            "tp_rate_resolved",
+            "edge_vs_breakeven_zscore",
+            "selector_density_distance",
+            "resolved_signals_total",
             "arm_score_min",
+            "fire_score_floor",
             "turn_down_delta",
         ],
-        ascending=[False, False, False, True, True, True],
+        ascending=[False, False, True, False, True, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
     best = ranked.iloc[0]
@@ -791,7 +875,13 @@ def select_detector_policy(
             f"best_policy=arm={best_policy.arm_score_min:.6f},"
             f"fire={best_policy.fire_score_floor:.6f},"
             f"turn={best_policy.turn_down_delta:.6f} "
-            f"best_selection_score={float(best['selection_score']):.6f}"
+            f"tp_rate_resolved={float(best['tp_rate_resolved']):.6f} "
+            f"edge_vs_breakeven_zscore={float(best['edge_vs_breakeven_zscore']):.6f} "
+            f"fires_per_30d={float(best['fires_per_30d']):.6f} "
+            f"resolved_signals_total={int(round(float(best['resolved_signals_total'])))} "
+            f"selector_density_ok={bool(best['selector_density_ok'])} "
+            f"selector_support_ok={bool(best['selector_support_ok'])} "
+            f"fallback_tier={fallback_tier}"
         ),
     )
     return best_policy, sweep_df
@@ -1164,6 +1254,76 @@ def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
     if value < 15.0:
         return float((15.0 - value) / 15.0)
     return float((value - 180.0) / 180.0)
+
+
+def _resolve_selector_thresholds(
+        search_config: DetectorPolicySearchConfig | None,
+) -> tuple[float, float, int]:
+    if search_config is None:
+        return 110.0, 180.0, 80
+    return (
+        float(search_config.selector_val_fires_per_30d_min),
+        float(search_config.selector_val_fires_per_30d_max),
+        int(search_config.selector_min_resolved_signals),
+    )
+
+
+def _build_execution_aware_selector_metrics(
+        candidate_signals_df: pd.DataFrame, execution_contract: ExecutionContract
+) -> dict[str, float | None]:
+    if candidate_signals_df.empty or "row_trade_outcome" not in candidate_signals_df.columns:
+        resolved_signals_total = 0
+        tp_total = 0
+        sl_total = 0
+    else:
+        outcome = (
+            candidate_signals_df["row_trade_outcome"].astype(str).str.strip().str.lower()
+        )
+        tp_total = int(outcome.eq("tp").sum())
+        sl_total = int(outcome.eq("sl").sum())
+        resolved_signals_total = int(tp_total + sl_total)
+    tp_rate_resolved = (
+        float(tp_total / resolved_signals_total)
+        if resolved_signals_total > 0
+        else 0.0
+    )
+    sl_rate_resolved = (
+        float(sl_total / resolved_signals_total)
+        if resolved_signals_total > 0
+        else 0.0
+    )
+    tp_pct = float(execution_contract.tp_pct)
+    sl_pct_abs = abs(float(execution_contract.sl_pct))
+    breakeven_denominator = tp_pct + sl_pct_abs
+    tp_rate_breakeven = (
+        float(sl_pct_abs / breakeven_denominator)
+        if breakeven_denominator > 0.0
+        else 0.5
+    )
+    tp_rate_edge_vs_breakeven = float(tp_rate_resolved - tp_rate_breakeven)
+    if resolved_signals_total <= 0:
+        edge_vs_breakeven_zscore: float | None = None
+    else:
+        variance = (
+                tp_rate_breakeven
+                * (1.0 - tp_rate_breakeven)
+                / float(resolved_signals_total)
+        )
+        edge_vs_breakeven_zscore = (
+            float(tp_rate_edge_vs_breakeven / math.sqrt(variance))
+            if variance > 0.0
+            else None
+        )
+    return {
+        "resolved_signals_total": float(resolved_signals_total),
+        "tp_total": float(tp_total),
+        "sl_total": float(sl_total),
+        "tp_rate_resolved": float(tp_rate_resolved),
+        "sl_rate_resolved": float(sl_rate_resolved),
+        "tp_rate_breakeven": float(tp_rate_breakeven),
+        "tp_rate_edge_vs_breakeven": float(tp_rate_edge_vs_breakeven),
+        "edge_vs_breakeven_zscore": float(edge_vs_breakeven_zscore),
+    }
 
 
 def _log_p_good_distribution(

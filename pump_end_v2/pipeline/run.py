@@ -295,6 +295,7 @@ def run_pump_end_v2_pipeline(
     selected_detector_policy, detector_policy_sweep_df = select_detector_policy(
         val_policy_rows,
         config.detector_policy,
+        execution_contract=config.execution,
         search_config=config.search_detector_policy,
         window_start=config.splits.train_end,
         window_end=config.splits.val_end,
