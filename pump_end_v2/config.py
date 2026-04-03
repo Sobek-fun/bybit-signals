@@ -40,6 +40,8 @@ class ResolverConfig:
     tp_row_weight: float
     sl_row_weight: float
     timeout_row_weight: float
+    timing_window_bars: int
+    timing_utility_tolerance: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,6 +436,17 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
         raise ValueError(
             "data.resolver.max_wait_bars_for_success must be <= data.resolver.horizon_bars"
         )
+    timing_window_bars = _require_positive_int(
+        section.get("timing_window_bars", 2), "data.resolver.timing_window_bars"
+    )
+    timing_utility_tolerance = _require_bounded_float(
+        section.get("timing_utility_tolerance", 0.05),
+        "data.resolver.timing_utility_tolerance",
+        lower=0.0,
+        upper=1.0,
+        inclusive_lower=True,
+        inclusive_upper=True,
+    )
     return ResolverConfig(
         horizon_bars=horizon_bars,
         success_pullback_pct=_require_positive_float(
@@ -456,6 +469,8 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
         timeout_row_weight=_require_positive_float(
             section.get("timeout_row_weight", 0.5), "data.resolver.timeout_row_weight"
         ),
+        timing_window_bars=timing_window_bars,
+        timing_utility_tolerance=timing_utility_tolerance,
     )
 
 
