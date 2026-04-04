@@ -11,3 +11,4 @@ requests
 pandas-ta
 websockets
 aiogram
+torch
