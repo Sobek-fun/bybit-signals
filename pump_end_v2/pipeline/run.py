@@ -31,6 +31,15 @@ from pump_end_v2.detector import (
     select_detector_policy,
     summarize_detector_oof_importance,
 )
+from pump_end_v2.detector.diagnostics import (
+    build_detector_episode_diagnostics,
+    build_detector_episode_group_summary,
+    build_detector_episode_rank_report,
+    build_detector_feature_signal_report,
+    build_detector_row_decile_report,
+    build_detector_row_rank_report,
+    build_detector_training_overfit_report,
+)
 from pump_end_v2.execution import (
     build_execution_market_view,
     build_execution_metrics,
@@ -226,6 +235,15 @@ def run_pump_end_v2_pipeline(
     )
     detector_dataset = build_detector_dataset(detector_feature_view, resolved_rows)
     detector_dataset = assign_detector_dataset_splits(detector_dataset, config.splits)
+    detector_train_feature_signal_report_df = build_detector_feature_signal_report(
+        detector_dataset, resolved_rows, "train"
+    )
+    detector_val_feature_signal_report_df = build_detector_feature_signal_report(
+        detector_dataset, resolved_rows, "val"
+    )
+    detector_test_feature_signal_report_df = build_detector_feature_signal_report(
+        detector_dataset, resolved_rows, "test"
+    )
     detector_sequence_store = build_detector_sequence_store(
         detector_dataset_df=detector_dataset,
         token_state_tradable_df=token_state_tradable,
@@ -313,6 +331,12 @@ def run_pump_end_v2_pipeline(
         train_oof_episode_policy_summary_df,
         window_days=detector_train_oof_window_days,
     )
+    detector_train_oof_row_rank_report = build_detector_row_rank_report(
+        train_oof_policy_rows
+    )
+    detector_train_oof_episode_rank_report = build_detector_episode_rank_report(
+        train_oof_policy_rows
+    )
     val_candidate_signals_df, val_episode_policy_summary_df = (
         apply_episode_aware_detector_policy(val_policy_rows, selected_detector_policy)
     )
@@ -325,6 +349,15 @@ def run_pump_end_v2_pipeline(
     detector_val_target_metrics = build_detector_target_metrics(val_policy_rows)
     detector_val_score_deciles_df = build_detector_score_decile_report(val_policy_rows)
     detector_val_rank_quality = build_detector_rank_quality_report(val_policy_rows)
+    detector_val_row_rank_report = build_detector_row_rank_report(val_policy_rows)
+    detector_val_row_decile_report_df = build_detector_row_decile_report(val_policy_rows)
+    detector_val_episode_rank_report = build_detector_episode_rank_report(val_policy_rows)
+    detector_val_episode_diagnostics_df = build_detector_episode_diagnostics(
+        val_policy_rows, val_candidate_signals_df
+    )
+    detector_val_episode_group_summary_df = build_detector_episode_group_summary(
+        detector_val_episode_diagnostics_df
+    )
     detector_val_elapsed = time.perf_counter() - detector_val_started
     stage_done("PIPELINE", "DETECTOR_VAL_POLICY", elapsed_sec=detector_val_elapsed)
 
@@ -351,6 +384,19 @@ def run_pump_end_v2_pipeline(
     detector_test_target_metrics = build_detector_target_metrics(test_policy_rows)
     detector_test_score_deciles_df = build_detector_score_decile_report(test_policy_rows)
     detector_test_rank_quality = build_detector_rank_quality_report(test_policy_rows)
+    detector_test_row_rank_report = build_detector_row_rank_report(test_policy_rows)
+    detector_test_row_decile_report_df = build_detector_row_decile_report(
+        test_policy_rows
+    )
+    detector_test_episode_rank_report = build_detector_episode_rank_report(
+        test_policy_rows
+    )
+    detector_test_episode_diagnostics_df = build_detector_episode_diagnostics(
+        test_policy_rows, test_candidate_signals_df
+    )
+    detector_test_episode_group_summary_df = build_detector_episode_group_summary(
+        detector_test_episode_diagnostics_df
+    )
     detector_oof_importance_summary_df = summarize_detector_oof_importance(
         detector_oof_importance_folds_df, top_k=20
     )
@@ -361,6 +407,9 @@ def run_pump_end_v2_pipeline(
     )
     sequence_training_history_train_only_df = pd.DataFrame(
         getattr(detector_model_test, "training_history", [])
+    )
+    detector_sequence_overfit_report = build_detector_training_overfit_report(
+        sequence_train_stats, sequence_training_history_train_only_df
     )
     sequence_spec = {
         "pre_episode_context_bars": int(
@@ -876,6 +925,14 @@ def run_pump_end_v2_pipeline(
         detector_train_oof_policy_metrics,
         detector_dir / "train_oof_policy_metrics.json",
     )
+    _save_json_and_log(
+        detector_train_oof_row_rank_report,
+        detector_dir / "train_oof_row_rank_report.json",
+    )
+    _save_json_and_log(
+        detector_train_oof_episode_rank_report,
+        detector_dir / "train_oof_episode_rank_report.json",
+    )
     _save_df_and_log(val_policy_rows, detector_dir / "val_policy_rows.parquet")
     _save_df_and_log(
         val_candidate_signals_df, detector_dir / "val_candidate_signals.parquet"
@@ -896,6 +953,23 @@ def run_pump_end_v2_pipeline(
     _save_json_and_log(
         detector_val_rank_quality, detector_dir / "val_rank_quality.json"
     )
+    _save_json_and_log(
+        detector_val_row_rank_report, detector_dir / "val_row_rank_report.json"
+    )
+    _save_df_and_log(
+        detector_val_row_decile_report_df, detector_dir / "val_row_decile_report.csv"
+    )
+    _save_json_and_log(
+        detector_val_episode_rank_report, detector_dir / "val_episode_rank_report.json"
+    )
+    _save_df_and_log(
+        detector_val_episode_diagnostics_df,
+        detector_dir / "val_episode_diagnostics.csv",
+    )
+    _save_df_and_log(
+        detector_val_episode_group_summary_df,
+        detector_dir / "val_episode_group_summary.csv",
+    )
     _save_df_and_log(test_policy_rows, detector_dir / "test_policy_rows.parquet")
     _save_df_and_log(
         test_candidate_signals_df, detector_dir / "test_candidate_signals.parquet"
@@ -915,6 +989,39 @@ def run_pump_end_v2_pipeline(
     )
     _save_json_and_log(
         detector_test_rank_quality, detector_dir / "test_rank_quality.json"
+    )
+    _save_json_and_log(
+        detector_test_row_rank_report, detector_dir / "test_row_rank_report.json"
+    )
+    _save_df_and_log(
+        detector_test_row_decile_report_df, detector_dir / "test_row_decile_report.csv"
+    )
+    _save_json_and_log(
+        detector_test_episode_rank_report, detector_dir / "test_episode_rank_report.json"
+    )
+    _save_df_and_log(
+        detector_test_episode_diagnostics_df,
+        detector_dir / "test_episode_diagnostics.csv",
+    )
+    _save_df_and_log(
+        detector_test_episode_group_summary_df,
+        detector_dir / "test_episode_group_summary.csv",
+    )
+    _save_df_and_log(
+        detector_train_feature_signal_report_df,
+        detector_dir / "train_feature_signal_report.csv",
+    )
+    _save_df_and_log(
+        detector_val_feature_signal_report_df,
+        detector_dir / "val_feature_signal_report.csv",
+    )
+    _save_df_and_log(
+        detector_test_feature_signal_report_df,
+        detector_dir / "test_feature_signal_report.csv",
+    )
+    _save_json_and_log(
+        detector_sequence_overfit_report,
+        detector_dir / "sequence_overfit_report.json",
     )
     _save_json_and_log(
         detector_val_candidate_signal_strength,
