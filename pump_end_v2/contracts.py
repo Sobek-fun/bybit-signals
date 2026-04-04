@@ -25,8 +25,6 @@ class SignalQualityClass(StrEnum):
 
 class TargetReason(StrEnum):
     TP = "tp"
-    TOO_EARLY = "too_early"
-    TOO_LATE = "too_late"
     SL = "sl"
     TIMEOUT = "timeout"
     AMBIGUOUS = "ambiguous"

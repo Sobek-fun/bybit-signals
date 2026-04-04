@@ -40,8 +40,6 @@ class ResolverConfig:
     tp_row_weight: float
     sl_row_weight: float
     timeout_row_weight: float
-    timing_window_bars: int
-    timing_utility_tolerance: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,17 +434,6 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
         raise ValueError(
             "data.resolver.max_wait_bars_for_success must be <= data.resolver.horizon_bars"
         )
-    timing_window_bars = _require_positive_int(
-        section.get("timing_window_bars", 2), "data.resolver.timing_window_bars"
-    )
-    timing_utility_tolerance = _require_bounded_float(
-        section.get("timing_utility_tolerance", 0.05),
-        "data.resolver.timing_utility_tolerance",
-        lower=0.0,
-        upper=1.0,
-        inclusive_lower=True,
-        inclusive_upper=True,
-    )
     return ResolverConfig(
         horizon_bars=horizon_bars,
         success_pullback_pct=_require_positive_float(
@@ -469,8 +456,6 @@ def _build_resolver(section: dict[str, Any]) -> ResolverConfig:
         timeout_row_weight=_require_positive_float(
             section.get("timeout_row_weight", 0.5), "data.resolver.timeout_row_weight"
         ),
-        timing_window_bars=timing_window_bars,
-        timing_utility_tolerance=timing_utility_tolerance,
     )
 
 
@@ -648,13 +633,13 @@ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
 
 
 def _require_bounded_float(
-    value: Any,
-    field_name: str,
-    *,
-    lower: float,
-    upper: float,
-    inclusive_lower: bool,
-    inclusive_upper: bool,
+        value: Any,
+        field_name: str,
+        *,
+        lower: float,
+        upper: float,
+        inclusive_lower: bool,
+        inclusive_upper: bool,
 ) -> float:
     try:
         parsed = float(value)
@@ -706,7 +691,7 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
 
 
 def _parse_float_candidates(
-    value: Any, field_name: str, *, allow_empty: bool = True
+        value: Any, field_name: str, *, allow_empty: bool = True
 ) -> tuple[float, ...]:
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list")
@@ -722,7 +707,7 @@ def _parse_float_candidates(
 
 
 def _build_detector_policy_search(
-    search_section: Any,
+        search_section: Any,
 ) -> DetectorPolicySearchConfig | None:
     if search_section is None:
         return None
@@ -784,7 +769,7 @@ def _build_gate_config(section: dict[str, Any]) -> GateConfig:
 
 
 def _build_gate_threshold_search(
-    search_section: Any,
+        search_section: Any,
 ) -> GateThresholdSearchConfig | None:
     if search_section is None:
         return None
@@ -832,9 +817,9 @@ def _build_gate_threshold_search(
         upper=1.0,
     )
     if (
-        min_blocked_share_model is not None
-        and max_blocked_share_model is not None
-        and min_blocked_share_model > max_blocked_share_model
+            min_blocked_share_model is not None
+            and max_blocked_share_model is not None
+            and min_blocked_share_model > max_blocked_share_model
     ):
         raise ValueError(
             "search.gate_threshold.min_blocked_share_model must be <= search.gate_threshold.max_blocked_share_model"
@@ -852,9 +837,9 @@ def _build_gate_threshold_search(
         upper=None,
     )
     if (
-        min_signals_per_30d_after_execution is not None
-        and max_signals_per_30d_after_execution is not None
-        and min_signals_per_30d_after_execution > max_signals_per_30d_after_execution
+            min_signals_per_30d_after_execution is not None
+            and max_signals_per_30d_after_execution is not None
+            and min_signals_per_30d_after_execution > max_signals_per_30d_after_execution
     ):
         raise ValueError(
             "search.gate_threshold.min_signals_per_30d_after_execution must be <= search.gate_threshold.max_signals_per_30d_after_execution"
@@ -874,11 +859,11 @@ def _build_gate_threshold_search(
 
 
 def _parse_optional_bounded_float(
-    value: Any,
-    field_name: str,
-    *,
-    lower: float | None,
-    upper: float | None,
+        value: Any,
+        field_name: str,
+        *,
+        lower: float | None,
+        upper: float | None,
 ) -> float | None:
     if value is None:
         return None
@@ -894,7 +879,7 @@ def _parse_optional_bounded_float(
 
 
 def _build_gate_model(
-    section: dict[str, Any], execution_contract: ExecutionContract
+        section: dict[str, Any], execution_contract: ExecutionContract
 ) -> GateModelConfig:
     model_section = section.get("model")
     if not isinstance(model_section, dict):
