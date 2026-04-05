@@ -412,6 +412,30 @@ def build_detector_training_overfit_report(
             "train_loss_drift_from_best": 0.0,
             "best_epoch_fraction_of_training": 0.0,
             "overfit_started_epoch": 0,
+            "best_classification_loss": float(
+                _safe_float(sequence_train_stats.get("best_classification_loss"), 0.0)
+            ),
+            "best_ranking_loss": float(
+                _safe_float(sequence_train_stats.get("best_ranking_loss"), 0.0)
+            ),
+            "final_classification_loss": float(
+                _safe_float(sequence_train_stats.get("final_classification_loss"), 0.0)
+            ),
+            "final_ranking_loss": float(
+                _safe_float(sequence_train_stats.get("final_ranking_loss"), 0.0)
+            ),
+            "ranking_pairs_train_total": int(
+                _safe_int(sequence_train_stats.get("ranking_pairs_train_total"), 0)
+            ),
+            "ranking_pairs_eval_total": int(
+                _safe_int(sequence_train_stats.get("ranking_pairs_eval_total"), 0)
+            ),
+            "hard_negative_rows_train_total": int(
+                _safe_int(sequence_train_stats.get("hard_negative_rows_train_total"), 0)
+            ),
+            "hard_negative_rows_eval_total": int(
+                _safe_int(sequence_train_stats.get("hard_negative_rows_eval_total"), 0)
+            ),
         }
     history["epoch"] = pd.to_numeric(history.get("epoch"), errors="coerce")
     history["train_loss"] = pd.to_numeric(history.get("train_loss"), errors="coerce")
@@ -437,6 +461,30 @@ def build_detector_training_overfit_report(
             "train_loss_drift_from_best": 0.0,
             "best_epoch_fraction_of_training": 0.0,
             "overfit_started_epoch": 0,
+            "best_classification_loss": float(
+                _safe_float(sequence_train_stats.get("best_classification_loss"), 0.0)
+            ),
+            "best_ranking_loss": float(
+                _safe_float(sequence_train_stats.get("best_ranking_loss"), 0.0)
+            ),
+            "final_classification_loss": float(
+                _safe_float(sequence_train_stats.get("final_classification_loss"), 0.0)
+            ),
+            "final_ranking_loss": float(
+                _safe_float(sequence_train_stats.get("final_ranking_loss"), 0.0)
+            ),
+            "ranking_pairs_train_total": int(
+                _safe_int(sequence_train_stats.get("ranking_pairs_train_total"), 0)
+            ),
+            "ranking_pairs_eval_total": int(
+                _safe_int(sequence_train_stats.get("ranking_pairs_eval_total"), 0)
+            ),
+            "hard_negative_rows_train_total": int(
+                _safe_int(sequence_train_stats.get("hard_negative_rows_train_total"), 0)
+            ),
+            "hard_negative_rows_eval_total": int(
+                _safe_int(sequence_train_stats.get("hard_negative_rows_eval_total"), 0)
+            ),
         }
     best_epoch_from_stats = _safe_int(sequence_train_stats.get("best_epoch"), 0)
     best_row = history.loc[history["epoch"] == float(best_epoch_from_stats)]
@@ -479,6 +527,30 @@ def build_detector_training_overfit_report(
             float(best_epoch) / float(max(epochs_ran, 1))
         ),
         "overfit_started_epoch": int(overfit_started_epoch),
+        "best_classification_loss": float(
+            _safe_float(sequence_train_stats.get("best_classification_loss"), 0.0)
+        ),
+        "best_ranking_loss": float(
+            _safe_float(sequence_train_stats.get("best_ranking_loss"), 0.0)
+        ),
+        "final_classification_loss": float(
+            _safe_float(sequence_train_stats.get("final_classification_loss"), 0.0)
+        ),
+        "final_ranking_loss": float(
+            _safe_float(sequence_train_stats.get("final_ranking_loss"), 0.0)
+        ),
+        "ranking_pairs_train_total": int(
+            _safe_int(sequence_train_stats.get("ranking_pairs_train_total"), 0)
+        ),
+        "ranking_pairs_eval_total": int(
+            _safe_int(sequence_train_stats.get("ranking_pairs_eval_total"), 0)
+        ),
+        "hard_negative_rows_train_total": int(
+            _safe_int(sequence_train_stats.get("hard_negative_rows_train_total"), 0)
+        ),
+        "hard_negative_rows_eval_total": int(
+            _safe_int(sequence_train_stats.get("hard_negative_rows_eval_total"), 0)
+        ),
     }
 
 

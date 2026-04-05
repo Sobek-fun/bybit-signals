@@ -1150,6 +1150,21 @@ def run_pump_end_v2_pipeline(
             ).sum()
         ),
         "sequence_shape": [int(v) for v in detector_sequence_store.x.shape],
+        "detector_diagnostics_summary": _build_detector_diagnostics_summary(
+            detector_val_row_rank_report=detector_val_row_rank_report,
+            detector_test_row_rank_report=detector_test_row_rank_report,
+            detector_val_episode_rank_report=detector_val_episode_rank_report,
+            detector_test_episode_rank_report=detector_test_episode_rank_report,
+            detector_val_episode_group_summary_df=detector_val_episode_group_summary_df,
+            detector_test_episode_group_summary_df=detector_test_episode_group_summary_df,
+            detector_train_feature_signal_report_df=detector_train_feature_signal_report_df,
+            detector_val_feature_signal_report_df=detector_val_feature_signal_report_df,
+            detector_test_feature_signal_report_df=detector_test_feature_signal_report_df,
+            detector_sequence_overfit_report=detector_sequence_overfit_report,
+            sequence_train_stats=sequence_train_stats,
+            detector_val_policy_metrics=detector_val_policy_metrics,
+            detector_test_policy_metrics=detector_test_policy_metrics,
+        ),
         "val_candidate_signal_strength": gate_val_candidate_signal_strength,
         "test_candidate_signal_strength": gate_test_candidate_signal_strength,
         "val_gate_rank_quality": val_gate_rank_quality,
@@ -1233,6 +1248,344 @@ def _gate_model_to_dict(model_config: Any) -> dict[str, float]:
         "tp_row_weight": float(model_config.tp_row_weight),
         "sl_row_weight": float(model_config.sl_row_weight),
     }
+
+
+def _build_detector_diagnostics_summary(
+    *,
+    detector_val_row_rank_report: dict[str, Any],
+    detector_test_row_rank_report: dict[str, Any],
+    detector_val_episode_rank_report: dict[str, Any],
+    detector_test_episode_rank_report: dict[str, Any],
+    detector_val_episode_group_summary_df: pd.DataFrame,
+    detector_test_episode_group_summary_df: pd.DataFrame,
+    detector_train_feature_signal_report_df: pd.DataFrame,
+    detector_val_feature_signal_report_df: pd.DataFrame,
+    detector_test_feature_signal_report_df: pd.DataFrame,
+    detector_sequence_overfit_report: dict[str, Any],
+    sequence_train_stats: dict[str, Any],
+    detector_val_policy_metrics: dict[str, Any],
+    detector_test_policy_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    val_group = _episode_group_index(detector_val_episode_group_summary_df)
+    test_group = _episode_group_index(detector_test_episode_group_summary_df)
+    train_feature_summary = _feature_signal_rollup(detector_train_feature_signal_report_df)
+    val_feature_summary = _feature_signal_rollup(detector_val_feature_signal_report_df)
+    test_feature_summary = _feature_signal_rollup(detector_test_feature_signal_report_df)
+    same_direction_val_test = _same_direction_feature_total(
+        detector_val_feature_signal_report_df, detector_test_feature_signal_report_df
+    )
+    same_direction_train_val_test = _same_direction_feature_total_three(
+        detector_train_feature_signal_report_df,
+        detector_val_feature_signal_report_df,
+        detector_test_feature_signal_report_df,
+    )
+    test_best = _best_feature_row(detector_test_feature_signal_report_df)
+    training_health = {
+        "best_epoch": int(_safe_int(detector_sequence_overfit_report.get("best_epoch"), 0)),
+        "epochs_ran": int(_safe_int(detector_sequence_overfit_report.get("epochs_ran"), 0)),
+        "best_epoch_fraction_of_training": _safe_float(
+            detector_sequence_overfit_report.get("best_epoch_fraction_of_training"), 0.0
+        ),
+        "overfit_started_epoch": int(
+            _safe_int(detector_sequence_overfit_report.get("overfit_started_epoch"), 0)
+        ),
+        "best_eval_loss": _safe_float(
+            detector_sequence_overfit_report.get("best_eval_loss"), 0.0
+        ),
+        "final_eval_loss": _safe_float(
+            detector_sequence_overfit_report.get("final_eval_loss"), 0.0
+        ),
+        "eval_loss_drift_from_best": _safe_float(
+            detector_sequence_overfit_report.get("eval_loss_drift_from_best"), 0.0
+        ),
+        "best_classification_loss": _safe_float(
+            sequence_train_stats.get("best_classification_loss"), 0.0
+        ),
+        "best_ranking_loss": _safe_float(sequence_train_stats.get("best_ranking_loss"), 0.0),
+        "final_classification_loss": _safe_float(
+            sequence_train_stats.get("final_classification_loss"), 0.0
+        ),
+        "final_ranking_loss": _safe_float(
+            sequence_train_stats.get("final_ranking_loss"), 0.0
+        ),
+        "ranking_pairs_train_total": int(
+            _safe_int(sequence_train_stats.get("ranking_pairs_train_total"), 0)
+        ),
+        "ranking_pairs_eval_total": int(
+            _safe_int(sequence_train_stats.get("ranking_pairs_eval_total"), 0)
+        ),
+        "hard_negative_rows_train_total": int(
+            _safe_int(sequence_train_stats.get("hard_negative_rows_train_total"), 0)
+        ),
+        "hard_negative_rows_eval_total": int(
+            _safe_int(sequence_train_stats.get("hard_negative_rows_eval_total"), 0)
+        ),
+    }
+    return {
+        "row_rank_quality": {
+            "val_auc_tp_vs_non_tp": _safe_float(
+                detector_val_row_rank_report.get("auc_tp_vs_non_tp"), 0.0
+            ),
+            "test_auc_tp_vs_non_tp": _safe_float(
+                detector_test_row_rank_report.get("auc_tp_vs_non_tp"), 0.0
+            ),
+            "val_top_decile_tp_rate": _safe_float(
+                detector_val_row_rank_report.get("top_decile_tp_rate"), 0.0
+            ),
+            "test_top_decile_tp_rate": _safe_float(
+                detector_test_row_rank_report.get("top_decile_tp_rate"), 0.0
+            ),
+            "val_bottom_decile_tp_rate": _safe_float(
+                detector_val_row_rank_report.get("bottom_decile_tp_rate"), 0.0
+            ),
+            "test_bottom_decile_tp_rate": _safe_float(
+                detector_test_row_rank_report.get("bottom_decile_tp_rate"), 0.0
+            ),
+            "val_corr_p_good_trade_pnl": _safe_float(
+                detector_val_row_rank_report.get("corr_p_good_trade_pnl"), 0.0
+            ),
+            "test_corr_p_good_trade_pnl": _safe_float(
+                detector_test_row_rank_report.get("corr_p_good_trade_pnl"), 0.0
+            ),
+            "val_corr_p_good_mae": _safe_float(
+                detector_val_row_rank_report.get("corr_p_good_mae"), 0.0
+            ),
+            "test_corr_p_good_mae": _safe_float(
+                detector_test_row_rank_report.get("corr_p_good_mae"), 0.0
+            ),
+        },
+        "episode_rank_quality": {
+            "val_auc_episode_max_p_good": _safe_float(
+                detector_val_episode_rank_report.get("auc_episode_max_p_good"), 0.0
+            ),
+            "test_auc_episode_max_p_good": _safe_float(
+                detector_test_episode_rank_report.get("auc_episode_max_p_good"), 0.0
+            ),
+            "val_auc_episode_p_good_range": _safe_float(
+                detector_val_episode_rank_report.get("auc_episode_p_good_range"), 0.0
+            ),
+            "test_auc_episode_p_good_range": _safe_float(
+                detector_test_episode_rank_report.get("auc_episode_p_good_range"), 0.0
+            ),
+            "val_mean_max_p_good_tradeable": _safe_float(
+                detector_val_episode_rank_report.get("mean_max_p_good_tradeable"), 0.0
+            ),
+            "val_mean_max_p_good_nontradeable": _safe_float(
+                detector_val_episode_rank_report.get("mean_max_p_good_nontradeable"), 0.0
+            ),
+            "test_mean_max_p_good_tradeable": _safe_float(
+                detector_test_episode_rank_report.get("mean_max_p_good_tradeable"), 0.0
+            ),
+            "test_mean_max_p_good_nontradeable": _safe_float(
+                detector_test_episode_rank_report.get("mean_max_p_good_nontradeable"), 0.0
+            ),
+        },
+        "episode_group_contrast": {
+            "val_fired_tradeable_mean_p_good_range": _safe_float(
+                val_group.get("fired_tradeable", {}).get("mean_p_good_range"), 0.0
+            ),
+            "val_missed_tradeable_mean_p_good_range": _safe_float(
+                val_group.get("missed_tradeable", {}).get("mean_p_good_range"), 0.0
+            ),
+            "test_fired_tradeable_mean_p_good_range": _safe_float(
+                test_group.get("fired_tradeable", {}).get("mean_p_good_range"), 0.0
+            ),
+            "test_missed_tradeable_mean_p_good_range": _safe_float(
+                test_group.get("missed_tradeable", {}).get("mean_p_good_range"), 0.0
+            ),
+            "val_fired_tradeable_mean_first_tp_age": _safe_float(
+                val_group.get("fired_tradeable", {}).get("mean_first_tp_age"), 0.0
+            ),
+            "val_missed_tradeable_mean_first_tp_age": _safe_float(
+                val_group.get("missed_tradeable", {}).get("mean_first_tp_age"), 0.0
+            ),
+            "test_fired_tradeable_mean_first_tp_age": _safe_float(
+                test_group.get("fired_tradeable", {}).get("mean_first_tp_age"), 0.0
+            ),
+            "test_missed_tradeable_mean_first_tp_age": _safe_float(
+                test_group.get("missed_tradeable", {}).get("mean_first_tp_age"), 0.0
+            ),
+        },
+        "feature_signal_summary": {
+            "train_features_abs_auc_gt_0_02_total": int(
+                train_feature_summary["abs_auc_gt_0_02_total"]
+            ),
+            "val_features_abs_auc_gt_0_02_total": int(
+                val_feature_summary["abs_auc_gt_0_02_total"]
+            ),
+            "test_features_abs_auc_gt_0_02_total": int(
+                test_feature_summary["abs_auc_gt_0_02_total"]
+            ),
+            "val_test_same_direction_features_total": int(same_direction_val_test),
+            "train_val_test_same_direction_features_total": int(
+                same_direction_train_val_test
+            ),
+            "best_test_feature_name": str(test_best["feature_name"]),
+            "best_test_feature_auc": _safe_float(test_best["feature_auc"], 0.0),
+            "best_test_feature_abs_auc_distance_from_0_5": _safe_float(
+                test_best["feature_abs_auc_distance_from_0_5"], 0.0
+            ),
+        },
+        "training_health": training_health,
+        "policy_usefulness_summary": {
+            "val_good_episode_capture_rate": _safe_float(
+                detector_val_policy_metrics.get("good_episode_capture_rate"), 0.0
+            ),
+            "test_good_episode_capture_rate": _safe_float(
+                detector_test_policy_metrics.get("good_episode_capture_rate"), 0.0
+            ),
+            "val_fired_good_rate": _safe_float(
+                detector_val_policy_metrics.get("fired_good_rate"), 0.0
+            ),
+            "test_fired_good_rate": _safe_float(
+                detector_test_policy_metrics.get("fired_good_rate"), 0.0
+            ),
+            "val_fires_per_30d": _safe_float(
+                detector_val_policy_metrics.get("fires_per_30d"), 0.0
+            ),
+            "test_fires_per_30d": _safe_float(
+                detector_test_policy_metrics.get("fires_per_30d"), 0.0
+            ),
+            "val_arm_to_fire_conversion": _safe_float(
+                detector_val_policy_metrics.get("arm_to_fire_conversion"), 0.0
+            ),
+            "test_arm_to_fire_conversion": _safe_float(
+                detector_test_policy_metrics.get("arm_to_fire_conversion"), 0.0
+            ),
+        },
+    }
+
+
+def _episode_group_index(group_summary_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    if group_summary_df is None or group_summary_df.empty:
+        return {}
+    frame = group_summary_df.copy()
+    if "episode_group" not in frame.columns:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in frame.itertuples(index=False):
+        key = str(getattr(row, "episode_group", ""))
+        out[key] = row._asdict()
+    return out
+
+
+def _feature_signal_rollup(feature_signal_df: pd.DataFrame) -> dict[str, int]:
+    if feature_signal_df is None or feature_signal_df.empty:
+        return {"abs_auc_gt_0_02_total": 0}
+    if "abs_auc_distance_from_0_5" not in feature_signal_df.columns:
+        return {"abs_auc_gt_0_02_total": 0}
+    abs_auc = pd.to_numeric(
+        feature_signal_df["abs_auc_distance_from_0_5"], errors="coerce"
+    ).fillna(0.0)
+    return {"abs_auc_gt_0_02_total": int((abs_auc > 0.02).sum())}
+
+
+def _same_direction_feature_total(
+    left_df: pd.DataFrame, right_df: pd.DataFrame
+) -> int:
+    left = _feature_direction_series(left_df)
+    right = _feature_direction_series(right_df)
+    if left.empty or right.empty:
+        return 0
+    merged = left.to_frame("left").merge(
+        right.to_frame("right"), left_index=True, right_index=True, how="inner"
+    )
+    if merged.empty:
+        return 0
+    return int((merged["left"] == merged["right"]).sum())
+
+
+def _same_direction_feature_total_three(
+    train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
+) -> int:
+    train = _feature_direction_series(train_df)
+    val = _feature_direction_series(val_df)
+    test = _feature_direction_series(test_df)
+    if train.empty or val.empty or test.empty:
+        return 0
+    merged = (
+        train.to_frame("train")
+        .merge(val.to_frame("val"), left_index=True, right_index=True, how="inner")
+        .merge(test.to_frame("test"), left_index=True, right_index=True, how="inner")
+    )
+    if merged.empty:
+        return 0
+    mask = (merged["train"] == merged["val"]) & (merged["val"] == merged["test"])
+    return int(mask.sum())
+
+
+def _feature_direction_series(feature_df: pd.DataFrame) -> pd.Series:
+    if feature_df is None or feature_df.empty:
+        return pd.Series(dtype=bool)
+    required = {"feature", "direction_tp_gt_non_tp"}
+    if not required.issubset(feature_df.columns):
+        return pd.Series(dtype=bool)
+    frame = feature_df.loc[:, ["feature", "direction_tp_gt_non_tp"]].copy()
+    frame["feature"] = frame["feature"].astype(str)
+    frame["direction_tp_gt_non_tp"] = frame["direction_tp_gt_non_tp"].astype(bool)
+    frame = frame.drop_duplicates(subset=["feature"], keep="last")
+    return frame.set_index("feature")["direction_tp_gt_non_tp"]
+
+
+def _best_feature_row(feature_df: pd.DataFrame) -> dict[str, Any]:
+    if feature_df is None or feature_df.empty:
+        return {
+            "feature_name": "",
+            "feature_auc": 0.0,
+            "feature_abs_auc_distance_from_0_5": 0.0,
+        }
+    required = {"feature", "univariate_auc_tp_vs_non_tp", "abs_auc_distance_from_0_5"}
+    if not required.issubset(feature_df.columns):
+        return {
+            "feature_name": "",
+            "feature_auc": 0.0,
+            "feature_abs_auc_distance_from_0_5": 0.0,
+        }
+    frame = feature_df.loc[
+        :, ["feature", "univariate_auc_tp_vs_non_tp", "abs_auc_distance_from_0_5"]
+    ].copy()
+    frame["univariate_auc_tp_vs_non_tp"] = pd.to_numeric(
+        frame["univariate_auc_tp_vs_non_tp"], errors="coerce"
+    )
+    frame["abs_auc_distance_from_0_5"] = pd.to_numeric(
+        frame["abs_auc_distance_from_0_5"], errors="coerce"
+    )
+    frame = frame.dropna(subset=["abs_auc_distance_from_0_5"])
+    if frame.empty:
+        return {
+            "feature_name": "",
+            "feature_auc": 0.0,
+            "feature_abs_auc_distance_from_0_5": 0.0,
+        }
+    best = frame.sort_values(
+        ["abs_auc_distance_from_0_5", "feature"],
+        ascending=[False, True],
+        kind="mergesort",
+    ).iloc[0]
+    return {
+        "feature_name": str(best["feature"]),
+        "feature_auc": _safe_float(best["univariate_auc_tp_vs_non_tp"], 0.0),
+        "feature_abs_auc_distance_from_0_5": _safe_float(
+            best["abs_auc_distance_from_0_5"], 0.0
+        ),
+    }
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not pd.notna(out):
+        return float(default)
+    return float(out)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _derive_1m_stage_intervals(
