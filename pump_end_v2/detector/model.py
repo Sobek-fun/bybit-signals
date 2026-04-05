@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 
 from pump_end_v2.config import DetectorModelConfig
+from pump_end_v2.detector.ranking import (
+    build_detector_ranking_pairs,
+    build_hard_negative_row_weights,
+)
 from pump_end_v2.detector.sequence_dataset import (
     DetectorSequenceStore,
     extract_sequences_for_rows,
@@ -36,6 +40,11 @@ class SequenceDetector:
     fit_eval_min_rows: int
     sequence_learning_rate: float
     weight_decay: float
+    ranking_lambda: float
+    hard_negative_weight_multiplier: float
+    hard_negative_max_age_distance: int
+    max_ranking_pairs_per_episode: int
+    timeout_pair_weight: float
     scaler_mean: np.ndarray | None = None
     scaler_std: np.ndarray | None = None
     sequence_store: DetectorSequenceStore | None = None
@@ -92,6 +101,11 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
         fit_eval_min_rows=int(model_config.fit_eval_min_rows),
         sequence_learning_rate=float(model_config.sequence_learning_rate),
         weight_decay=float(model_config.weight_decay),
+        ranking_lambda=float(model_config.ranking_lambda),
+        hard_negative_weight_multiplier=float(model_config.hard_negative_weight_multiplier),
+        hard_negative_max_age_distance=int(model_config.hard_negative_max_age_distance),
+        max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
+        timeout_pair_weight=float(model_config.timeout_pair_weight),
     )
 
 
@@ -112,14 +126,21 @@ def fit_detector_model(
     y_train = pd.to_numeric(train_df[target_column], errors="coerce").fillna(0.0).to_numpy(
         dtype=np.float32
     )
-    if "target_row_weight" in train_df.columns:
-        sample_weight_train = (
-            pd.to_numeric(train_df["target_row_weight"], errors="coerce")
-            .fillna(1.0)
-            .to_numpy(dtype=np.float32)
-        )
-    else:
-        sample_weight_train = np.ones(len(train_df), dtype=np.float32)
+    sample_weight_train, hard_negative_mask_train = build_hard_negative_row_weights(
+        train_df,
+        hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
+        hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
+        timeout_hard_negative_weight_multiplier=1.5,
+        return_hard_negative_mask=True,
+    )
+    ranking_pairs_train_df = build_detector_ranking_pairs(
+        train_df,
+        timeout_pair_weight=float(model.timeout_pair_weight),
+        max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+    )
+    ranking_pairs_train = _prepare_pair_index_data(
+        ranking_pairs_train_df, train_df["decision_row_id"].astype(str)
+    )
     if len(y_train) == 0:
         raise ValueError("fit_detector_model received empty train rows")
     scaler_mean, scaler_std = _fit_scaler(x_train_raw, valid_train)
@@ -128,6 +149,8 @@ def fit_detector_model(
     x_eval_input: np.ndarray | None = None
     y_eval: np.ndarray | None = None
     sample_weight_eval: np.ndarray | None = None
+    ranking_pairs_eval: dict[str, np.ndarray] | None = None
+    hard_negative_mask_eval: np.ndarray | None = None
     if eval_df is not None and len(eval_df) > 0:
         _require_columns(eval_df, ["decision_row_id", target_column], "eval_df")
         x_eval_raw, valid_eval, in_episode_eval = extract_sequences_for_rows(
@@ -136,14 +159,21 @@ def fit_detector_model(
         y_eval = pd.to_numeric(eval_df[target_column], errors="coerce").fillna(0.0).to_numpy(
             dtype=np.float32
         )
-        if "target_row_weight" in eval_df.columns:
-            sample_weight_eval = (
-                pd.to_numeric(eval_df["target_row_weight"], errors="coerce")
-                .fillna(1.0)
-                .to_numpy(dtype=np.float32)
-            )
-        else:
-            sample_weight_eval = np.ones(len(eval_df), dtype=np.float32)
+        sample_weight_eval, hard_negative_mask_eval = build_hard_negative_row_weights(
+            eval_df,
+            hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
+            hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
+            timeout_hard_negative_weight_multiplier=1.5,
+            return_hard_negative_mask=True,
+        )
+        ranking_pairs_eval_df = build_detector_ranking_pairs(
+            eval_df,
+            timeout_pair_weight=float(model.timeout_pair_weight),
+            max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+        )
+        ranking_pairs_eval = _prepare_pair_index_data(
+            ranking_pairs_eval_df, eval_df["decision_row_id"].astype(str)
+        )
         x_eval_scaled = _transform_with_scaler(
             x_eval_raw, valid_eval, scaler_mean, scaler_std
         )
@@ -162,6 +192,13 @@ def fit_detector_model(
         early_stopping_patience=int(model.early_stopping_patience),
         learning_rate=float(model.sequence_learning_rate),
         weight_decay=float(model.weight_decay),
+        ranking_pairs_train=ranking_pairs_train,
+        ranking_pairs_eval=ranking_pairs_eval,
+        ranking_lambda=float(model.ranking_lambda),
+        hard_negative_rows_train_total=int(np.sum(hard_negative_mask_train)),
+        hard_negative_rows_eval_total=(
+            int(np.sum(hard_negative_mask_eval)) if hard_negative_mask_eval is not None else 0
+        ),
     )
     model.scaler_mean = scaler_mean
     model.scaler_std = scaler_std
@@ -395,3 +432,36 @@ def _binary_logloss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     p = np.clip(p, 1e-7, 1.0 - 1e-7)
     loss = -(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
     return float(np.mean(loss))
+
+
+def _prepare_pair_index_data(
+    ranking_pairs_df: pd.DataFrame, decision_row_ids: pd.Series
+) -> dict[str, np.ndarray]:
+    if ranking_pairs_df.empty:
+        return {
+            "better_idx": np.zeros(0, dtype=np.int64),
+            "worse_idx": np.zeros(0, dtype=np.int64),
+            "pair_weight": np.zeros(0, dtype=np.float32),
+        }
+    id_to_pos = {str(row_id): idx for idx, row_id in enumerate(decision_row_ids.tolist())}
+    better_ids = ranking_pairs_df["better_decision_row_id"].astype(str).to_numpy(dtype=object)
+    worse_ids = ranking_pairs_df["worse_decision_row_id"].astype(str).to_numpy(dtype=object)
+    pair_weights = pd.to_numeric(ranking_pairs_df["pair_weight"], errors="coerce").fillna(0.0)
+    better_idx: list[int] = []
+    worse_idx: list[int] = []
+    weights: list[float] = []
+    for b_id, w_id, weight in zip(better_ids, worse_ids, pair_weights, strict=False):
+        b_pos = id_to_pos.get(str(b_id))
+        w_pos = id_to_pos.get(str(w_id))
+        if b_pos is None or w_pos is None:
+            continue
+        if float(weight) <= 0.0:
+            continue
+        better_idx.append(int(b_pos))
+        worse_idx.append(int(w_pos))
+        weights.append(float(weight))
+    return {
+        "better_idx": np.asarray(better_idx, dtype=np.int64),
+        "worse_idx": np.asarray(worse_idx, dtype=np.int64),
+        "pair_weight": np.asarray(weights, dtype=np.float32),
+    }
