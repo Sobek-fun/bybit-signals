@@ -62,6 +62,11 @@ class DetectorModelConfig:
     weight_decay: float
     pre_episode_context_bars: int
     decision_window_bars: int
+    ranking_lambda: float
+    hard_negative_weight_multiplier: float
+    hard_negative_max_age_distance: int
+    max_ranking_pairs_per_episode: int
+    timeout_pair_weight: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,6 +622,26 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
         decision_window_bars=_require_positive_int(
             model_section.get("decision_window_bars", 6),
             "detector.model.decision_window_bars",
+        ),
+        ranking_lambda=_require_positive_float(
+            model_section.get("ranking_lambda", 0.5),
+            "detector.model.ranking_lambda",
+        ),
+        hard_negative_weight_multiplier=_require_positive_float(
+            model_section.get("hard_negative_weight_multiplier", 2.0),
+            "detector.model.hard_negative_weight_multiplier",
+        ),
+        hard_negative_max_age_distance=_require_non_negative_int(
+            model_section.get("hard_negative_max_age_distance", 2),
+            "detector.model.hard_negative_max_age_distance",
+        ),
+        max_ranking_pairs_per_episode=_require_positive_int(
+            model_section.get("max_ranking_pairs_per_episode", 8),
+            "detector.model.max_ranking_pairs_per_episode",
+        ),
+        timeout_pair_weight=_require_positive_float(
+            model_section.get("timeout_pair_weight", 0.5),
+            "detector.model.timeout_pair_weight",
         ),
     )
 

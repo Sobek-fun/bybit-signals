@@ -55,6 +55,11 @@ l2_leaf_reg = 3.0
 random_seed = 42
 pre_episode_context_bars = 16
 decision_window_bars = 6
+ranking_lambda = 0.5
+hard_negative_weight_multiplier = 2.0
+hard_negative_max_age_distance = 2
+max_ranking_pairs_per_episode = 8
+timeout_pair_weight = 0.5
 
 [detector.cv]
 min_train_days = 90
