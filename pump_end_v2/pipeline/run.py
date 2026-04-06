@@ -1270,18 +1270,27 @@ def _build_detector_diagnostics_summary(
 ) -> dict[str, Any]:
     val_group = _episode_group_index(detector_val_episode_group_summary_df)
     test_group = _episode_group_index(detector_test_episode_group_summary_df)
-    train_feature_summary = _feature_signal_rollup(detector_train_feature_signal_report_df)
-    val_feature_summary = _feature_signal_rollup(detector_val_feature_signal_report_df)
-    test_feature_summary = _feature_signal_rollup(detector_test_feature_signal_report_df)
+    train_feature_tp_sl = _select_feature_contrast(
+        detector_train_feature_signal_report_df, "tp_vs_sl"
+    )
+    val_feature_tp_sl = _select_feature_contrast(
+        detector_val_feature_signal_report_df, "tp_vs_sl"
+    )
+    test_feature_tp_sl = _select_feature_contrast(
+        detector_test_feature_signal_report_df, "tp_vs_sl"
+    )
+    train_feature_summary = _feature_signal_rollup(train_feature_tp_sl)
+    val_feature_summary = _feature_signal_rollup(val_feature_tp_sl)
+    test_feature_summary = _feature_signal_rollup(test_feature_tp_sl)
     same_direction_val_test = _same_direction_feature_total(
-        detector_val_feature_signal_report_df, detector_test_feature_signal_report_df
+        val_feature_tp_sl, test_feature_tp_sl
     )
     same_direction_train_val_test = _same_direction_feature_total_three(
-        detector_train_feature_signal_report_df,
-        detector_val_feature_signal_report_df,
-        detector_test_feature_signal_report_df,
+        train_feature_tp_sl,
+        val_feature_tp_sl,
+        test_feature_tp_sl,
     )
-    test_best = _best_feature_row(detector_test_feature_signal_report_df)
+    test_best = _best_feature_row(test_feature_tp_sl)
     training_health = {
         "best_epoch": int(_safe_int(detector_sequence_overfit_report.get("best_epoch"), 0)),
         "epochs_ran": int(_safe_int(detector_sequence_overfit_report.get("epochs_ran"), 0)),
@@ -1477,6 +1486,16 @@ def _episode_group_index(group_summary_df: pd.DataFrame) -> dict[str, dict[str, 
         key = str(getattr(row, "episode_group", ""))
         out[key] = row._asdict()
     return out
+
+
+def _select_feature_contrast(feature_df: pd.DataFrame, contrast: str) -> pd.DataFrame:
+    if feature_df is None or feature_df.empty:
+        return pd.DataFrame()
+    if "contrast" not in feature_df.columns:
+        return feature_df.copy()
+    frame = feature_df.copy()
+    frame["contrast"] = frame["contrast"].astype(str)
+    return frame[frame["contrast"] == str(contrast)].copy()
 
 
 def _feature_signal_rollup(feature_signal_df: pd.DataFrame) -> dict[str, int]:
