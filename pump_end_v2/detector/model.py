@@ -7,10 +7,6 @@ import numpy as np
 import pandas as pd
 
 from pump_end_v2.config import DetectorModelConfig
-from pump_end_v2.detector.ranking import (
-    build_detector_ranking_pairs,
-    build_hard_negative_row_weights,
-)
 from pump_end_v2.detector.sequence_dataset import (
     DetectorSequenceStore,
     extract_sequences_for_rows,
@@ -18,7 +14,7 @@ from pump_end_v2.detector.sequence_dataset import (
 from pump_end_v2.detector.sequence_model import (
     SequenceTCNBinaryClassifier,
     SequenceTrainStats,
-    predict_sequence_model_proba,
+    predict_sequence_model_outputs,
     train_sequence_model,
 )
 from pump_end_v2.features.manifest import (
@@ -45,6 +41,7 @@ class SequenceDetector:
     hard_negative_max_age_distance: int
     max_ranking_pairs_per_episode: int
     timeout_pair_weight: float
+    outcome_aux_lambda: float
     scaler_mean: np.ndarray | None = None
     scaler_std: np.ndarray | None = None
     sequence_store: DetectorSequenceStore | None = None
@@ -106,6 +103,7 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
         hard_negative_max_age_distance=int(model_config.hard_negative_max_age_distance),
         max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
         timeout_pair_weight=float(model_config.timeout_pair_weight),
+        outcome_aux_lambda=float(model_config.outcome_aux_lambda),
     )
 
 
@@ -117,89 +115,108 @@ def fit_detector_model(
     eval_df: pd.DataFrame | None = None,
     sequence_store: DetectorSequenceStore | None = None,
 ) -> SequenceDetector:
-    _require_columns(train_df, ["decision_row_id", target_column], "train_df")
+    _require_columns(
+        train_df,
+        [
+            "decision_row_id",
+            "episode_id",
+            "trainable_row",
+            "is_ideal_entry",
+            "target_reason",
+        ],
+        "train_df",
+    )
     store = _resolve_sequence_store(model, sequence_store)
     model.sequence_store = store
-    x_train_raw, valid_train, in_episode_train = extract_sequences_for_rows(
-        store, train_df["decision_row_id"].astype(str)
-    )
-    y_train = pd.to_numeric(train_df[target_column], errors="coerce").fillna(0.0).to_numpy(
-        dtype=np.float32
-    )
-    sample_weight_train, hard_negative_mask_train = build_hard_negative_row_weights(
-        train_df,
-        hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
-        hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
-        timeout_hard_negative_weight_multiplier=1.5,
-        return_hard_negative_mask=True,
-    )
-    ranking_pairs_train_df = build_detector_ranking_pairs(
-        train_df,
-        timeout_pair_weight=float(model.timeout_pair_weight),
-        max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
-    )
-    ranking_pairs_train = _prepare_pair_index_data(
-        ranking_pairs_train_df, train_df["decision_row_id"].astype(str)
-    )
-    if len(y_train) == 0:
+    train_fit = _prepare_fit_rows(train_df)
+    if train_fit.empty:
         raise ValueError("fit_detector_model received empty train rows")
+    x_train_raw, valid_train, in_episode_train, readout_index_train = (
+        extract_sequences_for_rows(store, train_fit["decision_row_id"].astype(str))
+    )
     scaler_mean, scaler_std = _fit_scaler(x_train_raw, valid_train)
     x_train_scaled = _transform_with_scaler(x_train_raw, valid_train, scaler_mean, scaler_std)
     x_train_input = _stack_model_inputs(x_train_scaled, valid_train, in_episode_train)
+    train_decision_row_ids = train_fit["decision_row_id"].astype(str).to_numpy(dtype=object)
+    train_episode_ids = train_fit["episode_id"].astype(str).to_numpy(dtype=object)
+    train_episode_target_map = _build_episode_target_row_id_map(train_fit)
+    train_outcome_targets = _encode_outcome_targets(train_fit["target_reason"])
+    train_outcome_weights = _resolve_outcome_weights(train_fit)
     x_eval_input: np.ndarray | None = None
-    y_eval: np.ndarray | None = None
-    sample_weight_eval: np.ndarray | None = None
-    ranking_pairs_eval: dict[str, np.ndarray] | None = None
-    hard_negative_mask_eval: np.ndarray | None = None
+    eval_episode_ids: np.ndarray | None = None
+    eval_decision_row_ids: np.ndarray | None = None
+    eval_readout_index: np.ndarray | None = None
+    eval_episode_target_map: dict[str, str | None] | None = None
+    eval_outcome_targets: np.ndarray | None = None
+    eval_outcome_weights: np.ndarray | None = None
     if eval_df is not None and len(eval_df) > 0:
-        _require_columns(eval_df, ["decision_row_id", target_column], "eval_df")
-        x_eval_raw, valid_eval, in_episode_eval = extract_sequences_for_rows(
-            store, eval_df["decision_row_id"].astype(str)
-        )
-        y_eval = pd.to_numeric(eval_df[target_column], errors="coerce").fillna(0.0).to_numpy(
-            dtype=np.float32
-        )
-        sample_weight_eval, hard_negative_mask_eval = build_hard_negative_row_weights(
+        _require_columns(
             eval_df,
-            hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
-            hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
-            timeout_hard_negative_weight_multiplier=1.5,
-            return_hard_negative_mask=True,
+            [
+                "decision_row_id",
+                "episode_id",
+                "trainable_row",
+                "is_ideal_entry",
+                "target_reason",
+            ],
+            "eval_df",
         )
-        ranking_pairs_eval_df = build_detector_ranking_pairs(
-            eval_df,
-            timeout_pair_weight=float(model.timeout_pair_weight),
-            max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
-        )
-        ranking_pairs_eval = _prepare_pair_index_data(
-            ranking_pairs_eval_df, eval_df["decision_row_id"].astype(str)
-        )
-        x_eval_scaled = _transform_with_scaler(
-            x_eval_raw, valid_eval, scaler_mean, scaler_std
-        )
-        x_eval_input = _stack_model_inputs(x_eval_scaled, valid_eval, in_episode_eval)
+        eval_fit = _prepare_fit_rows(eval_df)
+        if not eval_fit.empty:
+            x_eval_raw, valid_eval, in_episode_eval, eval_readout_index = (
+                extract_sequences_for_rows(store, eval_fit["decision_row_id"].astype(str))
+            )
+            eval_outcome_targets = _encode_outcome_targets(eval_fit["target_reason"])
+            eval_outcome_weights = _resolve_outcome_weights(eval_fit)
+            eval_episode_ids = eval_fit["episode_id"].astype(str).to_numpy(dtype=object)
+            eval_decision_row_ids = eval_fit["decision_row_id"].astype(str).to_numpy(
+                dtype=object
+            )
+            eval_episode_target_map = _build_episode_target_row_id_map(eval_fit)
+            x_eval_scaled = _transform_with_scaler(
+                x_eval_raw, valid_eval, scaler_mean, scaler_std
+            )
+            x_eval_input = _stack_model_inputs(x_eval_scaled, valid_eval, in_episode_eval)
     stats: SequenceTrainStats = train_sequence_model(
         model=model.network,
         x_train=x_train_input,
-        y_train=y_train,
-        sample_weight_train=sample_weight_train,
-        train_episode_ids=train_df["episode_id"].astype(str).to_numpy(dtype=object),
+        y_train=np.zeros(len(train_fit), dtype=np.float32),
+        sample_weight_train=np.ones(len(train_fit), dtype=np.float32),
+        train_episode_ids=train_episode_ids,
+        train_decision_row_ids=train_decision_row_ids,
+        train_readout_index=readout_index_train,
+        train_episode_target_row_id_map=train_episode_target_map,
+        train_outcome_targets=train_outcome_targets,
+        train_outcome_weights=train_outcome_weights,
         x_eval=x_eval_input,
-        y_eval=y_eval,
-        sample_weight_eval=sample_weight_eval,
+        y_eval=(
+            np.zeros(len(eval_decision_row_ids), dtype=np.float32)
+            if eval_decision_row_ids is not None
+            else None
+        ),
+        sample_weight_eval=(
+            np.ones(len(eval_decision_row_ids), dtype=np.float32)
+            if eval_decision_row_ids is not None
+            else None
+        ),
+        eval_episode_ids=eval_episode_ids,
+        eval_decision_row_ids=eval_decision_row_ids,
+        eval_readout_index=eval_readout_index,
+        eval_episode_target_row_id_map=eval_episode_target_map,
+        eval_outcome_targets=eval_outcome_targets,
+        eval_outcome_weights=eval_outcome_weights,
         random_seed=int(model.random_seed),
         batch_size=int(model.batch_size),
         max_epochs=int(model.max_epochs),
         early_stopping_patience=int(model.early_stopping_patience),
         learning_rate=float(model.sequence_learning_rate),
         weight_decay=float(model.weight_decay),
-        ranking_pairs_train=ranking_pairs_train,
-        ranking_pairs_eval=ranking_pairs_eval,
-        ranking_lambda=float(model.ranking_lambda),
-        hard_negative_rows_train_total=int(np.sum(hard_negative_mask_train)),
-        hard_negative_rows_eval_total=(
-            int(np.sum(hard_negative_mask_eval)) if hard_negative_mask_eval is not None else 0
-        ),
+        outcome_aux_lambda=float(model.outcome_aux_lambda),
+        ranking_pairs_train=None,
+        ranking_pairs_eval=None,
+        ranking_lambda=0.0,
+        hard_negative_rows_train_total=0,
+        hard_negative_rows_eval_total=0,
     )
     model.scaler_mean = scaler_mean
     model.scaler_std = scaler_std
@@ -216,18 +233,29 @@ def predict_detector_scores(
 ) -> pd.DataFrame:
     _require_columns(df, [*DETECTOR_IDENTITY_COLUMNS, "decision_row_id"], "df")
     if df.empty:
-        return pd.DataFrame(columns=[*DETECTOR_IDENTITY_COLUMNS, "p_good"])
+        return pd.DataFrame(
+            columns=[
+                *DETECTOR_IDENTITY_COLUMNS,
+                "p_good",
+                "p_tp_row",
+                "p_timeout_row",
+                "p_sl_row",
+            ]
+        )
     if model.scaler_mean is None or model.scaler_std is None:
         raise ValueError("model is not fitted: scaler stats are missing")
     store = _resolve_sequence_store(model, sequence_store)
-    x_raw, valid_mask, in_episode_mask = extract_sequences_for_rows(
+    x_raw, valid_mask, in_episode_mask, readout_index = extract_sequences_for_rows(
         store, df["decision_row_id"].astype(str)
     )
     x_scaled = _transform_with_scaler(x_raw, valid_mask, model.scaler_mean, model.scaler_std)
     x_input = _stack_model_inputs(x_scaled, valid_mask, in_episode_mask)
-    scores = predict_sequence_model_proba(model.network, x_input).astype(float)
+    outputs = predict_sequence_model_outputs(model.network, x_input, readout_index)
     out = df.loc[:, list(DETECTOR_IDENTITY_COLUMNS)].copy()
-    out["p_good"] = scores
+    out["p_good"] = outputs["p_good"].astype(float)
+    out["p_tp_row"] = outputs["p_tp_row"].astype(float)
+    out["p_timeout_row"] = outputs["p_timeout_row"].astype(float)
+    out["p_sl_row"] = outputs["p_sl_row"].astype(float)
     return out
 
 
@@ -318,49 +346,7 @@ def build_sequence_permutation_importance_table(
     target_column: str,
     sequence_store: DetectorSequenceStore | None = None,
 ) -> pd.DataFrame:
-    if eval_df.empty:
-        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
-    if model.scaler_mean is None or model.scaler_std is None:
-        raise ValueError("model is not fitted: scaler stats are missing")
-    _require_columns(eval_df, ["decision_row_id", target_column], "eval_df")
-    store = _resolve_sequence_store(model, sequence_store)
-    feature_columns = list(model.feature_columns)
-    if not feature_columns:
-        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
-    x_eval_raw, valid_eval, in_episode_eval = extract_sequences_for_rows(
-        store, eval_df["decision_row_id"].astype(str)
-    )
-    y_eval = (
-        pd.to_numeric(eval_df[target_column], errors="coerce")
-        .fillna(0.0)
-        .to_numpy(dtype=np.float32)
-    )
-    if len(y_eval) == 0:
-        return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
-    x_eval_scaled = _transform_with_scaler(
-        x_eval_raw, valid_eval, model.scaler_mean, model.scaler_std
-    )
-    x_eval_input = _stack_model_inputs(x_eval_scaled, valid_eval, in_episode_eval)
-    baseline_pred = predict_sequence_model_proba(model.network, x_eval_input).astype(float)
-    baseline_loss = _binary_logloss(y_eval.astype(float), baseline_pred)
-    rng = np.random.default_rng(int(model.random_seed))
-    rows: list[dict[str, float | str]] = []
-    for feature_idx, feature_name in enumerate(feature_columns):
-        shuffled = x_eval_scaled.copy()
-        perm = rng.permutation(shuffled.shape[0])
-        shuffled[:, :, feature_idx] = shuffled[perm, :, feature_idx]
-        shuffled_input = _stack_model_inputs(shuffled, valid_eval, in_episode_eval)
-        perm_pred = predict_sequence_model_proba(model.network, shuffled_input).astype(float)
-        perm_loss = _binary_logloss(y_eval.astype(float), perm_pred)
-        rows.append(
-            {
-                "feature": str(feature_name),
-                "importance_raw": float(perm_loss - baseline_loss),
-            }
-        )
-    out = pd.DataFrame(rows, columns=["feature", "importance_raw"])
-    out["importance_norm"] = _normalize_importance(out["importance_raw"])
-    return out
+    return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
 
 
 def _normalize_importance(values: pd.Series) -> pd.Series:
@@ -417,6 +403,51 @@ def _stack_model_inputs(
     valid = valid_mask.astype(np.float32)[..., np.newaxis]
     in_episode = in_episode_mask.astype(np.float32)[..., np.newaxis]
     return np.concatenate([x_scaled, valid, in_episode], axis=2).astype(np.float32, copy=False)
+
+
+def _prepare_fit_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    out = out[out["trainable_row"].astype(bool)].copy()
+    if out.empty:
+        return out
+    sort_columns = ["episode_id", "decision_row_id"]
+    if "episode_age_bars" in out.columns:
+        sort_columns = ["episode_id", "episode_age_bars", "decision_row_id"]
+    elif "context_bar_open_time" in out.columns:
+        sort_columns = ["episode_id", "context_bar_open_time", "decision_row_id"]
+    return out.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
+
+
+def _build_episode_target_row_id_map(frame: pd.DataFrame) -> dict[str, str | None]:
+    mapping: dict[str, str | None] = {}
+    for episode_id, group in frame.groupby("episode_id", sort=False):
+        g = group.copy()
+        ideal = g[g["is_ideal_entry"].astype(bool)].copy()
+        if ideal.empty:
+            mapping[str(episode_id)] = None
+            continue
+        ideal = ideal.sort_values(
+            ["context_bar_open_time", "decision_row_id"], kind="mergesort"
+        )
+        mapping[str(episode_id)] = str(ideal.iloc[0]["decision_row_id"])
+    return mapping
+
+
+def _encode_outcome_targets(target_reason: pd.Series) -> np.ndarray:
+    reason = target_reason.astype(str).str.strip().str.lower()
+    out = np.full(len(reason), -1, dtype=np.int64)
+    out[reason.eq("tp").to_numpy(dtype=bool, copy=False)] = 0
+    out[reason.eq("timeout").to_numpy(dtype=bool, copy=False)] = 1
+    out[reason.eq("sl").to_numpy(dtype=bool, copy=False)] = 2
+    return out
+
+
+def _resolve_outcome_weights(frame: pd.DataFrame) -> np.ndarray:
+    if "target_row_weight" not in frame.columns:
+        return np.ones(len(frame), dtype=np.float32)
+    weights = pd.to_numeric(frame["target_row_weight"], errors="coerce").fillna(1.0)
+    weights = weights.clip(lower=0.0)
+    return weights.to_numpy(dtype=np.float32, copy=False)
 
 
 def _require_columns(df: pd.DataFrame, columns: list[str], name: str) -> None:
