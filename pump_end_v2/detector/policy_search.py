@@ -44,6 +44,9 @@ POLICY_ROW_COLUMNS: tuple[str, ...] = (
     "decision_time",
     "entry_bar_open_time",
     "p_good",
+    "p_tp_row",
+    "p_timeout_row",
+    "p_sl_row",
     "score_source",
     "fold_id",
     "policy_context_only",
@@ -105,6 +108,8 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "selector_density_ok",
     "selector_support_ok",
     "selector_density_distance",
+    "timeout_total",
+    "timeout_share",
 )
 
 POLICY_BASE_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -728,6 +733,8 @@ def sweep_detector_policy(
                     f"turn={candidate.turn_down_delta:.6f} signals_total={len(candidate_signals_df)} "
                     f"tp_rate_resolved={float(selector_metrics['tp_rate_resolved']):.6f} "
                     f"resolved_signals_total={int(round(resolved_signals_total))} "
+                    f"timeout_total={int(round(float(selector_metrics['timeout_total'])))} "
+                    f"timeout_share={float(selector_metrics['timeout_share']):.6f} "
                     f"selection_score={float(metrics['selection_score']):.6f} current_best={best_selection_score:.6f} "
                     f"elapsed_sec={elapsed:.3f} eta_sec={eta:.3f}"
                 ),
@@ -764,6 +771,8 @@ def sweep_detector_policy(
                 "selector_density_ok": selector_density_ok,
                 "selector_support_ok": selector_support_ok,
                 "selector_density_distance": selector_density_distance,
+                "timeout_total": selector_metrics["timeout_total"],
+                "timeout_share": selector_metrics["timeout_share"],
             }
         )
     sweep_df = pd.DataFrame(rows, columns=list(SWEEP_COLUMNS))
@@ -879,6 +888,8 @@ def select_detector_policy(
             f"edge_vs_breakeven_zscore={float(best['edge_vs_breakeven_zscore']):.6f} "
             f"fires_per_30d={float(best['fires_per_30d']):.6f} "
             f"resolved_signals_total={int(round(float(best['resolved_signals_total'])))} "
+            f"timeout_total={int(round(float(best['timeout_total'])))} "
+            f"timeout_share={float(best['timeout_share']):.6f} "
             f"selector_density_ok={bool(best['selector_density_ok'])} "
             f"selector_support_ok={bool(best['selector_support_ok'])} "
             f"fallback_tier={fallback_tier}"
@@ -1068,6 +1079,8 @@ def _split_fit_train_eval_chronological(
     eval_inner = trainable[
         trainable["context_bar_open_time"] >= eval_start_time
     ].copy()
+    train_inner = _retain_complete_trainable_episodes(trainable, train_inner)
+    eval_inner = _retain_complete_trainable_episodes(trainable, eval_inner)
     if len(train_inner) < 2 or len(eval_inner) < 2:
         return (
             trainable,
@@ -1079,40 +1092,6 @@ def _split_fit_train_eval_chronological(
                 "fallback_reason": "split_too_small",
             },
         )
-    train_classes = (
-        pd.to_numeric(train_inner[target_column], errors="coerce")
-        .fillna(0.0)
-        .astype(int)
-        .unique()
-    )
-    eval_classes = (
-        pd.to_numeric(eval_inner[target_column], errors="coerce")
-        .fillna(0.0)
-        .astype(int)
-        .unique()
-    )
-    if len(train_classes) < 2:
-        return (
-            trainable,
-            None,
-            {
-                "monitor_name": "train_loss_fallback",
-                "train_rows": int(len(trainable)),
-                "eval_rows": 0,
-                "fallback_reason": "train_single_class",
-            },
-        )
-    if len(eval_classes) < 2:
-        return (
-            trainable,
-            None,
-            {
-                "monitor_name": "train_loss_fallback",
-                "train_rows": int(len(trainable)),
-                "eval_rows": 0,
-                "fallback_reason": "eval_single_class",
-            },
-        )
     return (
         train_inner,
         eval_inner,
@@ -1122,6 +1101,35 @@ def _split_fit_train_eval_chronological(
             "eval_rows": int(len(eval_inner)),
             "fallback_reason": "",
         },
+    )
+
+
+def _retain_complete_trainable_episodes(
+    full_trainable_frame: pd.DataFrame, slice_frame: pd.DataFrame
+) -> pd.DataFrame:
+    if slice_frame.empty:
+        return slice_frame.copy()
+    full_sets = (
+        full_trainable_frame.groupby("episode_id")["decision_row_id"]
+        .apply(lambda s: frozenset(s.astype(str)))
+        .to_dict()
+    )
+    slice_sets = (
+        slice_frame.groupby("episode_id")["decision_row_id"]
+        .apply(lambda s: frozenset(s.astype(str)))
+        .to_dict()
+    )
+    keep_episode_ids = [
+        str(ep)
+        for ep, row_set in slice_sets.items()
+        if row_set == full_sets.get(ep, frozenset())
+    ]
+    if not keep_episode_ids:
+        return slice_frame.iloc[0:0].copy()
+    return (
+        slice_frame[slice_frame["episode_id"].astype(str).isin(keep_episode_ids)]
+        .copy()
+        .reset_index(drop=True)
     )
 
 
@@ -1275,12 +1283,14 @@ def _build_execution_aware_selector_metrics(
         resolved_signals_total = 0
         tp_total = 0
         sl_total = 0
+        timeout_total = 0
     else:
         outcome = (
             candidate_signals_df["row_trade_outcome"].astype(str).str.strip().str.lower()
         )
         tp_total = int(outcome.eq("tp").sum())
         sl_total = int(outcome.eq("sl").sum())
+        timeout_total = int(outcome.eq("timeout").sum())
         resolved_signals_total = int(tp_total + sl_total)
     tp_rate_resolved = (
         float(tp_total / resolved_signals_total)
@@ -1318,6 +1328,10 @@ def _build_execution_aware_selector_metrics(
         "resolved_signals_total": float(resolved_signals_total),
         "tp_total": float(tp_total),
         "sl_total": float(sl_total),
+        "timeout_total": float(timeout_total),
+        "timeout_share": float(
+            timeout_total / len(candidate_signals_df) if len(candidate_signals_df) > 0 else 0.0
+        ),
         "tp_rate_resolved": float(tp_rate_resolved),
         "sl_rate_resolved": float(sl_rate_resolved),
         "tp_rate_breakeven": float(tp_rate_breakeven),
