@@ -18,6 +18,7 @@ _BAR_NS = int(pd.Timedelta(minutes=15).value)
 _META_COLUMNS: tuple[str, ...] = (
     *DETECTOR_IDENTITY_COLUMNS,
     "episode_open_time",
+    "episode_age_bars",
     "dataset_split",
     "trainable_row",
     "target_good_short_now",
@@ -38,6 +39,7 @@ class DetectorSequenceStore:
     x: np.ndarray
     valid_mask: np.ndarray
     in_episode_mask: np.ndarray
+    context_step_index: np.ndarray
     row_index_by_decision_row_id: dict[str, int]
     feature_columns: tuple[str, ...]
     lookback_bars: int
@@ -216,12 +218,25 @@ def build_detector_sequence_store(
     x = np.zeros((rows_total, lookback_bars, feature_total), dtype=np.float32)
     valid_mask = np.zeros((rows_total, lookback_bars), dtype=np.bool_)
     in_episode_mask = np.zeros((rows_total, lookback_bars), dtype=np.bool_)
+    context_step_index = np.zeros(rows_total, dtype=np.int64)
     for row_idx, row in enumerate(meta_df.itertuples(index=False)):
         symbol = str(getattr(row, _SYMBOL_COLUMN))
         episode_id = str(getattr(row, _EPISODE_ID_COLUMN))
         context_ts = pd.Timestamp(getattr(row, "context_bar_open_time")).value
         open_ts = int(episode_open_ts.get(episode_id, context_ts + 1))
         window_start_ts = open_ts - pre_episode_context_bars * _BAR_NS
+        context_step = int((context_ts - window_start_ts) // _BAR_NS)
+        if context_step < 0 or context_step >= lookback_bars:
+            raise ValueError(
+                f"context_step_index out of range row_idx={row_idx} value={context_step} lookback_bars={lookback_bars}"
+            )
+        episode_age_bars = int(getattr(row, "episode_age_bars"))
+        expected_context_step = pre_episode_context_bars + episode_age_bars - 1
+        if context_step != expected_context_step:
+            raise ValueError(
+                f"context_step_index mismatch row_idx={row_idx} context_step={context_step} expected={expected_context_step}"
+            )
+        context_step_index[row_idx] = context_step
         for step in range(lookback_bars):
             ts = window_start_ts + step * _BAR_NS
             if ts > context_ts:
@@ -253,6 +268,10 @@ def build_detector_sequence_store(
                 x[row_idx, step, episode_assign_targets] = episode_values[
                     episode_assign_sources
                 ]
+        if not bool(valid_mask[row_idx, context_step]):
+            raise ValueError(
+                f"context step must be valid for row_idx={row_idx} context_step_index={context_step}"
+            )
     invalid_mask = ~np.isfinite(x)
     if invalid_mask.any():
         invalid_positions = np.argwhere(invalid_mask)
@@ -274,6 +293,7 @@ def build_detector_sequence_store(
         x=x,
         valid_mask=valid_mask,
         in_episode_mask=in_episode_mask,
+        context_step_index=context_step_index,
         row_index_by_decision_row_id=row_index,
         feature_columns=feature_columns,
         lookback_bars=lookback_bars,
@@ -284,7 +304,7 @@ def build_detector_sequence_store(
 
 def extract_sequences_for_rows(
     sequence_store: DetectorSequenceStore, decision_row_ids: pd.Series | list[str]
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     ids = pd.Series(decision_row_ids).astype(str).tolist()
     if not ids:
         f = len(sequence_store.feature_columns)
@@ -293,6 +313,7 @@ def extract_sequences_for_rows(
             np.zeros((0, t, f), dtype=np.float32),
             np.zeros((0, t), dtype=np.bool_),
             np.zeros((0, t), dtype=np.bool_),
+            np.zeros(0, dtype=np.int64),
         )
     indices: list[int] = []
     missing: list[str] = []
@@ -309,7 +330,8 @@ def extract_sequences_for_rows(
     x = sequence_store.x[indices].astype(np.float32, copy=False)
     valid = sequence_store.valid_mask[indices].astype(np.bool_, copy=False)
     in_episode = sequence_store.in_episode_mask[indices].astype(np.bool_, copy=False)
-    return x, valid, in_episode
+    readout_index = sequence_store.context_step_index[indices].astype(np.int64, copy=False)
+    return x, valid, in_episode, readout_index
 
 
 def _resolve_source_columns(
