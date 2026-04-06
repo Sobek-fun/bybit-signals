@@ -183,6 +183,7 @@ def fit_detector_model(
         x_train=x_train_input,
         y_train=y_train,
         sample_weight_train=sample_weight_train,
+        train_episode_ids=train_df["episode_id"].astype(str).to_numpy(dtype=object),
         x_eval=x_eval_input,
         y_eval=y_eval,
         sample_weight_eval=sample_weight_eval,

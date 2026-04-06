@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 
 SEQUENCE_BATCH_SIZE = 256
@@ -161,6 +161,7 @@ def train_sequence_model(
     x_train: np.ndarray,
     y_train: np.ndarray,
     sample_weight_train: np.ndarray,
+    train_episode_ids: np.ndarray,
     x_eval: np.ndarray | None,
     y_eval: np.ndarray | None,
     sample_weight_eval: np.ndarray | None,
@@ -182,6 +183,8 @@ def train_sequence_model(
         raise ValueError("train_sequence_model received non-finite y_train")
     if not np.isfinite(sample_weight_train).all():
         raise ValueError("train_sequence_model received non-finite sample_weight_train")
+    if len(train_episode_ids) != len(y_train):
+        raise ValueError("train_episode_ids length must match y_train length")
     if x_eval is not None and not np.isfinite(x_eval).all():
         raise ValueError("train_sequence_model received non-finite x_eval")
     if y_eval is not None and not np.isfinite(y_eval).all():
@@ -204,11 +207,10 @@ def train_sequence_model(
     y_train_device = y_train_t.to(device)
     w_train_device = w_train_t.to(device)
     train_ds = TensorDataset(x_train_t, y_train_t, w_train_t, idx_train_t)
-    train_loader = DataLoader(
-        train_ds,
+    episode_batches = _build_episode_index_batches(
+        train_episode_ids=train_episode_ids,
         batch_size=int(batch_size),
-        shuffle=True,
-        drop_last=False,
+        random_seed=int(random_seed),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -243,7 +245,8 @@ def train_sequence_model(
         train_classification_sum = 0.0
         train_ranking_sum = 0.0
         train_count = 0
-        for batch_x, batch_y, batch_w, batch_idx in train_loader:
+        for batch_indices in episode_batches:
+            batch_x, batch_y, batch_w, batch_idx = _slice_batch(train_ds, batch_indices)
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             batch_w = batch_w.to(device)
@@ -254,7 +257,7 @@ def train_sequence_model(
                 raise ValueError(
                     f"non-finite train classification loss detected: loss={float(classification_loss.item())}"
                 )
-            batch_pairs = _extract_batch_ranking_pairs(
+            batch_pairs = _extract_batch_ranking_pairs_by_global_index(
                 ranking_pairs_train, batch_idx.detach().cpu().numpy()
             )
             ranking_loss_batch = _pairwise_ranking_loss(logits, batch_pairs, device=device)
@@ -444,7 +447,7 @@ def _normalize_ranking_pairs(
     }
 
 
-def _extract_batch_ranking_pairs(
+def _extract_batch_ranking_pairs_by_global_index(
     ranking_pairs: dict[str, np.ndarray], batch_indices: np.ndarray
 ) -> dict[str, np.ndarray]:
     if batch_indices.size == 0:
@@ -479,6 +482,56 @@ def _extract_batch_ranking_pairs(
         "worse_idx": np.asarray(worse_local, dtype=np.int64),
         "pair_weight": np.asarray(weights_local, dtype=np.float32),
     }
+
+
+def _build_episode_index_batches(
+    train_episode_ids: np.ndarray,
+    batch_size: int,
+    random_seed: int,
+) -> list[np.ndarray]:
+    episode_ids = np.asarray(train_episode_ids, dtype=object).astype(str)
+    groups: dict[str, list[int]] = {}
+    for idx, episode_id in enumerate(episode_ids.tolist()):
+        groups.setdefault(str(episode_id), []).append(int(idx))
+    rng = np.random.default_rng(int(random_seed))
+    episode_keys = np.asarray(list(groups.keys()), dtype=object)
+    if episode_keys.size > 0:
+        rng.shuffle(episode_keys)
+    batches: list[np.ndarray] = []
+    current: list[int] = []
+    current_size = 0
+    target_batch_size = max(int(batch_size), 1)
+    for key in episode_keys.tolist():
+        episode_indices = groups[str(key)]
+        episode_len = len(episode_indices)
+        if current and (current_size + episode_len) > target_batch_size:
+            batches.append(np.asarray(current, dtype=np.int64))
+            current = []
+            current_size = 0
+        current.extend(episode_indices)
+        current_size += episode_len
+        if current_size >= target_batch_size:
+            batches.append(np.asarray(current, dtype=np.int64))
+            current = []
+            current_size = 0
+    if current:
+        batches.append(np.asarray(current, dtype=np.int64))
+    if not batches:
+        return [np.arange(len(episode_ids), dtype=np.int64)]
+    return batches
+
+
+def _slice_batch(
+    dataset: TensorDataset, batch_indices: np.ndarray
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    idx = torch.tensor(batch_indices, dtype=torch.long)
+    x_all, y_all, w_all, i_all = dataset.tensors
+    return (
+        x_all.index_select(0, idx),
+        y_all.index_select(0, idx),
+        w_all.index_select(0, idx),
+        i_all.index_select(0, idx),
+    )
 
 
 def predict_sequence_model_proba(
