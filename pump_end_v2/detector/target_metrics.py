@@ -23,7 +23,8 @@ def build_detector_target_metrics(
             "sl_fp_rate": 0.0,
             "timeout_fp_rate": 0.0,
             "ambiguous_fp_rate": 0.0,
-            "roc_auc_tp_vs_non_tp": 0.0,
+            "roc_auc_tp_vs_sl": 0.0,
+            "roc_auc_tp_vs_timeout": 0.0,
             "mean_p_good_tp": 0.0,
             "mean_p_good_sl": 0.0,
             "mean_p_good_timeout": 0.0,
@@ -34,10 +35,9 @@ def build_detector_target_metrics(
     predicted_good = p_good_numeric.fillna(0.0) >= float(good_threshold)
     reasons = frame["target_reason"].astype(str).str.strip().str.lower()
     actual_good = reasons.eq("tp")
-    valid_auc_mask = p_good_numeric.notna()
-    auc_score = _binary_roc_auc(
-        actual_good.loc[valid_auc_mask].astype(int),
-        p_good_numeric.loc[valid_auc_mask].astype(float),
+    auc_tp_vs_sl = _binary_roc_auc_for_reason_pair(p_good_numeric, reasons, "tp", "sl")
+    auc_tp_vs_timeout = _binary_roc_auc_for_reason_pair(
+        p_good_numeric, reasons, "tp", "timeout"
     )
     tp = int((predicted_good & actual_good).sum())
     pred_pos = int(predicted_good.sum())
@@ -50,7 +50,8 @@ def build_detector_target_metrics(
         "sl_fp_rate": _reason_fp_rate(predicted_good, reasons, "sl"),
         "timeout_fp_rate": _reason_fp_rate(predicted_good, reasons, "timeout"),
         "ambiguous_fp_rate": _reason_fp_rate(predicted_good, reasons, "ambiguous"),
-        "roc_auc_tp_vs_non_tp": float(auc_score),
+        "roc_auc_tp_vs_sl": float(auc_tp_vs_sl),
+        "roc_auc_tp_vs_timeout": float(auc_tp_vs_timeout),
         "mean_p_good_tp": _mean_p_good_for_reason(p_good_numeric, reasons, "tp"),
         "mean_p_good_sl": _mean_p_good_for_reason(p_good_numeric, reasons, "sl"),
         "mean_p_good_timeout": _mean_p_good_for_reason(p_good_numeric, reasons, "timeout"),
@@ -155,9 +156,11 @@ def build_detector_rank_quality_report(policy_rows_df: pd.DataFrame) -> dict[str
     if frame.empty:
         return {
             "rows_total": 0.0,
-            "roc_auc_tp_vs_non_tp": 0.0,
+            "roc_auc_tp_vs_sl": 0.0,
+            "roc_auc_tp_vs_timeout": 0.0,
             "mean_p_good_tp": 0.0,
-            "mean_p_good_non_tp": 0.0,
+            "mean_p_good_sl": 0.0,
+            "mean_p_good_timeout": 0.0,
             "top_decile_tp_rate": 0.0,
             "bottom_decile_tp_rate": 0.0,
         }
@@ -168,15 +171,25 @@ def build_detector_rank_quality_report(policy_rows_df: pd.DataFrame) -> dict[str
     if frame.empty:
         return {
             "rows_total": 0.0,
-            "roc_auc_tp_vs_non_tp": 0.0,
+            "roc_auc_tp_vs_sl": 0.0,
+            "roc_auc_tp_vs_timeout": 0.0,
             "mean_p_good_tp": 0.0,
-            "mean_p_good_non_tp": 0.0,
+            "mean_p_good_sl": 0.0,
+            "mean_p_good_timeout": 0.0,
             "top_decile_tp_rate": 0.0,
             "bottom_decile_tp_rate": 0.0,
         }
-    auc_score = _binary_roc_auc(frame["target_tp"], frame["p_good"])
+    auc_tp_vs_sl = _binary_roc_auc_for_reason_pair(
+        frame["p_good"], frame["target_reason"], "tp", "sl"
+    )
+    auc_tp_vs_timeout = _binary_roc_auc_for_reason_pair(
+        frame["p_good"], frame["target_reason"], "tp", "timeout"
+    )
     mean_p_good_tp = float(frame.loc[frame["target_tp"] == 1, "p_good"].mean())
-    mean_p_good_non_tp = float(frame.loc[frame["target_tp"] != 1, "p_good"].mean())
+    mean_p_good_sl = float(frame.loc[frame["target_reason"] == "sl", "p_good"].mean())
+    mean_p_good_timeout = float(
+        frame.loc[frame["target_reason"] == "timeout", "p_good"].mean()
+    )
     quantiles = min(10, int(len(frame)))
     ranks = frame["p_good"].rank(method="first")
     frame["decile"] = pd.qcut(ranks, q=quantiles, labels=False) + 1
@@ -190,14 +203,28 @@ def build_detector_rank_quality_report(policy_rows_df: pd.DataFrame) -> dict[str
     )
     return {
         "rows_total": float(len(frame)),
-        "roc_auc_tp_vs_non_tp": float(auc_score),
+        "roc_auc_tp_vs_sl": float(auc_tp_vs_sl),
+        "roc_auc_tp_vs_timeout": float(auc_tp_vs_timeout),
         "mean_p_good_tp": 0.0 if np.isnan(mean_p_good_tp) else float(mean_p_good_tp),
-        "mean_p_good_non_tp": 0.0
-        if np.isnan(mean_p_good_non_tp)
-        else float(mean_p_good_non_tp),
+        "mean_p_good_sl": 0.0 if np.isnan(mean_p_good_sl) else float(mean_p_good_sl),
+        "mean_p_good_timeout": 0.0
+        if np.isnan(mean_p_good_timeout)
+        else float(mean_p_good_timeout),
         "top_decile_tp_rate": float(top_decile_tp_rate),
         "bottom_decile_tp_rate": float(bottom_decile_tp_rate),
     }
+
+
+def _binary_roc_auc_for_reason_pair(
+    p_good_numeric: pd.Series, reasons: pd.Series, positive_reason: str, negative_reason: str
+) -> float:
+    reason_series = reasons.astype(str).str.strip().str.lower()
+    mask = reason_series.isin([positive_reason, negative_reason]) & p_good_numeric.notna()
+    if not bool(mask.any()):
+        return 0.0
+    y_true = (reason_series.loc[mask] == positive_reason).astype(int)
+    y_score = p_good_numeric.loc[mask].astype(float)
+    return _binary_roc_auc(y_true, y_score)
 
 
 def _reason_fp_rate(

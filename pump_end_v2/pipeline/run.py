@@ -1151,6 +1151,7 @@ def run_pump_end_v2_pipeline(
         ),
         "sequence_shape": [int(v) for v in detector_sequence_store.x.shape],
         "detector_diagnostics_summary": _build_detector_diagnostics_summary(
+            detector_train_oof_row_rank_report=detector_train_oof_row_rank_report,
             detector_val_row_rank_report=detector_val_row_rank_report,
             detector_test_row_rank_report=detector_test_row_rank_report,
             detector_val_episode_rank_report=detector_val_episode_rank_report,
@@ -1252,6 +1253,7 @@ def _gate_model_to_dict(model_config: Any) -> dict[str, float]:
 
 def _build_detector_diagnostics_summary(
     *,
+    detector_train_oof_row_rank_report: dict[str, Any],
     detector_val_row_rank_report: dict[str, Any],
     detector_test_row_rank_report: dict[str, Any],
     detector_val_episode_rank_report: dict[str, Any],
@@ -1298,15 +1300,11 @@ def _build_detector_diagnostics_summary(
         "eval_loss_drift_from_best": _safe_float(
             detector_sequence_overfit_report.get("eval_loss_drift_from_best"), 0.0
         ),
-        "best_classification_loss": _safe_float(
-            sequence_train_stats.get("best_classification_loss"), 0.0
-        ),
-        "best_ranking_loss": _safe_float(sequence_train_stats.get("best_ranking_loss"), 0.0),
-        "final_classification_loss": _safe_float(
-            sequence_train_stats.get("final_classification_loss"), 0.0
-        ),
-        "final_ranking_loss": _safe_float(
-            sequence_train_stats.get("final_ranking_loss"), 0.0
+        "best_choice_loss": _safe_float(sequence_train_stats.get("best_choice_loss"), 0.0),
+        "best_outcome_loss": _safe_float(sequence_train_stats.get("best_outcome_loss"), 0.0),
+        "final_choice_loss": _safe_float(sequence_train_stats.get("final_choice_loss"), 0.0),
+        "final_outcome_loss": _safe_float(
+            sequence_train_stats.get("final_outcome_loss"), 0.0
         ),
         "ranking_pairs_train_total": int(
             _safe_int(sequence_train_stats.get("ranking_pairs_train_total"), 0)
@@ -1323,11 +1321,23 @@ def _build_detector_diagnostics_summary(
     }
     return {
         "row_rank_quality": {
-            "val_auc_tp_vs_non_tp": _safe_float(
-                detector_val_row_rank_report.get("auc_tp_vs_non_tp"), 0.0
+            "train_auc_tp_vs_sl": _safe_float(
+                detector_train_oof_row_rank_report.get("auc_tp_vs_sl"), 0.0
             ),
-            "test_auc_tp_vs_non_tp": _safe_float(
-                detector_test_row_rank_report.get("auc_tp_vs_non_tp"), 0.0
+            "train_auc_tp_vs_timeout": _safe_float(
+                detector_train_oof_row_rank_report.get("auc_tp_vs_timeout"), 0.0
+            ),
+            "val_auc_tp_vs_sl": _safe_float(
+                detector_val_row_rank_report.get("auc_tp_vs_sl"), 0.0
+            ),
+            "test_auc_tp_vs_sl": _safe_float(
+                detector_test_row_rank_report.get("auc_tp_vs_sl"), 0.0
+            ),
+            "val_auc_tp_vs_timeout": _safe_float(
+                detector_val_row_rank_report.get("auc_tp_vs_timeout"), 0.0
+            ),
+            "test_auc_tp_vs_timeout": _safe_float(
+                detector_test_row_rank_report.get("auc_tp_vs_timeout"), 0.0
             ),
             "val_top_decile_tp_rate": _safe_float(
                 detector_val_row_rank_report.get("top_decile_tp_rate"), 0.0
@@ -1517,14 +1527,14 @@ def _same_direction_feature_total_three(
 def _feature_direction_series(feature_df: pd.DataFrame) -> pd.Series:
     if feature_df is None or feature_df.empty:
         return pd.Series(dtype=bool)
-    required = {"feature", "direction_tp_gt_non_tp"}
+    required = {"feature", "direction_left_gt_right"}
     if not required.issubset(feature_df.columns):
         return pd.Series(dtype=bool)
-    frame = feature_df.loc[:, ["feature", "direction_tp_gt_non_tp"]].copy()
+    frame = feature_df.loc[:, ["feature", "direction_left_gt_right"]].copy()
     frame["feature"] = frame["feature"].astype(str)
-    frame["direction_tp_gt_non_tp"] = frame["direction_tp_gt_non_tp"].astype(bool)
+    frame["direction_left_gt_right"] = frame["direction_left_gt_right"].astype(bool)
     frame = frame.drop_duplicates(subset=["feature"], keep="last")
-    return frame.set_index("feature")["direction_tp_gt_non_tp"]
+    return frame.set_index("feature")["direction_left_gt_right"]
 
 
 def _best_feature_row(feature_df: pd.DataFrame) -> dict[str, Any]:
@@ -1534,18 +1544,16 @@ def _best_feature_row(feature_df: pd.DataFrame) -> dict[str, Any]:
             "feature_auc": 0.0,
             "feature_abs_auc_distance_from_0_5": 0.0,
         }
-    required = {"feature", "univariate_auc_tp_vs_non_tp", "abs_auc_distance_from_0_5"}
+    required = {"feature", "univariate_auc", "abs_auc_distance_from_0_5"}
     if not required.issubset(feature_df.columns):
         return {
             "feature_name": "",
             "feature_auc": 0.0,
             "feature_abs_auc_distance_from_0_5": 0.0,
         }
-    frame = feature_df.loc[
-        :, ["feature", "univariate_auc_tp_vs_non_tp", "abs_auc_distance_from_0_5"]
-    ].copy()
-    frame["univariate_auc_tp_vs_non_tp"] = pd.to_numeric(
-        frame["univariate_auc_tp_vs_non_tp"], errors="coerce"
+    frame = feature_df.loc[:, ["feature", "univariate_auc", "abs_auc_distance_from_0_5"]].copy()
+    frame["univariate_auc"] = pd.to_numeric(
+        frame["univariate_auc"], errors="coerce"
     )
     frame["abs_auc_distance_from_0_5"] = pd.to_numeric(
         frame["abs_auc_distance_from_0_5"], errors="coerce"
@@ -1564,7 +1572,7 @@ def _best_feature_row(feature_df: pd.DataFrame) -> dict[str, Any]:
     ).iloc[0]
     return {
         "feature_name": str(best["feature"]),
-        "feature_auc": _safe_float(best["univariate_auc_tp_vs_non_tp"], 0.0),
+        "feature_auc": _safe_float(best["univariate_auc"], 0.0),
         "feature_abs_auc_distance_from_0_5": _safe_float(
             best["abs_auc_distance_from_0_5"], 0.0
         ),

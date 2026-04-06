@@ -19,6 +19,8 @@ def build_detector_row_rank_report(policy_rows_df: pd.DataFrame) -> dict[str, fl
             "sl_rows_total": 0.0,
             "timeout_rows_total": 0.0,
             "p_good_nan_share": 0.0,
+            "auc_tp_vs_sl": 0.0,
+            "auc_tp_vs_timeout": 0.0,
             "auc_tp_vs_non_tp": 0.0,
             "mean_p_good_tp": 0.0,
             "mean_p_good_sl": 0.0,
@@ -39,10 +41,15 @@ def build_detector_row_rank_report(policy_rows_df: pd.DataFrame) -> dict[str, fl
     tp_mask = frame["target_tp"].astype(bool)
     sl_mask = frame["outcome_label"].eq("sl")
     timeout_mask = frame["outcome_label"].eq("timeout")
-    valid_auc = p_good.notna()
-    auc = _binary_roc_auc(
-        frame.loc[valid_auc, "target_tp"].astype(int),
-        p_good.loc[valid_auc].astype(float),
+    auc_tp_vs_non_tp = _binary_roc_auc(
+        frame.loc[p_good.notna(), "target_tp"].astype(int),
+        p_good.loc[p_good.notna()].astype(float),
+    )
+    auc_tp_vs_sl = _binary_roc_auc_for_outcome_pair(
+        p_good, frame["outcome_label"], "tp", "sl"
+    )
+    auc_tp_vs_timeout = _binary_roc_auc_for_outcome_pair(
+        p_good, frame["outcome_label"], "tp", "timeout"
     )
     top_stats = _row_decile_edge_stats(frame, edge="top")
     bottom_stats = _row_decile_edge_stats(frame, edge="bottom")
@@ -53,7 +60,9 @@ def build_detector_row_rank_report(policy_rows_df: pd.DataFrame) -> dict[str, fl
         "sl_rows_total": float(int(sl_mask.sum())),
         "timeout_rows_total": float(int(timeout_mask.sum())),
         "p_good_nan_share": float(p_good.isna().mean()),
-        "auc_tp_vs_non_tp": float(auc),
+        "auc_tp_vs_sl": float(auc_tp_vs_sl),
+        "auc_tp_vs_timeout": float(auc_tp_vs_timeout),
+        "auc_tp_vs_non_tp": float(auc_tp_vs_non_tp),
         "mean_p_good_tp": _safe_mean(p_good.loc[tp_mask]),
         "mean_p_good_sl": _safe_mean(p_good.loc[sl_mask]),
         "mean_p_good_timeout": _safe_mean(p_good.loc[timeout_mask]),
@@ -316,18 +325,19 @@ def build_detector_feature_signal_report(
     columns = [
         "feature",
         "split",
+        "contrast",
         "rows_total",
-        "tp_rows_total",
-        "non_tp_rows_total",
+        "left_rows_total",
+        "right_rows_total",
         "missing_share",
-        "tp_mean",
-        "non_tp_mean",
-        "tp_median",
-        "non_tp_median",
+        "left_mean",
+        "right_mean",
+        "left_median",
+        "right_median",
         "standardized_mean_diff",
-        "univariate_auc_tp_vs_non_tp",
+        "univariate_auc",
         "abs_auc_distance_from_0_5",
-        "direction_tp_gt_non_tp",
+        "direction_left_gt_right",
     ]
     split = str(split_name).strip().lower()
     if split not in {"train", "val", "test"}:
@@ -350,40 +360,48 @@ def build_detector_feature_signal_report(
     truth = _derive_truth_target(frame)
     frame = frame.loc[truth["valid_truth"]].copy()
     frame["target_tp"] = truth.loc[truth["valid_truth"], "target_tp"].astype(int).to_numpy()
+    frame["outcome_label"] = (
+        truth.loc[truth["valid_truth"], "outcome_label"].astype(str).str.lower().to_numpy()
+    )
     if frame.empty:
         return pd.DataFrame(columns=columns)
-    tp_total = int(frame["target_tp"].sum())
-    non_tp_total = int((frame["target_tp"] == 0).sum())
+    contrasts = [("tp_vs_sl", "tp", "sl"), ("tp_vs_timeout", "tp", "timeout")]
     out_rows: list[dict[str, Any]] = []
-    for feature in DETECTOR_FEATURE_COLUMNS:
-        if feature not in frame.columns:
+    for contrast_name, left_label, right_label in contrasts:
+        contrast_frame = frame[frame["outcome_label"].isin([left_label, right_label])].copy()
+        if contrast_frame.empty:
             continue
-        values = pd.to_numeric(frame[feature], errors="coerce")
-        tp_values = values.loc[frame["target_tp"] == 1]
-        non_tp_values = values.loc[frame["target_tp"] == 0]
-        auc = _binary_roc_auc(frame["target_tp"], values)
-        tp_mean = _safe_mean(tp_values)
-        non_tp_mean = _safe_mean(non_tp_values)
-        pooled_std = _safe_pooled_std(tp_values, non_tp_values)
-        smd = (tp_mean - non_tp_mean) / pooled_std if pooled_std > 0.0 else 0.0
-        out_rows.append(
-            {
-                "feature": str(feature),
-                "split": split,
-                "rows_total": float(len(frame)),
-                "tp_rows_total": float(tp_total),
-                "non_tp_rows_total": float(non_tp_total),
-                "missing_share": float(values.isna().mean()),
-                "tp_mean": float(tp_mean),
-                "non_tp_mean": float(non_tp_mean),
-                "tp_median": _safe_median(tp_values),
-                "non_tp_median": _safe_median(non_tp_values),
-                "standardized_mean_diff": float(smd),
-                "univariate_auc_tp_vs_non_tp": float(auc),
-                "abs_auc_distance_from_0_5": float(abs(auc - 0.5)),
-                "direction_tp_gt_non_tp": bool(tp_mean > non_tp_mean),
-            }
-        )
+        target = (contrast_frame["outcome_label"] == left_label).astype(int)
+        for feature in DETECTOR_FEATURE_COLUMNS:
+            if feature not in contrast_frame.columns:
+                continue
+            values = pd.to_numeric(contrast_frame[feature], errors="coerce")
+            left_values = values.loc[target == 1]
+            right_values = values.loc[target == 0]
+            auc = _binary_roc_auc(target, values)
+            left_mean = _safe_mean(left_values)
+            right_mean = _safe_mean(right_values)
+            pooled_std = _safe_pooled_std(left_values, right_values)
+            smd = (left_mean - right_mean) / pooled_std if pooled_std > 0.0 else 0.0
+            out_rows.append(
+                {
+                    "feature": str(feature),
+                    "split": split,
+                    "contrast": contrast_name,
+                    "rows_total": float(len(contrast_frame)),
+                    "left_rows_total": float(int((target == 1).sum())),
+                    "right_rows_total": float(int((target == 0).sum())),
+                    "missing_share": float(values.isna().mean()),
+                    "left_mean": float(left_mean),
+                    "right_mean": float(right_mean),
+                    "left_median": _safe_median(left_values),
+                    "right_median": _safe_median(right_values),
+                    "standardized_mean_diff": float(smd),
+                    "univariate_auc": float(auc),
+                    "abs_auc_distance_from_0_5": float(abs(auc - 0.5)),
+                    "direction_left_gt_right": bool(left_mean > right_mean),
+                }
+            )
     return pd.DataFrame(out_rows, columns=columns)
 
 
@@ -412,6 +430,24 @@ def build_detector_training_overfit_report(
             "train_loss_drift_from_best": 0.0,
             "best_epoch_fraction_of_training": 0.0,
             "overfit_started_epoch": 0,
+            "train_episodes_total": int(
+                _safe_int(sequence_train_stats.get("train_episodes_total"), 0)
+            ),
+            "eval_episodes_total": int(
+                _safe_int(sequence_train_stats.get("eval_episodes_total"), 0)
+            ),
+            "best_choice_loss": float(
+                _safe_float(sequence_train_stats.get("best_choice_loss"), 0.0)
+            ),
+            "best_outcome_loss": float(
+                _safe_float(sequence_train_stats.get("best_outcome_loss"), 0.0)
+            ),
+            "final_choice_loss": float(
+                _safe_float(sequence_train_stats.get("final_choice_loss"), 0.0)
+            ),
+            "final_outcome_loss": float(
+                _safe_float(sequence_train_stats.get("final_outcome_loss"), 0.0)
+            ),
             "best_classification_loss": float(
                 _safe_float(sequence_train_stats.get("best_classification_loss"), 0.0)
             ),
@@ -461,6 +497,24 @@ def build_detector_training_overfit_report(
             "train_loss_drift_from_best": 0.0,
             "best_epoch_fraction_of_training": 0.0,
             "overfit_started_epoch": 0,
+            "train_episodes_total": int(
+                _safe_int(sequence_train_stats.get("train_episodes_total"), 0)
+            ),
+            "eval_episodes_total": int(
+                _safe_int(sequence_train_stats.get("eval_episodes_total"), 0)
+            ),
+            "best_choice_loss": float(
+                _safe_float(sequence_train_stats.get("best_choice_loss"), 0.0)
+            ),
+            "best_outcome_loss": float(
+                _safe_float(sequence_train_stats.get("best_outcome_loss"), 0.0)
+            ),
+            "final_choice_loss": float(
+                _safe_float(sequence_train_stats.get("final_choice_loss"), 0.0)
+            ),
+            "final_outcome_loss": float(
+                _safe_float(sequence_train_stats.get("final_outcome_loss"), 0.0)
+            ),
             "best_classification_loss": float(
                 _safe_float(sequence_train_stats.get("best_classification_loss"), 0.0)
             ),
@@ -527,6 +581,24 @@ def build_detector_training_overfit_report(
             float(best_epoch) / float(max(epochs_ran, 1))
         ),
         "overfit_started_epoch": int(overfit_started_epoch),
+        "train_episodes_total": int(
+            _safe_int(sequence_train_stats.get("train_episodes_total"), 0)
+        ),
+        "eval_episodes_total": int(
+            _safe_int(sequence_train_stats.get("eval_episodes_total"), 0)
+        ),
+        "best_choice_loss": float(
+            _safe_float(sequence_train_stats.get("best_choice_loss"), 0.0)
+        ),
+        "best_outcome_loss": float(
+            _safe_float(sequence_train_stats.get("best_outcome_loss"), 0.0)
+        ),
+        "final_choice_loss": float(
+            _safe_float(sequence_train_stats.get("final_choice_loss"), 0.0)
+        ),
+        "final_outcome_loss": float(
+            _safe_float(sequence_train_stats.get("final_outcome_loss"), 0.0)
+        ),
         "best_classification_loss": float(
             _safe_float(sequence_train_stats.get("best_classification_loss"), 0.0)
         ),
@@ -927,3 +999,15 @@ def _binary_roc_auc(y_true: pd.Series, y_score: pd.Series) -> float:
     if not np.isfinite(auc):
         return 0.0
     return float(max(0.0, min(1.0, auc)))
+
+
+def _binary_roc_auc_for_outcome_pair(
+    scores: pd.Series, outcome_label: pd.Series, positive_label: str, negative_label: str
+) -> float:
+    scores_num = pd.to_numeric(scores, errors="coerce")
+    labels = outcome_label.astype(str).str.strip().str.lower()
+    mask = labels.isin([positive_label, negative_label]) & scores_num.notna()
+    if not bool(mask.any()):
+        return 0.0
+    target = (labels.loc[mask] == positive_label).astype(int)
+    return _binary_roc_auc(target, scores_num.loc[mask].astype(float))
