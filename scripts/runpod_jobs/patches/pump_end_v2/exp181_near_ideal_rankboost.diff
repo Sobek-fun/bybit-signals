@@ -1,0 +1,215 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..f97744d 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -69,6 +69,9 @@ class DetectorModelConfig:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    near_ideal_tp_sl_pair_weight: float
++    near_ideal_tp_sl_max_age_distance: int
++    near_ideal_tp_sl_max_pairs_per_episode: int
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -658,6 +661,18 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+         main_target_mode=_parse_detector_main_target_mode(
+             model_section.get("main_target_mode", "tp_vs_non_tp")
+         ),
++        near_ideal_tp_sl_pair_weight=_require_non_negative_float(
++            model_section.get("near_ideal_tp_sl_pair_weight", 0.0),
++            "detector.model.near_ideal_tp_sl_pair_weight",
++        ),
++        near_ideal_tp_sl_max_age_distance=_require_non_negative_int(
++            model_section.get("near_ideal_tp_sl_max_age_distance", 0),
++            "detector.model.near_ideal_tp_sl_max_age_distance",
++        ),
++        near_ideal_tp_sl_max_pairs_per_episode=_require_non_negative_int(
++            model_section.get("near_ideal_tp_sl_max_pairs_per_episode", 0),
++            "detector.model.near_ideal_tp_sl_max_pairs_per_episode",
++        ),
+     )
+ 
+ 
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index e0fd64d..3c46199 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -18,6 +18,7 @@ from pump_end_v2.detector.sequence_model import (
+     train_sequence_model,
+ )
+ from pump_end_v2.detector.ranking import (
++    build_near_ideal_tp_sl_pairs,
+     build_detector_ranking_pairs,
+     build_hard_negative_row_weights,
+ )
+@@ -47,6 +48,9 @@ class SequenceDetector:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    near_ideal_tp_sl_pair_weight: float
++    near_ideal_tp_sl_max_age_distance: int
++    near_ideal_tp_sl_max_pairs_per_episode: int
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -110,6 +114,13 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+         main_target_mode=str(model_config.main_target_mode),
++        near_ideal_tp_sl_pair_weight=float(model_config.near_ideal_tp_sl_pair_weight),
++        near_ideal_tp_sl_max_age_distance=int(
++            model_config.near_ideal_tp_sl_max_age_distance
++        ),
++        near_ideal_tp_sl_max_pairs_per_episode=int(
++            model_config.near_ideal_tp_sl_max_pairs_per_episode
++        ),
+     )
+ 
+ 
+@@ -161,6 +172,24 @@ def fit_detector_model(
+         timeout_pair_weight=float(model.timeout_pair_weight),
+         max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+     )
++    if (
++        float(model.near_ideal_tp_sl_pair_weight) > 0.0
++        and int(model.near_ideal_tp_sl_max_pairs_per_episode) > 0
++    ):
++        near_ideal_pairs_train_df = build_near_ideal_tp_sl_pairs(
++            train_fit,
++            near_ideal_tp_sl_pair_weight=float(model.near_ideal_tp_sl_pair_weight),
++            near_ideal_tp_sl_max_age_distance=int(
++                model.near_ideal_tp_sl_max_age_distance
++            ),
++            near_ideal_tp_sl_max_pairs_per_episode=int(
++                model.near_ideal_tp_sl_max_pairs_per_episode
++            ),
++        )
++        if not near_ideal_pairs_train_df.empty:
++            ranking_pairs_train_df = pd.concat(
++                [ranking_pairs_train_df, near_ideal_pairs_train_df], ignore_index=True
++            ).reset_index(drop=True)
+     if model.main_target_mode == "tp_vs_sl_only":
+         train_target_reason = train_fit["target_reason"].astype(str).str.strip().str.lower()
+         timeout_train_mask = train_target_reason.eq("timeout").to_numpy(copy=False)
+@@ -222,6 +251,27 @@ def fit_detector_model(
+                 timeout_pair_weight=float(model.timeout_pair_weight),
+                 max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+             )
++            if (
++                float(model.near_ideal_tp_sl_pair_weight) > 0.0
++                and int(model.near_ideal_tp_sl_max_pairs_per_episode) > 0
++            ):
++                near_ideal_pairs_eval_df = build_near_ideal_tp_sl_pairs(
++                    eval_fit,
++                    near_ideal_tp_sl_pair_weight=float(
++                        model.near_ideal_tp_sl_pair_weight
++                    ),
++                    near_ideal_tp_sl_max_age_distance=int(
++                        model.near_ideal_tp_sl_max_age_distance
++                    ),
++                    near_ideal_tp_sl_max_pairs_per_episode=int(
++                        model.near_ideal_tp_sl_max_pairs_per_episode
++                    ),
++                )
++                if not near_ideal_pairs_eval_df.empty:
++                    ranking_pairs_eval_df = pd.concat(
++                        [ranking_pairs_eval_df, near_ideal_pairs_eval_df],
++                        ignore_index=True,
++                    ).reset_index(drop=True)
+             if model.main_target_mode == "tp_vs_sl_only":
+                 eval_target_reason = (
+                     eval_fit["target_reason"].astype(str).str.strip().str.lower()
+diff --git a/pump_end_v2/detector/ranking.py b/pump_end_v2/detector/ranking.py
+index b863105..63a5d55 100644
+--- a/pump_end_v2/detector/ranking.py
++++ b/pump_end_v2/detector/ranking.py
+@@ -191,6 +191,88 @@ def build_hard_negative_row_weights(
+     return weights.astype(np.float32, copy=False)
+ 
+ 
++def build_near_ideal_tp_sl_pairs(
++    frame: pd.DataFrame,
++    near_ideal_tp_sl_pair_weight: float,
++    near_ideal_tp_sl_max_age_distance: int,
++    near_ideal_tp_sl_max_pairs_per_episode: int,
++) -> pd.DataFrame:
++    _require_columns(
++        frame,
++        [
++            "episode_id",
++            "decision_row_id",
++            "episode_age_bars",
++            "row_trade_outcome",
++            "is_ideal_entry",
++            "trainable_row",
++        ],
++        "frame",
++    )
++    pair_weight = float(near_ideal_tp_sl_pair_weight)
++    if pair_weight <= 0.0:
++        raise ValueError("near_ideal_tp_sl_pair_weight must be positive")
++    max_age_distance = int(near_ideal_tp_sl_max_age_distance)
++    if max_age_distance < 0:
++        raise ValueError("near_ideal_tp_sl_max_age_distance must be non-negative")
++    max_pairs = int(near_ideal_tp_sl_max_pairs_per_episode)
++    if max_pairs < 0:
++        raise ValueError("near_ideal_tp_sl_max_pairs_per_episode must be non-negative")
++    if max_pairs == 0 or frame.empty:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    local = frame.copy()
++    local["trainable_row"] = local["trainable_row"].astype(bool)
++    local = local[local["trainable_row"]].copy()
++    if local.empty:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    local["episode_id"] = local["episode_id"].astype(str)
++    local["decision_row_id"] = local["decision_row_id"].astype(str)
++    local["episode_age_bars"] = pd.to_numeric(local["episode_age_bars"], errors="coerce")
++    local["row_trade_outcome"] = (
++        local["row_trade_outcome"].astype(str).str.strip().str.lower()
++    )
++    local["is_ideal_entry"] = local["is_ideal_entry"].astype(bool)
++    local = local[local["episode_age_bars"].notna()].copy()
++    if local.empty:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    rows: list[dict[str, object]] = []
++    for episode_id, group in local.groupby("episode_id", sort=False):
++        ideal = group[group["is_ideal_entry"]].copy()
++        if ideal.empty:
++            continue
++        ideal_row = ideal.sort_values(
++            ["episode_age_bars", "decision_row_id"], kind="mergesort"
++        ).iloc[0]
++        ideal_age = float(ideal_row["episode_age_bars"])
++        ideal_decision_row_id = str(ideal_row["decision_row_id"])
++        sl_rows = group[group["row_trade_outcome"] == "sl"].copy()
++        if sl_rows.empty:
++            continue
++        sl_rows["age_distance_abs"] = (
++            pd.to_numeric(sl_rows["episode_age_bars"], errors="coerce") - ideal_age
++        ).abs()
++        sl_rows = sl_rows[sl_rows["age_distance_abs"] <= float(max_age_distance)].copy()
++        if sl_rows.empty:
++            continue
++        sl_rows = sl_rows.sort_values(
++            ["age_distance_abs", "episode_age_bars", "decision_row_id"],
++            kind="mergesort",
++        ).head(max_pairs)
++        for sl_row in sl_rows.itertuples(index=False):
++            rows.append(
++                {
++                    "episode_id": str(episode_id),
++                    "better_decision_row_id": ideal_decision_row_id,
++                    "worse_decision_row_id": str(sl_row.decision_row_id),
++                    "pair_type": "near_ideal_tp_vs_sl",
++                    "pair_weight": pair_weight,
++                }
++            )
++    if not rows:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    return pd.DataFrame(rows, columns=list(_PAIR_COLUMNS)).reset_index(drop=True)
++
++
+ def _build_local_pairs(
+     better: pd.DataFrame,
+     worse: pd.DataFrame,

@@ -1,0 +1,569 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..7c933af 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -69,6 +69,9 @@ class DetectorModelConfig:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    supcon_lambda: float
++    supcon_temperature: float
++    supcon_proj_dim: int
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -658,6 +661,28 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+         main_target_mode=_parse_detector_main_target_mode(
+             model_section.get("main_target_mode", "tp_vs_non_tp")
+         ),
++        supcon_lambda=_require_bounded_float(
++            model_section.get("supcon_lambda", 0.0),
++            "detector.model.supcon_lambda",
++            lower=0.0,
++            upper=1.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        supcon_temperature=_require_bounded_float(
++            model_section.get("supcon_temperature", 0.1),
++            "detector.model.supcon_temperature",
++            lower=0.01,
++            upper=2.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        supcon_proj_dim=_require_bounded_int(
++            model_section.get("supcon_proj_dim", 32),
++            "detector.model.supcon_proj_dim",
++            lower=8,
++            upper=256,
++        ),
+     )
+ 
+ 
+@@ -703,6 +728,22 @@ def _require_bounded_float(
+     return parsed
+ 
+ 
++def _require_bounded_int(
++        value: Any,
++        field_name: str,
++        *,
++        lower: int,
++        upper: int,
++) -> int:
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError(f"{field_name} must be integer") from exc
++    if not (int(lower) <= parsed <= int(upper)):
++        raise ValueError(f"{field_name} must be in range [{int(lower)}, {int(upper)}]")
++    return parsed
++
++
+ def _build_detector_cv(section: dict[str, Any]) -> DetectorCVConfig:
+     cv_section = section.get("cv")
+     if not isinstance(cv_section, dict):
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index e0fd64d..8a70b2f 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -47,6 +47,8 @@ class SequenceDetector:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    supcon_lambda: float
++    supcon_temperature: float
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -87,6 +89,7 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         kernel_size=int(model_config.kernel_size),
+         dilations=tuple(int(v) for v in model_config.dilations),
+         dropout=float(model_config.dropout),
++        supcon_proj_dim=int(model_config.supcon_proj_dim),
+     )
+     lookback_bars = int(model_config.pre_episode_context_bars) + int(
+         model_config.decision_window_bars
+@@ -110,6 +113,8 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+         main_target_mode=str(model_config.main_target_mode),
++        supcon_lambda=float(model_config.supcon_lambda),
++        supcon_temperature=float(model_config.supcon_temperature),
+     )
+ 
+ 
+@@ -175,6 +180,7 @@ def fit_detector_model(
+     )
+     train_outcome_targets = _encode_outcome_targets(train_fit["target_reason"])
+     train_outcome_weights = _resolve_outcome_weights(train_fit)
++    train_supcon_labels = _encode_supcon_labels(train_fit["target_reason"])
+     x_eval_input: np.ndarray | None = None
+     y_eval: np.ndarray | None = None
+     sample_weight_eval: np.ndarray | None = None
+@@ -184,6 +190,7 @@ def fit_detector_model(
+     hard_negative_eval_total = 0
+     eval_outcome_targets: np.ndarray | None = None
+     eval_outcome_weights: np.ndarray | None = None
++    eval_supcon_labels: np.ndarray | None = None
+     if eval_df is not None and len(eval_df) > 0:
+         _require_columns(
+             eval_df,
+@@ -203,6 +210,7 @@ def fit_detector_model(
+             )
+             eval_outcome_targets = _encode_outcome_targets(eval_fit["target_reason"])
+             eval_outcome_weights = _resolve_outcome_weights(eval_fit)
++            eval_supcon_labels = _encode_supcon_labels(eval_fit["target_reason"])
+             eval_episode_ids = eval_fit["episode_id"].astype(str).to_numpy(dtype=object)
+             y_eval = (
+                 pd.to_numeric(eval_fit[target_column], errors="coerce")
+@@ -252,6 +260,7 @@ def fit_detector_model(
+         train_episode_target_row_id_map=None,
+         train_outcome_targets=train_outcome_targets,
+         train_outcome_weights=train_outcome_weights,
++        train_supcon_labels=train_supcon_labels,
+         x_eval=x_eval_input,
+         y_eval=y_eval,
+         sample_weight_eval=sample_weight_eval,
+@@ -261,6 +270,7 @@ def fit_detector_model(
+         eval_episode_target_row_id_map=None,
+         eval_outcome_targets=eval_outcome_targets,
+         eval_outcome_weights=eval_outcome_weights,
++        eval_supcon_labels=eval_supcon_labels,
+         random_seed=int(model.random_seed),
+         batch_size=int(model.batch_size),
+         max_epochs=int(model.max_epochs),
+@@ -271,6 +281,8 @@ def fit_detector_model(
+         ranking_pairs_train=ranking_pairs_train,
+         ranking_pairs_eval=ranking_pairs_eval,
+         ranking_lambda=float(model.ranking_lambda),
++        supcon_lambda=float(model.supcon_lambda),
++        supcon_temperature=float(model.supcon_temperature),
+         hard_negative_rows_train_total=hard_negative_train_total,
+         hard_negative_rows_eval_total=hard_negative_eval_total,
+     )
+@@ -498,6 +510,14 @@ def _encode_outcome_targets(target_reason: pd.Series) -> np.ndarray:
+     return out
+ 
+ 
++def _encode_supcon_labels(target_reason: pd.Series) -> np.ndarray:
++    reason = target_reason.astype(str).str.strip().str.lower()
++    out = np.full(len(reason), -1, dtype=np.int64)
++    out[reason.eq("tp").to_numpy(dtype=bool, copy=False)] = 1
++    out[reason.eq("sl").to_numpy(dtype=bool, copy=False)] = 0
++    return out
++
++
+ def _resolve_outcome_weights(frame: pd.DataFrame) -> np.ndarray:
+     if "target_row_weight" not in frame.columns:
+         return np.ones(len(frame), dtype=np.float32)
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index 3a57778..ea5b3ba 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -74,6 +74,7 @@ class SequenceTCNBinaryClassifier(nn.Module):
+         kernel_size: int = SEQUENCE_KERNEL_SIZE,
+         dilations: tuple[int, ...] = SEQUENCE_DILATIONS,
+         dropout: float = SEQUENCE_DROPOUT,
++        supcon_proj_dim: int = 32,
+     ):
+         super().__init__()
+         channels = int(hidden_channels)
+@@ -101,9 +102,14 @@ class SequenceTCNBinaryClassifier(nn.Module):
+             nn.ReLU(),
+             nn.Linear(32, 3),
+         )
++        self.contrastive_projection = nn.Sequential(
++            nn.Linear(channels, channels),
++            nn.ReLU(),
++            nn.Linear(channels, int(supcon_proj_dim)),
++        )
+         self.skip_bias = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+ 
+-    def forward(self, x: Tensor, readout_index: Tensor) -> tuple[Tensor, Tensor]:
++    def encode_context(self, x: Tensor, readout_index: Tensor) -> Tensor:
+         temporal = x.transpose(1, 2)
+         encoded = self.tcn(temporal)
+         if readout_index.ndim != 1:
+@@ -113,7 +119,13 @@ class SequenceTCNBinaryClassifier(nn.Module):
+         max_step = int(encoded.shape[2]) - 1
+         gather_idx = torch.clamp(readout_index.to(dtype=torch.long), min=0, max=max_step)
+         batch_idx = torch.arange(encoded.shape[0], device=encoded.device, dtype=torch.long)
+-        context_step = encoded[batch_idx, :, gather_idx]
++        return encoded[batch_idx, :, gather_idx]
++
++    def project_contrastive(self, context_step: Tensor) -> Tensor:
++        return self.contrastive_projection(context_step)
++
++    def forward(self, x: Tensor, readout_index: Tensor) -> tuple[Tensor, Tensor]:
++        context_step = self.encode_context(x, readout_index)
+         entry_logits = self.entry_head(context_step).squeeze(-1)
+         outcome_logits = self.outcome_head(context_step)
+         return entry_logits, outcome_logits
+@@ -136,9 +148,11 @@ class SequenceTrainStats:
+     best_choice_loss: float
+     best_ranking_loss: float
+     best_outcome_loss: float
++    best_supcon_loss: float
+     final_choice_loss: float
+     final_ranking_loss: float
+     final_outcome_loss: float
++    final_supcon_loss: float
+     outcome_aux_lambda: float
+     skip_bias: float
+     ranking_pairs_train_total: int
+@@ -167,9 +181,11 @@ class SequenceTrainStats:
+             "best_choice_loss": float(self.best_choice_loss),
+             "best_ranking_loss": float(self.best_ranking_loss),
+             "best_outcome_loss": float(self.best_outcome_loss),
++            "best_supcon_loss": float(self.best_supcon_loss),
+             "final_choice_loss": float(self.final_choice_loss),
+             "final_ranking_loss": float(self.final_ranking_loss),
+             "final_outcome_loss": float(self.final_outcome_loss),
++            "final_supcon_loss": float(self.final_supcon_loss),
+             "outcome_aux_lambda": float(self.outcome_aux_lambda),
+             "skip_bias": float(self.skip_bias),
+             "best_classification_loss": float(self.best_choice_loss),
+@@ -197,6 +213,7 @@ def train_sequence_model(
+     train_episode_target_row_id_map: dict[str, str | None] | None = None,
+     train_outcome_targets: np.ndarray | None = None,
+     train_outcome_weights: np.ndarray | None = None,
++    train_supcon_labels: np.ndarray | None = None,
+     x_eval: np.ndarray | None = None,
+     y_eval: np.ndarray | None = None,
+     sample_weight_eval: np.ndarray | None = None,
+@@ -206,6 +223,7 @@ def train_sequence_model(
+     eval_episode_target_row_id_map: dict[str, str | None] | None = None,
+     eval_outcome_targets: np.ndarray | None = None,
+     eval_outcome_weights: np.ndarray | None = None,
++    eval_supcon_labels: np.ndarray | None = None,
+     random_seed: int = 0,
+     batch_size: int = SEQUENCE_BATCH_SIZE,
+     max_epochs: int = SEQUENCE_MAX_EPOCHS,
+@@ -216,6 +234,8 @@ def train_sequence_model(
+     ranking_pairs_train: dict[str, np.ndarray] | None = None,
+     ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+     ranking_lambda: float = 0.5,
++    supcon_lambda: float = 0.0,
++    supcon_temperature: float = 0.1,
+     hard_negative_rows_train_total: int = 0,
+     hard_negative_rows_eval_total: int = 0,
+ ) -> SequenceTrainStats:
+@@ -243,6 +263,12 @@ def train_sequence_model(
+     outcome_aux_lambda = float(outcome_aux_lambda)
+     if outcome_aux_lambda < 0.0:
+         raise ValueError("outcome_aux_lambda must be non-negative")
++    supcon_lambda = float(supcon_lambda)
++    if supcon_lambda < 0.0 or supcon_lambda > 1.0:
++        raise ValueError("supcon_lambda must satisfy 0 <= x <= 1")
++    supcon_temperature = float(supcon_temperature)
++    if supcon_temperature < 0.01 or supcon_temperature > 2.0:
++        raise ValueError("supcon_temperature must satisfy 0.01 <= x <= 2.0")
+     ranking_pairs_train = _normalize_ranking_pairs(ranking_pairs_train, "ranking_pairs_train")
+     ranking_pairs_eval = _normalize_ranking_pairs(ranking_pairs_eval, "ranking_pairs_eval")
+     if train_outcome_targets is None:
+@@ -255,6 +281,10 @@ def train_sequence_model(
+         raise ValueError("train_outcome_weights length must match y_train length")
+     if not np.isfinite(train_outcome_weights).all():
+         raise ValueError("train_sequence_model received non-finite train_outcome_weights")
++    if train_supcon_labels is None:
++        train_supcon_labels = np.full(len(y_train), -1, dtype=np.int64)
++    if len(train_supcon_labels) != len(y_train):
++        raise ValueError("train_supcon_labels length must match y_train length")
+     if x_eval is not None and y_eval is not None and len(x_eval) > 0:
+         if eval_outcome_targets is None:
+             eval_outcome_targets = np.full(len(y_eval), -1, dtype=np.int64)
+@@ -262,6 +292,10 @@ def train_sequence_model(
+             eval_outcome_weights = np.ones(len(y_eval), dtype=np.float32)
+         if not np.isfinite(eval_outcome_weights).all():
+             raise ValueError("train_sequence_model received non-finite eval_outcome_weights")
++        if eval_supcon_labels is None:
++            eval_supcon_labels = np.full(len(y_eval), -1, dtype=np.int64)
++        if len(eval_supcon_labels) != len(y_eval):
++            raise ValueError("eval_supcon_labels length must match y_eval length")
+     torch.manual_seed(int(random_seed))
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     model.to(device)
+@@ -271,12 +305,14 @@ def train_sequence_model(
+     readout_train_t = torch.tensor(train_readout_index, dtype=torch.long)
+     outcome_target_train_t = torch.tensor(train_outcome_targets, dtype=torch.long)
+     outcome_weight_train_t = torch.tensor(train_outcome_weights, dtype=torch.float32)
++    supcon_label_train_t = torch.tensor(train_supcon_labels, dtype=torch.long)
+     x_train_device = x_train_t.to(device)
+     y_train_device = y_train_t.to(device)
+     w_train_device = w_train_t.to(device)
+     readout_train_device = readout_train_t.to(device)
+     outcome_target_train_device = outcome_target_train_t.to(device)
+     outcome_weight_train_device = outcome_weight_train_t.to(device)
++    supcon_label_train_device = supcon_label_train_t.to(device)
+     idx_train_t = torch.arange(len(y_train), dtype=torch.long)
+     train_ds = TensorDataset(
+         x_train_t,
+@@ -285,6 +321,7 @@ def train_sequence_model(
+         readout_train_t,
+         outcome_target_train_t,
+         outcome_weight_train_t,
++        supcon_label_train_t,
+         idx_train_t,
+     )
+     episode_batches = _build_episode_index_batches(
+@@ -297,7 +334,7 @@ def train_sequence_model(
+         lr=float(learning_rate),
+         weight_decay=float(weight_decay),
+     )
+-    eval_data: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
++    eval_data: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
+     monitor_name = "train_loss_fallback"
+     if (
+         x_eval is not None
+@@ -316,15 +353,18 @@ def train_sequence_model(
+             torch.tensor(eval_readout_index, dtype=torch.long, device=device),
+             torch.tensor(eval_outcome_targets, dtype=torch.long, device=device),
+             torch.tensor(eval_outcome_weights, dtype=torch.float32, device=device),
++            torch.tensor(eval_supcon_labels, dtype=torch.long, device=device),
+         )
+         monitor_name = "eval_loss"
+     best_loss = float("inf")
+     best_choice_loss = 0.0
+     best_ranking_loss = 0.0
+     best_outcome_loss = 0.0
++    best_supcon_loss = 0.0
+     final_choice_loss = 0.0
+     final_ranking_loss = 0.0
+     final_outcome_loss = 0.0
++    final_supcon_loss = 0.0
+     best_epoch = 0
+     best_state: dict[str, Tensor] | None = None
+     patience_left = int(early_stopping_patience)
+@@ -337,6 +377,7 @@ def train_sequence_model(
+         train_choice_sum = 0.0
+         train_ranking_sum = 0.0
+         train_outcome_sum = 0.0
++        train_supcon_sum = 0.0
+         train_count = 0
+         for batch_indices in episode_batches:
+             (
+@@ -346,6 +387,7 @@ def train_sequence_model(
+                 batch_readout,
+                 batch_outcome_targets,
+                 batch_outcome_weights,
++                batch_supcon_labels,
+                 batch_idx,
+             ) = _slice_batch(train_ds, batch_indices)
+             batch_x = batch_x.to(device)
+@@ -354,8 +396,12 @@ def train_sequence_model(
+             batch_readout = batch_readout.to(device)
+             batch_outcome_targets = batch_outcome_targets.to(device)
+             batch_outcome_weights = batch_outcome_weights.to(device)
++            batch_supcon_labels = batch_supcon_labels.to(device)
+             optimizer.zero_grad(set_to_none=True)
+-            entry_logits, outcome_logits = model(batch_x, batch_readout)
++            context_step = model.encode_context(batch_x, batch_readout)
++            entry_logits = model.entry_head(context_step).squeeze(-1)
++            outcome_logits = model.outcome_head(context_step)
++            projected = model.project_contrastive(context_step)
+             classification_loss = _weighted_bce_loss(entry_logits, batch_y, batch_w)
+             if not torch.isfinite(classification_loss):
+                 raise ValueError(
+@@ -372,10 +418,16 @@ def train_sequence_model(
+                 targets=batch_outcome_targets,
+                 sample_weight=batch_outcome_weights,
+             )
++            supcon_loss_batch = _supervised_contrastive_loss(
++                embeddings=projected,
++                labels=batch_supcon_labels,
++                temperature=supcon_temperature,
++            )
+             total_loss_batch = (
+                 classification_loss
+                 + ranking_lambda * ranking_loss_batch
+                 + outcome_aux_lambda * outcome_loss
++                + supcon_lambda * supcon_loss_batch
+             )
+             if not torch.isfinite(total_loss_batch):
+                 raise ValueError(
+@@ -388,16 +440,19 @@ def train_sequence_model(
+             train_choice_sum += float(classification_loss.item()) * float(batch_size_local)
+             train_ranking_sum += float(ranking_loss_batch.item()) * float(batch_size_local)
+             train_outcome_sum += float(outcome_loss.item()) * float(batch_size_local)
++            train_supcon_sum += float(supcon_loss_batch.item()) * float(batch_size_local)
+             train_count += batch_size_local
+         train_choice_epoch = float(train_choice_sum / float(max(train_count, 1)))
+         train_ranking_epoch = float(train_ranking_sum / float(max(train_count, 1)))
+         train_outcome_epoch = float(train_outcome_sum / float(max(train_count, 1)))
++        train_supcon_epoch = float(train_supcon_sum / float(max(train_count, 1)))
+         train_loss_epoch = float(train_loss_sum / float(max(train_count, 1)))
+         model.eval()
+         with torch.no_grad():
+-            train_entry_logits, train_outcome_logits = model(
+-                x_train_device, readout_train_device
+-            )
++            train_context = model.encode_context(x_train_device, readout_train_device)
++            train_entry_logits = model.entry_head(train_context).squeeze(-1)
++            train_outcome_logits = model.outcome_head(train_context)
++            train_projected = model.project_contrastive(train_context)
+             train_choice_monitor = float(
+                 _weighted_bce_loss(train_entry_logits, y_train_device, w_train_device).item()
+             )
+@@ -413,13 +468,24 @@ def train_sequence_model(
+                     sample_weight=outcome_weight_train_device,
+                 ).item()
+             )
++            train_supcon_monitor = float(
++                _supervised_contrastive_loss(
++                    embeddings=train_projected,
++                    labels=supcon_label_train_device,
++                    temperature=supcon_temperature,
++                ).item()
++            )
+             train_loss_monitor = float(
+                 train_choice_monitor
+                 + ranking_lambda * train_ranking_monitor
+                 + outcome_aux_lambda * train_outcome_monitor
++                + supcon_lambda * train_supcon_monitor
+             )
+             if eval_data is not None:
+-                eval_entry_logits, eval_outcome_logits = model(eval_data[0], eval_data[3])
++                eval_context = model.encode_context(eval_data[0], eval_data[3])
++                eval_entry_logits = model.entry_head(eval_context).squeeze(-1)
++                eval_outcome_logits = model.outcome_head(eval_context)
++                eval_projected = model.project_contrastive(eval_context)
+                 eval_choice_loss = float(
+                     _weighted_bce_loss(eval_entry_logits, eval_data[1], eval_data[2]).item()
+                 )
+@@ -435,14 +501,23 @@ def train_sequence_model(
+                         sample_weight=eval_data[5],
+                     ).item()
+                 )
++                eval_supcon_loss = float(
++                    _supervised_contrastive_loss(
++                        embeddings=eval_projected,
++                        labels=eval_data[6],
++                        temperature=supcon_temperature,
++                    ).item()
++                )
+             else:
+                 eval_choice_loss = float(train_choice_monitor)
+                 eval_ranking_loss = float(train_ranking_monitor)
+                 eval_outcome_loss = float(train_outcome_monitor)
++                eval_supcon_loss = float(train_supcon_monitor)
+             eval_loss = float(
+                 eval_choice_loss
+                 + ranking_lambda * eval_ranking_loss
+                 + outcome_aux_lambda * eval_outcome_loss
++                + supcon_lambda * eval_supcon_loss
+             )
+         if not np.isfinite(eval_loss):
+             raise ValueError(f"non-finite eval total loss detected: eval_loss={eval_loss}")
+@@ -453,6 +528,7 @@ def train_sequence_model(
+             best_choice_loss = float(eval_choice_loss)
+             best_ranking_loss = float(eval_ranking_loss)
+             best_outcome_loss = float(eval_outcome_loss)
++            best_supcon_loss = float(eval_supcon_loss)
+             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+             patience_left = int(early_stopping_patience)
+             is_best_epoch = True
+@@ -464,6 +540,7 @@ def train_sequence_model(
+                 final_choice_loss = float(eval_choice_loss)
+                 final_ranking_loss = float(eval_ranking_loss)
+                 final_outcome_loss = float(eval_outcome_loss)
++                final_supcon_loss = float(eval_supcon_loss)
+                 training_history.append(
+                     {
+                         "epoch": int(epoch),
+@@ -472,9 +549,11 @@ def train_sequence_model(
+                         "train_choice_loss": float(train_choice_epoch),
+                         "train_ranking_loss": float(train_ranking_epoch),
+                         "train_outcome_loss": float(train_outcome_epoch),
++                        "train_supcon_loss": float(train_supcon_epoch),
+                         "eval_choice_loss": float(eval_choice_loss),
+                         "eval_ranking_loss": float(eval_ranking_loss),
+                         "eval_outcome_loss": float(eval_outcome_loss),
++                        "eval_supcon_loss": float(eval_supcon_loss),
+                         "is_best_epoch": int(is_best_epoch),
+                     }
+                 )
+@@ -483,6 +562,7 @@ def train_sequence_model(
+         final_choice_loss = float(eval_choice_loss)
+         final_ranking_loss = float(eval_ranking_loss)
+         final_outcome_loss = float(eval_outcome_loss)
++        final_supcon_loss = float(eval_supcon_loss)
+         training_history.append(
+             {
+                 "epoch": int(epoch),
+@@ -491,9 +571,11 @@ def train_sequence_model(
+                 "train_choice_loss": float(train_choice_epoch),
+                 "train_ranking_loss": float(train_ranking_epoch),
+                 "train_outcome_loss": float(train_outcome_epoch),
++                "train_supcon_loss": float(train_supcon_epoch),
+                 "eval_choice_loss": float(eval_choice_loss),
+                 "eval_ranking_loss": float(eval_ranking_loss),
+                 "eval_outcome_loss": float(eval_outcome_loss),
++                "eval_supcon_loss": float(eval_supcon_loss),
+                 "is_best_epoch": int(is_best_epoch),
+             }
+         )
+@@ -520,9 +602,11 @@ def train_sequence_model(
+         best_choice_loss=float(best_choice_loss),
+         best_ranking_loss=float(best_ranking_loss),
+         best_outcome_loss=float(best_outcome_loss),
++        best_supcon_loss=float(best_supcon_loss),
+         final_choice_loss=float(final_choice_loss),
+         final_ranking_loss=float(final_ranking_loss),
+         final_outcome_loss=float(final_outcome_loss),
++        final_supcon_loss=float(final_supcon_loss),
+         outcome_aux_lambda=float(outcome_aux_lambda),
+         skip_bias=float(model.skip_bias.detach().cpu().item()),
+         ranking_pairs_train_total=int(len(ranking_pairs_train["pair_weight"])),
+@@ -733,7 +817,7 @@ def _slice_batch(
+     dataset: TensorDataset, batch_indices: np.ndarray
+ ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+     idx = torch.tensor(batch_indices, dtype=torch.long)
+-    x_all, y_all, w_all, readout_all, outcome_target_all, outcome_weight_all, i_all = dataset.tensors
++    x_all, y_all, w_all, readout_all, outcome_target_all, outcome_weight_all, supcon_label_all, i_all = dataset.tensors
+     return (
+         x_all.index_select(0, idx),
+         y_all.index_select(0, idx),
+@@ -741,10 +825,41 @@ def _slice_batch(
+         readout_all.index_select(0, idx),
+         outcome_target_all.index_select(0, idx),
+         outcome_weight_all.index_select(0, idx),
++        supcon_label_all.index_select(0, idx),
+         i_all.index_select(0, idx),
+     )
+ 
+ 
++def _supervised_contrastive_loss(embeddings: Tensor, labels: Tensor, temperature: float) -> Tensor:
++    valid_mask = (labels == 0) | (labels == 1)
++    if int(valid_mask.sum().item()) < 2:
++        return embeddings.new_tensor(0.0)
++    z = F.normalize(embeddings[valid_mask], dim=1)
++    y = labels[valid_mask]
++    labels_unique = torch.unique(y)
++    if int(labels_unique.numel()) < 2:
++        return embeddings.new_tensor(0.0)
++    for cls in (0, 1):
++        cls_count = int((y == int(cls)).sum().item())
++        if cls_count < 2:
++            return embeddings.new_tensor(0.0)
++    same = y.unsqueeze(0) == y.unsqueeze(1)
++    eye = torch.eye(int(y.shape[0]), device=y.device, dtype=torch.bool)
++    positive_mask = same & (~eye)
++    has_positive = positive_mask.any(dim=1)
++    if not bool(has_positive.any().item()):
++        return embeddings.new_tensor(0.0)
++    logits = torch.matmul(z, z.transpose(0, 1)) / float(temperature)
++    logits = logits - torch.max(logits, dim=1, keepdim=True).values.detach()
++    logits_mask = ~eye
++    exp_logits = torch.exp(logits) * logits_mask.to(dtype=logits.dtype)
++    denom = torch.sum(exp_logits, dim=1, keepdim=True).clamp_min(1e-12)
++    log_prob = logits - torch.log(denom)
++    pos_counts = positive_mask.sum(dim=1).clamp_min(1).to(dtype=log_prob.dtype)
++    pos_mean_log_prob = (log_prob * positive_mask.to(dtype=log_prob.dtype)).sum(dim=1) / pos_counts
++    return -pos_mean_log_prob[has_positive].mean()
++
++
+ def predict_sequence_model_outputs(
+     model: SequenceTCNBinaryClassifier, x: np.ndarray, readout_index: np.ndarray
+ ) -> dict[str, np.ndarray]:

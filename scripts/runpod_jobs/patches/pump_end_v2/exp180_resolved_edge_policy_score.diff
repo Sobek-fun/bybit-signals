@@ -1,0 +1,193 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..8c70e08 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -84,6 +84,7 @@ class DetectorPolicyConfig:
+     fire_score_floor: float
+     turn_down_delta: float
+     min_peak_gain_after_arm: float
++    policy_score_mode: str
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -725,6 +726,7 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
+     fire_score_floor = float(section.get("fire_score_floor"))
+     turn_down_delta = float(section.get("turn_down_delta"))
+     min_peak_gain_after_arm = float(section.get("min_peak_gain_after_arm", 0.0))
++    policy_score_mode = str(section.get("policy_score_mode", "p_good")).strip().lower()
+     if not (0.0 < arm_score_min <= 1.0):
+         raise ValueError("detector.arm_score_min must satisfy 0 < x <= 1")
+     if not (0.0 <= fire_score_floor <= arm_score_min):
+@@ -737,11 +739,16 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
+         raise ValueError(
+             "detector.min_peak_gain_after_arm must satisfy 0 <= x <= 1"
+         )
++    if policy_score_mode not in {"p_good", "resolved_edge_product"}:
++        raise ValueError(
++            "detector.policy_score_mode must be one of: p_good, resolved_edge_product"
++        )
+     return DetectorPolicyConfig(
+         arm_score_min=arm_score_min,
+         fire_score_floor=fire_score_floor,
+         turn_down_delta=turn_down_delta,
+         min_peak_gain_after_arm=min_peak_gain_after_arm,
++        policy_score_mode=policy_score_mode,
+     )
+ 
+ 
+diff --git a/pump_end_v2/detector/policy.py b/pump_end_v2/detector/policy.py
+index 8e8a728..75479ef 100644
+--- a/pump_end_v2/detector/policy.py
++++ b/pump_end_v2/detector/policy.py
+@@ -14,6 +14,8 @@ INPUT_REQUIRED_COLUMNS: tuple[str, ...] = (
+     "decision_time",
+     "entry_bar_open_time",
+     "p_good",
++    "p_tp_row",
++    "p_sl_row",
+     "score_source",
+     "policy_context_only",
+     "episode_age_bars",
+@@ -57,6 +59,11 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
+     "peak_p_good_before_fire",
+     "peak_gain_from_arm_before_fire",
+     "p_good_drop_from_peak",
++    "policy_score",
++    "policy_peak_score_before_fire",
++    "policy_score_at_arm",
++    "policy_score_drop_from_peak",
++    "policy_score_mode",
+     "distance_from_episode_high_pct",
+     "episode_runup_from_open_pct",
+     "episode_extension_from_open_pct",
+@@ -147,6 +154,8 @@ def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[st
+         )
+     frame["policy_context_only"] = frame["policy_context_only"].astype(bool)
+     frame["p_good"] = frame["p_good"].astype(float)
++    frame["p_tp_row"] = frame["p_tp_row"].astype(float)
++    frame["p_sl_row"] = frame["p_sl_row"].astype(float)
+     if not has_fold_id:
+         frame["fold_id"] = pd.NA
+     sort_columns = ["score_source", "episode_id", "context_bar_open_time"]
+@@ -208,24 +217,30 @@ def apply_episode_aware_detector_policy_cached(
+             if fired or expired:
+                 continue
+             current_p_good = float(row.p_good)
+-            if current_p_good >= detector_policy_config.arm_score_min:
++            current_policy_score = _resolve_policy_score(
++                p_good=current_p_good,
++                p_tp_row=float(row.p_tp_row),
++                p_sl_row=float(row.p_sl_row),
++                policy_score_mode=detector_policy_config.policy_score_mode,
++            )
++            if current_policy_score >= detector_policy_config.arm_score_min:
+                 if not armed_flag:
+                     armed_flag = True
+                     had_arm = True
+-                    p_good_at_arm = current_p_good
+-                    peak_p_good = current_p_good
+-                elif peak_p_good is not None and current_p_good > peak_p_good:
+-                    peak_p_good = current_p_good
++                    p_good_at_arm = current_policy_score
++                    peak_p_good = current_policy_score
++                elif peak_p_good is not None and current_policy_score > peak_p_good:
++                    peak_p_good = current_policy_score
+             if not armed_flag or peak_p_good is None or p_good_at_arm is None:
+                 continue
+             peak_gain_from_arm = float(peak_p_good - p_good_at_arm)
+-            drop_from_peak = float(peak_p_good - current_p_good)
++            drop_from_peak = float(peak_p_good - current_policy_score)
+             if (
+                 peak_gain_from_arm
+                 >= detector_policy_config.min_peak_gain_after_arm
+                 and
+                 drop_from_peak >= detector_policy_config.turn_down_delta
+-                and current_p_good >= detector_policy_config.fire_score_floor
++                and current_policy_score >= detector_policy_config.fire_score_floor
+             ):
+                 if bool(row.policy_context_only):
+                     expired = True
+@@ -264,6 +279,11 @@ def apply_episode_aware_detector_policy_cached(
+                     "peak_p_good_before_fire": peak_p_good,
+                     "peak_gain_from_arm_before_fire": peak_gain_from_arm,
+                     "p_good_drop_from_peak": drop_from_peak,
++                    "policy_score": current_policy_score,
++                    "policy_peak_score_before_fire": peak_p_good,
++                    "policy_score_at_arm": p_good_at_arm,
++                    "policy_score_drop_from_peak": drop_from_peak,
++                    "policy_score_mode": detector_policy_config.policy_score_mode,
+                     "distance_from_episode_high_pct": row.distance_from_episode_high_pct,
+                     "episode_runup_from_open_pct": _row_value(
+                         row, "episode_runup_from_open_pct"
+@@ -295,7 +315,10 @@ def apply_episode_aware_detector_policy_cached(
+                 candidate_rows.append(fire_signal_row)
+                 fired = True
+                 continue
+-            if armed_flag and current_p_good < detector_policy_config.fire_score_floor:
++            if (
++                armed_flag
++                and current_policy_score < detector_policy_config.fire_score_floor
++            ):
+                 armed_flag = False
+                 peak_p_good = None
+                 p_good_at_arm = None
+@@ -527,6 +550,25 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
+     return float(numerator / denominator)
+ 
+ 
++def _resolve_policy_score(
++    *,
++    p_good: float,
++    p_tp_row: float,
++    p_sl_row: float,
++    policy_score_mode: str,
++) -> float:
++    mode = str(policy_score_mode).strip().lower()
++    if mode == "p_good":
++        score = float(p_good)
++    elif mode == "resolved_edge_product":
++        resolved_mass = float(p_tp_row) + float(p_sl_row)
++        resolved_edge = float(p_tp_row) / max(float(resolved_mass), 1e-9)
++        score = float(p_good) * resolved_edge
++    else:
++        raise ValueError(f"unsupported detector policy_score_mode: {policy_score_mode!r}")
++    return float(min(1.0, max(0.0, score)))
++
++
+ def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
+     value = float(fires_per_30d)
+     if 15.0 <= value <= 180.0:
+diff --git a/pump_end_v2/detector/policy_search.py b/pump_end_v2/detector/policy_search.py
+index 5fdc322..d0e190c 100644
+--- a/pump_end_v2/detector/policy_search.py
++++ b/pump_end_v2/detector/policy_search.py
+@@ -745,6 +745,7 @@ def sweep_detector_policy(
+                     f"arm={candidate.arm_score_min:.6f} fire={candidate.fire_score_floor:.6f} "
+                     f"turn={candidate.turn_down_delta:.6f} "
+                     f"peak_gain={candidate.min_peak_gain_after_arm:.6f} "
++                    f"policy_score_mode={candidate.policy_score_mode} "
+                     f"signals_total={len(candidate_signals_df)} "
+                     f"tp_rate_resolved={float(selector_metrics['tp_rate_resolved']):.6f} "
+                     f"resolved_signals_total={int(round(resolved_signals_total))} "
+@@ -902,7 +903,8 @@ def select_detector_policy(
+             f"best_policy=arm={best_policy.arm_score_min:.6f},"
+             f"fire={best_policy.fire_score_floor:.6f},"
+             f"turn={best_policy.turn_down_delta:.6f},"
+-            f"peak_gain={best_policy.min_peak_gain_after_arm:.6f} "
++            f"peak_gain={best_policy.min_peak_gain_after_arm:.6f},"
++            f"policy_score_mode={best_policy.policy_score_mode} "
+             f"tp_rate_resolved={float(best['tp_rate_resolved']):.6f} "
+             f"edge_vs_breakeven_zscore={float(best['edge_vs_breakeven_zscore']):.6f} "
+             f"fires_per_30d={float(best['fires_per_30d']):.6f} "
+diff --git a/pump_end_v2/pipeline/run.py b/pump_end_v2/pipeline/run.py
+index 67e1f27..5db1bb1 100644
+--- a/pump_end_v2/pipeline/run.py
++++ b/pump_end_v2/pipeline/run.py
+@@ -1237,6 +1237,7 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
+         "fire_score_floor": float(policy.fire_score_floor),
+         "turn_down_delta": float(policy.turn_down_delta),
+         "min_peak_gain_after_arm": float(policy.min_peak_gain_after_arm),
++        "policy_score_mode": str(policy.policy_score_mode),
+     }
+ 
+ 

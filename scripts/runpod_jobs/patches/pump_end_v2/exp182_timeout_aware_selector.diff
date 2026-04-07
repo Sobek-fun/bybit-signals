@@ -1,0 +1,81 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..6b20bec 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -95,6 +95,7 @@ class DetectorPolicySearchConfig:
+     selector_val_fires_per_30d_min: float
+     selector_val_fires_per_30d_max: float
+     selector_min_resolved_signals: int
++    selector_timeout_share_max: float | None
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -798,6 +799,9 @@ def _build_detector_policy_search(
+     selector_min_resolved_signals = int(
+         detector_policy_section.get("selector_min_resolved_signals", 80)
+     )
++    selector_timeout_share_max = detector_policy_section.get(
++        "selector_timeout_share_max"
++    )
+     if selector_val_fires_per_30d_min <= 0.0:
+         raise ValueError(
+             "search.detector_policy.selector_val_fires_per_30d_min must be positive"
+@@ -810,6 +814,12 @@ def _build_detector_policy_search(
+         raise ValueError(
+             "search.detector_policy.selector_min_resolved_signals must be positive"
+         )
++    if selector_timeout_share_max is not None:
++        selector_timeout_share_max = float(selector_timeout_share_max)
++        if not (0.0 <= selector_timeout_share_max <= 1.0):
++            raise ValueError(
++                "search.detector_policy.selector_timeout_share_max must satisfy 0 <= x <= 1"
++            )
+     for value in peak_gain_candidates:
+         if not (0.0 <= float(value) <= 1.0):
+             raise ValueError(
+@@ -823,6 +833,7 @@ def _build_detector_policy_search(
+         selector_val_fires_per_30d_min=selector_val_fires_per_30d_min,
+         selector_val_fires_per_30d_max=selector_val_fires_per_30d_max,
+         selector_min_resolved_signals=selector_min_resolved_signals,
++        selector_timeout_share_max=selector_timeout_share_max,
+     )
+ 
+ 
+diff --git a/pump_end_v2/detector/policy_search.py b/pump_end_v2/detector/policy_search.py
+index 5fdc322..e4a1477 100644
+--- a/pump_end_v2/detector/policy_search.py
++++ b/pump_end_v2/detector/policy_search.py
+@@ -874,10 +874,24 @@ def select_detector_policy(
+     admissible["resolved_signals_total"] = pd.to_numeric(
+         admissible["resolved_signals_total"], errors="coerce"
+     ).fillna(0.0)
++    admissible["timeout_share"] = pd.to_numeric(
++        admissible["timeout_share"], errors="coerce"
++    ).fillna(float("inf"))
++    if (
++        search_config is not None
++        and search_config.selector_timeout_share_max is not None
++    ):
++        max_timeout_share = float(search_config.selector_timeout_share_max)
++        timeout_ok = admissible[
++            admissible["timeout_share"] <= max_timeout_share
++        ].copy()
++        if not timeout_ok.empty:
++            admissible = timeout_ok
+     ranked = admissible.sort_values(
+         by=[
+             "tp_rate_resolved",
+             "edge_vs_breakeven_zscore",
++            "timeout_share",
+             "selector_density_distance",
+             "resolved_signals_total",
+             "arm_score_min",
+@@ -885,7 +899,7 @@ def select_detector_policy(
+             "turn_down_delta",
+             "min_peak_gain_after_arm",
+         ],
+-        ascending=[False, False, True, False, True, True, True, True],
++        ascending=[False, False, True, True, False, True, True, True, True],
+         kind="mergesort",
+     ).reset_index(drop=True)
+     best = ranked.iloc[0]
