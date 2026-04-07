@@ -1,3 +1,5 @@
+scripts/runpod_jobs/pod_inventory.local.json
+scripts/runpod_jobs/experiment_specs.local.json
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -22,3 +24,6 @@ t
 
 # AI
 bybit-signals.xml
+
+# Project Specific
+artifacts
