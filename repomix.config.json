@@ -26,7 +26,24 @@
     "useGitignore": true,
     "useDefaultPatterns": true,
     "customPatterns": [
-      "uv.lock"
+      "uv.lock",
+      "pump_end",
+      "pump_end_clustering_prod",
+      "pump_end_prod",
+      "pump_end_threshold",
+      "pump_end_threshold_regime",
+      "pump_long",
+      "pump_end_v2",
+      "pump_end_v2/config/",
+      "pump_end_v2/docs/",
+      "artifacts",
+      "scripts",
+      "scripts/runpod_jobs",
+      "scripts/runpod_jobs/patches/threshold",
+      "scripts/runpod_jobs/patches/regime",
+      "scripts/runpod_jobs/token_lists",
+      "catboost_info",
+      "LICENSE"
     ]
   },
   "security": {
