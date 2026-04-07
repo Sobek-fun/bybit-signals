@@ -1236,6 +1236,7 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
         "arm_score_min": float(policy.arm_score_min),
         "fire_score_floor": float(policy.fire_score_floor),
         "turn_down_delta": float(policy.turn_down_delta),
+        "min_peak_gain_after_arm": float(policy.min_peak_gain_after_arm),
     }
 
 
