@@ -68,6 +68,7 @@ class DetectorModelConfig:
     max_ranking_pairs_per_episode: int
     timeout_pair_weight: float
     outcome_aux_lambda: float
+    main_target_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,7 @@ class DetectorPolicyConfig:
     arm_score_min: float
     fire_score_floor: float
     turn_down_delta: float
+    min_peak_gain_after_arm: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +91,7 @@ class DetectorPolicySearchConfig:
     arm_candidates: tuple[float, ...]
     fire_candidates: tuple[float, ...]
     turn_candidates: tuple[float, ...]
+    peak_gain_candidates: tuple[float, ...]
     selector_val_fires_per_30d_min: float
     selector_val_fires_per_30d_max: float
     selector_min_resolved_signals: int
@@ -652,6 +655,18 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
             inclusive_lower=True,
             inclusive_upper=True,
         ),
+        main_target_mode=_parse_detector_main_target_mode(
+            model_section.get("main_target_mode", "tp_vs_non_tp")
+        ),
+    )
+
+
+def _parse_detector_main_target_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    if mode in {"tp_vs_non_tp", "tp_vs_sl_only"}:
+        return mode
+    raise ValueError(
+        "detector.model.main_target_mode must be one of: tp_vs_non_tp, tp_vs_sl_only"
     )
 
 
@@ -709,6 +724,7 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
     arm_score_min = float(section.get("arm_score_min"))
     fire_score_floor = float(section.get("fire_score_floor"))
     turn_down_delta = float(section.get("turn_down_delta"))
+    min_peak_gain_after_arm = float(section.get("min_peak_gain_after_arm", 0.0))
     if not (0.0 < arm_score_min <= 1.0):
         raise ValueError("detector.arm_score_min must satisfy 0 < x <= 1")
     if not (0.0 <= fire_score_floor <= arm_score_min):
@@ -717,10 +733,15 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
         )
     if not (0.0 < turn_down_delta <= 1.0):
         raise ValueError("detector.turn_down_delta must satisfy 0 < x <= 1")
+    if not (0.0 <= min_peak_gain_after_arm <= 1.0):
+        raise ValueError(
+            "detector.min_peak_gain_after_arm must satisfy 0 <= x <= 1"
+        )
     return DetectorPolicyConfig(
         arm_score_min=arm_score_min,
         fire_score_floor=fire_score_floor,
         turn_down_delta=turn_down_delta,
+        min_peak_gain_after_arm=min_peak_gain_after_arm,
     )
 
 
@@ -764,6 +785,10 @@ def _build_detector_policy_search(
         detector_policy_section.get("turn_candidates", []),
         "search.detector_policy.turn_candidates",
     )
+    peak_gain_candidates = _parse_float_candidates(
+        detector_policy_section.get("peak_gain_candidates", []),
+        "search.detector_policy.peak_gain_candidates",
+    )
     selector_val_fires_per_30d_min = float(
         detector_policy_section.get("selector_val_fires_per_30d_min", 110.0)
     )
@@ -785,10 +810,16 @@ def _build_detector_policy_search(
         raise ValueError(
             "search.detector_policy.selector_min_resolved_signals must be positive"
         )
+    for value in peak_gain_candidates:
+        if not (0.0 <= float(value) <= 1.0):
+            raise ValueError(
+                "search.detector_policy.peak_gain_candidates must contain values in [0, 1]"
+            )
     return DetectorPolicySearchConfig(
         arm_candidates=arm_candidates,
         fire_candidates=fire_candidates,
         turn_candidates=turn_candidates,
+        peak_gain_candidates=peak_gain_candidates,
         selector_val_fires_per_30d_min=selector_val_fires_per_30d_min,
         selector_val_fires_per_30d_max=selector_val_fires_per_30d_max,
         selector_min_resolved_signals=selector_min_resolved_signals,
