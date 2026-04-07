@@ -1,0 +1,227 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index 748f71d..d22b2ff 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -68,6 +68,10 @@ class DetectorModelConfig:
+     max_ranking_pairs_per_episode: int
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
++    main_loss_mode: str
++    focal_gamma: float
++    sl_only_hard_negatives: bool
++    timeout_hard_negative_weight_multiplier: float
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -652,9 +656,26 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+             inclusive_lower=True,
+             inclusive_upper=True,
+         ),
++        main_loss_mode=_parse_main_loss_mode(model_section.get("main_loss_mode", "bce")),
++        focal_gamma=_require_non_negative_float(
++            model_section.get("focal_gamma", 0.0),
++            "detector.model.focal_gamma",
++        ),
++        sl_only_hard_negatives=bool(model_section.get("sl_only_hard_negatives", False)),
++        timeout_hard_negative_weight_multiplier=_require_positive_float(
++            model_section.get("timeout_hard_negative_weight_multiplier", 1.5),
++            "detector.model.timeout_hard_negative_weight_multiplier",
++        ),
+     )
+ 
+ 
++def _parse_main_loss_mode(value: Any) -> str:
++    mode = str(value).strip().lower()
++    if mode not in {"bce", "focal"}:
++        raise ValueError("detector.model.main_loss_mode must be one of: bce, focal")
++    return mode
++
++
+ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     if not isinstance(value, list):
+         raise ValueError(f"{field_name} must be a list")
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index 88c5813..4b4d975 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -46,6 +46,10 @@ class SequenceDetector:
+     max_ranking_pairs_per_episode: int
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
++    main_loss_mode: str
++    focal_gamma: float
++    sl_only_hard_negatives: bool
++    timeout_hard_negative_weight_multiplier: float
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -108,6 +112,12 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
++        main_loss_mode=str(model_config.main_loss_mode),
++        focal_gamma=float(model_config.focal_gamma),
++        sl_only_hard_negatives=bool(model_config.sl_only_hard_negatives),
++        timeout_hard_negative_weight_multiplier=float(
++            model_config.timeout_hard_negative_weight_multiplier
++        ),
+     )
+ 
+ 
+@@ -152,6 +162,10 @@ def fit_detector_model(
+         train_fit,
+         hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
+         hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
++        timeout_hard_negative_weight_multiplier=float(
++            model.timeout_hard_negative_weight_multiplier
++        ),
++        sl_only_hard_negatives=bool(model.sl_only_hard_negatives),
+         return_hard_negative_mask=True,
+     )
+     ranking_pairs_train_df = build_detector_ranking_pairs(
+@@ -203,6 +217,10 @@ def fit_detector_model(
+                 eval_fit,
+                 hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
+                 hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
++                timeout_hard_negative_weight_multiplier=float(
++                    model.timeout_hard_negative_weight_multiplier
++                ),
++                sl_only_hard_negatives=bool(model.sl_only_hard_negatives),
+                 return_hard_negative_mask=True,
+             )
+             hard_negative_eval_total = int(np.sum(hard_negative_eval_mask))
+@@ -249,6 +267,8 @@ def fit_detector_model(
+         ranking_pairs_train=ranking_pairs_train,
+         ranking_pairs_eval=ranking_pairs_eval,
+         ranking_lambda=float(model.ranking_lambda),
++        main_loss_mode=str(model.main_loss_mode),
++        focal_gamma=float(model.focal_gamma),
+         hard_negative_rows_train_total=hard_negative_train_total,
+         hard_negative_rows_eval_total=hard_negative_eval_total,
+     )
+diff --git a/pump_end_v2/detector/ranking.py b/pump_end_v2/detector/ranking.py
+index b863105..e22eefe 100644
+--- a/pump_end_v2/detector/ranking.py
++++ b/pump_end_v2/detector/ranking.py
+@@ -110,6 +110,7 @@ def build_hard_negative_row_weights(
+     hard_negative_weight_multiplier: float,
+     hard_negative_max_age_distance: int,
+     timeout_hard_negative_weight_multiplier: float = 1.5,
++    sl_only_hard_negatives: bool = False,
+     return_hard_negative_mask: bool = False,
+ ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+     _require_columns(
+@@ -185,7 +186,8 @@ def build_hard_negative_row_weights(
+     sl_hard = hard_negative_mask & (outcomes == "sl")
+     timeout_hard = hard_negative_mask & (outcomes == "timeout")
+     weights[sl_hard] *= np.float32(sl_multiplier)
+-    weights[timeout_hard] *= np.float32(timeout_multiplier)
++    if not sl_only_hard_negatives:
++        weights[timeout_hard] *= np.float32(timeout_multiplier)
+     if return_hard_negative_mask:
+         return weights.astype(np.float32, copy=False), hard_negative_mask
+     return weights.astype(np.float32, copy=False)
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index df12d6a..3a5785d 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -216,6 +216,8 @@ def train_sequence_model(
+     ranking_pairs_train: dict[str, np.ndarray] | None = None,
+     ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+     ranking_lambda: float = 0.5,
++    main_loss_mode: str = "bce",
++    focal_gamma: float = 0.0,
+     hard_negative_rows_train_total: int = 0,
+     hard_negative_rows_eval_total: int = 0,
+ ) -> SequenceTrainStats:
+@@ -240,6 +242,12 @@ def train_sequence_model(
+     ranking_lambda = float(ranking_lambda)
+     if ranking_lambda <= 0.0:
+         raise ValueError("ranking_lambda must be positive")
++    main_loss_mode = str(main_loss_mode).strip().lower()
++    if main_loss_mode not in {"bce", "focal"}:
++        raise ValueError("main_loss_mode must be one of: bce, focal")
++    focal_gamma = float(focal_gamma)
++    if focal_gamma < 0.0:
++        raise ValueError("focal_gamma must be non-negative")
+     outcome_aux_lambda = float(outcome_aux_lambda)
+     if outcome_aux_lambda < 0.0:
+         raise ValueError("outcome_aux_lambda must be non-negative")
+@@ -356,7 +364,13 @@ def train_sequence_model(
+             batch_outcome_weights = batch_outcome_weights.to(device)
+             optimizer.zero_grad(set_to_none=True)
+             entry_logits, outcome_logits = model(batch_x, batch_readout)
+-            classification_loss = _weighted_bce_loss(entry_logits, batch_y, batch_w)
++            classification_loss = _weighted_main_binary_loss(
++                logits=entry_logits,
++                targets=batch_y,
++                sample_weight=batch_w,
++                main_loss_mode=main_loss_mode,
++                focal_gamma=focal_gamma,
++            )
+             if not torch.isfinite(classification_loss):
+                 raise ValueError(
+                     f"non-finite train classification loss detected: loss={float(classification_loss.item())}"
+@@ -399,7 +413,13 @@ def train_sequence_model(
+                 x_train_device, readout_train_device
+             )
+             train_choice_monitor = float(
+-                _weighted_bce_loss(train_entry_logits, y_train_device, w_train_device).item()
++                _weighted_main_binary_loss(
++                    logits=train_entry_logits,
++                    targets=y_train_device,
++                    sample_weight=w_train_device,
++                    main_loss_mode=main_loss_mode,
++                    focal_gamma=focal_gamma,
++                ).item()
+             )
+             train_ranking_monitor = float(
+                 _pairwise_ranking_loss(
+@@ -421,7 +441,13 @@ def train_sequence_model(
+             if eval_data is not None:
+                 eval_entry_logits, eval_outcome_logits = model(eval_data[0], eval_data[3])
+                 eval_choice_loss = float(
+-                    _weighted_bce_loss(eval_entry_logits, eval_data[1], eval_data[2]).item()
++                    _weighted_main_binary_loss(
++                        logits=eval_entry_logits,
++                        targets=eval_data[1],
++                        sample_weight=eval_data[2],
++                        main_loss_mode=main_loss_mode,
++                        focal_gamma=focal_gamma,
++                    ).item()
+                 )
+                 eval_ranking_loss = float(
+                     _pairwise_ranking_loss(
+@@ -584,7 +610,31 @@ def _weighted_bce_loss(logits: Tensor, targets: Tensor, sample_weight: Tensor) -
+     weights = torch.clamp(sample_weight, min=0.0)
+     denom = torch.sum(weights)
+     if float(denom.item()) <= 0.0:
+-        return torch.mean(per_row_loss)
++        return torch.zeros((), dtype=per_row_loss.dtype, device=per_row_loss.device)
++    return torch.sum(per_row_loss * weights) / denom
++
++
++def _weighted_main_binary_loss(
++    logits: Tensor,
++    targets: Tensor,
++    sample_weight: Tensor,
++    main_loss_mode: str,
++    focal_gamma: float,
++) -> Tensor:
++    mode = str(main_loss_mode).strip().lower()
++    if mode == "bce":
++        return _weighted_bce_loss(logits, targets, sample_weight)
++    if mode != "focal":
++        raise ValueError("main_loss_mode must be one of: bce, focal")
++    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
++    p = torch.sigmoid(logits)
++    pt = targets * p + (1.0 - targets) * (1.0 - p)
++    focal_factor = (1.0 - pt) ** float(focal_gamma)
++    per_row_loss = focal_factor * bce
++    weights = torch.clamp(sample_weight, min=0.0)
++    denom = torch.sum(weights)
++    if float(denom.item()) <= 0.0:
++        return torch.zeros((), dtype=per_row_loss.dtype, device=per_row_loss.device)
+     return torch.sum(per_row_loss * weights) / denom
+ 
+ 

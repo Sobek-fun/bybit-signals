@@ -1,0 +1,167 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index 748f71d..04fe658 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -68,6 +68,7 @@ class DetectorModelConfig:
+     max_ranking_pairs_per_episode: int
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
++    main_target_mode: str
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -652,9 +653,21 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+             inclusive_lower=True,
+             inclusive_upper=True,
+         ),
++        main_target_mode=_parse_detector_main_target_mode(
++            model_section.get("main_target_mode", "tp_vs_non_tp")
++        ),
+     )
+ 
+ 
++def _parse_detector_main_target_mode(value: Any) -> str:
++    mode = str(value).strip().lower()
++    if mode not in {"tp_vs_non_tp", "tp_vs_sl_only"}:
++        raise ValueError(
++            "detector.model.main_target_mode must be one of: tp_vs_non_tp, tp_vs_sl_only"
++        )
++    return mode
++
++
+ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     if not isinstance(value, list):
+         raise ValueError(f"{field_name} must be a list")
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index 88c5813..0c1e328 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -46,6 +46,7 @@ class SequenceDetector:
+     max_ranking_pairs_per_episode: int
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
++    main_target_mode: str
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -108,6 +109,7 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
++        main_target_mode=str(model_config.main_target_mode),
+     )
+ 
+ 
+@@ -159,6 +161,21 @@ def fit_detector_model(
+         timeout_pair_weight=float(model.timeout_pair_weight),
+         max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+     )
++    train_target_reason = train_fit["target_reason"].astype(str).str.strip().str.lower()
++    if model.main_target_mode == "tp_vs_sl_only":
++        timeout_train_mask = train_target_reason.eq("timeout").to_numpy(
++            dtype=bool, copy=False
++        )
++        sample_weight_train = np.asarray(sample_weight_train, dtype=np.float32).copy()
++        sample_weight_train[timeout_train_mask] = np.float32(0.0)
++        if not ranking_pairs_train_df.empty:
++            ranking_pairs_train_df = (
++                ranking_pairs_train_df[
++                    ranking_pairs_train_df["pair_type"] == "tp_vs_sl"
++                ]
++                .copy()
++                .reset_index(drop=True)
++            )
+     ranking_pairs_train = _prepare_pair_index_data(
+         ranking_pairs_train_df, train_fit["decision_row_id"].astype(str)
+     )
+@@ -211,6 +228,23 @@ def fit_detector_model(
+                 timeout_pair_weight=float(model.timeout_pair_weight),
+                 max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+             )
++            eval_target_reason = (
++                eval_fit["target_reason"].astype(str).str.strip().str.lower()
++            )
++            if model.main_target_mode == "tp_vs_sl_only":
++                timeout_eval_mask = eval_target_reason.eq("timeout").to_numpy(
++                    dtype=bool, copy=False
++                )
++                sample_weight_eval = np.asarray(sample_weight_eval, dtype=np.float32).copy()
++                sample_weight_eval[timeout_eval_mask] = np.float32(0.0)
++                if not ranking_pairs_eval_df.empty:
++                    ranking_pairs_eval_df = (
++                        ranking_pairs_eval_df[
++                            ranking_pairs_eval_df["pair_type"] == "tp_vs_sl"
++                        ]
++                        .copy()
++                        .reset_index(drop=True)
++                    )
+             ranking_pairs_eval = _prepare_pair_index_data(
+                 ranking_pairs_eval_df, eval_fit["decision_row_id"].astype(str)
+             )
+diff --git a/pump_end_v2/detector/policy_search.py b/pump_end_v2/detector/policy_search.py
+index 08cecba..8fa5557 100644
+--- a/pump_end_v2/detector/policy_search.py
++++ b/pump_end_v2/detector/policy_search.py
+@@ -1108,6 +1108,49 @@ def _split_fit_train_eval_chronological(
+                 "fallback_reason": reason,
+             },
+         )
++    if detector_model_config.main_target_mode == "tp_vs_sl_only":
++        train_main_rows = train_inner[
++            train_inner["target_reason"].astype(str).str.strip().str.lower().isin(
++                ["tp", "sl"]
++            )
++        ]
++        eval_main_rows = eval_inner[
++            eval_inner["target_reason"].astype(str).str.strip().str.lower().isin(
++                ["tp", "sl"]
++            )
++        ]
++        train_main_single_class = (
++            train_main_rows["target_reason"]
++            .astype(str)
++            .str.strip()
++            .str.lower()
++            .nunique()
++            < 2
++        )
++        eval_main_single_class = (
++            eval_main_rows["target_reason"]
++            .astype(str)
++            .str.strip()
++            .str.lower()
++            .nunique()
++            < 2
++        )
++        if train_main_single_class or eval_main_single_class:
++            reason = (
++                "train_main_single_class"
++                if train_main_single_class
++                else "eval_main_single_class"
++            )
++            return (
++                trainable,
++                None,
++                {
++                    "monitor_name": "train_loss_fallback",
++                    "train_rows": int(len(trainable)),
++                    "eval_rows": 0,
++                    "fallback_reason": reason,
++                },
++            )
+     return (
+         train_inner,
+         eval_inner,
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index df12d6a..3a57778 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -584,7 +584,7 @@ def _weighted_bce_loss(logits: Tensor, targets: Tensor, sample_weight: Tensor) -
+     weights = torch.clamp(sample_weight, min=0.0)
+     denom = torch.sum(weights)
+     if float(denom.item()) <= 0.0:
+-        return torch.mean(per_row_loss)
++        return torch.zeros((), dtype=per_row_loss.dtype, device=per_row_loss.device)
+     return torch.sum(per_row_loss * weights) / denom
+ 
+ 

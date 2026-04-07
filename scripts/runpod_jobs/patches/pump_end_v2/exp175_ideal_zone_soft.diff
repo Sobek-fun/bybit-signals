@@ -1,0 +1,299 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index 748f71d..a6a1a54 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -68,6 +68,12 @@ class DetectorModelConfig:
+     max_ranking_pairs_per_episode: int
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
++    tp_target_shape_mode: str
++    ideal_entry_weight_multiplier: float
++    near_ideal_tp_weight_multiplier: float
++    far_tp_weight_multiplier: float
++    near_ideal_max_bars: int
++    ideal_tp_pair_weight: float
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -652,9 +658,41 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+             inclusive_lower=True,
+             inclusive_upper=True,
+         ),
++        tp_target_shape_mode=_parse_tp_target_shape_mode(
++            model_section.get("tp_target_shape_mode", "flat_tp")
++        ),
++        ideal_entry_weight_multiplier=_require_positive_float(
++            model_section.get("ideal_entry_weight_multiplier", 1.0),
++            "detector.model.ideal_entry_weight_multiplier",
++        ),
++        near_ideal_tp_weight_multiplier=_require_positive_float(
++            model_section.get("near_ideal_tp_weight_multiplier", 1.0),
++            "detector.model.near_ideal_tp_weight_multiplier",
++        ),
++        far_tp_weight_multiplier=_require_positive_float(
++            model_section.get("far_tp_weight_multiplier", 1.0),
++            "detector.model.far_tp_weight_multiplier",
++        ),
++        near_ideal_max_bars=_require_non_negative_int(
++            model_section.get("near_ideal_max_bars", 0),
++            "detector.model.near_ideal_max_bars",
++        ),
++        ideal_tp_pair_weight=_require_positive_float(
++            model_section.get("ideal_tp_pair_weight", 0.25),
++            "detector.model.ideal_tp_pair_weight",
++        ),
+     )
+ 
+ 
++def _parse_tp_target_shape_mode(value: Any) -> str:
++    mode = str(value).strip().lower()
++    if mode not in {"flat_tp", "ideal_zone_soft"}:
++        raise ValueError(
++            "detector.model.tp_target_shape_mode must be one of: flat_tp, ideal_zone_soft"
++        )
++    return mode
++
++
+ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     if not isinstance(value, list):
+         raise ValueError(f"{field_name} must be a list")
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index 88c5813..7358bc8 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -18,6 +18,7 @@ from pump_end_v2.detector.sequence_model import (
+     train_sequence_model,
+ )
+ from pump_end_v2.detector.ranking import (
++    build_ideal_tp_ranking_pairs,
+     build_detector_ranking_pairs,
+     build_hard_negative_row_weights,
+ )
+@@ -46,6 +47,12 @@ class SequenceDetector:
+     max_ranking_pairs_per_episode: int
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
++    tp_target_shape_mode: str
++    ideal_entry_weight_multiplier: float
++    near_ideal_tp_weight_multiplier: float
++    far_tp_weight_multiplier: float
++    near_ideal_max_bars: int
++    ideal_tp_pair_weight: float
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -108,6 +115,14 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
++        tp_target_shape_mode=str(model_config.tp_target_shape_mode),
++        ideal_entry_weight_multiplier=float(model_config.ideal_entry_weight_multiplier),
++        near_ideal_tp_weight_multiplier=float(
++            model_config.near_ideal_tp_weight_multiplier
++        ),
++        far_tp_weight_multiplier=float(model_config.far_tp_weight_multiplier),
++        near_ideal_max_bars=int(model_config.near_ideal_max_bars),
++        ideal_tp_pair_weight=float(model_config.ideal_tp_pair_weight),
+     )
+ 
+ 
+@@ -154,11 +169,29 @@ def fit_detector_model(
+         hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
+         return_hard_negative_mask=True,
+     )
++    if model.tp_target_shape_mode == "ideal_zone_soft":
++        sample_weight_train = _apply_ideal_zone_positive_weight_shaping(
++            frame=train_fit,
++            sample_weight=sample_weight_train,
++            ideal_entry_weight_multiplier=float(model.ideal_entry_weight_multiplier),
++            near_ideal_tp_weight_multiplier=float(model.near_ideal_tp_weight_multiplier),
++            far_tp_weight_multiplier=float(model.far_tp_weight_multiplier),
++            near_ideal_max_bars=int(model.near_ideal_max_bars),
++        )
+     ranking_pairs_train_df = build_detector_ranking_pairs(
+         train_fit,
+         timeout_pair_weight=float(model.timeout_pair_weight),
+         max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+     )
++    if model.tp_target_shape_mode == "ideal_zone_soft":
++        ideal_pairs_train_df = build_ideal_tp_ranking_pairs(
++            train_fit, ideal_tp_pair_weight=float(model.ideal_tp_pair_weight)
++        )
++        if not ideal_pairs_train_df.empty:
++            ranking_pairs_train_df = (
++                pd.concat([ranking_pairs_train_df, ideal_pairs_train_df], ignore_index=True)
++                .reset_index(drop=True)
++            )
+     ranking_pairs_train = _prepare_pair_index_data(
+         ranking_pairs_train_df, train_fit["decision_row_id"].astype(str)
+     )
+@@ -205,12 +238,34 @@ def fit_detector_model(
+                 hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
+                 return_hard_negative_mask=True,
+             )
++            if model.tp_target_shape_mode == "ideal_zone_soft":
++                sample_weight_eval = _apply_ideal_zone_positive_weight_shaping(
++                    frame=eval_fit,
++                    sample_weight=sample_weight_eval,
++                    ideal_entry_weight_multiplier=float(model.ideal_entry_weight_multiplier),
++                    near_ideal_tp_weight_multiplier=float(
++                        model.near_ideal_tp_weight_multiplier
++                    ),
++                    far_tp_weight_multiplier=float(model.far_tp_weight_multiplier),
++                    near_ideal_max_bars=int(model.near_ideal_max_bars),
++                )
+             hard_negative_eval_total = int(np.sum(hard_negative_eval_mask))
+             ranking_pairs_eval_df = build_detector_ranking_pairs(
+                 eval_fit,
+                 timeout_pair_weight=float(model.timeout_pair_weight),
+                 max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+             )
++            if model.tp_target_shape_mode == "ideal_zone_soft":
++                ideal_pairs_eval_df = build_ideal_tp_ranking_pairs(
++                    eval_fit, ideal_tp_pair_weight=float(model.ideal_tp_pair_weight)
++                )
++                if not ideal_pairs_eval_df.empty:
++                    ranking_pairs_eval_df = (
++                        pd.concat(
++                            [ranking_pairs_eval_df, ideal_pairs_eval_df], ignore_index=True
++                        )
++                        .reset_index(drop=True)
++                    )
+             ranking_pairs_eval = _prepare_pair_index_data(
+                 ranking_pairs_eval_df, eval_fit["decision_row_id"].astype(str)
+             )
+@@ -490,6 +545,64 @@ def _require_columns(df: pd.DataFrame, columns: list[str], name: str) -> None:
+         raise ValueError(f"{name} missing required columns: {missing}")
+ 
+ 
++def _apply_ideal_zone_positive_weight_shaping(
++    frame: pd.DataFrame,
++    sample_weight: np.ndarray,
++    ideal_entry_weight_multiplier: float,
++    near_ideal_tp_weight_multiplier: float,
++    far_tp_weight_multiplier: float,
++    near_ideal_max_bars: int,
++) -> np.ndarray:
++    _require_columns(
++        frame,
++        [
++            "episode_id",
++            "decision_row_id",
++            "target_reason",
++            "is_ideal_entry",
++            "ideal_entry_row_id",
++            "episode_age_bars",
++        ],
++        "frame",
++    )
++    weights = np.asarray(sample_weight, dtype=np.float32).copy()
++    if len(weights) != len(frame):
++        raise ValueError("sample_weight length must match frame length")
++    work = frame.copy()
++    work["episode_id"] = work["episode_id"].astype(str)
++    work["decision_row_id"] = work["decision_row_id"].astype(str)
++    work["target_reason"] = work["target_reason"].astype(str).str.strip().str.lower()
++    work["is_ideal_entry"] = work["is_ideal_entry"].astype(bool)
++    work["ideal_entry_row_id"] = work["ideal_entry_row_id"].astype(str)
++    work["episode_age_bars"] = pd.to_numeric(work["episode_age_bars"], errors="coerce")
++    for _, group in work.groupby("episode_id", sort=False):
++        tp_rows = group[group["target_reason"] == "tp"].copy()
++        if tp_rows.empty:
++            continue
++        ideal_rows = tp_rows[tp_rows["is_ideal_entry"]].copy()
++        if ideal_rows.empty:
++            continue
++        ideal_ref = ideal_rows.iloc[0]
++        ideal_age = float(ideal_ref["episode_age_bars"])
++        if not np.isfinite(ideal_age):
++            continue
++        ideal_row_id = str(ideal_ref["ideal_entry_row_id"])
++        idxs = tp_rows.index.to_numpy(dtype=int)
++        row_ids = tp_rows["decision_row_id"].to_numpy(dtype=object)
++        row_ages = tp_rows["episode_age_bars"].to_numpy(dtype=float)
++        for idx, row_id, row_age in zip(idxs, row_ids, row_ages, strict=False):
++            if str(row_id) == ideal_row_id:
++                weights[idx] *= np.float32(ideal_entry_weight_multiplier)
++                continue
++            if np.isfinite(row_age) and abs(float(row_age) - ideal_age) <= float(
++                near_ideal_max_bars
++            ):
++                weights[idx] *= np.float32(near_ideal_tp_weight_multiplier)
++            else:
++                weights[idx] *= np.float32(far_tp_weight_multiplier)
++    return weights
++
++
+ def _binary_logloss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+     y = np.asarray(y_true, dtype=float)
+     p = np.asarray(y_pred, dtype=float)
+diff --git a/pump_end_v2/detector/ranking.py b/pump_end_v2/detector/ranking.py
+index b863105..0b48c9f 100644
+--- a/pump_end_v2/detector/ranking.py
++++ b/pump_end_v2/detector/ranking.py
+@@ -191,6 +191,65 @@ def build_hard_negative_row_weights(
+     return weights.astype(np.float32, copy=False)
+ 
+ 
++def build_ideal_tp_ranking_pairs(
++    frame: pd.DataFrame, ideal_tp_pair_weight: float
++) -> pd.DataFrame:
++    _require_columns(
++        frame,
++        [
++            "episode_id",
++            "decision_row_id",
++            "episode_age_bars",
++            "row_trade_outcome",
++            "is_ideal_entry",
++            "trainable_row",
++        ],
++        "frame",
++    )
++    pair_weight = float(ideal_tp_pair_weight)
++    if pair_weight <= 0.0:
++        raise ValueError("ideal_tp_pair_weight must be positive")
++    if frame.empty:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    local = frame.copy()
++    local["trainable_row"] = local["trainable_row"].astype(bool)
++    local = local[local["trainable_row"]].copy()
++    if local.empty:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    local["episode_id"] = local["episode_id"].astype(str)
++    local["decision_row_id"] = local["decision_row_id"].astype(str)
++    local["row_trade_outcome"] = (
++        local["row_trade_outcome"].astype(str).str.strip().str.lower()
++    )
++    local["is_ideal_entry"] = local["is_ideal_entry"].astype(bool)
++    rows: list[dict[str, object]] = []
++    for episode_id, group in local.groupby("episode_id", sort=False):
++        ideal = group[group["is_ideal_entry"]].copy()
++        if len(ideal) != 1:
++            continue
++        ideal_row = ideal.iloc[0]
++        ideal_decision_row_id = str(ideal_row["decision_row_id"])
++        tp_rows = group[group["row_trade_outcome"] == "tp"].copy()
++        if tp_rows.empty:
++            continue
++        other_tp_rows = tp_rows[tp_rows["decision_row_id"] != ideal_decision_row_id].copy()
++        if other_tp_rows.empty:
++            continue
++        for tp_row in other_tp_rows.itertuples(index=False):
++            rows.append(
++                {
++                    "episode_id": str(episode_id),
++                    "better_decision_row_id": ideal_decision_row_id,
++                    "worse_decision_row_id": str(tp_row.decision_row_id),
++                    "pair_type": "ideal_tp_vs_other_tp",
++                    "pair_weight": pair_weight,
++                }
++            )
++    if not rows:
++        return pd.DataFrame(columns=list(_PAIR_COLUMNS))
++    return pd.DataFrame(rows, columns=list(_PAIR_COLUMNS)).reset_index(drop=True)
++
++
+ def _build_local_pairs(
+     better: pd.DataFrame,
+     worse: pd.DataFrame,
