@@ -1,0 +1,436 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..882f66d 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -69,6 +69,10 @@ class DetectorModelConfig:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    entry_head_mode: str
++    entry_moe_router_hidden: int
++    entry_moe_temperature: float
++    entry_moe_entropy_lambda: float
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -658,6 +662,31 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+         main_target_mode=_parse_detector_main_target_mode(
+             model_section.get("main_target_mode", "tp_vs_non_tp")
+         ),
++        entry_head_mode=_parse_entry_head_mode(
++            model_section.get("entry_head_mode", "dense")
++        ),
++        entry_moe_router_hidden=_require_bounded_int(
++            model_section.get("entry_moe_router_hidden", 16),
++            "detector.model.entry_moe_router_hidden",
++            lower=4,
++            upper=128,
++        ),
++        entry_moe_temperature=_require_bounded_float(
++            model_section.get("entry_moe_temperature", 1.0),
++            "detector.model.entry_moe_temperature",
++            lower=0.1,
++            upper=5.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        entry_moe_entropy_lambda=_require_bounded_float(
++            model_section.get("entry_moe_entropy_lambda", 0.0),
++            "detector.model.entry_moe_entropy_lambda",
++            lower=0.0,
++            upper=1.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
+     )
+ 
+ 
+@@ -670,6 +699,13 @@ def _parse_detector_main_target_mode(value: Any) -> str:
+     )
+ 
+ 
++def _parse_entry_head_mode(value: Any) -> str:
++    mode = str(value).strip().lower()
++    if mode in {"dense", "moe2"}:
++        return mode
++    raise ValueError("detector.model.entry_head_mode must be one of: dense, moe2")
++
++
+ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     if not isinstance(value, list):
+         raise ValueError(f"{field_name} must be a list")
+@@ -681,6 +717,22 @@ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     return tuple(out)
+ 
+ 
++def _require_bounded_int(
++        value: Any,
++        field_name: str,
++        *,
++        lower: int,
++        upper: int,
++) -> int:
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError(f"{field_name} must be integer") from exc
++    if not (int(lower) <= parsed <= int(upper)):
++        raise ValueError(f"{field_name} must be in range [{int(lower)}, {int(upper)}]")
++    return parsed
++
++
+ def _require_bounded_float(
+         value: Any,
+         field_name: str,
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index e0fd64d..df25ca8 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -47,6 +47,7 @@ class SequenceDetector:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    entry_moe_entropy_lambda: float
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -87,6 +88,9 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         kernel_size=int(model_config.kernel_size),
+         dilations=tuple(int(v) for v in model_config.dilations),
+         dropout=float(model_config.dropout),
++        entry_head_mode=str(model_config.entry_head_mode),
++        entry_moe_router_hidden=int(model_config.entry_moe_router_hidden),
++        entry_moe_temperature=float(model_config.entry_moe_temperature),
+     )
+     lookback_bars = int(model_config.pre_episode_context_bars) + int(
+         model_config.decision_window_bars
+@@ -110,6 +114,7 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+         main_target_mode=str(model_config.main_target_mode),
++        entry_moe_entropy_lambda=float(model_config.entry_moe_entropy_lambda),
+     )
+ 
+ 
+@@ -271,6 +276,7 @@ def fit_detector_model(
+         ranking_pairs_train=ranking_pairs_train,
+         ranking_pairs_eval=ranking_pairs_eval,
+         ranking_lambda=float(model.ranking_lambda),
++        entry_moe_entropy_lambda=float(model.entry_moe_entropy_lambda),
+         hard_negative_rows_train_total=hard_negative_train_total,
+         hard_negative_rows_eval_total=hard_negative_eval_total,
+     )
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index 3a57778..70e8197 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -74,6 +74,9 @@ class SequenceTCNBinaryClassifier(nn.Module):
+         kernel_size: int = SEQUENCE_KERNEL_SIZE,
+         dilations: tuple[int, ...] = SEQUENCE_DILATIONS,
+         dropout: float = SEQUENCE_DROPOUT,
++        entry_head_mode: str = "dense",
++        entry_moe_router_hidden: int = 16,
++        entry_moe_temperature: float = 1.0,
+     ):
+         super().__init__()
+         channels = int(hidden_channels)
+@@ -91,11 +94,31 @@ class SequenceTCNBinaryClassifier(nn.Module):
+             )
+             in_channels = channels
+         self.tcn = nn.Sequential(*blocks)
++        mode = str(entry_head_mode).strip().lower()
++        if mode not in {"dense", "moe2"}:
++            raise ValueError("entry_head_mode must be one of: dense, moe2")
++        self.entry_head_mode = mode
++        self.entry_moe_temperature = float(entry_moe_temperature)
+         self.entry_head = nn.Sequential(
+             nn.Linear(channels, 32),
+             nn.ReLU(),
+             nn.Linear(32, 1),
+         )
++        self.entry_head_expert_1 = nn.Sequential(
++            nn.Linear(channels, 32),
++            nn.ReLU(),
++            nn.Linear(32, 1),
++        )
++        self.entry_head_expert_2 = nn.Sequential(
++            nn.Linear(channels, 32),
++            nn.ReLU(),
++            nn.Linear(32, 1),
++        )
++        self.entry_router = nn.Sequential(
++            nn.Linear(channels, int(entry_moe_router_hidden)),
++            nn.ReLU(),
++            nn.Linear(int(entry_moe_router_hidden), 2),
++        )
+         self.outcome_head = nn.Sequential(
+             nn.Linear(channels, 32),
+             nn.ReLU(),
+@@ -114,10 +137,22 @@ class SequenceTCNBinaryClassifier(nn.Module):
+         gather_idx = torch.clamp(readout_index.to(dtype=torch.long), min=0, max=max_step)
+         batch_idx = torch.arange(encoded.shape[0], device=encoded.device, dtype=torch.long)
+         context_step = encoded[batch_idx, :, gather_idx]
+-        entry_logits = self.entry_head(context_step).squeeze(-1)
++        entry_logits, _ = self.compute_entry_logits(context_step)
+         outcome_logits = self.outcome_head(context_step)
+         return entry_logits, outcome_logits
+ 
++    def compute_entry_logits(self, context_step: Tensor) -> tuple[Tensor, Tensor | None]:
++        if self.entry_head_mode == "dense":
++            return self.entry_head(context_step).squeeze(-1), None
++        expert_1 = self.entry_head_expert_1(context_step).squeeze(-1)
++        expert_2 = self.entry_head_expert_2(context_step).squeeze(-1)
++        router_logits = self.entry_router(context_step)
++        router_probs = torch.softmax(
++            router_logits / float(max(self.entry_moe_temperature, 1e-6)), dim=1
++        )
++        mixed = router_probs[:, 0] * expert_1 + router_probs[:, 1] * expert_2
++        return mixed, router_probs
++
+ 
+ @dataclass(slots=True)
+ class SequenceTrainStats:
+@@ -136,6 +171,9 @@ class SequenceTrainStats:
+     best_choice_loss: float
+     best_ranking_loss: float
+     best_outcome_loss: float
++    router_load_expert_1: float
++    router_load_expert_2: float
++    router_balance_loss: float
+     final_choice_loss: float
+     final_ranking_loss: float
+     final_outcome_loss: float
+@@ -167,6 +205,9 @@ class SequenceTrainStats:
+             "best_choice_loss": float(self.best_choice_loss),
+             "best_ranking_loss": float(self.best_ranking_loss),
+             "best_outcome_loss": float(self.best_outcome_loss),
++            "router_load_expert_1": float(self.router_load_expert_1),
++            "router_load_expert_2": float(self.router_load_expert_2),
++            "router_balance_loss": float(self.router_balance_loss),
+             "final_choice_loss": float(self.final_choice_loss),
+             "final_ranking_loss": float(self.final_ranking_loss),
+             "final_outcome_loss": float(self.final_outcome_loss),
+@@ -216,6 +257,7 @@ def train_sequence_model(
+     ranking_pairs_train: dict[str, np.ndarray] | None = None,
+     ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+     ranking_lambda: float = 0.5,
++    entry_moe_entropy_lambda: float = 0.0,
+     hard_negative_rows_train_total: int = 0,
+     hard_negative_rows_eval_total: int = 0,
+ ) -> SequenceTrainStats:
+@@ -243,6 +285,9 @@ def train_sequence_model(
+     outcome_aux_lambda = float(outcome_aux_lambda)
+     if outcome_aux_lambda < 0.0:
+         raise ValueError("outcome_aux_lambda must be non-negative")
++    entry_moe_entropy_lambda = float(entry_moe_entropy_lambda)
++    if entry_moe_entropy_lambda < 0.0 or entry_moe_entropy_lambda > 1.0:
++        raise ValueError("entry_moe_entropy_lambda must satisfy 0 <= x <= 1")
+     ranking_pairs_train = _normalize_ranking_pairs(ranking_pairs_train, "ranking_pairs_train")
+     ranking_pairs_eval = _normalize_ranking_pairs(ranking_pairs_eval, "ranking_pairs_eval")
+     if train_outcome_targets is None:
+@@ -322,6 +367,9 @@ def train_sequence_model(
+     best_choice_loss = 0.0
+     best_ranking_loss = 0.0
+     best_outcome_loss = 0.0
++    router_load_expert_1 = 0.0
++    router_load_expert_2 = 0.0
++    router_balance_loss_best = 0.0
+     final_choice_loss = 0.0
+     final_ranking_loss = 0.0
+     final_outcome_loss = 0.0
+@@ -337,6 +385,9 @@ def train_sequence_model(
+         train_choice_sum = 0.0
+         train_ranking_sum = 0.0
+         train_outcome_sum = 0.0
++        train_router_balance_sum = 0.0
++        train_router_load_1_sum = 0.0
++        train_router_load_2_sum = 0.0
+         train_count = 0
+         for batch_indices in episode_batches:
+             (
+@@ -355,7 +406,14 @@ def train_sequence_model(
+             batch_outcome_targets = batch_outcome_targets.to(device)
+             batch_outcome_weights = batch_outcome_weights.to(device)
+             optimizer.zero_grad(set_to_none=True)
+-            entry_logits, outcome_logits = model(batch_x, batch_readout)
++            temporal = batch_x.transpose(1, 2)
++            encoded = model.tcn(temporal)
++            max_step = int(encoded.shape[2]) - 1
++            gather_idx = torch.clamp(batch_readout.to(dtype=torch.long), min=0, max=max_step)
++            batch_idx_t = torch.arange(encoded.shape[0], device=encoded.device, dtype=torch.long)
++            context_step = encoded[batch_idx_t, :, gather_idx]
++            entry_logits, router_probs = model.compute_entry_logits(context_step)
++            outcome_logits = model.outcome_head(context_step)
+             classification_loss = _weighted_bce_loss(entry_logits, batch_y, batch_w)
+             if not torch.isfinite(classification_loss):
+                 raise ValueError(
+@@ -372,10 +430,12 @@ def train_sequence_model(
+                 targets=batch_outcome_targets,
+                 sample_weight=batch_outcome_weights,
+             )
++            router_balance = _router_balance_loss(router_probs, entry_logits.device)
+             total_loss_batch = (
+                 classification_loss
+                 + ranking_lambda * ranking_loss_batch
+                 + outcome_aux_lambda * outcome_loss
++                + entry_moe_entropy_lambda * router_balance
+             )
+             if not torch.isfinite(total_loss_batch):
+                 raise ValueError(
+@@ -388,16 +448,28 @@ def train_sequence_model(
+             train_choice_sum += float(classification_loss.item()) * float(batch_size_local)
+             train_ranking_sum += float(ranking_loss_batch.item()) * float(batch_size_local)
+             train_outcome_sum += float(outcome_loss.item()) * float(batch_size_local)
++            train_router_balance_sum += float(router_balance.item()) * float(batch_size_local)
++            if router_probs is not None:
++                train_router_load_1_sum += float(router_probs[:, 0].mean().item()) * float(batch_size_local)
++                train_router_load_2_sum += float(router_probs[:, 1].mean().item()) * float(batch_size_local)
+             train_count += batch_size_local
+         train_choice_epoch = float(train_choice_sum / float(max(train_count, 1)))
+         train_ranking_epoch = float(train_ranking_sum / float(max(train_count, 1)))
+         train_outcome_epoch = float(train_outcome_sum / float(max(train_count, 1)))
++        train_router_balance_epoch = float(train_router_balance_sum / float(max(train_count, 1)))
++        train_router_load_1_epoch = float(train_router_load_1_sum / float(max(train_count, 1)))
++        train_router_load_2_epoch = float(train_router_load_2_sum / float(max(train_count, 1)))
+         train_loss_epoch = float(train_loss_sum / float(max(train_count, 1)))
+         model.eval()
+         with torch.no_grad():
+-            train_entry_logits, train_outcome_logits = model(
+-                x_train_device, readout_train_device
+-            )
++            train_temporal = x_train_device.transpose(1, 2)
++            train_encoded = model.tcn(train_temporal)
++            train_max_step = int(train_encoded.shape[2]) - 1
++            train_gather = torch.clamp(readout_train_device.to(dtype=torch.long), min=0, max=train_max_step)
++            train_batch_idx = torch.arange(train_encoded.shape[0], device=train_encoded.device, dtype=torch.long)
++            train_context = train_encoded[train_batch_idx, :, train_gather]
++            train_entry_logits, train_router_probs = model.compute_entry_logits(train_context)
++            train_outcome_logits = model.outcome_head(train_context)
+             train_choice_monitor = float(
+                 _weighted_bce_loss(train_entry_logits, y_train_device, w_train_device).item()
+             )
+@@ -413,13 +485,24 @@ def train_sequence_model(
+                     sample_weight=outcome_weight_train_device,
+                 ).item()
+             )
++            train_router_balance_monitor = float(
++                _router_balance_loss(train_router_probs, train_entry_logits.device).item()
++            )
+             train_loss_monitor = float(
+                 train_choice_monitor
+                 + ranking_lambda * train_ranking_monitor
+                 + outcome_aux_lambda * train_outcome_monitor
++                + entry_moe_entropy_lambda * train_router_balance_monitor
+             )
+             if eval_data is not None:
+-                eval_entry_logits, eval_outcome_logits = model(eval_data[0], eval_data[3])
++                eval_temporal = eval_data[0].transpose(1, 2)
++                eval_encoded = model.tcn(eval_temporal)
++                eval_max_step = int(eval_encoded.shape[2]) - 1
++                eval_gather = torch.clamp(eval_data[3].to(dtype=torch.long), min=0, max=eval_max_step)
++                eval_batch_idx = torch.arange(eval_encoded.shape[0], device=eval_encoded.device, dtype=torch.long)
++                eval_context = eval_encoded[eval_batch_idx, :, eval_gather]
++                eval_entry_logits, eval_router_probs = model.compute_entry_logits(eval_context)
++                eval_outcome_logits = model.outcome_head(eval_context)
+                 eval_choice_loss = float(
+                     _weighted_bce_loss(eval_entry_logits, eval_data[1], eval_data[2]).item()
+                 )
+@@ -435,14 +518,27 @@ def train_sequence_model(
+                         sample_weight=eval_data[5],
+                     ).item()
+                 )
++                eval_router_balance = float(
++                    _router_balance_loss(eval_router_probs, eval_entry_logits.device).item()
++                )
++                eval_router_load_1 = float(
++                    0.0 if eval_router_probs is None else eval_router_probs[:, 0].mean().item()
++                )
++                eval_router_load_2 = float(
++                    0.0 if eval_router_probs is None else eval_router_probs[:, 1].mean().item()
++                )
+             else:
+                 eval_choice_loss = float(train_choice_monitor)
+                 eval_ranking_loss = float(train_ranking_monitor)
+                 eval_outcome_loss = float(train_outcome_monitor)
++                eval_router_balance = float(train_router_balance_monitor)
++                eval_router_load_1 = float(0.0 if train_router_probs is None else train_router_probs[:, 0].mean().item())
++                eval_router_load_2 = float(0.0 if train_router_probs is None else train_router_probs[:, 1].mean().item())
+             eval_loss = float(
+                 eval_choice_loss
+                 + ranking_lambda * eval_ranking_loss
+                 + outcome_aux_lambda * eval_outcome_loss
++                + entry_moe_entropy_lambda * eval_router_balance
+             )
+         if not np.isfinite(eval_loss):
+             raise ValueError(f"non-finite eval total loss detected: eval_loss={eval_loss}")
+@@ -453,6 +549,9 @@ def train_sequence_model(
+             best_choice_loss = float(eval_choice_loss)
+             best_ranking_loss = float(eval_ranking_loss)
+             best_outcome_loss = float(eval_outcome_loss)
++            router_load_expert_1 = float(eval_router_load_1)
++            router_load_expert_2 = float(eval_router_load_2)
++            router_balance_loss_best = float(eval_router_balance)
+             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+             patience_left = int(early_stopping_patience)
+             is_best_epoch = True
+@@ -472,9 +571,17 @@ def train_sequence_model(
+                         "train_choice_loss": float(train_choice_epoch),
+                         "train_ranking_loss": float(train_ranking_epoch),
+                         "train_outcome_loss": float(train_outcome_epoch),
++                        "train_router_balance_loss": float(train_router_balance_epoch),
++                        "train_router_load_expert_1": float(train_router_load_1_epoch),
++                        "train_router_load_expert_2": float(train_router_load_2_epoch),
+                         "eval_choice_loss": float(eval_choice_loss),
+                         "eval_ranking_loss": float(eval_ranking_loss),
+                         "eval_outcome_loss": float(eval_outcome_loss),
++                        "eval_router_balance_loss": float(eval_router_balance),
++                        "eval_router_load_expert_1": float(eval_router_load_1),
++                        "eval_router_load_expert_2": float(eval_router_load_2),
++                        "router_allocation_summary_train": f"{train_router_load_1_epoch:.4f}/{train_router_load_2_epoch:.4f}",
++                        "router_allocation_summary_eval": f"{eval_router_load_1:.4f}/{eval_router_load_2:.4f}",
+                         "is_best_epoch": int(is_best_epoch),
+                     }
+                 )
+@@ -491,9 +598,17 @@ def train_sequence_model(
+                 "train_choice_loss": float(train_choice_epoch),
+                 "train_ranking_loss": float(train_ranking_epoch),
+                 "train_outcome_loss": float(train_outcome_epoch),
++                "train_router_balance_loss": float(train_router_balance_epoch),
++                "train_router_load_expert_1": float(train_router_load_1_epoch),
++                "train_router_load_expert_2": float(train_router_load_2_epoch),
+                 "eval_choice_loss": float(eval_choice_loss),
+                 "eval_ranking_loss": float(eval_ranking_loss),
+                 "eval_outcome_loss": float(eval_outcome_loss),
++                "eval_router_balance_loss": float(eval_router_balance),
++                "eval_router_load_expert_1": float(eval_router_load_1),
++                "eval_router_load_expert_2": float(eval_router_load_2),
++                "router_allocation_summary_train": f"{train_router_load_1_epoch:.4f}/{train_router_load_2_epoch:.4f}",
++                "router_allocation_summary_eval": f"{eval_router_load_1:.4f}/{eval_router_load_2:.4f}",
+                 "is_best_epoch": int(is_best_epoch),
+             }
+         )
+@@ -520,6 +635,9 @@ def train_sequence_model(
+         best_choice_loss=float(best_choice_loss),
+         best_ranking_loss=float(best_ranking_loss),
+         best_outcome_loss=float(best_outcome_loss),
++        router_load_expert_1=float(router_load_expert_1),
++        router_load_expert_2=float(router_load_expert_2),
++        router_balance_loss=float(router_balance_loss_best),
+         final_choice_loss=float(final_choice_loss),
+         final_ranking_loss=float(final_ranking_loss),
+         final_outcome_loss=float(final_outcome_loss),
+@@ -626,6 +744,14 @@ def _weighted_outcome_ce_loss(
+     return torch.sum(per_row_loss * weights) / denom
+ 
+ 
++def _router_balance_loss(router_probs: Tensor | None, device: torch.device) -> Tensor:
++    if router_probs is None or int(router_probs.shape[0]) == 0:
++        return torch.zeros((), dtype=torch.float32, device=device)
++    target = torch.tensor([0.5, 0.5], dtype=router_probs.dtype, device=router_probs.device)
++    mean_load = torch.mean(router_probs, dim=0)
++    return torch.mean((mean_load - target) ** 2)
++
++
+ def _normalize_ranking_pairs(
+     ranking_pairs: dict[str, np.ndarray] | None, name: str
+ ) -> dict[str, np.ndarray]:

@@ -1,0 +1,491 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..a575286 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -69,6 +69,8 @@ class DetectorModelConfig:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    group_dro_lambda: float
++    group_dro_group_mode: str
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -658,6 +660,17 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+         main_target_mode=_parse_detector_main_target_mode(
+             model_section.get("main_target_mode", "tp_vs_non_tp")
+         ),
++        group_dro_lambda=_require_bounded_float(
++            model_section.get("group_dro_lambda", 0.0),
++            "detector.model.group_dro_lambda",
++            lower=0.0,
++            upper=1.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        group_dro_group_mode=_parse_group_dro_group_mode(
++            model_section.get("group_dro_group_mode", "none")
++        ),
+     )
+ 
+ 
+@@ -670,6 +683,13 @@ def _parse_detector_main_target_mode(value: Any) -> str:
+     )
+ 
+ 
++def _parse_group_dro_group_mode(value: Any) -> str:
++    mode = str(value).strip().lower()
++    if mode in {"none", "age_x_distance"}:
++        return mode
++    raise ValueError("detector.model.group_dro_group_mode must be one of: none, age_x_distance")
++
++
+ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     if not isinstance(value, list):
+         raise ValueError(f"{field_name} must be a list")
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index e0fd64d..81e8214 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -47,6 +47,8 @@ class SequenceDetector:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    group_dro_lambda: float
++    group_dro_group_mode: str
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -110,6 +112,8 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+         main_target_mode=str(model_config.main_target_mode),
++        group_dro_lambda=float(model_config.group_dro_lambda),
++        group_dro_group_mode=str(model_config.group_dro_group_mode),
+     )
+ 
+ 
+@@ -175,6 +179,7 @@ def fit_detector_model(
+     )
+     train_outcome_targets = _encode_outcome_targets(train_fit["target_reason"])
+     train_outcome_weights = _resolve_outcome_weights(train_fit)
++    train_group_ids = _build_group_ids(train_fit, group_mode=model.group_dro_group_mode)
+     x_eval_input: np.ndarray | None = None
+     y_eval: np.ndarray | None = None
+     sample_weight_eval: np.ndarray | None = None
+@@ -184,6 +189,7 @@ def fit_detector_model(
+     hard_negative_eval_total = 0
+     eval_outcome_targets: np.ndarray | None = None
+     eval_outcome_weights: np.ndarray | None = None
++    eval_group_ids: np.ndarray | None = None
+     if eval_df is not None and len(eval_df) > 0:
+         _require_columns(
+             eval_df,
+@@ -203,6 +209,11 @@ def fit_detector_model(
+             )
+             eval_outcome_targets = _encode_outcome_targets(eval_fit["target_reason"])
+             eval_outcome_weights = _resolve_outcome_weights(eval_fit)
++            eval_group_ids = _build_group_ids(
++                eval_fit,
++                group_mode=model.group_dro_group_mode,
++                train_distance_median=_group_distance_median(train_fit),
++            )
+             eval_episode_ids = eval_fit["episode_id"].astype(str).to_numpy(dtype=object)
+             y_eval = (
+                 pd.to_numeric(eval_fit[target_column], errors="coerce")
+@@ -252,6 +263,7 @@ def fit_detector_model(
+         train_episode_target_row_id_map=None,
+         train_outcome_targets=train_outcome_targets,
+         train_outcome_weights=train_outcome_weights,
++        train_group_ids=train_group_ids,
+         x_eval=x_eval_input,
+         y_eval=y_eval,
+         sample_weight_eval=sample_weight_eval,
+@@ -261,6 +273,7 @@ def fit_detector_model(
+         eval_episode_target_row_id_map=None,
+         eval_outcome_targets=eval_outcome_targets,
+         eval_outcome_weights=eval_outcome_weights,
++        eval_group_ids=eval_group_ids,
+         random_seed=int(model.random_seed),
+         batch_size=int(model.batch_size),
+         max_epochs=int(model.max_epochs),
+@@ -271,6 +284,7 @@ def fit_detector_model(
+         ranking_pairs_train=ranking_pairs_train,
+         ranking_pairs_eval=ranking_pairs_eval,
+         ranking_lambda=float(model.ranking_lambda),
++        group_dro_lambda=float(model.group_dro_lambda),
+         hard_negative_rows_train_total=hard_negative_train_total,
+         hard_negative_rows_eval_total=hard_negative_eval_total,
+     )
+@@ -506,6 +520,42 @@ def _resolve_outcome_weights(frame: pd.DataFrame) -> np.ndarray:
+     return weights.to_numpy(dtype=np.float32, copy=False)
+ 
+ 
++def _group_distance_median(frame: pd.DataFrame) -> float:
++    if "distance_from_episode_high_pct" not in frame.columns:
++        return 0.0
++    values = pd.to_numeric(frame["distance_from_episode_high_pct"], errors="coerce")
++    median = float(values.median(skipna=True)) if len(values) > 0 else 0.0
++    if not np.isfinite(median):
++        return 0.0
++    return median
++
++
++def _build_group_ids(
++    frame: pd.DataFrame,
++    *,
++    group_mode: str,
++    train_distance_median: float | None = None,
++) -> np.ndarray:
++    n = len(frame)
++    if group_mode != "age_x_distance":
++        return np.zeros(n, dtype=np.int64)
++    distance_median = float(train_distance_median) if train_distance_median is not None else _group_distance_median(frame)
++    if "episode_age_bars" in frame.columns:
++        age = pd.to_numeric(frame["episode_age_bars"], errors="coerce").fillna(0)
++    else:
++        age = pd.Series(np.zeros(n, dtype=np.float64))
++    age_bucket = (age.to_numpy(dtype=np.float64, copy=False) > 2.0).astype(np.int64)
++    if "distance_from_episode_high_pct" in frame.columns:
++        distance = pd.to_numeric(frame["distance_from_episode_high_pct"], errors="coerce")
++    else:
++        distance = pd.Series(np.full(n, np.nan, dtype=np.float64))
++    distance = distance.fillna(distance_median)
++    distance_bucket = (
++        distance.to_numpy(dtype=np.float64, copy=False) > float(distance_median)
++    ).astype(np.int64)
++    return (age_bucket * 2 + distance_bucket).astype(np.int64, copy=False)
++
++
+ def _require_columns(df: pd.DataFrame, columns: list[str], name: str) -> None:
+     missing = [col for col in columns if col not in df.columns]
+     if missing:
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index 3a57778..4cb9451 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -136,6 +136,11 @@ class SequenceTrainStats:
+     best_choice_loss: float
+     best_ranking_loss: float
+     best_outcome_loss: float
++    worst_group_bce: float
++    best_group_bce: float
++    train_group_counts: str
++    eval_group_counts: str
++    group_imbalance_summary: str
+     final_choice_loss: float
+     final_ranking_loss: float
+     final_outcome_loss: float
+@@ -167,6 +172,11 @@ class SequenceTrainStats:
+             "best_choice_loss": float(self.best_choice_loss),
+             "best_ranking_loss": float(self.best_ranking_loss),
+             "best_outcome_loss": float(self.best_outcome_loss),
++            "worst_group_bce": float(self.worst_group_bce),
++            "best_group_bce": float(self.best_group_bce),
++            "train_group_counts": str(self.train_group_counts),
++            "eval_group_counts": str(self.eval_group_counts),
++            "group_imbalance_summary": str(self.group_imbalance_summary),
+             "final_choice_loss": float(self.final_choice_loss),
+             "final_ranking_loss": float(self.final_ranking_loss),
+             "final_outcome_loss": float(self.final_outcome_loss),
+@@ -197,6 +207,7 @@ def train_sequence_model(
+     train_episode_target_row_id_map: dict[str, str | None] | None = None,
+     train_outcome_targets: np.ndarray | None = None,
+     train_outcome_weights: np.ndarray | None = None,
++    train_group_ids: np.ndarray | None = None,
+     x_eval: np.ndarray | None = None,
+     y_eval: np.ndarray | None = None,
+     sample_weight_eval: np.ndarray | None = None,
+@@ -206,6 +217,7 @@ def train_sequence_model(
+     eval_episode_target_row_id_map: dict[str, str | None] | None = None,
+     eval_outcome_targets: np.ndarray | None = None,
+     eval_outcome_weights: np.ndarray | None = None,
++    eval_group_ids: np.ndarray | None = None,
+     random_seed: int = 0,
+     batch_size: int = SEQUENCE_BATCH_SIZE,
+     max_epochs: int = SEQUENCE_MAX_EPOCHS,
+@@ -216,6 +228,7 @@ def train_sequence_model(
+     ranking_pairs_train: dict[str, np.ndarray] | None = None,
+     ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+     ranking_lambda: float = 0.5,
++    group_dro_lambda: float = 0.0,
+     hard_negative_rows_train_total: int = 0,
+     hard_negative_rows_eval_total: int = 0,
+ ) -> SequenceTrainStats:
+@@ -243,6 +256,9 @@ def train_sequence_model(
+     outcome_aux_lambda = float(outcome_aux_lambda)
+     if outcome_aux_lambda < 0.0:
+         raise ValueError("outcome_aux_lambda must be non-negative")
++    group_dro_lambda = float(group_dro_lambda)
++    if group_dro_lambda < 0.0 or group_dro_lambda > 1.0:
++        raise ValueError("group_dro_lambda must satisfy 0 <= x <= 1")
+     ranking_pairs_train = _normalize_ranking_pairs(ranking_pairs_train, "ranking_pairs_train")
+     ranking_pairs_eval = _normalize_ranking_pairs(ranking_pairs_eval, "ranking_pairs_eval")
+     if train_outcome_targets is None:
+@@ -253,6 +269,10 @@ def train_sequence_model(
+         raise ValueError("train_outcome_targets length must match y_train length")
+     if len(train_outcome_weights) != len(y_train):
+         raise ValueError("train_outcome_weights length must match y_train length")
++    if train_group_ids is None:
++        train_group_ids = np.zeros(len(y_train), dtype=np.int64)
++    if len(train_group_ids) != len(y_train):
++        raise ValueError("train_group_ids length must match y_train length")
+     if not np.isfinite(train_outcome_weights).all():
+         raise ValueError("train_sequence_model received non-finite train_outcome_weights")
+     if x_eval is not None and y_eval is not None and len(x_eval) > 0:
+@@ -262,6 +282,10 @@ def train_sequence_model(
+             eval_outcome_weights = np.ones(len(y_eval), dtype=np.float32)
+         if not np.isfinite(eval_outcome_weights).all():
+             raise ValueError("train_sequence_model received non-finite eval_outcome_weights")
++        if eval_group_ids is None:
++            eval_group_ids = np.zeros(len(y_eval), dtype=np.int64)
++        if len(eval_group_ids) != len(y_eval):
++            raise ValueError("eval_group_ids length must match y_eval length")
+     torch.manual_seed(int(random_seed))
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     model.to(device)
+@@ -271,12 +295,14 @@ def train_sequence_model(
+     readout_train_t = torch.tensor(train_readout_index, dtype=torch.long)
+     outcome_target_train_t = torch.tensor(train_outcome_targets, dtype=torch.long)
+     outcome_weight_train_t = torch.tensor(train_outcome_weights, dtype=torch.float32)
++    group_id_train_t = torch.tensor(train_group_ids, dtype=torch.long)
+     x_train_device = x_train_t.to(device)
+     y_train_device = y_train_t.to(device)
+     w_train_device = w_train_t.to(device)
+     readout_train_device = readout_train_t.to(device)
+     outcome_target_train_device = outcome_target_train_t.to(device)
+     outcome_weight_train_device = outcome_weight_train_t.to(device)
++    group_id_train_device = group_id_train_t.to(device)
+     idx_train_t = torch.arange(len(y_train), dtype=torch.long)
+     train_ds = TensorDataset(
+         x_train_t,
+@@ -285,6 +311,7 @@ def train_sequence_model(
+         readout_train_t,
+         outcome_target_train_t,
+         outcome_weight_train_t,
++        group_id_train_t,
+         idx_train_t,
+     )
+     episode_batches = _build_episode_index_batches(
+@@ -297,7 +324,7 @@ def train_sequence_model(
+         lr=float(learning_rate),
+         weight_decay=float(weight_decay),
+     )
+-    eval_data: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
++    eval_data: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
+     monitor_name = "train_loss_fallback"
+     if (
+         x_eval is not None
+@@ -316,12 +343,15 @@ def train_sequence_model(
+             torch.tensor(eval_readout_index, dtype=torch.long, device=device),
+             torch.tensor(eval_outcome_targets, dtype=torch.long, device=device),
+             torch.tensor(eval_outcome_weights, dtype=torch.float32, device=device),
++            torch.tensor(eval_group_ids, dtype=torch.long, device=device),
+         )
+         monitor_name = "eval_loss"
+     best_loss = float("inf")
+     best_choice_loss = 0.0
+     best_ranking_loss = 0.0
+     best_outcome_loss = 0.0
++    worst_group_bce_best = 0.0
++    best_group_bce_best = 0.0
+     final_choice_loss = 0.0
+     final_ranking_loss = 0.0
+     final_outcome_loss = 0.0
+@@ -346,6 +376,7 @@ def train_sequence_model(
+                 batch_readout,
+                 batch_outcome_targets,
+                 batch_outcome_weights,
++                batch_group_ids,
+                 batch_idx,
+             ) = _slice_batch(train_ds, batch_indices)
+             batch_x = batch_x.to(device)
+@@ -354,9 +385,16 @@ def train_sequence_model(
+             batch_readout = batch_readout.to(device)
+             batch_outcome_targets = batch_outcome_targets.to(device)
+             batch_outcome_weights = batch_outcome_weights.to(device)
++            batch_group_ids = batch_group_ids.to(device)
+             optimizer.zero_grad(set_to_none=True)
+             entry_logits, outcome_logits = model(batch_x, batch_readout)
+-            classification_loss = _weighted_bce_loss(entry_logits, batch_y, batch_w)
++            classification_loss, _, _ = _group_dro_main_bce_loss(
++                logits=entry_logits,
++                targets=batch_y,
++                sample_weight=batch_w,
++                group_ids=batch_group_ids,
++                group_dro_lambda=group_dro_lambda,
++            )
+             if not torch.isfinite(classification_loss):
+                 raise ValueError(
+                     f"non-finite train classification loss detected: loss={float(classification_loss.item())}"
+@@ -413,15 +451,29 @@ def train_sequence_model(
+                     sample_weight=outcome_weight_train_device,
+                 ).item()
+             )
++            train_group_dro_main, train_worst_group, train_best_group = _group_dro_main_bce_loss(
++                logits=train_entry_logits,
++                targets=y_train_device,
++                sample_weight=w_train_device,
++                group_ids=group_id_train_device,
++                group_dro_lambda=group_dro_lambda,
++            )
+             train_loss_monitor = float(
+-                train_choice_monitor
++                float(train_group_dro_main.item())
+                 + ranking_lambda * train_ranking_monitor
+                 + outcome_aux_lambda * train_outcome_monitor
+             )
+             if eval_data is not None:
+                 eval_entry_logits, eval_outcome_logits = model(eval_data[0], eval_data[3])
++                eval_group_dro_main, eval_worst_group_t, eval_best_group_t = _group_dro_main_bce_loss(
++                    logits=eval_entry_logits,
++                    targets=eval_data[1],
++                    sample_weight=eval_data[2],
++                    group_ids=eval_data[6],
++                    group_dro_lambda=group_dro_lambda,
++                )
+                 eval_choice_loss = float(
+-                    _weighted_bce_loss(eval_entry_logits, eval_data[1], eval_data[2]).item()
++                    eval_group_dro_main.item()
+                 )
+                 eval_ranking_loss = float(
+                     _pairwise_ranking_loss(
+@@ -435,10 +487,14 @@ def train_sequence_model(
+                         sample_weight=eval_data[5],
+                     ).item()
+                 )
++                eval_worst_group = float(eval_worst_group_t.item())
++                eval_best_group = float(eval_best_group_t.item())
+             else:
+                 eval_choice_loss = float(train_choice_monitor)
+                 eval_ranking_loss = float(train_ranking_monitor)
+                 eval_outcome_loss = float(train_outcome_monitor)
++                eval_worst_group = float(train_worst_group.item())
++                eval_best_group = float(train_best_group.item())
+             eval_loss = float(
+                 eval_choice_loss
+                 + ranking_lambda * eval_ranking_loss
+@@ -453,6 +509,8 @@ def train_sequence_model(
+             best_choice_loss = float(eval_choice_loss)
+             best_ranking_loss = float(eval_ranking_loss)
+             best_outcome_loss = float(eval_outcome_loss)
++            worst_group_bce_best = float(eval_worst_group)
++            best_group_bce_best = float(eval_best_group)
+             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+             patience_left = int(early_stopping_patience)
+             is_best_epoch = True
+@@ -475,6 +533,10 @@ def train_sequence_model(
+                         "eval_choice_loss": float(eval_choice_loss),
+                         "eval_ranking_loss": float(eval_ranking_loss),
+                         "eval_outcome_loss": float(eval_outcome_loss),
++                        "train_worst_group_bce": float(train_worst_group.item()),
++                        "train_best_group_bce": float(train_best_group.item()),
++                        "eval_worst_group_bce": float(eval_worst_group),
++                        "eval_best_group_bce": float(eval_best_group),
+                         "is_best_epoch": int(is_best_epoch),
+                     }
+                 )
+@@ -494,6 +556,10 @@ def train_sequence_model(
+                 "eval_choice_loss": float(eval_choice_loss),
+                 "eval_ranking_loss": float(eval_ranking_loss),
+                 "eval_outcome_loss": float(eval_outcome_loss),
++                "train_worst_group_bce": float(train_worst_group.item()),
++                "train_best_group_bce": float(train_best_group.item()),
++                "eval_worst_group_bce": float(eval_worst_group),
++                "eval_best_group_bce": float(eval_best_group),
+                 "is_best_epoch": int(is_best_epoch),
+             }
+         )
+@@ -520,6 +586,11 @@ def train_sequence_model(
+         best_choice_loss=float(best_choice_loss),
+         best_ranking_loss=float(best_ranking_loss),
+         best_outcome_loss=float(best_outcome_loss),
++        worst_group_bce=float(worst_group_bce_best),
++        best_group_bce=float(best_group_bce_best),
++        train_group_counts=_group_counts_summary(train_group_ids),
++        eval_group_counts=_group_counts_summary(eval_group_ids if eval_group_ids is not None else np.zeros(0, dtype=np.int64)),
++        group_imbalance_summary=_group_imbalance_summary(train_group_ids),
+         final_choice_loss=float(final_choice_loss),
+         final_ranking_loss=float(final_ranking_loss),
+         final_outcome_loss=float(final_outcome_loss),
+@@ -588,6 +659,37 @@ def _weighted_bce_loss(logits: Tensor, targets: Tensor, sample_weight: Tensor) -
+     return torch.sum(per_row_loss * weights) / denom
+ 
+ 
++def _group_dro_main_bce_loss(
++    logits: Tensor,
++    targets: Tensor,
++    sample_weight: Tensor,
++    group_ids: Tensor,
++    group_dro_lambda: float,
++) -> tuple[Tensor, Tensor, Tensor]:
++    per_row_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
++    weights = torch.clamp(sample_weight, min=0.0)
++    erm_main = _weighted_bce_loss(logits, targets, weights)
++    unique_groups = torch.unique(group_ids)
++    group_losses: list[Tensor] = []
++    for g in unique_groups:
++        g_mask = group_ids == g
++        gw = weights[g_mask]
++        if int(gw.numel()) == 0:
++            continue
++        g_denom = torch.sum(gw)
++        if float(g_denom.item()) <= 0.0:
++            continue
++        g_loss = torch.sum(per_row_loss[g_mask] * gw) / g_denom
++        group_losses.append(g_loss)
++    if not group_losses:
++        return erm_main, erm_main.detach(), erm_main.detach()
++    group_tensor = torch.stack(group_losses)
++    worst_group = torch.max(group_tensor)
++    best_group = torch.min(group_tensor)
++    mixed = (1.0 - float(group_dro_lambda)) * erm_main + float(group_dro_lambda) * worst_group
++    return mixed, worst_group.detach(), best_group.detach()
++
++
+ def _pairwise_ranking_loss(
+     logits: Tensor, ranking_pairs: dict[str, np.ndarray], device: torch.device
+ ) -> Tensor:
+@@ -733,7 +835,7 @@ def _slice_batch(
+     dataset: TensorDataset, batch_indices: np.ndarray
+ ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+     idx = torch.tensor(batch_indices, dtype=torch.long)
+-    x_all, y_all, w_all, readout_all, outcome_target_all, outcome_weight_all, i_all = dataset.tensors
++    x_all, y_all, w_all, readout_all, outcome_target_all, outcome_weight_all, group_id_all, i_all = dataset.tensors
+     return (
+         x_all.index_select(0, idx),
+         y_all.index_select(0, idx),
+@@ -741,10 +843,33 @@ def _slice_batch(
+         readout_all.index_select(0, idx),
+         outcome_target_all.index_select(0, idx),
+         outcome_weight_all.index_select(0, idx),
++        group_id_all.index_select(0, idx),
+         i_all.index_select(0, idx),
+     )
+ 
+ 
++def _group_counts_summary(group_ids: np.ndarray) -> str:
++    if group_ids.size == 0:
++        return "g0=0,g1=0,g2=0,g3=0"
++    arr = np.asarray(group_ids, dtype=np.int64)
++    counts = [int(np.sum(arr == i)) for i in (0, 1, 2, 3)]
++    return f"g0={counts[0]},g1={counts[1]},g2={counts[2]},g3={counts[3]}"
++
++
++def _group_imbalance_summary(group_ids: np.ndarray) -> str:
++    if group_ids.size == 0:
++        return "min=0,max=0,ratio=0.0000"
++    arr = np.asarray(group_ids, dtype=np.int64)
++    counts = np.asarray([int(np.sum(arr == i)) for i in (0, 1, 2, 3)], dtype=np.int64)
++    non_zero = counts[counts > 0]
++    if non_zero.size == 0:
++        return "min=0,max=0,ratio=0.0000"
++    min_count = int(non_zero.min())
++    max_count = int(non_zero.max())
++    ratio = float(min_count) / float(max(max_count, 1))
++    return f"min={min_count},max={max_count},ratio={ratio:.4f}"
++
++
+ def predict_sequence_model_outputs(
+     model: SequenceTCNBinaryClassifier, x: np.ndarray, readout_index: np.ndarray
+ ) -> dict[str, np.ndarray]:

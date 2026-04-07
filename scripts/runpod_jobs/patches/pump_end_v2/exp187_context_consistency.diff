@@ -1,0 +1,400 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..b2a3ec5 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -69,6 +69,10 @@ class DetectorModelConfig:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    consistency_lambda: float
++    consistency_noise_std: float
++    consistency_mask_prob: float
++    consistency_mode: str
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -658,6 +662,33 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+         main_target_mode=_parse_detector_main_target_mode(
+             model_section.get("main_target_mode", "tp_vs_non_tp")
+         ),
++        consistency_lambda=_require_bounded_float(
++            model_section.get("consistency_lambda", 0.0),
++            "detector.model.consistency_lambda",
++            lower=0.0,
++            upper=1.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        consistency_noise_std=_require_bounded_float(
++            model_section.get("consistency_noise_std", 0.0),
++            "detector.model.consistency_noise_std",
++            lower=0.0,
++            upper=0.25,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        consistency_mask_prob=_require_bounded_float(
++            model_section.get("consistency_mask_prob", 0.0),
++            "detector.model.consistency_mask_prob",
++            lower=0.0,
++            upper=0.5,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        consistency_mode=_parse_consistency_mode(
++            model_section.get("consistency_mode", "none")
++        ),
+     )
+ 
+ 
+@@ -670,6 +701,13 @@ def _parse_detector_main_target_mode(value: Any) -> str:
+     )
+ 
+ 
++def _parse_consistency_mode(value: Any) -> str:
++    mode = str(value).strip().lower()
++    if mode in {"none", "gaussian_context"}:
++        return mode
++    raise ValueError("detector.model.consistency_mode must be one of: none, gaussian_context")
++
++
+ def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+     if not isinstance(value, list):
+         raise ValueError(f"{field_name} must be a list")
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index e0fd64d..dcd7d02 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -47,6 +47,10 @@ class SequenceDetector:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    consistency_lambda: float
++    consistency_noise_std: float
++    consistency_mask_prob: float
++    consistency_mode: str
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -110,6 +114,10 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+         main_target_mode=str(model_config.main_target_mode),
++        consistency_lambda=float(model_config.consistency_lambda),
++        consistency_noise_std=float(model_config.consistency_noise_std),
++        consistency_mask_prob=float(model_config.consistency_mask_prob),
++        consistency_mode=str(model_config.consistency_mode),
+     )
+ 
+ 
+@@ -271,6 +279,10 @@ def fit_detector_model(
+         ranking_pairs_train=ranking_pairs_train,
+         ranking_pairs_eval=ranking_pairs_eval,
+         ranking_lambda=float(model.ranking_lambda),
++        consistency_lambda=float(model.consistency_lambda),
++        consistency_noise_std=float(model.consistency_noise_std),
++        consistency_mask_prob=float(model.consistency_mask_prob),
++        consistency_mode=str(model.consistency_mode),
+         hard_negative_rows_train_total=hard_negative_train_total,
+         hard_negative_rows_eval_total=hard_negative_eval_total,
+     )
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index 3a57778..ecda07b 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -136,9 +136,11 @@ class SequenceTrainStats:
+     best_choice_loss: float
+     best_ranking_loss: float
+     best_outcome_loss: float
++    best_consistency_loss: float
+     final_choice_loss: float
+     final_ranking_loss: float
+     final_outcome_loss: float
++    final_consistency_loss: float
+     outcome_aux_lambda: float
+     skip_bias: float
+     ranking_pairs_train_total: int
+@@ -167,9 +169,11 @@ class SequenceTrainStats:
+             "best_choice_loss": float(self.best_choice_loss),
+             "best_ranking_loss": float(self.best_ranking_loss),
+             "best_outcome_loss": float(self.best_outcome_loss),
++            "best_consistency_loss": float(self.best_consistency_loss),
+             "final_choice_loss": float(self.final_choice_loss),
+             "final_ranking_loss": float(self.final_ranking_loss),
+             "final_outcome_loss": float(self.final_outcome_loss),
++            "final_consistency_loss": float(self.final_consistency_loss),
+             "outcome_aux_lambda": float(self.outcome_aux_lambda),
+             "skip_bias": float(self.skip_bias),
+             "best_classification_loss": float(self.best_choice_loss),
+@@ -216,6 +220,10 @@ def train_sequence_model(
+     ranking_pairs_train: dict[str, np.ndarray] | None = None,
+     ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+     ranking_lambda: float = 0.5,
++    consistency_lambda: float = 0.0,
++    consistency_noise_std: float = 0.0,
++    consistency_mask_prob: float = 0.0,
++    consistency_mode: str = "none",
+     hard_negative_rows_train_total: int = 0,
+     hard_negative_rows_eval_total: int = 0,
+ ) -> SequenceTrainStats:
+@@ -243,6 +251,18 @@ def train_sequence_model(
+     outcome_aux_lambda = float(outcome_aux_lambda)
+     if outcome_aux_lambda < 0.0:
+         raise ValueError("outcome_aux_lambda must be non-negative")
++    consistency_lambda = float(consistency_lambda)
++    if consistency_lambda < 0.0 or consistency_lambda > 1.0:
++        raise ValueError("consistency_lambda must satisfy 0 <= x <= 1")
++    consistency_noise_std = float(consistency_noise_std)
++    if consistency_noise_std < 0.0 or consistency_noise_std > 0.25:
++        raise ValueError("consistency_noise_std must satisfy 0 <= x <= 0.25")
++    consistency_mask_prob = float(consistency_mask_prob)
++    if consistency_mask_prob < 0.0 or consistency_mask_prob > 0.5:
++        raise ValueError("consistency_mask_prob must satisfy 0 <= x <= 0.5")
++    consistency_mode = str(consistency_mode).strip().lower()
++    if consistency_mode not in {"none", "gaussian_context"}:
++        raise ValueError("consistency_mode must be one of: none, gaussian_context")
+     ranking_pairs_train = _normalize_ranking_pairs(ranking_pairs_train, "ranking_pairs_train")
+     ranking_pairs_eval = _normalize_ranking_pairs(ranking_pairs_eval, "ranking_pairs_eval")
+     if train_outcome_targets is None:
+@@ -322,9 +342,11 @@ def train_sequence_model(
+     best_choice_loss = 0.0
+     best_ranking_loss = 0.0
+     best_outcome_loss = 0.0
++    best_consistency_loss = 0.0
+     final_choice_loss = 0.0
+     final_ranking_loss = 0.0
+     final_outcome_loss = 0.0
++    final_consistency_loss = 0.0
+     best_epoch = 0
+     best_state: dict[str, Tensor] | None = None
+     patience_left = int(early_stopping_patience)
+@@ -337,6 +359,7 @@ def train_sequence_model(
+         train_choice_sum = 0.0
+         train_ranking_sum = 0.0
+         train_outcome_sum = 0.0
++        train_consistency_sum = 0.0
+         train_count = 0
+         for batch_indices in episode_batches:
+             (
+@@ -372,10 +395,22 @@ def train_sequence_model(
+                 targets=batch_outcome_targets,
+                 sample_weight=batch_outcome_weights,
+             )
++            consistency_loss_batch = _consistency_loss(
++                model=model,
++                batch_x=batch_x,
++                batch_readout=batch_readout,
++                sample_weight=batch_w,
++                clean_entry_logits=entry_logits,
++                clean_outcome_logits=outcome_logits,
++                consistency_mode=consistency_mode,
++                consistency_noise_std=consistency_noise_std,
++                consistency_mask_prob=consistency_mask_prob,
++            )
+             total_loss_batch = (
+                 classification_loss
+                 + ranking_lambda * ranking_loss_batch
+                 + outcome_aux_lambda * outcome_loss
++                + consistency_lambda * consistency_loss_batch
+             )
+             if not torch.isfinite(total_loss_batch):
+                 raise ValueError(
+@@ -388,10 +423,12 @@ def train_sequence_model(
+             train_choice_sum += float(classification_loss.item()) * float(batch_size_local)
+             train_ranking_sum += float(ranking_loss_batch.item()) * float(batch_size_local)
+             train_outcome_sum += float(outcome_loss.item()) * float(batch_size_local)
++            train_consistency_sum += float(consistency_loss_batch.item()) * float(batch_size_local)
+             train_count += batch_size_local
+         train_choice_epoch = float(train_choice_sum / float(max(train_count, 1)))
+         train_ranking_epoch = float(train_ranking_sum / float(max(train_count, 1)))
+         train_outcome_epoch = float(train_outcome_sum / float(max(train_count, 1)))
++        train_consistency_epoch = float(train_consistency_sum / float(max(train_count, 1)))
+         train_loss_epoch = float(train_loss_sum / float(max(train_count, 1)))
+         model.eval()
+         with torch.no_grad():
+@@ -413,10 +450,24 @@ def train_sequence_model(
+                     sample_weight=outcome_weight_train_device,
+                 ).item()
+             )
++            train_consistency_monitor = float(
++                _consistency_loss(
++                    model=model,
++                    batch_x=x_train_device,
++                    batch_readout=readout_train_device,
++                    sample_weight=w_train_device,
++                    clean_entry_logits=train_entry_logits,
++                    clean_outcome_logits=train_outcome_logits,
++                    consistency_mode=consistency_mode,
++                    consistency_noise_std=consistency_noise_std,
++                    consistency_mask_prob=consistency_mask_prob,
++                ).item()
++            )
+             train_loss_monitor = float(
+                 train_choice_monitor
+                 + ranking_lambda * train_ranking_monitor
+                 + outcome_aux_lambda * train_outcome_monitor
++                + consistency_lambda * train_consistency_monitor
+             )
+             if eval_data is not None:
+                 eval_entry_logits, eval_outcome_logits = model(eval_data[0], eval_data[3])
+@@ -435,14 +486,29 @@ def train_sequence_model(
+                         sample_weight=eval_data[5],
+                     ).item()
+                 )
++                eval_consistency_loss = float(
++                    _consistency_loss(
++                        model=model,
++                        batch_x=eval_data[0],
++                        batch_readout=eval_data[3],
++                        sample_weight=eval_data[2],
++                        clean_entry_logits=eval_entry_logits,
++                        clean_outcome_logits=eval_outcome_logits,
++                        consistency_mode=consistency_mode,
++                        consistency_noise_std=consistency_noise_std,
++                        consistency_mask_prob=consistency_mask_prob,
++                    ).item()
++                )
+             else:
+                 eval_choice_loss = float(train_choice_monitor)
+                 eval_ranking_loss = float(train_ranking_monitor)
+                 eval_outcome_loss = float(train_outcome_monitor)
++                eval_consistency_loss = float(train_consistency_monitor)
+             eval_loss = float(
+                 eval_choice_loss
+                 + ranking_lambda * eval_ranking_loss
+                 + outcome_aux_lambda * eval_outcome_loss
++                + consistency_lambda * eval_consistency_loss
+             )
+         if not np.isfinite(eval_loss):
+             raise ValueError(f"non-finite eval total loss detected: eval_loss={eval_loss}")
+@@ -453,6 +519,7 @@ def train_sequence_model(
+             best_choice_loss = float(eval_choice_loss)
+             best_ranking_loss = float(eval_ranking_loss)
+             best_outcome_loss = float(eval_outcome_loss)
++            best_consistency_loss = float(eval_consistency_loss)
+             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+             patience_left = int(early_stopping_patience)
+             is_best_epoch = True
+@@ -464,6 +531,7 @@ def train_sequence_model(
+                 final_choice_loss = float(eval_choice_loss)
+                 final_ranking_loss = float(eval_ranking_loss)
+                 final_outcome_loss = float(eval_outcome_loss)
++                final_consistency_loss = float(eval_consistency_loss)
+                 training_history.append(
+                     {
+                         "epoch": int(epoch),
+@@ -472,9 +540,11 @@ def train_sequence_model(
+                         "train_choice_loss": float(train_choice_epoch),
+                         "train_ranking_loss": float(train_ranking_epoch),
+                         "train_outcome_loss": float(train_outcome_epoch),
++                        "train_consistency_loss": float(train_consistency_epoch),
+                         "eval_choice_loss": float(eval_choice_loss),
+                         "eval_ranking_loss": float(eval_ranking_loss),
+                         "eval_outcome_loss": float(eval_outcome_loss),
++                        "eval_consistency_loss": float(eval_consistency_loss),
+                         "is_best_epoch": int(is_best_epoch),
+                     }
+                 )
+@@ -483,6 +553,7 @@ def train_sequence_model(
+         final_choice_loss = float(eval_choice_loss)
+         final_ranking_loss = float(eval_ranking_loss)
+         final_outcome_loss = float(eval_outcome_loss)
++        final_consistency_loss = float(eval_consistency_loss)
+         training_history.append(
+             {
+                 "epoch": int(epoch),
+@@ -491,9 +562,11 @@ def train_sequence_model(
+                 "train_choice_loss": float(train_choice_epoch),
+                 "train_ranking_loss": float(train_ranking_epoch),
+                 "train_outcome_loss": float(train_outcome_epoch),
++                "train_consistency_loss": float(train_consistency_epoch),
+                 "eval_choice_loss": float(eval_choice_loss),
+                 "eval_ranking_loss": float(eval_ranking_loss),
+                 "eval_outcome_loss": float(eval_outcome_loss),
++                "eval_consistency_loss": float(eval_consistency_loss),
+                 "is_best_epoch": int(is_best_epoch),
+             }
+         )
+@@ -520,9 +593,11 @@ def train_sequence_model(
+         best_choice_loss=float(best_choice_loss),
+         best_ranking_loss=float(best_ranking_loss),
+         best_outcome_loss=float(best_outcome_loss),
++        best_consistency_loss=float(best_consistency_loss),
+         final_choice_loss=float(final_choice_loss),
+         final_ranking_loss=float(final_ranking_loss),
+         final_outcome_loss=float(final_outcome_loss),
++        final_consistency_loss=float(final_consistency_loss),
+         outcome_aux_lambda=float(outcome_aux_lambda),
+         skip_bias=float(model.skip_bias.detach().cpu().item()),
+         ranking_pairs_train_total=int(len(ranking_pairs_train["pair_weight"])),
+@@ -626,6 +701,70 @@ def _weighted_outcome_ce_loss(
+     return torch.sum(per_row_loss * weights) / denom
+ 
+ 
++def _consistency_loss(
++    model: SequenceTCNBinaryClassifier,
++    batch_x: Tensor,
++    batch_readout: Tensor,
++    sample_weight: Tensor,
++    clean_entry_logits: Tensor,
++    clean_outcome_logits: Tensor,
++    consistency_mode: str,
++    consistency_noise_std: float,
++    consistency_mask_prob: float,
++) -> Tensor:
++    mode = str(consistency_mode).strip().lower()
++    if mode == "none":
++        return clean_entry_logits.new_tensor(0.0)
++    if mode != "gaussian_context":
++        return clean_entry_logits.new_tensor(0.0)
++    aug_x = _augment_context_view(
++        x=batch_x,
++        readout_index=batch_readout,
++        noise_std=float(consistency_noise_std),
++        mask_prob=float(consistency_mask_prob),
++    )
++    aug_entry_logits, aug_outcome_logits = model(aug_x, batch_readout)
++    active = torch.clamp(sample_weight, min=0.0) > 0
++    if not bool(active.any().item()):
++        return clean_entry_logits.new_tensor(0.0)
++    mse = F.mse_loss(aug_entry_logits[active], clean_entry_logits[active], reduction="mean")
++    clean_probs = torch.softmax(clean_outcome_logits[active], dim=1).clamp_min(1e-12)
++    aug_log_probs = torch.log_softmax(aug_outcome_logits[active], dim=1)
++    kl = F.kl_div(aug_log_probs, clean_probs, reduction="batchmean", log_target=False)
++    return mse + 0.5 * kl
++
++
++def _augment_context_view(
++    x: Tensor,
++    readout_index: Tensor,
++    noise_std: float,
++    mask_prob: float,
++) -> Tensor:
++    aug = x.clone()
++    if aug.ndim != 3 or int(aug.shape[2]) < 3:
++        return aug
++    feature_count = int(aug.shape[2]) - 2
++    valid_mask = aug[:, :, feature_count] > 0.5
++    in_episode_mask = aug[:, :, feature_count + 1] > 0.5
++    step_idx = torch.arange(int(aug.shape[1]), device=aug.device).unsqueeze(0)
++    readout = torch.clamp(
++        readout_index.to(device=aug.device, dtype=torch.long),
++        min=0,
++        max=max(int(aug.shape[1]) - 1, 0),
++    ).unsqueeze(1)
++    not_readout = step_idx != readout
++    pre_context = ~in_episode_mask
++    perturb_mask = valid_mask & not_readout & pre_context
++    if noise_std > 0.0:
++        noise = torch.randn_like(aug[:, :, :feature_count]) * float(noise_std)
++        aug[:, :, :feature_count] = aug[:, :, :feature_count] + noise * perturb_mask.unsqueeze(-1).to(dtype=aug.dtype)
++    if mask_prob > 0.0:
++        drop = (torch.rand_like(aug[:, :, :feature_count]) < float(mask_prob)).to(dtype=aug.dtype)
++        keep = 1.0 - drop * perturb_mask.unsqueeze(-1).to(dtype=aug.dtype)
++        aug[:, :, :feature_count] = aug[:, :, :feature_count] * keep
++    return aug
++
++
+ def _normalize_ranking_pairs(
+     ranking_pairs: dict[str, np.ndarray] | None, name: str
+ ) -> dict[str, np.ndarray]:

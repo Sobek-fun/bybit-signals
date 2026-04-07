@@ -1,0 +1,296 @@
+diff --git a/pump_end_v2/config.py b/pump_end_v2/config.py
+index c27a294..43c6f46 100644
+--- a/pump_end_v2/config.py
++++ b/pump_end_v2/config.py
+@@ -69,6 +69,8 @@ class DetectorModelConfig:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    ap_aux_lambda: float
++    ap_temperature: float
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -658,6 +660,22 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
+         main_target_mode=_parse_detector_main_target_mode(
+             model_section.get("main_target_mode", "tp_vs_non_tp")
+         ),
++        ap_aux_lambda=_require_bounded_float(
++            model_section.get("ap_aux_lambda", 0.0),
++            "detector.model.ap_aux_lambda",
++            lower=0.0,
++            upper=1.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
++        ap_temperature=_require_bounded_float(
++            model_section.get("ap_temperature", 0.1),
++            "detector.model.ap_temperature",
++            lower=0.005,
++            upper=1.0,
++            inclusive_lower=True,
++            inclusive_upper=True,
++        ),
+     )
+ 
+ 
+diff --git a/pump_end_v2/detector/model.py b/pump_end_v2/detector/model.py
+index e0fd64d..459c214 100644
+--- a/pump_end_v2/detector/model.py
++++ b/pump_end_v2/detector/model.py
+@@ -47,6 +47,8 @@ class SequenceDetector:
+     timeout_pair_weight: float
+     outcome_aux_lambda: float
+     main_target_mode: str
++    ap_aux_lambda: float
++    ap_temperature: float
+     scaler_mean: np.ndarray | None = None
+     scaler_std: np.ndarray | None = None
+     sequence_store: DetectorSequenceStore | None = None
+@@ -110,6 +112,8 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
+         timeout_pair_weight=float(model_config.timeout_pair_weight),
+         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+         main_target_mode=str(model_config.main_target_mode),
++        ap_aux_lambda=float(model_config.ap_aux_lambda),
++        ap_temperature=float(model_config.ap_temperature),
+     )
+ 
+ 
+@@ -271,6 +275,8 @@ def fit_detector_model(
+         ranking_pairs_train=ranking_pairs_train,
+         ranking_pairs_eval=ranking_pairs_eval,
+         ranking_lambda=float(model.ranking_lambda),
++        ap_aux_lambda=float(model.ap_aux_lambda),
++        ap_temperature=float(model.ap_temperature),
+         hard_negative_rows_train_total=hard_negative_train_total,
+         hard_negative_rows_eval_total=hard_negative_eval_total,
+     )
+diff --git a/pump_end_v2/detector/sequence_model.py b/pump_end_v2/detector/sequence_model.py
+index 3a57778..1a853fd 100644
+--- a/pump_end_v2/detector/sequence_model.py
++++ b/pump_end_v2/detector/sequence_model.py
+@@ -136,9 +136,11 @@ class SequenceTrainStats:
+     best_choice_loss: float
+     best_ranking_loss: float
+     best_outcome_loss: float
++    best_ap_loss: float
+     final_choice_loss: float
+     final_ranking_loss: float
+     final_outcome_loss: float
++    final_ap_loss: float
+     outcome_aux_lambda: float
+     skip_bias: float
+     ranking_pairs_train_total: int
+@@ -167,9 +169,11 @@ class SequenceTrainStats:
+             "best_choice_loss": float(self.best_choice_loss),
+             "best_ranking_loss": float(self.best_ranking_loss),
+             "best_outcome_loss": float(self.best_outcome_loss),
++            "best_ap_loss": float(self.best_ap_loss),
+             "final_choice_loss": float(self.final_choice_loss),
+             "final_ranking_loss": float(self.final_ranking_loss),
+             "final_outcome_loss": float(self.final_outcome_loss),
++            "final_ap_loss": float(self.final_ap_loss),
+             "outcome_aux_lambda": float(self.outcome_aux_lambda),
+             "skip_bias": float(self.skip_bias),
+             "best_classification_loss": float(self.best_choice_loss),
+@@ -216,6 +220,8 @@ def train_sequence_model(
+     ranking_pairs_train: dict[str, np.ndarray] | None = None,
+     ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+     ranking_lambda: float = 0.5,
++    ap_aux_lambda: float = 0.0,
++    ap_temperature: float = 0.1,
+     hard_negative_rows_train_total: int = 0,
+     hard_negative_rows_eval_total: int = 0,
+ ) -> SequenceTrainStats:
+@@ -243,6 +249,12 @@ def train_sequence_model(
+     outcome_aux_lambda = float(outcome_aux_lambda)
+     if outcome_aux_lambda < 0.0:
+         raise ValueError("outcome_aux_lambda must be non-negative")
++    ap_aux_lambda = float(ap_aux_lambda)
++    if ap_aux_lambda < 0.0 or ap_aux_lambda > 1.0:
++        raise ValueError("ap_aux_lambda must satisfy 0 <= x <= 1")
++    ap_temperature = float(ap_temperature)
++    if ap_temperature < 0.005 or ap_temperature > 1.0:
++        raise ValueError("ap_temperature must satisfy 0.005 <= x <= 1.0")
+     ranking_pairs_train = _normalize_ranking_pairs(ranking_pairs_train, "ranking_pairs_train")
+     ranking_pairs_eval = _normalize_ranking_pairs(ranking_pairs_eval, "ranking_pairs_eval")
+     if train_outcome_targets is None:
+@@ -322,9 +334,11 @@ def train_sequence_model(
+     best_choice_loss = 0.0
+     best_ranking_loss = 0.0
+     best_outcome_loss = 0.0
++    best_ap_loss = 0.0
+     final_choice_loss = 0.0
+     final_ranking_loss = 0.0
+     final_outcome_loss = 0.0
++    final_ap_loss = 0.0
+     best_epoch = 0
+     best_state: dict[str, Tensor] | None = None
+     patience_left = int(early_stopping_patience)
+@@ -337,6 +351,7 @@ def train_sequence_model(
+         train_choice_sum = 0.0
+         train_ranking_sum = 0.0
+         train_outcome_sum = 0.0
++        train_ap_sum = 0.0
+         train_count = 0
+         for batch_indices in episode_batches:
+             (
+@@ -372,10 +387,16 @@ def train_sequence_model(
+                 targets=batch_outcome_targets,
+                 sample_weight=batch_outcome_weights,
+             )
++            ap_loss_batch = _smooth_ap_loss(
++                scores=entry_logits,
++                outcome_targets=batch_outcome_targets,
++                tau=ap_temperature,
++            )
+             total_loss_batch = (
+                 classification_loss
+                 + ranking_lambda * ranking_loss_batch
+                 + outcome_aux_lambda * outcome_loss
++                + ap_aux_lambda * ap_loss_batch
+             )
+             if not torch.isfinite(total_loss_batch):
+                 raise ValueError(
+@@ -388,10 +409,12 @@ def train_sequence_model(
+             train_choice_sum += float(classification_loss.item()) * float(batch_size_local)
+             train_ranking_sum += float(ranking_loss_batch.item()) * float(batch_size_local)
+             train_outcome_sum += float(outcome_loss.item()) * float(batch_size_local)
++            train_ap_sum += float(ap_loss_batch.item()) * float(batch_size_local)
+             train_count += batch_size_local
+         train_choice_epoch = float(train_choice_sum / float(max(train_count, 1)))
+         train_ranking_epoch = float(train_ranking_sum / float(max(train_count, 1)))
+         train_outcome_epoch = float(train_outcome_sum / float(max(train_count, 1)))
++        train_ap_epoch = float(train_ap_sum / float(max(train_count, 1)))
+         train_loss_epoch = float(train_loss_sum / float(max(train_count, 1)))
+         model.eval()
+         with torch.no_grad():
+@@ -413,10 +436,18 @@ def train_sequence_model(
+                     sample_weight=outcome_weight_train_device,
+                 ).item()
+             )
++            train_ap_monitor = float(
++                _smooth_ap_loss(
++                    scores=train_entry_logits,
++                    outcome_targets=outcome_target_train_device,
++                    tau=ap_temperature,
++                ).item()
++            )
+             train_loss_monitor = float(
+                 train_choice_monitor
+                 + ranking_lambda * train_ranking_monitor
+                 + outcome_aux_lambda * train_outcome_monitor
++                + ap_aux_lambda * train_ap_monitor
+             )
+             if eval_data is not None:
+                 eval_entry_logits, eval_outcome_logits = model(eval_data[0], eval_data[3])
+@@ -435,14 +466,23 @@ def train_sequence_model(
+                         sample_weight=eval_data[5],
+                     ).item()
+                 )
++                eval_ap_loss = float(
++                    _smooth_ap_loss(
++                        scores=eval_entry_logits,
++                        outcome_targets=eval_data[4],
++                        tau=ap_temperature,
++                    ).item()
++                )
+             else:
+                 eval_choice_loss = float(train_choice_monitor)
+                 eval_ranking_loss = float(train_ranking_monitor)
+                 eval_outcome_loss = float(train_outcome_monitor)
++                eval_ap_loss = float(train_ap_monitor)
+             eval_loss = float(
+                 eval_choice_loss
+                 + ranking_lambda * eval_ranking_loss
+                 + outcome_aux_lambda * eval_outcome_loss
++                + ap_aux_lambda * eval_ap_loss
+             )
+         if not np.isfinite(eval_loss):
+             raise ValueError(f"non-finite eval total loss detected: eval_loss={eval_loss}")
+@@ -453,6 +493,7 @@ def train_sequence_model(
+             best_choice_loss = float(eval_choice_loss)
+             best_ranking_loss = float(eval_ranking_loss)
+             best_outcome_loss = float(eval_outcome_loss)
++            best_ap_loss = float(eval_ap_loss)
+             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+             patience_left = int(early_stopping_patience)
+             is_best_epoch = True
+@@ -464,6 +505,7 @@ def train_sequence_model(
+                 final_choice_loss = float(eval_choice_loss)
+                 final_ranking_loss = float(eval_ranking_loss)
+                 final_outcome_loss = float(eval_outcome_loss)
++                final_ap_loss = float(eval_ap_loss)
+                 training_history.append(
+                     {
+                         "epoch": int(epoch),
+@@ -472,9 +514,11 @@ def train_sequence_model(
+                         "train_choice_loss": float(train_choice_epoch),
+                         "train_ranking_loss": float(train_ranking_epoch),
+                         "train_outcome_loss": float(train_outcome_epoch),
++                        "train_ap_loss": float(train_ap_epoch),
+                         "eval_choice_loss": float(eval_choice_loss),
+                         "eval_ranking_loss": float(eval_ranking_loss),
+                         "eval_outcome_loss": float(eval_outcome_loss),
++                        "eval_ap_loss": float(eval_ap_loss),
+                         "is_best_epoch": int(is_best_epoch),
+                     }
+                 )
+@@ -483,6 +527,7 @@ def train_sequence_model(
+         final_choice_loss = float(eval_choice_loss)
+         final_ranking_loss = float(eval_ranking_loss)
+         final_outcome_loss = float(eval_outcome_loss)
++        final_ap_loss = float(eval_ap_loss)
+         training_history.append(
+             {
+                 "epoch": int(epoch),
+@@ -491,9 +536,11 @@ def train_sequence_model(
+                 "train_choice_loss": float(train_choice_epoch),
+                 "train_ranking_loss": float(train_ranking_epoch),
+                 "train_outcome_loss": float(train_outcome_epoch),
++                "train_ap_loss": float(train_ap_epoch),
+                 "eval_choice_loss": float(eval_choice_loss),
+                 "eval_ranking_loss": float(eval_ranking_loss),
+                 "eval_outcome_loss": float(eval_outcome_loss),
++                "eval_ap_loss": float(eval_ap_loss),
+                 "is_best_epoch": int(is_best_epoch),
+             }
+         )
+@@ -520,9 +567,11 @@ def train_sequence_model(
+         best_choice_loss=float(best_choice_loss),
+         best_ranking_loss=float(best_ranking_loss),
+         best_outcome_loss=float(best_outcome_loss),
++        best_ap_loss=float(best_ap_loss),
+         final_choice_loss=float(final_choice_loss),
+         final_ranking_loss=float(final_ranking_loss),
+         final_outcome_loss=float(final_outcome_loss),
++        final_ap_loss=float(final_ap_loss),
+         outcome_aux_lambda=float(outcome_aux_lambda),
+         skip_bias=float(model.skip_bias.detach().cpu().item()),
+         ranking_pairs_train_total=int(len(ranking_pairs_train["pair_weight"])),
+@@ -626,6 +675,25 @@ def _weighted_outcome_ce_loss(
+     return torch.sum(per_row_loss * weights) / denom
+ 
+ 
++def _smooth_ap_loss(scores: Tensor, outcome_targets: Tensor, tau: float, eps: float = 1e-12) -> Tensor:
++    valid_mask = (outcome_targets == 0) | (outcome_targets == 2)
++    if int(valid_mask.sum().item()) < 2:
++        return scores.new_tensor(0.0)
++    scores_v = scores[valid_mask]
++    labels = (outcome_targets[valid_mask] == 0).to(dtype=scores.dtype)
++    pos_mask = labels > 0.5
++    neg_mask = labels < 0.5
++    if not bool(pos_mask.any().item()) or not bool(neg_mask.any().item()):
++        return scores.new_tensor(0.0)
++    score_diff = (scores_v.unsqueeze(1) - scores_v.unsqueeze(0)) / float(tau)
++    r = torch.sigmoid(score_diff)
++    numerators = torch.sum(r * labels.unsqueeze(1), dim=0)
++    denominators = torch.sum(r, dim=0).clamp_min(float(eps))
++    precision = numerators / denominators
++    smooth_ap = precision[pos_mask].mean()
++    return 1.0 - smooth_ap
++
++
+ def _normalize_ranking_pairs(
+     ranking_pairs: dict[str, np.ndarray] | None, name: str
+ ) -> dict[str, np.ndarray]:
