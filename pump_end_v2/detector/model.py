@@ -46,6 +46,7 @@ class SequenceDetector:
     max_ranking_pairs_per_episode: int
     timeout_pair_weight: float
     outcome_aux_lambda: float
+    main_target_mode: str
     scaler_mean: np.ndarray | None = None
     scaler_std: np.ndarray | None = None
     sequence_store: DetectorSequenceStore | None = None
@@ -108,6 +109,7 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
         max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
         timeout_pair_weight=float(model_config.timeout_pair_weight),
         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
+        main_target_mode=str(model_config.main_target_mode),
     )
 
 
@@ -159,6 +161,15 @@ def fit_detector_model(
         timeout_pair_weight=float(model.timeout_pair_weight),
         max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
     )
+    if model.main_target_mode == "tp_vs_sl_only":
+        train_target_reason = train_fit["target_reason"].astype(str).str.strip().str.lower()
+        timeout_train_mask = train_target_reason.eq("timeout").to_numpy(copy=False)
+        sample_weight_train = sample_weight_train.astype(np.float32, copy=True)
+        sample_weight_train[timeout_train_mask] = 0.0
+        if not ranking_pairs_train_df.empty:
+            ranking_pairs_train_df = ranking_pairs_train_df[
+                ranking_pairs_train_df["pair_type"].astype(str).eq("tp_vs_sl")
+            ].copy()
     ranking_pairs_train = _prepare_pair_index_data(
         ranking_pairs_train_df, train_fit["decision_row_id"].astype(str)
     )
@@ -211,6 +222,17 @@ def fit_detector_model(
                 timeout_pair_weight=float(model.timeout_pair_weight),
                 max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
             )
+            if model.main_target_mode == "tp_vs_sl_only":
+                eval_target_reason = (
+                    eval_fit["target_reason"].astype(str).str.strip().str.lower()
+                )
+                timeout_eval_mask = eval_target_reason.eq("timeout").to_numpy(copy=False)
+                sample_weight_eval = sample_weight_eval.astype(np.float32, copy=True)
+                sample_weight_eval[timeout_eval_mask] = 0.0
+                if not ranking_pairs_eval_df.empty:
+                    ranking_pairs_eval_df = ranking_pairs_eval_df[
+                        ranking_pairs_eval_df["pair_type"].astype(str).eq("tp_vs_sl")
+                    ].copy()
             ranking_pairs_eval = _prepare_pair_index_data(
                 ranking_pairs_eval_df, eval_fit["decision_row_id"].astype(str)
             )

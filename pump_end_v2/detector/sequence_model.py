@@ -584,7 +584,7 @@ def _weighted_bce_loss(logits: Tensor, targets: Tensor, sample_weight: Tensor) -
     weights = torch.clamp(sample_weight, min=0.0)
     denom = torch.sum(weights)
     if float(denom.item()) <= 0.0:
-        return torch.mean(per_row_loss)
+        return torch.zeros((), dtype=per_row_loss.dtype, device=per_row_loss.device)
     return torch.sum(per_row_loss * weights) / denom
 
 
