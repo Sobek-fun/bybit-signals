@@ -1079,8 +1079,6 @@ def _split_fit_train_eval_chronological(
     eval_inner = trainable[
         trainable["context_bar_open_time"] >= eval_start_time
     ].copy()
-    train_inner = _retain_complete_trainable_episodes(trainable, train_inner)
-    eval_inner = _retain_complete_trainable_episodes(trainable, eval_inner)
     if len(train_inner) < 2 or len(eval_inner) < 2:
         return (
             trainable,
@@ -1092,6 +1090,24 @@ def _split_fit_train_eval_chronological(
                 "fallback_reason": "split_too_small",
             },
         )
+    train_single_class = (
+        pd.to_numeric(train_inner[target_column], errors="coerce").fillna(0.0).nunique() < 2
+    )
+    eval_single_class = (
+        pd.to_numeric(eval_inner[target_column], errors="coerce").fillna(0.0).nunique() < 2
+    )
+    if train_single_class or eval_single_class:
+        reason = "train_single_class" if train_single_class else "eval_single_class"
+        return (
+            trainable,
+            None,
+            {
+                "monitor_name": "train_loss_fallback",
+                "train_rows": int(len(trainable)),
+                "eval_rows": 0,
+                "fallback_reason": reason,
+            },
+        )
     return (
         train_inner,
         eval_inner,
@@ -1101,35 +1117,6 @@ def _split_fit_train_eval_chronological(
             "eval_rows": int(len(eval_inner)),
             "fallback_reason": "",
         },
-    )
-
-
-def _retain_complete_trainable_episodes(
-    full_trainable_frame: pd.DataFrame, slice_frame: pd.DataFrame
-) -> pd.DataFrame:
-    if slice_frame.empty:
-        return slice_frame.copy()
-    full_sets = (
-        full_trainable_frame.groupby("episode_id")["decision_row_id"]
-        .apply(lambda s: frozenset(s.astype(str)))
-        .to_dict()
-    )
-    slice_sets = (
-        slice_frame.groupby("episode_id")["decision_row_id"]
-        .apply(lambda s: frozenset(s.astype(str)))
-        .to_dict()
-    )
-    keep_episode_ids = [
-        str(ep)
-        for ep, row_set in slice_sets.items()
-        if row_set == full_sets.get(ep, frozenset())
-    ]
-    if not keep_episode_ids:
-        return slice_frame.iloc[0:0].copy()
-    return (
-        slice_frame[slice_frame["episode_id"].astype(str).isin(keep_episode_ids)]
-        .copy()
-        .reset_index(drop=True)
     )
 
 

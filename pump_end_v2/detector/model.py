@@ -17,6 +17,10 @@ from pump_end_v2.detector.sequence_model import (
     predict_sequence_model_outputs,
     train_sequence_model,
 )
+from pump_end_v2.detector.ranking import (
+    build_detector_ranking_pairs,
+    build_hard_negative_row_weights,
+)
 from pump_end_v2.features.manifest import (
     DETECTOR_IDENTITY_COLUMNS,
     DETECTOR_SEQUENCE_FEATURE_COLUMNS,
@@ -137,16 +141,36 @@ def fit_detector_model(
     scaler_mean, scaler_std = _fit_scaler(x_train_raw, valid_train)
     x_train_scaled = _transform_with_scaler(x_train_raw, valid_train, scaler_mean, scaler_std)
     x_train_input = _stack_model_inputs(x_train_scaled, valid_train, in_episode_train)
-    train_decision_row_ids = train_fit["decision_row_id"].astype(str).to_numpy(dtype=object)
     train_episode_ids = train_fit["episode_id"].astype(str).to_numpy(dtype=object)
-    train_episode_target_map = _build_episode_target_row_id_map(train_fit)
+    y_train = (
+        pd.to_numeric(train_fit[target_column], errors="coerce")
+        .fillna(0.0)
+        .astype(np.float32)
+        .to_numpy(copy=False)
+    )
+    sample_weight_train, hard_negative_train_mask = build_hard_negative_row_weights(
+        train_fit,
+        hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
+        hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
+        return_hard_negative_mask=True,
+    )
+    ranking_pairs_train_df = build_detector_ranking_pairs(
+        train_fit,
+        timeout_pair_weight=float(model.timeout_pair_weight),
+        max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+    )
+    ranking_pairs_train = _prepare_pair_index_data(
+        ranking_pairs_train_df, train_fit["decision_row_id"].astype(str)
+    )
     train_outcome_targets = _encode_outcome_targets(train_fit["target_reason"])
     train_outcome_weights = _resolve_outcome_weights(train_fit)
     x_eval_input: np.ndarray | None = None
+    y_eval: np.ndarray | None = None
+    sample_weight_eval: np.ndarray | None = None
     eval_episode_ids: np.ndarray | None = None
-    eval_decision_row_ids: np.ndarray | None = None
     eval_readout_index: np.ndarray | None = None
-    eval_episode_target_map: dict[str, str | None] | None = None
+    ranking_pairs_eval: dict[str, np.ndarray] | None = None
+    hard_negative_eval_total = 0
     eval_outcome_targets: np.ndarray | None = None
     eval_outcome_weights: np.ndarray | None = None
     if eval_df is not None and len(eval_df) > 0:
@@ -169,40 +193,50 @@ def fit_detector_model(
             eval_outcome_targets = _encode_outcome_targets(eval_fit["target_reason"])
             eval_outcome_weights = _resolve_outcome_weights(eval_fit)
             eval_episode_ids = eval_fit["episode_id"].astype(str).to_numpy(dtype=object)
-            eval_decision_row_ids = eval_fit["decision_row_id"].astype(str).to_numpy(
-                dtype=object
+            y_eval = (
+                pd.to_numeric(eval_fit[target_column], errors="coerce")
+                .fillna(0.0)
+                .astype(np.float32)
+                .to_numpy(copy=False)
             )
-            eval_episode_target_map = _build_episode_target_row_id_map(eval_fit)
+            sample_weight_eval, hard_negative_eval_mask = build_hard_negative_row_weights(
+                eval_fit,
+                hard_negative_weight_multiplier=float(model.hard_negative_weight_multiplier),
+                hard_negative_max_age_distance=int(model.hard_negative_max_age_distance),
+                return_hard_negative_mask=True,
+            )
+            hard_negative_eval_total = int(np.sum(hard_negative_eval_mask))
+            ranking_pairs_eval_df = build_detector_ranking_pairs(
+                eval_fit,
+                timeout_pair_weight=float(model.timeout_pair_weight),
+                max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
+            )
+            ranking_pairs_eval = _prepare_pair_index_data(
+                ranking_pairs_eval_df, eval_fit["decision_row_id"].astype(str)
+            )
             x_eval_scaled = _transform_with_scaler(
                 x_eval_raw, valid_eval, scaler_mean, scaler_std
             )
             x_eval_input = _stack_model_inputs(x_eval_scaled, valid_eval, in_episode_eval)
+    hard_negative_train_total = int(np.sum(hard_negative_train_mask))
     stats: SequenceTrainStats = train_sequence_model(
         model=model.network,
         x_train=x_train_input,
-        y_train=np.zeros(len(train_fit), dtype=np.float32),
-        sample_weight_train=np.ones(len(train_fit), dtype=np.float32),
+        y_train=y_train,
+        sample_weight_train=sample_weight_train,
         train_episode_ids=train_episode_ids,
-        train_decision_row_ids=train_decision_row_ids,
+        train_decision_row_ids=None,
         train_readout_index=readout_index_train,
-        train_episode_target_row_id_map=train_episode_target_map,
+        train_episode_target_row_id_map=None,
         train_outcome_targets=train_outcome_targets,
         train_outcome_weights=train_outcome_weights,
         x_eval=x_eval_input,
-        y_eval=(
-            np.zeros(len(eval_decision_row_ids), dtype=np.float32)
-            if eval_decision_row_ids is not None
-            else None
-        ),
-        sample_weight_eval=(
-            np.ones(len(eval_decision_row_ids), dtype=np.float32)
-            if eval_decision_row_ids is not None
-            else None
-        ),
+        y_eval=y_eval,
+        sample_weight_eval=sample_weight_eval,
         eval_episode_ids=eval_episode_ids,
-        eval_decision_row_ids=eval_decision_row_ids,
+        eval_decision_row_ids=None,
         eval_readout_index=eval_readout_index,
-        eval_episode_target_row_id_map=eval_episode_target_map,
+        eval_episode_target_row_id_map=None,
         eval_outcome_targets=eval_outcome_targets,
         eval_outcome_weights=eval_outcome_weights,
         random_seed=int(model.random_seed),
@@ -212,11 +246,11 @@ def fit_detector_model(
         learning_rate=float(model.sequence_learning_rate),
         weight_decay=float(model.weight_decay),
         outcome_aux_lambda=float(model.outcome_aux_lambda),
-        ranking_pairs_train=None,
-        ranking_pairs_eval=None,
-        ranking_lambda=0.0,
-        hard_negative_rows_train_total=0,
-        hard_negative_rows_eval_total=0,
+        ranking_pairs_train=ranking_pairs_train,
+        ranking_pairs_eval=ranking_pairs_eval,
+        ranking_lambda=float(model.ranking_lambda),
+        hard_negative_rows_train_total=hard_negative_train_total,
+        hard_negative_rows_eval_total=hard_negative_eval_total,
     )
     model.scaler_mean = scaler_mean
     model.scaler_std = scaler_std

@@ -624,7 +624,7 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
             model_section.get("decision_window_bars", 6),
             "detector.model.decision_window_bars",
         ),
-        ranking_lambda=_require_non_negative_float(
+        ranking_lambda=_require_positive_float(
             model_section.get("ranking_lambda", 0.5),
             "detector.model.ranking_lambda",
         ),
