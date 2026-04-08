@@ -68,6 +68,7 @@ class DetectorModelConfig:
     max_ranking_pairs_per_episode: int
     timeout_pair_weight: float
     outcome_aux_lambda: float
+    main_target_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,7 +653,19 @@ def _build_detector_model(section: dict[str, Any]) -> DetectorModelConfig:
             inclusive_lower=True,
             inclusive_upper=True,
         ),
+        main_target_mode=_parse_detector_main_target_mode(
+            model_section.get("main_target_mode", "tp_vs_non_tp")
+        ),
     )
+
+
+def _parse_detector_main_target_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    if mode not in {"tp_vs_non_tp", "tp_vs_sl_only"}:
+        raise ValueError(
+            "detector.model.main_target_mode must be one of: tp_vs_non_tp, tp_vs_sl_only"
+        )
+    return mode
 
 
 def _parse_positive_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:

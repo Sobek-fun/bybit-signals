@@ -1108,6 +1108,49 @@ def _split_fit_train_eval_chronological(
                 "fallback_reason": reason,
             },
         )
+    if detector_model_config.main_target_mode == "tp_vs_sl_only":
+        train_main_rows = train_inner[
+            train_inner["target_reason"].astype(str).str.strip().str.lower().isin(
+                ["tp", "sl"]
+            )
+        ]
+        eval_main_rows = eval_inner[
+            eval_inner["target_reason"].astype(str).str.strip().str.lower().isin(
+                ["tp", "sl"]
+            )
+        ]
+        train_main_single_class = (
+                train_main_rows["target_reason"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .nunique()
+                < 2
+        )
+        eval_main_single_class = (
+                eval_main_rows["target_reason"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .nunique()
+                < 2
+        )
+        if train_main_single_class or eval_main_single_class:
+            reason = (
+                "train_main_single_class"
+                if train_main_single_class
+                else "eval_main_single_class"
+            )
+            return (
+                trainable,
+                None,
+                {
+                    "monitor_name": "train_loss_fallback",
+                    "train_rows": int(len(trainable)),
+                    "eval_rows": 0,
+                    "fallback_reason": reason,
+                },
+            )
     return (
         train_inner,
         eval_inner,
