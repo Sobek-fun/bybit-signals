@@ -603,6 +603,7 @@ def build_detector_policy_grid(
                     fire_score_floor=_round6(float(fire_score_floor)),
                     turn_down_delta=_round6(float(turn_down_delta)),
                     min_peak_gain_after_arm=_round6(float(min_peak_gain_after_arm)),
+                    policy_score_mode=base_policy_config.policy_score_mode,
                 )
             )
         unique: dict[tuple[float, float, float, float], DetectorPolicyConfig] = {}
@@ -668,6 +669,7 @@ def build_detector_policy_grid(
                     min_peak_gain_after_arm=float(
                         _round6(base_policy_config.min_peak_gain_after_arm)
                     ),
+                    policy_score_mode=base_policy_config.policy_score_mode,
                 )
             )
     return grid
@@ -746,6 +748,7 @@ def sweep_detector_policy(
                     f"policy sweep progress candidate={idx}/{len(candidates)} "
                     f"arm={candidate.arm_score_min:.6f} fire={candidate.fire_score_floor:.6f} "
                     f"turn={candidate.turn_down_delta:.6f} peak_gain={candidate.min_peak_gain_after_arm:.6f} "
+                    f"policy_score_mode={candidate.policy_score_mode} "
                     f"signals_total={len(candidate_signals_df)} "
                     f"tp_rate_resolved={float(selector_metrics['tp_rate_resolved']):.6f} "
                     f"resolved_signals_total={int(round(resolved_signals_total))} "
@@ -895,6 +898,7 @@ def select_detector_policy(
         fire_score_floor=float(best["fire_score_floor"]),
         turn_down_delta=float(best["turn_down_delta"]),
         min_peak_gain_after_arm=float(best["min_peak_gain_after_arm"]),
+        policy_score_mode=base_policy_config.policy_score_mode,
     )
     log_info(
         "POLICY",
@@ -903,7 +907,8 @@ def select_detector_policy(
             f"best_policy=arm={best_policy.arm_score_min:.6f},"
             f"fire={best_policy.fire_score_floor:.6f},"
             f"turn={best_policy.turn_down_delta:.6f},"
-            f"peak_gain={best_policy.min_peak_gain_after_arm:.6f} "
+            f"peak_gain={best_policy.min_peak_gain_after_arm:.6f},"
+            f"policy_score_mode={best_policy.policy_score_mode} "
             f"tp_rate_resolved={float(best['tp_rate_resolved']):.6f} "
             f"edge_vs_breakeven_zscore={float(best['edge_vs_breakeven_zscore']):.6f} "
             f"fires_per_30d={float(best['fires_per_30d']):.6f} "

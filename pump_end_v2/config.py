@@ -83,6 +83,7 @@ class DetectorPolicyConfig:
     fire_score_floor: float
     turn_down_delta: float
     min_peak_gain_after_arm: float
+    policy_score_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,6 +713,7 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
     fire_score_floor = float(section.get("fire_score_floor"))
     turn_down_delta = float(section.get("turn_down_delta"))
     min_peak_gain_after_arm = float(section.get("min_peak_gain_after_arm", 0.0))
+    policy_score_mode = str(section.get("policy_score_mode", "p_good")).strip().lower()
     if not (0.0 < arm_score_min <= 1.0):
         raise ValueError("detector.arm_score_min must satisfy 0 < x <= 1")
     if not (0.0 <= fire_score_floor <= arm_score_min):
@@ -722,11 +724,16 @@ def _build_detector_policy(section: dict[str, Any]) -> DetectorPolicyConfig:
         raise ValueError("detector.turn_down_delta must satisfy 0 < x <= 1")
     if not (0.0 <= min_peak_gain_after_arm <= 1.0):
         raise ValueError("detector.min_peak_gain_after_arm must satisfy 0 <= x <= 1")
+    if policy_score_mode not in {"p_good", "resolved_edge_product"}:
+        raise ValueError(
+            "detector.policy_score_mode must be one of: p_good, resolved_edge_product"
+        )
     return DetectorPolicyConfig(
         arm_score_min=arm_score_min,
         fire_score_floor=fire_score_floor,
         turn_down_delta=turn_down_delta,
         min_peak_gain_after_arm=min_peak_gain_after_arm,
+        policy_score_mode=policy_score_mode,
     )
 
 
