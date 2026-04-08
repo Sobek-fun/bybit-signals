@@ -53,7 +53,9 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "entry_bar_open_time",
     "episode_age_bars",
     "p_good",
+    "p_good_at_arm",
     "peak_p_good_before_fire",
+    "peak_gain_from_arm_before_fire",
     "p_good_drop_from_peak",
     "distance_from_episode_high_pct",
     "episode_runup_from_open_pct",
@@ -68,6 +70,7 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "policy_arm_score_min",
     "policy_fire_score_floor",
     "policy_turn_down_delta",
+    "policy_min_peak_gain_after_arm",
     "target_good_short_now",
     "target_reason",
     "row_trade_outcome",
@@ -199,6 +202,7 @@ def apply_episode_aware_detector_policy_cached(
         expired = False
         reset_count = 0
         peak_p_good: float | None = None
+        p_good_at_arm: float | None = None
         fire_signal_row: dict[str, Any] | None = None
         for row in prepared_group["rows_tuples"]:
             if fired or expired:
@@ -208,13 +212,18 @@ def apply_episode_aware_detector_policy_cached(
                 if not armed_flag:
                     armed_flag = True
                     had_arm = True
+                    p_good_at_arm = current_p_good
                     peak_p_good = current_p_good
                 elif peak_p_good is not None and current_p_good > peak_p_good:
                     peak_p_good = current_p_good
-            if not armed_flag or peak_p_good is None:
+            if not armed_flag or peak_p_good is None or p_good_at_arm is None:
                 continue
+            peak_gain_from_arm = float(peak_p_good - p_good_at_arm)
             drop_from_peak = float(peak_p_good - current_p_good)
             if (
+                peak_gain_from_arm
+                >= detector_policy_config.min_peak_gain_after_arm
+                and
                     drop_from_peak >= detector_policy_config.turn_down_delta
                     and current_p_good >= detector_policy_config.fire_score_floor
             ):
@@ -251,7 +260,9 @@ def apply_episode_aware_detector_policy_cached(
                     "entry_bar_open_time": pd.Timestamp(row.entry_bar_open_time),
                     "episode_age_bars": row.episode_age_bars,
                     "p_good": current_p_good,
+                    "p_good_at_arm": p_good_at_arm,
                     "peak_p_good_before_fire": peak_p_good,
+                    "peak_gain_from_arm_before_fire": peak_gain_from_arm,
                     "p_good_drop_from_peak": drop_from_peak,
                     "distance_from_episode_high_pct": row.distance_from_episode_high_pct,
                     "episode_runup_from_open_pct": _row_value(
@@ -276,6 +287,7 @@ def apply_episode_aware_detector_policy_cached(
                     "policy_arm_score_min": detector_policy_config.arm_score_min,
                     "policy_fire_score_floor": detector_policy_config.fire_score_floor,
                     "policy_turn_down_delta": detector_policy_config.turn_down_delta,
+                    "policy_min_peak_gain_after_arm": detector_policy_config.min_peak_gain_after_arm,
                     "bars_fire_to_ideal": bars_fire_to_ideal,
                 }
                 for column in _OPTIONAL_HINDSIGHT_COLUMNS:
@@ -286,6 +298,7 @@ def apply_episode_aware_detector_policy_cached(
             if current_p_good < detector_policy_config.fire_score_floor:
                 armed_flag = False
                 peak_p_good = None
+                p_good_at_arm = None
                 reset_count += 1
         summary_rows.append(
             {

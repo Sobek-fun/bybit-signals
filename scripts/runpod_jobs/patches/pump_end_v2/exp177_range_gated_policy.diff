@@ -114,8 +114,8 @@ index 9981f45..1a586c6 100644
 +                peak_gain_from_arm
 +                >= detector_policy_config.min_peak_gain_after_arm
 +                and
-                 drop_from_peak >= detector_policy_config.turn_down_delta
-                 and current_p_good >= detector_policy_config.fire_score_floor
+                     drop_from_peak >= detector_policy_config.turn_down_delta
+                     and current_p_good >= detector_policy_config.fire_score_floor
              ):
 @@ -251,7 +260,9 @@ def apply_episode_aware_detector_policy_cached(
                      "entry_bar_open_time": pd.Timestamp(row.entry_bar_open_time),
