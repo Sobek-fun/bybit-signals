@@ -85,7 +85,6 @@ SWEEP_COLUMNS: tuple[str, ...] = (
     "arm_score_min",
     "fire_score_floor",
     "turn_down_delta",
-    "min_peak_gain_after_arm",
     "episodes_total",
     "episodes_with_good_zone",
     "episodes_fired",
@@ -577,17 +576,11 @@ def build_detector_policy_grid(
             and len(search_config.fire_candidates) > 0
             and len(search_config.turn_candidates) > 0
     ):
-        peak_gain_candidates = (
-            search_config.peak_gain_candidates
-            if len(search_config.peak_gain_candidates) > 0
-            else (base_policy_config.min_peak_gain_after_arm,)
-        )
         grid: list[DetectorPolicyConfig] = []
-        for arm_score_min, fire_score_floor, turn_down_delta, min_peak_gain_after_arm in product(
+        for arm_score_min, fire_score_floor, turn_down_delta in product(
                 search_config.arm_candidates,
                 search_config.fire_candidates,
                 search_config.turn_candidates,
-                peak_gain_candidates,
         ):
             if not (0.0 < float(arm_score_min) <= 1.0):
                 continue
@@ -595,24 +588,19 @@ def build_detector_policy_grid(
                 continue
             if not (0.0 < float(turn_down_delta) <= 1.0):
                 continue
-            if not (0.0 <= float(min_peak_gain_after_arm) <= 1.0):
-                continue
             grid.append(
                 DetectorPolicyConfig(
                     arm_score_min=_round6(float(arm_score_min)),
                     fire_score_floor=_round6(float(fire_score_floor)),
                     turn_down_delta=_round6(float(turn_down_delta)),
-                    min_peak_gain_after_arm=_round6(float(min_peak_gain_after_arm)),
-                    policy_score_mode=base_policy_config.policy_score_mode,
                 )
             )
-        unique: dict[tuple[float, float, float, float], DetectorPolicyConfig] = {}
+        unique: dict[tuple[float, float, float], DetectorPolicyConfig] = {}
         for candidate in grid:
             key = (
                 candidate.arm_score_min,
                 candidate.fire_score_floor,
                 candidate.turn_down_delta,
-                candidate.min_peak_gain_after_arm,
             )
             unique[key] = candidate
         return sorted(
@@ -621,7 +609,6 @@ def build_detector_policy_grid(
                 item.arm_score_min,
                 item.fire_score_floor,
                 item.turn_down_delta,
-                item.min_peak_gain_after_arm,
             ),
         )
     arm_candidates = sorted(
@@ -666,10 +653,6 @@ def build_detector_policy_grid(
                     arm_score_min=arm_score_min,
                     fire_score_floor=fire_score_floor,
                     turn_down_delta=turn_down_delta,
-                    min_peak_gain_after_arm=float(
-                        _round6(base_policy_config.min_peak_gain_after_arm)
-                    ),
-                    policy_score_mode=base_policy_config.policy_score_mode,
                 )
             )
     return grid
@@ -747,9 +730,7 @@ def sweep_detector_policy(
                 (
                     f"policy sweep progress candidate={idx}/{len(candidates)} "
                     f"arm={candidate.arm_score_min:.6f} fire={candidate.fire_score_floor:.6f} "
-                    f"turn={candidate.turn_down_delta:.6f} peak_gain={candidate.min_peak_gain_after_arm:.6f} "
-                    f"policy_score_mode={candidate.policy_score_mode} "
-                    f"signals_total={len(candidate_signals_df)} "
+                    f"turn={candidate.turn_down_delta:.6f} signals_total={len(candidate_signals_df)} "
                     f"tp_rate_resolved={float(selector_metrics['tp_rate_resolved']):.6f} "
                     f"resolved_signals_total={int(round(resolved_signals_total))} "
                     f"timeout_total={int(round(float(selector_metrics['timeout_total'])))} "
@@ -763,7 +744,6 @@ def sweep_detector_policy(
                 "arm_score_min": candidate.arm_score_min,
                 "fire_score_floor": candidate.fire_score_floor,
                 "turn_down_delta": candidate.turn_down_delta,
-                "min_peak_gain_after_arm": candidate.min_peak_gain_after_arm,
                 "episodes_total": metrics["episodes_total"],
                 "episodes_with_good_zone": metrics["episodes_with_good_zone"],
                 "episodes_fired": metrics["episodes_fired"],
@@ -887,9 +867,8 @@ def select_detector_policy(
             "arm_score_min",
             "fire_score_floor",
             "turn_down_delta",
-            "min_peak_gain_after_arm",
         ],
-        ascending=[False, False, True, False, True, True, True, True],
+        ascending=[False, False, True, False, True, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
     best = ranked.iloc[0]
@@ -897,8 +876,6 @@ def select_detector_policy(
         arm_score_min=float(best["arm_score_min"]),
         fire_score_floor=float(best["fire_score_floor"]),
         turn_down_delta=float(best["turn_down_delta"]),
-        min_peak_gain_after_arm=float(best["min_peak_gain_after_arm"]),
-        policy_score_mode=base_policy_config.policy_score_mode,
     )
     log_info(
         "POLICY",
@@ -906,9 +883,7 @@ def select_detector_policy(
             "policy select done "
             f"best_policy=arm={best_policy.arm_score_min:.6f},"
             f"fire={best_policy.fire_score_floor:.6f},"
-            f"turn={best_policy.turn_down_delta:.6f},"
-            f"peak_gain={best_policy.min_peak_gain_after_arm:.6f},"
-            f"policy_score_mode={best_policy.policy_score_mode} "
+            f"turn={best_policy.turn_down_delta:.6f} "
             f"tp_rate_resolved={float(best['tp_rate_resolved']):.6f} "
             f"edge_vs_breakeven_zscore={float(best['edge_vs_breakeven_zscore']):.6f} "
             f"fires_per_30d={float(best['fires_per_30d']):.6f} "

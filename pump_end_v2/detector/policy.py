@@ -14,8 +14,6 @@ INPUT_REQUIRED_COLUMNS: tuple[str, ...] = (
     "decision_time",
     "entry_bar_open_time",
     "p_good",
-    "p_tp_row",
-    "p_sl_row",
     "score_source",
     "policy_context_only",
     "episode_age_bars",
@@ -55,15 +53,8 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "entry_bar_open_time",
     "episode_age_bars",
     "p_good",
-    "p_good_at_arm",
     "peak_p_good_before_fire",
-    "peak_gain_from_arm_before_fire",
     "p_good_drop_from_peak",
-    "policy_score",
-    "policy_peak_score_before_fire",
-    "policy_score_at_arm",
-    "policy_score_drop_from_peak",
-    "policy_score_mode",
     "distance_from_episode_high_pct",
     "episode_runup_from_open_pct",
     "episode_extension_from_open_pct",
@@ -77,7 +68,6 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "policy_arm_score_min",
     "policy_fire_score_floor",
     "policy_turn_down_delta",
-    "policy_min_peak_gain_after_arm",
     "target_good_short_now",
     "target_reason",
     "row_trade_outcome",
@@ -154,8 +144,6 @@ def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[st
         )
     frame["policy_context_only"] = frame["policy_context_only"].astype(bool)
     frame["p_good"] = frame["p_good"].astype(float)
-    frame["p_tp_row"] = frame["p_tp_row"].astype(float)
-    frame["p_sl_row"] = frame["p_sl_row"].astype(float)
     if not has_fold_id:
         frame["fold_id"] = pd.NA
     sort_columns = ["score_source", "episode_id", "context_bar_open_time"]
@@ -211,36 +199,24 @@ def apply_episode_aware_detector_policy_cached(
         expired = False
         reset_count = 0
         peak_p_good: float | None = None
-        p_good_at_arm: float | None = None
         fire_signal_row: dict[str, Any] | None = None
         for row in prepared_group["rows_tuples"]:
             if fired or expired:
                 continue
             current_p_good = float(row.p_good)
-            current_policy_score = _resolve_policy_score(
-                p_good=current_p_good,
-                p_tp_row=float(row.p_tp_row),
-                p_sl_row=float(row.p_sl_row),
-                policy_score_mode=detector_policy_config.policy_score_mode,
-            )
-            if current_policy_score >= detector_policy_config.arm_score_min:
+            if current_p_good >= detector_policy_config.arm_score_min:
                 if not armed_flag:
                     armed_flag = True
                     had_arm = True
-                    p_good_at_arm = current_policy_score
-                    peak_p_good = current_policy_score
-                elif peak_p_good is not None and current_policy_score > peak_p_good:
-                    peak_p_good = current_policy_score
-            if not armed_flag or peak_p_good is None or p_good_at_arm is None:
+                    peak_p_good = current_p_good
+                elif peak_p_good is not None and current_p_good > peak_p_good:
+                    peak_p_good = current_p_good
+            if not armed_flag or peak_p_good is None:
                 continue
-            peak_gain_from_arm = float(peak_p_good - p_good_at_arm)
-            drop_from_peak = float(peak_p_good - current_policy_score)
+            drop_from_peak = float(peak_p_good - current_p_good)
             if (
-                peak_gain_from_arm
-                >= detector_policy_config.min_peak_gain_after_arm
-                and
                     drop_from_peak >= detector_policy_config.turn_down_delta
-                and current_policy_score >= detector_policy_config.fire_score_floor
+                    and current_p_good >= detector_policy_config.fire_score_floor
             ):
                 if bool(row.policy_context_only):
                     expired = True
@@ -275,15 +251,8 @@ def apply_episode_aware_detector_policy_cached(
                     "entry_bar_open_time": pd.Timestamp(row.entry_bar_open_time),
                     "episode_age_bars": row.episode_age_bars,
                     "p_good": current_p_good,
-                    "p_good_at_arm": p_good_at_arm,
                     "peak_p_good_before_fire": peak_p_good,
-                    "peak_gain_from_arm_before_fire": peak_gain_from_arm,
                     "p_good_drop_from_peak": drop_from_peak,
-                    "policy_score": current_policy_score,
-                    "policy_peak_score_before_fire": peak_p_good,
-                    "policy_score_at_arm": p_good_at_arm,
-                    "policy_score_drop_from_peak": drop_from_peak,
-                    "policy_score_mode": detector_policy_config.policy_score_mode,
                     "distance_from_episode_high_pct": row.distance_from_episode_high_pct,
                     "episode_runup_from_open_pct": _row_value(
                         row, "episode_runup_from_open_pct"
@@ -307,7 +276,6 @@ def apply_episode_aware_detector_policy_cached(
                     "policy_arm_score_min": detector_policy_config.arm_score_min,
                     "policy_fire_score_floor": detector_policy_config.fire_score_floor,
                     "policy_turn_down_delta": detector_policy_config.turn_down_delta,
-                    "policy_min_peak_gain_after_arm": detector_policy_config.min_peak_gain_after_arm,
                     "bars_fire_to_ideal": bars_fire_to_ideal,
                 }
                 for column in _OPTIONAL_HINDSIGHT_COLUMNS:
@@ -315,13 +283,9 @@ def apply_episode_aware_detector_policy_cached(
                 candidate_rows.append(fire_signal_row)
                 fired = True
                 continue
-            if (
-                armed_flag
-                and current_policy_score < detector_policy_config.fire_score_floor
-            ):
+            if current_p_good < detector_policy_config.fire_score_floor:
                 armed_flag = False
                 peak_p_good = None
-                p_good_at_arm = None
                 reset_count += 1
         summary_rows.append(
             {
@@ -548,25 +512,6 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
     if denominator <= 0:
         return 0.0
     return float(numerator / denominator)
-
-
-def _resolve_policy_score(
-    *,
-    p_good: float,
-    p_tp_row: float,
-    p_sl_row: float,
-    policy_score_mode: str,
-) -> float:
-    mode = str(policy_score_mode).strip().lower()
-    if mode == "p_good":
-        score = float(p_good)
-    elif mode == "resolved_edge_product":
-        resolved_mass = float(p_tp_row) + float(p_sl_row)
-        resolved_edge = float(p_tp_row) / max(float(resolved_mass), 1e-9)
-        score = float(p_good) * resolved_edge
-    else:
-        raise ValueError(f"unsupported detector policy_score_mode: {policy_score_mode!r}")
-    return float(min(1.0, max(0.0, score)))
 
 
 def _compute_detector_density_sanity_penalty(fires_per_30d: float) -> float:
