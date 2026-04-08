@@ -1146,7 +1146,7 @@ def run_pump_end_v2_pipeline(
         "sequence_feature_count": int(len(detector_sequence_store.feature_columns)),
         "sequence_train_rows": int(
             (
-                detector_sequence_store.meta_df["dataset_split"].astype(str) == "train"
+                    detector_sequence_store.meta_df["dataset_split"].astype(str) == "train"
             ).sum()
         ),
         "sequence_shape": [int(v) for v in detector_sequence_store.x.shape],
@@ -1236,7 +1236,6 @@ def _policy_to_dict(policy: Any) -> dict[str, float]:
         "arm_score_min": float(policy.arm_score_min),
         "fire_score_floor": float(policy.fire_score_floor),
         "turn_down_delta": float(policy.turn_down_delta),
-        "min_peak_gain_after_arm": float(policy.min_peak_gain_after_arm),
     }
 
 
@@ -1253,21 +1252,21 @@ def _gate_model_to_dict(model_config: Any) -> dict[str, float]:
 
 
 def _build_detector_diagnostics_summary(
-    *,
-    detector_train_oof_row_rank_report: dict[str, Any],
-    detector_val_row_rank_report: dict[str, Any],
-    detector_test_row_rank_report: dict[str, Any],
-    detector_val_episode_rank_report: dict[str, Any],
-    detector_test_episode_rank_report: dict[str, Any],
-    detector_val_episode_group_summary_df: pd.DataFrame,
-    detector_test_episode_group_summary_df: pd.DataFrame,
-    detector_train_feature_signal_report_df: pd.DataFrame,
-    detector_val_feature_signal_report_df: pd.DataFrame,
-    detector_test_feature_signal_report_df: pd.DataFrame,
-    detector_sequence_overfit_report: dict[str, Any],
-    sequence_train_stats: dict[str, Any],
-    detector_val_policy_metrics: dict[str, Any],
-    detector_test_policy_metrics: dict[str, Any],
+        *,
+        detector_train_oof_row_rank_report: dict[str, Any],
+        detector_val_row_rank_report: dict[str, Any],
+        detector_test_row_rank_report: dict[str, Any],
+        detector_val_episode_rank_report: dict[str, Any],
+        detector_test_episode_rank_report: dict[str, Any],
+        detector_val_episode_group_summary_df: pd.DataFrame,
+        detector_test_episode_group_summary_df: pd.DataFrame,
+        detector_train_feature_signal_report_df: pd.DataFrame,
+        detector_val_feature_signal_report_df: pd.DataFrame,
+        detector_test_feature_signal_report_df: pd.DataFrame,
+        detector_sequence_overfit_report: dict[str, Any],
+        sequence_train_stats: dict[str, Any],
+        detector_val_policy_metrics: dict[str, Any],
+        detector_test_policy_metrics: dict[str, Any],
 ) -> dict[str, Any]:
     val_group = _episode_group_index(detector_val_episode_group_summary_df)
     test_group = _episode_group_index(detector_test_episode_group_summary_df)
@@ -1511,7 +1510,7 @@ def _feature_signal_rollup(feature_signal_df: pd.DataFrame) -> dict[str, int]:
 
 
 def _same_direction_feature_total(
-    left_df: pd.DataFrame, right_df: pd.DataFrame
+        left_df: pd.DataFrame, right_df: pd.DataFrame
 ) -> int:
     left = _feature_direction_series(left_df)
     right = _feature_direction_series(right_df)
@@ -1526,7 +1525,7 @@ def _same_direction_feature_total(
 
 
 def _same_direction_feature_total_three(
-    train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
+        train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
 ) -> int:
     train = _feature_direction_series(train_df)
     val = _feature_direction_series(val_df)

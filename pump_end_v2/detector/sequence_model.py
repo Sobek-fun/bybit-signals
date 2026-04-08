@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.data import TensorDataset
 
-
 SEQUENCE_BATCH_SIZE = 256
 SEQUENCE_MAX_EPOCHS = 40
 SEQUENCE_EARLY_STOPPING_PATIENCE = 5
@@ -37,12 +36,12 @@ class CausalConv1d(nn.Module):
 
 class TemporalResidualBlock(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int,
-        dropout: float,
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int,
+            dilation: int,
+            dropout: float,
     ):
         super().__init__()
         self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
@@ -68,12 +67,12 @@ class TemporalResidualBlock(nn.Module):
 
 class SequenceTCNBinaryClassifier(nn.Module):
     def __init__(
-        self,
-        input_feature_count: int,
-        hidden_channels: int = SEQUENCE_HIDDEN_CHANNELS,
-        kernel_size: int = SEQUENCE_KERNEL_SIZE,
-        dilations: tuple[int, ...] = SEQUENCE_DILATIONS,
-        dropout: float = SEQUENCE_DROPOUT,
+            self,
+            input_feature_count: int,
+            hidden_channels: int = SEQUENCE_HIDDEN_CHANNELS,
+            kernel_size: int = SEQUENCE_KERNEL_SIZE,
+            dilations: tuple[int, ...] = SEQUENCE_DILATIONS,
+            dropout: float = SEQUENCE_DROPOUT,
     ):
         super().__init__()
         channels = int(hidden_channels)
@@ -187,37 +186,37 @@ class SequenceTrainStats:
 
 
 def train_sequence_model(
-    model: SequenceTCNBinaryClassifier,
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    sample_weight_train: np.ndarray,
-    train_episode_ids: np.ndarray,
-    train_decision_row_ids: np.ndarray | None = None,
-    train_readout_index: np.ndarray | None = None,
-    train_episode_target_row_id_map: dict[str, str | None] | None = None,
-    train_outcome_targets: np.ndarray | None = None,
-    train_outcome_weights: np.ndarray | None = None,
-    x_eval: np.ndarray | None = None,
-    y_eval: np.ndarray | None = None,
-    sample_weight_eval: np.ndarray | None = None,
-    eval_episode_ids: np.ndarray | None = None,
-    eval_decision_row_ids: np.ndarray | None = None,
-    eval_readout_index: np.ndarray | None = None,
-    eval_episode_target_row_id_map: dict[str, str | None] | None = None,
-    eval_outcome_targets: np.ndarray | None = None,
-    eval_outcome_weights: np.ndarray | None = None,
-    random_seed: int = 0,
-    batch_size: int = SEQUENCE_BATCH_SIZE,
-    max_epochs: int = SEQUENCE_MAX_EPOCHS,
-    early_stopping_patience: int = SEQUENCE_EARLY_STOPPING_PATIENCE,
-    learning_rate: float = SEQUENCE_LEARNING_RATE,
-    weight_decay: float = SEQUENCE_WEIGHT_DECAY,
-    outcome_aux_lambda: float = 0.25,
-    ranking_pairs_train: dict[str, np.ndarray] | None = None,
-    ranking_pairs_eval: dict[str, np.ndarray] | None = None,
-    ranking_lambda: float = 0.5,
-    hard_negative_rows_train_total: int = 0,
-    hard_negative_rows_eval_total: int = 0,
+        model: SequenceTCNBinaryClassifier,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        sample_weight_train: np.ndarray,
+        train_episode_ids: np.ndarray,
+        train_decision_row_ids: np.ndarray | None = None,
+        train_readout_index: np.ndarray | None = None,
+        train_episode_target_row_id_map: dict[str, str | None] | None = None,
+        train_outcome_targets: np.ndarray | None = None,
+        train_outcome_weights: np.ndarray | None = None,
+        x_eval: np.ndarray | None = None,
+        y_eval: np.ndarray | None = None,
+        sample_weight_eval: np.ndarray | None = None,
+        eval_episode_ids: np.ndarray | None = None,
+        eval_decision_row_ids: np.ndarray | None = None,
+        eval_readout_index: np.ndarray | None = None,
+        eval_episode_target_row_id_map: dict[str, str | None] | None = None,
+        eval_outcome_targets: np.ndarray | None = None,
+        eval_outcome_weights: np.ndarray | None = None,
+        random_seed: int = 0,
+        batch_size: int = SEQUENCE_BATCH_SIZE,
+        max_epochs: int = SEQUENCE_MAX_EPOCHS,
+        early_stopping_patience: int = SEQUENCE_EARLY_STOPPING_PATIENCE,
+        learning_rate: float = SEQUENCE_LEARNING_RATE,
+        weight_decay: float = SEQUENCE_WEIGHT_DECAY,
+        outcome_aux_lambda: float = 0.25,
+        ranking_pairs_train: dict[str, np.ndarray] | None = None,
+        ranking_pairs_eval: dict[str, np.ndarray] | None = None,
+        ranking_lambda: float = 0.5,
+        hard_negative_rows_train_total: int = 0,
+        hard_negative_rows_eval_total: int = 0,
 ) -> SequenceTrainStats:
     if not np.isfinite(x_train).all():
         raise ValueError("train_sequence_model received non-finite x_train")
@@ -300,12 +299,12 @@ def train_sequence_model(
     eval_data: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
     monitor_name = "train_loss_fallback"
     if (
-        x_eval is not None
-        and y_eval is not None
-        and eval_readout_index is not None
-        and eval_outcome_targets is not None
-        and eval_outcome_weights is not None
-        and len(x_eval) > 0
+            x_eval is not None
+            and y_eval is not None
+            and eval_readout_index is not None
+            and eval_outcome_targets is not None
+            and eval_outcome_weights is not None
+            and len(x_eval) > 0
     ):
         if sample_weight_eval is None:
             sample_weight_eval = np.ones(len(y_eval), dtype=np.float32)
@@ -373,9 +372,9 @@ def train_sequence_model(
                 sample_weight=batch_outcome_weights,
             )
             total_loss_batch = (
-                classification_loss
-                + ranking_lambda * ranking_loss_batch
-                + outcome_aux_lambda * outcome_loss
+                    classification_loss
+                    + ranking_lambda * ranking_loss_batch
+                    + outcome_aux_lambda * outcome_loss
             )
             if not torch.isfinite(total_loss_batch):
                 raise ValueError(
@@ -543,11 +542,11 @@ def train_sequence_model(
 
 
 def _episode_choice_loss(
-    entry_logits: Tensor,
-    episode_ids: np.ndarray,
-    decision_row_ids: np.ndarray,
-    target_row_id_map: dict[str, str | None],
-    skip_bias: Tensor,
+        entry_logits: Tensor,
+        episode_ids: np.ndarray,
+        decision_row_ids: np.ndarray,
+        target_row_id_map: dict[str, str | None],
+        skip_bias: Tensor,
 ) -> Tensor:
     if entry_logits.numel() == 0:
         return entry_logits.new_tensor(0.0)
@@ -584,12 +583,12 @@ def _weighted_bce_loss(logits: Tensor, targets: Tensor, sample_weight: Tensor) -
     weights = torch.clamp(sample_weight, min=0.0)
     denom = torch.sum(weights)
     if float(denom.item()) <= 0.0:
-        return torch.zeros((), dtype=per_row_loss.dtype, device=per_row_loss.device)
+        return torch.mean(per_row_loss)
     return torch.sum(per_row_loss * weights) / denom
 
 
 def _pairwise_ranking_loss(
-    logits: Tensor, ranking_pairs: dict[str, np.ndarray], device: torch.device
+        logits: Tensor, ranking_pairs: dict[str, np.ndarray], device: torch.device
 ) -> Tensor:
     better_idx = ranking_pairs["better_idx"]
     worse_idx = ranking_pairs["worse_idx"]
@@ -611,7 +610,7 @@ def _pairwise_ranking_loss(
 
 
 def _weighted_outcome_ce_loss(
-    logits: Tensor, targets: Tensor, sample_weight: Tensor
+        logits: Tensor, targets: Tensor, sample_weight: Tensor
 ) -> Tensor:
     valid = targets >= 0
     if not bool(valid.any().item()):
@@ -627,7 +626,7 @@ def _weighted_outcome_ce_loss(
 
 
 def _normalize_ranking_pairs(
-    ranking_pairs: dict[str, np.ndarray] | None, name: str
+        ranking_pairs: dict[str, np.ndarray] | None, name: str
 ) -> dict[str, np.ndarray]:
     if ranking_pairs is None:
         return {
@@ -656,7 +655,7 @@ def _normalize_ranking_pairs(
 
 
 def _extract_batch_ranking_pairs_by_global_index(
-    ranking_pairs: dict[str, np.ndarray], batch_indices: np.ndarray
+        ranking_pairs: dict[str, np.ndarray], batch_indices: np.ndarray
 ) -> dict[str, np.ndarray]:
     if batch_indices.size == 0:
         return {
@@ -693,9 +692,9 @@ def _extract_batch_ranking_pairs_by_global_index(
 
 
 def _build_episode_index_batches(
-    train_episode_ids: np.ndarray,
-    batch_size: int,
-    random_seed: int,
+        train_episode_ids: np.ndarray,
+        batch_size: int,
+        random_seed: int,
 ) -> list[np.ndarray]:
     episode_ids = np.asarray(train_episode_ids, dtype=object).astype(str)
     groups: dict[str, list[int]] = {}
@@ -730,7 +729,7 @@ def _build_episode_index_batches(
 
 
 def _slice_batch(
-    dataset: TensorDataset, batch_indices: np.ndarray
+        dataset: TensorDataset, batch_indices: np.ndarray
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     idx = torch.tensor(batch_indices, dtype=torch.long)
     x_all, y_all, w_all, readout_all, outcome_target_all, outcome_weight_all, i_all = dataset.tensors
@@ -746,7 +745,7 @@ def _slice_batch(
 
 
 def predict_sequence_model_outputs(
-    model: SequenceTCNBinaryClassifier, x: np.ndarray, readout_index: np.ndarray
+        model: SequenceTCNBinaryClassifier, x: np.ndarray, readout_index: np.ndarray
 ) -> dict[str, np.ndarray]:
     if len(x) == 0:
         return {
@@ -774,6 +773,6 @@ def predict_sequence_model_outputs(
 
 
 def predict_sequence_model_proba(
-    model: SequenceTCNBinaryClassifier, x: np.ndarray, readout_index: np.ndarray
+        model: SequenceTCNBinaryClassifier, x: np.ndarray, readout_index: np.ndarray
 ) -> np.ndarray:
     return predict_sequence_model_outputs(model, x, readout_index)["p_good"]

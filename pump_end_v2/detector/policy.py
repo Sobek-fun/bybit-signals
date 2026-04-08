@@ -53,9 +53,7 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "entry_bar_open_time",
     "episode_age_bars",
     "p_good",
-    "p_good_at_arm",
     "peak_p_good_before_fire",
-    "peak_gain_from_arm_before_fire",
     "p_good_drop_from_peak",
     "distance_from_episode_high_pct",
     "episode_runup_from_open_pct",
@@ -70,7 +68,6 @@ CANDIDATE_LEDGER_COLUMNS: tuple[str, ...] = (
     "policy_arm_score_min",
     "policy_fire_score_floor",
     "policy_turn_down_delta",
-    "policy_min_peak_gain_after_arm",
     "target_good_short_now",
     "target_reason",
     "row_trade_outcome",
@@ -116,9 +113,9 @@ EPISODE_POLICY_SUMMARY_COLUMNS: tuple[str, ...] = (
 
 
 def apply_episode_aware_detector_policy(
-    scored_rows_df: pd.DataFrame,
-    detector_policy_config: DetectorPolicyConfig,
-    emit_summary_log: bool = True,
+        scored_rows_df: pd.DataFrame,
+        detector_policy_config: DetectorPolicyConfig,
+        emit_summary_log: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     runtime_cache = build_detector_policy_runtime_cache(scored_rows_df)
     return apply_episode_aware_detector_policy_cached(
@@ -181,9 +178,9 @@ def build_detector_policy_runtime_cache(scored_rows_df: pd.DataFrame) -> dict[st
 
 
 def apply_episode_aware_detector_policy_cached(
-    runtime_cache: dict[str, Any],
-    detector_policy_config: DetectorPolicyConfig,
-    emit_summary_log: bool = True,
+        runtime_cache: dict[str, Any],
+        detector_policy_config: DetectorPolicyConfig,
+        emit_summary_log: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     candidate_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
@@ -202,7 +199,6 @@ def apply_episode_aware_detector_policy_cached(
         expired = False
         reset_count = 0
         peak_p_good: float | None = None
-        p_good_at_arm: float | None = None
         fire_signal_row: dict[str, Any] | None = None
         for row in prepared_group["rows_tuples"]:
             if fired or expired:
@@ -212,20 +208,15 @@ def apply_episode_aware_detector_policy_cached(
                 if not armed_flag:
                     armed_flag = True
                     had_arm = True
-                    p_good_at_arm = current_p_good
                     peak_p_good = current_p_good
                 elif peak_p_good is not None and current_p_good > peak_p_good:
                     peak_p_good = current_p_good
-            if not armed_flag or peak_p_good is None or p_good_at_arm is None:
+            if not armed_flag or peak_p_good is None:
                 continue
-            peak_gain_from_arm = float(peak_p_good - p_good_at_arm)
             drop_from_peak = float(peak_p_good - current_p_good)
             if (
-                peak_gain_from_arm
-                >= detector_policy_config.min_peak_gain_after_arm
-                and
-                drop_from_peak >= detector_policy_config.turn_down_delta
-                and current_p_good >= detector_policy_config.fire_score_floor
+                    drop_from_peak >= detector_policy_config.turn_down_delta
+                    and current_p_good >= detector_policy_config.fire_score_floor
             ):
                 if bool(row.policy_context_only):
                     expired = True
@@ -260,9 +251,7 @@ def apply_episode_aware_detector_policy_cached(
                     "entry_bar_open_time": pd.Timestamp(row.entry_bar_open_time),
                     "episode_age_bars": row.episode_age_bars,
                     "p_good": current_p_good,
-                    "p_good_at_arm": p_good_at_arm,
                     "peak_p_good_before_fire": peak_p_good,
-                    "peak_gain_from_arm_before_fire": peak_gain_from_arm,
                     "p_good_drop_from_peak": drop_from_peak,
                     "distance_from_episode_high_pct": row.distance_from_episode_high_pct,
                     "episode_runup_from_open_pct": _row_value(
@@ -287,7 +276,6 @@ def apply_episode_aware_detector_policy_cached(
                     "policy_arm_score_min": detector_policy_config.arm_score_min,
                     "policy_fire_score_floor": detector_policy_config.fire_score_floor,
                     "policy_turn_down_delta": detector_policy_config.turn_down_delta,
-                    "policy_min_peak_gain_after_arm": detector_policy_config.min_peak_gain_after_arm,
                     "bars_fire_to_ideal": bars_fire_to_ideal,
                 }
                 for column in _OPTIONAL_HINDSIGHT_COLUMNS:
@@ -295,10 +283,9 @@ def apply_episode_aware_detector_policy_cached(
                 candidate_rows.append(fire_signal_row)
                 fired = True
                 continue
-            if armed_flag and current_p_good < detector_policy_config.fire_score_floor:
+            if current_p_good < detector_policy_config.fire_score_floor:
                 armed_flag = False
                 peak_p_good = None
-                p_good_at_arm = None
                 reset_count += 1
         summary_rows.append(
             {
@@ -366,11 +353,11 @@ def apply_episode_aware_detector_policy_cached(
 
 
 def build_detector_policy_metrics(
-    candidate_signals_df: pd.DataFrame,
-    episode_policy_summary_df: pd.DataFrame,
-    window_start: pd.Timestamp | None = None,
-    window_end: pd.Timestamp | None = None,
-    window_days: float | None = None,
+        candidate_signals_df: pd.DataFrame,
+        episode_policy_summary_df: pd.DataFrame,
+        window_start: pd.Timestamp | None = None,
+        window_end: pd.Timestamp | None = None,
+        window_days: float | None = None,
 ) -> dict[str, float]:
     _require_columns(episode_policy_summary_df, EPISODE_POLICY_SUMMARY_COLUMNS)
     episodes_total = int(len(episode_policy_summary_df))
@@ -432,8 +419,8 @@ def build_detector_policy_metrics(
     reset_without_fire_share = _safe_ratio(
         int(
             (
-                (episode_policy_summary_df["reset_count"].fillna(0).astype(int) > 0)
-                & ~fired_mask
+                    (episode_policy_summary_df["reset_count"].fillna(0).astype(int) > 0)
+                    & ~fired_mask
             ).sum()
         ),
         episodes_total,
@@ -441,10 +428,10 @@ def build_detector_policy_metrics(
     arm_to_fire_conversion = _safe_ratio(episodes_fired, episodes_armed)
     density_sanity_penalty = _compute_detector_density_sanity_penalty(fires_per_30d)
     selection_score = (
-        good_episode_capture_rate
-        + fired_good_rate
-        - bad_episode_fire_rate
-        - 0.15 * density_sanity_penalty
+            good_episode_capture_rate
+            + fired_good_rate
+            - bad_episode_fire_rate
+            - 0.15 * density_sanity_penalty
     )
     return {
         "episodes_total": float(episodes_total),
@@ -485,8 +472,8 @@ def compute_eval_window_days_from_policy_rows(policy_rows_df: pd.DataFrame) -> f
 
 
 def _compute_bars_fire_to_ideal(
-    entry_bar_open_time: pd.Timestamp,
-    ideal_entry_bar_open_time: pd.Timestamp | None,
+        entry_bar_open_time: pd.Timestamp,
+        ideal_entry_bar_open_time: pd.Timestamp | None,
 ) -> float:
     if ideal_entry_bar_open_time is None or pd.isna(ideal_entry_bar_open_time):
         return float("nan")
@@ -503,9 +490,9 @@ def _compute_fires_per_30d(fires_count: int, eval_window_days: float) -> float:
 
 
 def _resolve_eval_window_days(
-    window_start: pd.Timestamp | None,
-    window_end: pd.Timestamp | None,
-    window_days: float | None,
+        window_start: pd.Timestamp | None,
+        window_end: pd.Timestamp | None,
+        window_days: float | None,
 ) -> float:
     if window_days is not None:
         resolved = float(window_days)
@@ -544,8 +531,8 @@ def _compute_good_episode_flag(active_rows: pd.DataFrame) -> bool:
     if "target_good_short_now" in active_rows.columns:
         return bool(
             (
-                pd.to_numeric(active_rows["target_good_short_now"], errors="coerce")
-                == 1
+                    pd.to_numeric(active_rows["target_good_short_now"], errors="coerce")
+                    == 1
             ).any()
         )
     return False

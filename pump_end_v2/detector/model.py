@@ -46,7 +46,6 @@ class SequenceDetector:
     max_ranking_pairs_per_episode: int
     timeout_pair_weight: float
     outcome_aux_lambda: float
-    main_target_mode: str
     scaler_mean: np.ndarray | None = None
     scaler_std: np.ndarray | None = None
     sequence_store: DetectorSequenceStore | None = None
@@ -109,17 +108,16 @@ def build_detector_model(model_config: DetectorModelConfig) -> SequenceDetector:
         max_ranking_pairs_per_episode=int(model_config.max_ranking_pairs_per_episode),
         timeout_pair_weight=float(model_config.timeout_pair_weight),
         outcome_aux_lambda=float(model_config.outcome_aux_lambda),
-        main_target_mode=str(model_config.main_target_mode),
     )
 
 
 def fit_detector_model(
-    model: SequenceDetector,
-    train_df: pd.DataFrame,
-    feature_columns: list[str] | tuple[str, ...],
-    target_column: str,
-    eval_df: pd.DataFrame | None = None,
-    sequence_store: DetectorSequenceStore | None = None,
+        model: SequenceDetector,
+        train_df: pd.DataFrame,
+        feature_columns: list[str] | tuple[str, ...],
+        target_column: str,
+        eval_df: pd.DataFrame | None = None,
+        sequence_store: DetectorSequenceStore | None = None,
 ) -> SequenceDetector:
     _require_columns(
         train_df,
@@ -161,15 +159,6 @@ def fit_detector_model(
         timeout_pair_weight=float(model.timeout_pair_weight),
         max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
     )
-    if model.main_target_mode == "tp_vs_sl_only":
-        train_target_reason = train_fit["target_reason"].astype(str).str.strip().str.lower()
-        timeout_train_mask = train_target_reason.eq("timeout").to_numpy(copy=False)
-        sample_weight_train = sample_weight_train.astype(np.float32, copy=True)
-        sample_weight_train[timeout_train_mask] = 0.0
-        if not ranking_pairs_train_df.empty:
-            ranking_pairs_train_df = ranking_pairs_train_df[
-                ranking_pairs_train_df["pair_type"].astype(str).eq("tp_vs_sl")
-            ].copy()
     ranking_pairs_train = _prepare_pair_index_data(
         ranking_pairs_train_df, train_fit["decision_row_id"].astype(str)
     )
@@ -222,17 +211,6 @@ def fit_detector_model(
                 timeout_pair_weight=float(model.timeout_pair_weight),
                 max_ranking_pairs_per_episode=int(model.max_ranking_pairs_per_episode),
             )
-            if model.main_target_mode == "tp_vs_sl_only":
-                eval_target_reason = (
-                    eval_fit["target_reason"].astype(str).str.strip().str.lower()
-                )
-                timeout_eval_mask = eval_target_reason.eq("timeout").to_numpy(copy=False)
-                sample_weight_eval = sample_weight_eval.astype(np.float32, copy=True)
-                sample_weight_eval[timeout_eval_mask] = 0.0
-                if not ranking_pairs_eval_df.empty:
-                    ranking_pairs_eval_df = ranking_pairs_eval_df[
-                        ranking_pairs_eval_df["pair_type"].astype(str).eq("tp_vs_sl")
-                    ].copy()
             ranking_pairs_eval = _prepare_pair_index_data(
                 ranking_pairs_eval_df, eval_fit["decision_row_id"].astype(str)
             )
@@ -282,10 +260,10 @@ def fit_detector_model(
 
 
 def predict_detector_scores(
-    model: SequenceDetector,
-    df: pd.DataFrame,
-    feature_columns: list[str] | tuple[str, ...],
-    sequence_store: DetectorSequenceStore | None = None,
+        model: SequenceDetector,
+        df: pd.DataFrame,
+        feature_columns: list[str] | tuple[str, ...],
+        sequence_store: DetectorSequenceStore | None = None,
 ) -> pd.DataFrame:
     _require_columns(df, [*DETECTOR_IDENTITY_COLUMNS, "decision_row_id"], "df")
     if df.empty:
@@ -316,7 +294,7 @@ def predict_detector_scores(
 
 
 def build_detector_feature_importance_table(
-    model: Any, feature_columns: list[str] | tuple[str, ...]
+        model: Any, feature_columns: list[str] | tuple[str, ...]
 ) -> pd.DataFrame:
     features = list(feature_columns)
     if not features:
@@ -340,7 +318,7 @@ def build_detector_feature_importance_table(
 
 
 def summarize_detector_oof_importance(
-    oof_importance_df: pd.DataFrame, top_k: int = 20
+        oof_importance_df: pd.DataFrame, top_k: int = 20
 ) -> pd.DataFrame:
     required = ("fold_id", "feature", "importance_norm")
     _require_columns(oof_importance_df, list(required), "oof_importance_df")
@@ -384,7 +362,7 @@ def summarize_detector_oof_importance(
     out["top20_hits"] = out["top20_hits"].fillna(0).astype(int)
     out["folds_total"] = folds_total
     out["top20_hit_rate"] = (
-        out["top20_hits"].astype(float) / float(max(folds_total, 1))
+            out["top20_hits"].astype(float) / float(max(folds_total, 1))
     )
     out = out.sort_values(
         ["mean_importance", "top20_hit_rate", "feature"],
@@ -397,10 +375,10 @@ def summarize_detector_oof_importance(
 
 
 def build_sequence_permutation_importance_table(
-    model: SequenceDetector,
-    eval_df: pd.DataFrame,
-    target_column: str,
-    sequence_store: DetectorSequenceStore | None = None,
+        model: SequenceDetector,
+        eval_df: pd.DataFrame,
+        target_column: str,
+        sequence_store: DetectorSequenceStore | None = None,
 ) -> pd.DataFrame:
     return pd.DataFrame(columns=["feature", "importance_raw", "importance_norm"])
 
@@ -416,7 +394,7 @@ def _normalize_importance(values: pd.Series) -> pd.Series:
 
 
 def _resolve_sequence_store(
-    model: SequenceDetector, sequence_store: DetectorSequenceStore | None
+        model: SequenceDetector, sequence_store: DetectorSequenceStore | None
 ) -> DetectorSequenceStore:
     store = sequence_store if sequence_store is not None else model.sequence_store
     if store is None:
@@ -442,7 +420,7 @@ def _fit_scaler(x: np.ndarray, valid_mask: np.ndarray) -> tuple[np.ndarray, np.n
 
 
 def _transform_with_scaler(
-    x: np.ndarray, valid_mask: np.ndarray, mean: np.ndarray, std: np.ndarray
+        x: np.ndarray, valid_mask: np.ndarray, mean: np.ndarray, std: np.ndarray
 ) -> np.ndarray:
     transformed = (x - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
     transformed = np.nan_to_num(
@@ -454,7 +432,7 @@ def _transform_with_scaler(
 
 
 def _stack_model_inputs(
-    x_scaled: np.ndarray, valid_mask: np.ndarray, in_episode_mask: np.ndarray
+        x_scaled: np.ndarray, valid_mask: np.ndarray, in_episode_mask: np.ndarray
 ) -> np.ndarray:
     valid = valid_mask.astype(np.float32)[..., np.newaxis]
     in_episode = in_episode_mask.astype(np.float32)[..., np.newaxis]
@@ -523,7 +501,7 @@ def _binary_logloss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def _prepare_pair_index_data(
-    ranking_pairs_df: pd.DataFrame, decision_row_ids: pd.Series
+        ranking_pairs_df: pd.DataFrame, decision_row_ids: pd.Series
 ) -> dict[str, np.ndarray]:
     if ranking_pairs_df.empty:
         return {
